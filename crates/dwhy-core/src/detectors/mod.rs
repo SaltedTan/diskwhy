@@ -2,6 +2,7 @@
 
 mod cargo_target;
 mod docker;
+mod node_modules;
 mod user_cache;
 
 use std::io::Read;
@@ -13,12 +14,14 @@ pub use cargo_target::CargoTarget;
 pub use docker::{
     BUILD_CACHE_AGE_HOURS, DockerBuildCache, DockerContainer, DockerImage, DockerVolume,
 };
+pub use node_modules::NodeModules;
 pub use user_cache::{RECENT_HOURS, UserCache};
 
 /// Every detector that is built, in catalog order.
 pub fn registry() -> Vec<Box<dyn Detector>> {
     vec![
         Box::new(CargoTarget),
+        Box::new(NodeModules),
         Box::new(UserCache::from_system()),
         Box::new(DockerImage),
         Box::new(DockerBuildCache),
