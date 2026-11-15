@@ -133,6 +133,7 @@ expression: sample()
       "probe": "postgres-wal",
       "path": "docker://volume/example_postgres_data",
       "bytes": 33041965056,
+      "nested_bytes": null,
       "last_modified": "2026-11-13T02:10:00Z",
       "growth": {
         "bytes_per_day": 4939212390,

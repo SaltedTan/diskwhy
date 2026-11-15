@@ -66,6 +66,7 @@ fn finding(
         probe: None,
         path,
         bytes,
+        nested_bytes: None,
         last_modified: when.map(rfc3339),
         growth: None,
         tier: Tier::Review,

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::detectors;
-use crate::report::{DetectorAvailability, DetectorRun, DockerSocket, Finding, ToolStatus};
+use crate::report::{DetectorAvailability, DetectorRun, DockerSocket, Finding, Tier, ToolStatus};
 use crate::tree::ScanTree;
 
 /// What a detector needs from the system.
@@ -205,27 +205,55 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
-/// Drops filesystem findings whose path lies inside another finding's path,
-/// so no byte is offered twice; the outermost finding wins. Pseudo-paths
-/// such as `docker://...` never nest. Returns the survivors, largest first.
+/// Applies the nesting rule to filesystem findings, so no byte is counted
+/// twice. A finding whose path lies inside another kept finding's path is
+/// dropped, unless its tier is cheaper than that finding's or that finding
+/// is `blocked`: then it is kept, and its bytes go into the nearest kept
+/// finding around it as `nested_bytes`, named in that one's reason. Of two
+/// findings at the same path the cheaper tier is the outer one.
+/// Pseudo-paths such as `docker://...` never nest. Returns the survivors,
+/// largest first.
 pub fn outermost(mut findings: Vec<Finding>) -> Vec<Finding> {
     findings.sort_by(|a, b| {
         Path::new(&a.path)
             .cmp(Path::new(&b.path))
+            .then_with(|| a.tier.cmp(&b.tier))
             .then_with(|| a.detector.cmp(&b.detector))
     });
     let mut kept: Vec<Finding> = Vec::new();
-    let mut last_fs: Option<PathBuf> = None;
+    let mut nested: Vec<(u64, usize)> = Vec::new();
+    let mut chain: Vec<usize> = Vec::new();
     for f in findings {
-        let is_fs = f.path.starts_with('/');
-        if is_fs {
+        if f.path.starts_with('/') {
             let p = Path::new(&f.path);
-            if last_fs.as_deref().is_some_and(|outer| p.starts_with(outer)) {
-                continue;
+            while chain
+                .last()
+                .is_some_and(|&i| !p.starts_with(Path::new(&kept[i].path)))
+            {
+                chain.pop();
             }
-            last_fs = Some(p.to_path_buf());
+            if let Some(&outer) = chain.last() {
+                let t = kept[outer].tier;
+                if f.tier >= t && t != Tier::Blocked {
+                    continue;
+                }
+                nested[outer].0 += f.bytes;
+                nested[outer].1 += 1;
+            }
+            chain.push(kept.len());
         }
         kept.push(f);
+        nested.push((0, 0));
+    }
+    for (f, (bytes, n)) in kept.iter_mut().zip(nested) {
+        if n > 0 {
+            f.nested_bytes = Some(bytes);
+            f.reason.push_str(&format!(
+                "; {} of it is in {n} finding{} inside it, reported separately",
+                crate::units::human(bytes),
+                if n == 1 { "" } else { "s" }
+            ));
+        }
     }
     kept.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.id.cmp(&b.id)));
     kept
@@ -363,6 +391,7 @@ mod tests {
             probe: None,
             path: path.into(),
             bytes,
+            nested_bytes: None,
             last_modified: None,
             growth: None,
             tier: Tier::Rebuildable,
@@ -413,6 +442,123 @@ mod tests {
                 "/p/scratch-x/target"
             ]
         );
+    }
+
+    fn ft(det: &str, path: &str, bytes: u64, tier: Tier) -> Finding {
+        Finding {
+            tier,
+            reason: "why".into(),
+            ..f(det, path, bytes)
+        }
+    }
+
+    fn by_path(kept: &[Finding]) -> Vec<(&str, Option<u64>)> {
+        let mut v: Vec<_> = kept
+            .iter()
+            .map(|f| (f.path.as_str(), f.nested_bytes))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn review_finding_keeps_cheaper_findings_inside_it() {
+        let kept = outermost(vec![
+            ft("git-worktree", "/w/x", 100, Tier::Review),
+            ft("cargo-target", "/w/x/target", 30, Tier::Rebuildable),
+            ft("venv", "/w/x/.venv", 20, Tier::Regenerable),
+        ]);
+        assert_eq!(
+            by_path(&kept),
+            [
+                ("/w/x", Some(50)),
+                ("/w/x/.venv", None),
+                ("/w/x/target", None)
+            ]
+        );
+        let outer = kept.iter().find(|f| f.path == "/w/x").unwrap();
+        assert_eq!(outer.bytes, 100, "bytes still say what removing it frees");
+        assert_eq!(
+            outer.reason,
+            "why; 50B of it is in 2 findings inside it, reported separately"
+        );
+        let inner = kept.iter().find(|f| f.path == "/w/x/target").unwrap();
+        assert_eq!(inner.reason, "why");
+    }
+
+    #[test]
+    fn blocked_finding_keeps_any_finding_inside_it() {
+        let kept = outermost(vec![
+            ft("git-worktree", "/w/locked", 100, Tier::Blocked),
+            ft("stale-tree", "/w/locked/scratch", 40, Tier::Review),
+            ft("user-cache", "/w/locked/cache", 10, Tier::Blocked),
+        ]);
+        assert_eq!(
+            by_path(&kept),
+            [
+                ("/w/locked", Some(50)),
+                ("/w/locked/cache", None),
+                ("/w/locked/scratch", None)
+            ]
+        );
+    }
+
+    #[test]
+    fn same_or_dearer_tier_inside_is_dropped() {
+        let kept = outermost(vec![
+            ft("git-worktree", "/w/x", 100, Tier::Review),
+            ft("stale-tree", "/w/x/old", 40, Tier::Review),
+            ft("cargo-target", "/w/t", 50, Tier::Rebuildable),
+            ft(
+                "cargo-target",
+                "/w/t/package/c/target",
+                5,
+                Tier::Rebuildable,
+            ),
+            ft("stale-tree", "/w/t/tmp", 5, Tier::Review),
+        ]);
+        assert_eq!(by_path(&kept), [("/w/t", None), ("/w/x", None)]);
+        assert!(kept.iter().all(|f| f.reason == "why"));
+    }
+
+    #[test]
+    fn same_path_keeps_the_cheaper_tier() {
+        let kept = outermost(vec![
+            ft("a-review", "/w/x", 100, Tier::Review),
+            ft("z-rebuildable", "/w/x", 100, Tier::Rebuildable),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].detector, "z-rebuildable");
+        assert_eq!(kept[0].nested_bytes, None);
+    }
+
+    #[test]
+    fn nested_bytes_of_a_chain_count_each_byte_once() {
+        let kept = outermost(vec![
+            ft("git-worktree", "/w/locked", 100, Tier::Blocked),
+            ft("stale-tree", "/w/locked/proj", 60, Tier::Review),
+            ft(
+                "cargo-target",
+                "/w/locked/proj/target",
+                25,
+                Tier::Rebuildable,
+            ),
+            ft("venv", "/w/locked/proj/target/.venv", 5, Tier::Regenerable),
+        ]);
+        assert_eq!(
+            by_path(&kept),
+            [
+                ("/w/locked", Some(60)),
+                ("/w/locked/proj", Some(25)),
+                ("/w/locked/proj/target", Some(5)),
+                ("/w/locked/proj/target/.venv", None)
+            ]
+        );
+        let own: u64 = kept
+            .iter()
+            .map(|f| f.bytes - f.nested_bytes.unwrap_or(0))
+            .sum();
+        assert_eq!(own, 100);
     }
 
     #[test]

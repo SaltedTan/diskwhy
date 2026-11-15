@@ -118,6 +118,12 @@ fn tier_name(t: Tier) -> &'static str {
     }
 }
 
+/// A finding's bytes less those held by findings inside it, which are
+/// listed and counted on their own.
+fn own_bytes(f: &Finding) -> u64 {
+    f.bytes.saturating_sub(f.nested_bytes.unwrap_or(0))
+}
+
 /// What the findings' actions can free, and how many findings were left
 /// out of that total: advice-only ones (such as an in-use volume) and
 /// blocked ones (a guard such as `recent-write` failed).
@@ -133,7 +139,7 @@ fn reclaimable(findings: &[&Finding]) -> (String, String) {
     let bytes: u64 = findings
         .iter()
         .filter(|f| f.action.kind != ActionKind::Advice && f.tier != Tier::Blocked)
-        .map(|f| f.bytes)
+        .map(|f| own_bytes(f))
         .sum();
     let mut note = String::new();
     if advice > 0 {
@@ -170,7 +176,7 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
             continue;
         }
         if tier == Tier::Blocked {
-            let bytes: u64 = in_tier.iter().map(|f| f.bytes).sum();
+            let bytes: u64 = in_tier.iter().map(|f| own_bytes(f)).sum();
             writeln!(
                 w,
                 "  blocked ({}, not offered: a guard failed)",
@@ -451,6 +457,7 @@ mod tests {
             probe: None,
             path: path.into(),
             bytes,
+            nested_bytes: None,
             last_modified: None,
             growth: None,
             tier,
@@ -582,6 +589,62 @@ mod tests {
         );
         assert!(
             text.contains("blocked by recent-write: last written 2 hours ago"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn nested_findings_are_counted_once() {
+        let mut wt = finding(
+            "git-worktree",
+            "/w/old",
+            500 << 20,
+            Tier::Review,
+            ActionKind::Command,
+        );
+        wt.nested_bytes = Some(200 << 20);
+        let mut locked = finding(
+            "git-worktree",
+            "/w/locked",
+            300 << 20,
+            Tier::Blocked,
+            ActionKind::Command,
+        );
+        locked.nested_bytes = Some(100 << 20);
+        let r = report(vec![
+            wt,
+            finding(
+                "cargo-target",
+                "/w/old/target",
+                200 << 20,
+                Tier::Rebuildable,
+                ActionKind::RemovePath,
+            ),
+            locked,
+            finding(
+                "cargo-target",
+                "/w/locked/target",
+                100 << 20,
+                Tier::Rebuildable,
+                ActionKind::RemovePath,
+            ),
+        ]);
+        let mut out = Vec::new();
+        render_findings(&mut out, &r, 10).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[1],
+            "findings: 4 (600.0M reclaimable; 1 blocked, not counted) from 1 of 1 detectors"
+        );
+        assert!(lines.contains(&"  rebuildable (300.0M)"), "{text}");
+        assert!(lines.contains(&"  review (300.0M)"), "{text}");
+        assert!(
+            lines.contains(&"  blocked (200.0M, not offered: a guard failed)"),
+            "{text}"
+        );
+        assert!(
+            lines.contains(&"    500.0M  git-worktree  /w/old"),
             "{text}"
         );
     }

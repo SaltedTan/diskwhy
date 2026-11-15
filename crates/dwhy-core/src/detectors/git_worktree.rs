@@ -1,24 +1,27 @@
 //! `git-worktree`: linked git worktrees that are stale or prunable.
 //!
 //! Repositories are found in the scan tree: a directory whose `.git` is a
-//! directory holding `worktrees/` has linked worktrees. For each one, diskwhy
-//! runs `git --no-optional-locks -C <repo> worktree list --porcelain` and
-//! looks at every linked worktree (never the main one):
+//! directory holding `worktrees/` has linked worktrees. So is the repository
+//! a scanned worktree's `.git` file points to (`gitdir: <repo>/.git/worktrees/
+//! <name>`), even when the repository itself is outside the scan. For each
+//! one, diskwhy runs `git --no-optional-locks -C <repo> worktree list
+//! --porcelain` and looks at every linked worktree (never the main one):
 //!
 //! - **stale**: the worktree is in the scan and nothing in it was written for
 //!   [`STALE_DAYS`] days. Action: `git -C <repo> worktree remove <path>`,
 //!   never `--force`, so git itself refuses a worktree with changes; the M2
 //!   guards (`git-unpublished`, `git-dirty`) decide whether it is safe.
-//! - **prunable**: git reports its directory gone. One finding per repo,
-//!   whatever its size, with `git -C <repo> worktree prune`, which removes
-//!   only the bookkeeping git keeps for missing worktrees.
+//! - **prunable**: git reports its directory gone. One finding per repo in
+//!   the scan, whatever its size, with `git -C <repo> worktree prune`, which
+//!   removes only the bookkeeping git keeps for missing worktrees.
 //! - **locked** (`git worktree lock`): reported as `blocked` with a `locked`
 //!   guard, never offered, since someone locked it on purpose.
 //!
 //! Everything is `review`: a worktree can hold work that exists nowhere else.
 //! Bare repositories are not looked at yet.
 
-use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
@@ -97,8 +100,7 @@ impl Detector for GitWorktree {
         };
         let mut out = Vec::new();
         let mut errors = Vec::new();
-        for repo in repos_with_worktrees(tree) {
-            let repo_dir = tree.path(repo);
+        for repo_dir in repos_with_worktrees(tree) {
             match list(&git, &repo_dir) {
                 Ok(entries) => out.extend(self.findings(tree, ctx, &git, &repo_dir, &entries)),
                 Err(e) => errors.push(format!("{}: {e}", repo_dir.display())),
@@ -113,19 +115,63 @@ impl Detector for GitWorktree {
     }
 }
 
-/// Directories whose `.git` directory holds a `worktrees/` directory.
-fn repos_with_worktrees(tree: &ScanTree) -> Vec<NodeId> {
-    tree.ids()
-        .filter(|&id| {
-            let n = tree.node(id);
-            n.is_dir
-                && n.markers.contains(Markers::DOT_GIT)
-                && tree
-                    .child_named(id, ".git")
-                    .and_then(|g| tree.child_named(g, "worktrees"))
-                    .is_some()
-        })
-        .collect()
+/// Directories whose `.git` directory holds a `worktrees/` directory, and
+/// the repositories that scanned worktrees' `.git` files point to.
+fn repos_with_worktrees(tree: &ScanTree) -> BTreeSet<PathBuf> {
+    let mut repos = BTreeSet::new();
+    for id in tree.ids() {
+        let n = tree.node(id);
+        if !n.is_dir || !n.markers.contains(Markers::DOT_GIT) {
+            continue;
+        }
+        match tree.child_named(id, ".git") {
+            Some(g) => {
+                if tree.child_named(g, "worktrees").is_some() {
+                    repos.insert(tree.path(id));
+                }
+            }
+            None => {
+                let dir = tree.path(id);
+                if let Some(repo) = linked_repo(&dir) {
+                    repos.insert(repo);
+                }
+            }
+        }
+    }
+    repos
+}
+
+/// The repository of the worktree at `dir`, from a `.git` file holding
+/// `gitdir: <repo>/.git/worktrees/<name>` (a submodule's points elsewhere).
+fn linked_repo(dir: &Path) -> Option<PathBuf> {
+    let head = read_head(&dir.join(".git"), 4096)?;
+    let text = String::from_utf8_lossy(&head);
+    let gitdir = resolve(dir, text.trim().strip_prefix("gitdir:")?.trim());
+    let worktrees = gitdir.parent()?;
+    let dot_git = worktrees.parent()?;
+    if worktrees.file_name()? != "worktrees" || dot_git.file_name()? != ".git" {
+        return None;
+    }
+    if !std::fs::symlink_metadata(&gitdir).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    dot_git.parent().map(Path::to_path_buf)
+}
+
+/// `path` resolved against `base` when relative, with `.` and `..`
+/// removed lexically.
+fn resolve(base: &Path, path: &str) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in base.join(path).components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn list(git: &str, repo: &Path) -> Result<Vec<WorktreeEntry>, String> {
@@ -136,6 +182,12 @@ fn list(git: &str, repo: &Path) -> Result<Vec<WorktreeEntry>, String> {
         .args(["worktree", "list", "--porcelain"])
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|e| format!("cannot run {git}: {e}"))?;
@@ -241,6 +293,7 @@ impl GitWorktree {
                 detector: self.name().into(),
                 probe: None,
                 bytes,
+                nested_bytes: None,
                 last_modified: Some(rfc3339(n.newest_mtime)),
                 growth: None,
                 tier,
@@ -262,11 +315,12 @@ impl GitWorktree {
                 path: path_s,
             });
         }
-        if !prunable.is_empty() {
-            let admin = repo.join(".git/worktrees");
+        let admin = repo.join(".git/worktrees");
+        let admin_id = tree.find(&admin).filter(|_| !prunable.is_empty());
+        if let Some(admin_id) = admin_id {
             let path_s = admin.to_string_lossy().into_owned();
-            let node = tree.find(&admin).map(|id| tree.node(id));
-            let bytes = admin_bytes(tree, &admin, &prunable);
+            let node = tree.node(admin_id);
+            let bytes = admin_bytes(tree, admin_id, &prunable);
             let names: Vec<String> = prunable
                 .iter()
                 .map(|e| e.path.display().to_string())
@@ -276,7 +330,8 @@ impl GitWorktree {
                 detector: self.name().into(),
                 probe: None,
                 bytes,
-                last_modified: node.map(|n| rfc3339(n.newest_mtime)),
+                nested_bytes: None,
+                last_modified: Some(rfc3339(node.newest_mtime)),
                 growth: None,
                 tier: Tier::Review,
                 reason: format!(
@@ -301,16 +356,13 @@ impl GitWorktree {
 
 /// Bytes of the `.git/worktrees/<name>` entries whose `gitdir` file points
 /// into one of the missing worktrees: what `git worktree prune` removes.
-fn admin_bytes(tree: &ScanTree, admin: &Path, missing: &[&WorktreeEntry]) -> u64 {
-    let Some(id) = tree.find(admin) else {
-        return 0;
-    };
-    tree.children(id)
+fn admin_bytes(tree: &ScanTree, admin: NodeId, missing: &[&WorktreeEntry]) -> u64 {
+    tree.children(admin)
         .iter()
         .filter(|&&c| {
-            let gitdir = tree.path(c).join("gitdir");
-            read_head(&gitdir, 4096).is_some_and(|b| {
-                let target = PathBuf::from(String::from_utf8_lossy(&b).trim());
+            let entry = tree.path(c);
+            read_head(&entry.join("gitdir"), 4096).is_some_and(|b| {
+                let target = resolve(&entry, String::from_utf8_lossy(&b).trim());
                 missing
                     .iter()
                     .any(|e| target.parent() == Some(e.path.as_path()))

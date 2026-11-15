@@ -131,6 +131,7 @@ expression: v
       "guards": [],
       "id": "[id]",
       "last_modified": "[last_modified]",
+      "nested_bytes": null,
       "path": "[root]/app/target",
       "probe": null,
       "reason": "[reason]",

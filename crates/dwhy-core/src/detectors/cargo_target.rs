@@ -85,6 +85,7 @@ impl Detector for CargoTarget {
                 detector: self.name().into(),
                 probe: None,
                 bytes,
+                nested_bytes: None,
                 last_modified: Some(rfc3339(n.newest_mtime)),
                 growth: None,
                 tier: Tier::Rebuildable,

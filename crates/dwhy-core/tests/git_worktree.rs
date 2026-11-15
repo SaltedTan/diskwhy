@@ -60,7 +60,8 @@ fn ctx_with(git: Option<&str>, off_path: Option<&str>) -> DetectContext {
     }
 }
 
-/// Runs git in `dir` with no user or system config.
+/// Runs git in `dir` with no user or system config, ignoring any repository
+/// the caller's environment points at.
 fn git(dir: &Path, args: &[&str]) {
     let st = Command::new("git")
         .args([
@@ -77,6 +78,12 @@ fn git(dir: &Path, args: &[&str]) {
         .env("GIT_AUTHOR_EMAIL", "t@example.com")
         .env("GIT_COMMITTER_NAME", "t")
         .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .status()
         .unwrap();
     assert!(st.success(), "git {args:?}");
@@ -112,7 +119,11 @@ fn tmp() -> (tempfile::TempDir, PathBuf) {
 
 /// A repo at `root/repo` with one commit.
 fn repo(root: &Path) -> PathBuf {
-    let r = root.join("repo");
+    repo_named(root, "repo")
+}
+
+fn repo_named(root: &Path, name: &str) -> PathBuf {
+    let r = root.join(name);
     fs::create_dir_all(&r).unwrap();
     git(&r, &["init", "-q"]);
     fs::write(r.join("README"), "hi").unwrap();
@@ -241,6 +252,76 @@ fn small_detached_and_unscanned_worktrees() {
 
     // Scanning only the repo: the worktrees next to it are not measured.
     assert!(findings(&r, Some("git")).is_empty());
+}
+
+#[test]
+fn worktrees_scanned_without_their_repos() {
+    let (_t, root) = tmp();
+    let wts = root.join("wts");
+    fs::create_dir_all(&wts).unwrap();
+    let a = repo_named(&root, "repo-a");
+    let a_old = worktree(&a, &wts, "a-old", 2);
+    let a_gone = worktree(&a, &wts, "a-gone", 0);
+    fs::remove_dir_all(&a_gone).unwrap();
+    // Recorded with relative paths: the `.git` file says `gitdir: ../../repo-b/...`.
+    let b = repo_named(&root, "repo-b");
+    git(&b, &["config", "worktree.useRelativePaths", "true"]);
+    let b_old = worktree(&b, &wts, "b-old", 2);
+    age_tree(&a_old, 30);
+    age_tree(&b_old, 30);
+
+    // Scanning only where the worktrees live finds both repos through the
+    // worktrees' `.git` files; prunable entries of repos outside the scan
+    // are not measured, so not reported.
+    let found = findings(&wts, Some("git"));
+    let paths: Vec<&str> = found.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, [s(&a_old), s(&b_old)]);
+    assert_eq!(
+        found[1].action.argv.as_deref().unwrap(),
+        ["git", "-C", s(&b), "worktree", "remove", s(&b_old)]
+    );
+
+    // The same worktrees from the root: each repo is read once.
+    let found = findings(&root, Some("git"));
+    let paths: Vec<&str> = found.iter().map(|f| f.path.as_str()).collect();
+    let admin = a.join(".git/worktrees");
+    assert_eq!(paths, [s(&admin), s(&a_old), s(&b_old)]);
+}
+
+#[test]
+fn prunable_bytes_with_relative_paths() {
+    let (_t, root) = tmp();
+    let r = repo(&root);
+    git(&r, &["config", "worktree.useRelativePaths", "true"]);
+    let gone = worktree(&r, &root, "wt-gone", 0);
+    worktree(&r, &root, "wt-kept", 0);
+    fs::remove_dir_all(&gone).unwrap();
+
+    let found = findings(&root, Some("git"));
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path, s(&r.join(".git/worktrees")));
+    let tree = scan_tree(&root);
+    let entry = tree.find(&r.join(".git/worktrees/wt-gone")).unwrap();
+    // Only wt-gone's bookkeeping goes, not wt-kept's.
+    assert_eq!(found[0].bytes, tree.node(entry).freeable());
+}
+
+#[test]
+fn submodule_git_files_are_not_followed() {
+    let (_t, root) = tmp();
+    let r = repo(&root);
+    fs::create_dir_all(r.join(".git/modules/sub")).unwrap();
+    let sub = r.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+    // git is never run, so a broken git is not an error.
+    let missing = root.join("no-such-git").to_string_lossy().into_owned();
+    assert!(
+        GitWorktree
+            .detect(&scan_tree(&root), &ctx_with(None, Some(&missing)))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
