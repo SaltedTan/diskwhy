@@ -34,7 +34,7 @@ CI (`.github/workflows/ci.yml`) runs exactly these checks. All of them must pass
 
 ## Safety rules (non-negotiable)
 
-- Scans are read-only. The walker opens directories with `O_NOFOLLOW` and stats entries with `fstatat(AT_SYMLINK_NOFOLLOW)`. Keep it that way: never follow symlinks, never write, never cross a filesystem boundary unless `--cross-filesystems` asks for it.
+- Scans are read-only. The walker opens directories with `O_NOFOLLOW` and stats entries with `fstatat(AT_SYMLINK_NOFOLLOW)`. Keep it that way: never follow symlinks, and never cross a filesystem boundary unless `--cross-filesystems` asks for it. A scan writes nothing except diskwhy's own state (DESIGN.md). In M0 that means nothing at all; from M3 on, snapshots go under `~/.local/state/diskwhy/`.
 - Never delete or modify anything outside temp-dir test fixtures, and never run anything with `sudo`, even to "check" a number. When a figure needs root, report it as unmeasured.
 - Removal code (M2+) must follow the DESIGN.md safety rules: tool-native commands or removal limited to the finding's root, guards re-run at apply time, and an audit log.
 - Git commands that diskwhy runs must use `--no-optional-locks`.
