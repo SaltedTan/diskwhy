@@ -7,13 +7,15 @@
 //!
 //! - one lockfile (`uv.lock`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`):
 //!   that tool's install command, pinned to the venv; several: no command,
-//!   the cost names them. Poetry and Pipenv can only be told to install into
-//!   `.venv`, so a venv with another name gets no command
+//!   the cost names them. Poetry, Pipenv and pdm install into `.venv` when
+//!   told to (or by default), so a venv with another name is recreated first
+//!   and the tool run with it active (`VIRTUAL_ENV`)
 //! - `requirements.txt`: recreate the venv with the same Python and install it
-//! - `pyproject.toml` with a `[project]` or `[tool.poetry]` table, or
-//!   `setup.py`, without a lockfile: reinstall the project, which resolves
-//!   dependencies again. A `pyproject.toml` that only configures tools
-//!   (`[tool.ruff]`) does not count
+//! - `pyproject.toml` with a `[project]` or `[tool.poetry]` table, `setup.py`,
+//!   or `setup.cfg` with a `[metadata]` or `[options]` section, without a
+//!   lockfile: reinstall the project, which resolves dependencies again. A
+//!   `pyproject.toml` that only configures tools (`[tool.ruff]`) does not
+//!   count
 //!
 //! A venv with none of these next to it holds packages installed by hand, so
 //! removing it loses that list: it is reported as `review`, with the command
@@ -92,9 +94,9 @@ fn is_file(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file())
 }
 
-/// True if the `pyproject.toml` at `path` has a `[project]` or
-/// `[tool.poetry]` table, rather than only tool settings.
-fn declares_project(path: &Path) -> bool {
+/// True if the TOML or INI file at `path` has one of `tables` as a header
+/// (`[tool.poetry]` is `["tool", "poetry"]`).
+fn has_table(path: &Path, tables: &[&[&str]]) -> bool {
     let Some(head) = read_head(path, 256 << 10) else {
         return false;
     };
@@ -106,7 +108,7 @@ fn declares_project(path: &Path) -> bool {
             return false;
         };
         let key: Vec<&str> = key.split('.').map(str::trim).collect();
-        key == ["project"] || key == ["tool", "poetry"]
+        tables.contains(&key.as_slice())
     })
 }
 
@@ -118,7 +120,8 @@ struct Project {
     other_requirements: Vec<String>,
     /// `pyproject.toml` declares a project.
     pyproject: bool,
-    setup_py: bool,
+    /// `setup.py`, or a `setup.cfg` with project metadata.
+    setup: bool,
 }
 
 impl Project {
@@ -145,8 +148,12 @@ impl Project {
                 .collect(),
             requirements: is_file(&dir.join("requirements.txt")),
             other_requirements,
-            pyproject: declares_project(&dir.join("pyproject.toml")),
-            setup_py: is_file(&dir.join("setup.py")),
+            pyproject: has_table(
+                &dir.join("pyproject.toml"),
+                &[&["project"], &["tool", "poetry"]],
+            ),
+            setup: is_file(&dir.join("setup.py"))
+                || has_table(&dir.join("setup.cfg"), &[&["metadata"], &["options"]]),
         }
     }
 
@@ -155,7 +162,7 @@ impl Project {
             && !self.requirements
             && self.other_requirements.is_empty()
             && !self.pyproject
-            && !self.setup_py
+            && !self.setup
     }
 }
 
@@ -337,39 +344,43 @@ fn recovery(p: &Project, dir: &Path, name: &str, venv: &str, cfg: &Cfg) -> (Tier
     } else {
         format!("UV_PROJECT_ENVIRONMENT={q} uv sync")
     };
-    // Recreate the venv the way it was made, then run `install` in it.
-    let recreate = |install_uv: &str, install_pip: &str| {
-        if cfg.uv {
-            let pyflag = py.map(|v| format!(" --python {v}")).unwrap_or_default();
-            format!("{cd}uv venv{pyflag} {q} && uv pip install --python {q} {install_uv}")
-        } else {
-            let python = py.map(|v| format!("python{v}")).unwrap_or("python3".into());
-            format!("{cd}{python} -m venv {q} && {q}/bin/pip install {install_pip}")
-        }
+    // Recreate the venv the way it was made.
+    let (make, pip) = if cfg.uv {
+        let pyflag = py.map(|v| format!(" --python {v}")).unwrap_or_default();
+        (
+            format!("uv venv{pyflag} {q}"),
+            format!("uv pip install --python {q}"),
+        )
+    } else {
+        let python = py.map(|v| format!("python{v}")).unwrap_or("python3".into());
+        (
+            format!("{python} -m venv {q}"),
+            format!("{q}/bin/pip install"),
+        )
     };
+    let recreate = |args: &str| format!("{cd}{make} && {pip} {args}");
     let rebuild = |how: Option<String>, cost: String| (Tier::Rebuildable, Recovery { cost, how });
 
     match p.locks.as_slice() {
         [(file, tool, cmd)] => {
-            // Poetry and Pipenv default to a central env; they can be told
-            // to use the project's .venv, but no other name.
-            let how = match *tool {
-                "uv" => Some(uv_sync),
-                "poetry" | "pipenv" if name != ".venv" => None,
-                "poetry" => Some(format!("POETRY_VIRTUALENVS_IN_PROJECT=true {cmd}")),
-                "pipenv" => Some(format!("PIPENV_VENV_IN_PROJECT=1 {cmd}")),
-                _ => Some(cmd.to_string()),
+            let pinned = format!(
+                "{cmd} reinstalls the packages pinned in {file}, downloading what its cache no longer holds"
+            );
+            // Poetry and Pipenv default to a central env and pdm to .venv;
+            // each uses the active venv instead.
+            let (how, cost) = match *tool {
+                "uv" => (uv_sync, pinned),
+                _ if name != ".venv" => (
+                    format!("{make} && VIRTUAL_ENV={} {cmd}", shell_quote(venv)),
+                    format!(
+                        "recreates the venv with {py_text}, then {cmd} installs the packages pinned in {file} into it; this relies on {tool} using the active venv (VIRTUAL_ENV) rather than one of its own"
+                    ),
+                ),
+                "poetry" => (format!("POETRY_VIRTUALENVS_IN_PROJECT=true {cmd}"), pinned),
+                "pipenv" => (format!("PIPENV_VENV_IN_PROJECT=1 {cmd}"), pinned),
+                _ => (cmd.to_string(), pinned),
             };
-            let cost = if how.is_some() {
-                format!(
-                    "{cmd} reinstalls the packages pinned in {file}, downloading what its cache no longer holds"
-                )
-            } else {
-                format!(
-                    "{file} pins the packages, but {tool} cannot install into a venv named {name}, only into .venv or its own central env: recreate the venv with {py_text} and install them yourself"
-                )
-            };
-            return rebuild(how.map(|h| format!("{cd}{h}")), cost);
+            return rebuild(Some(format!("{cd}{how}")), cost);
         }
         [] => {}
         many => {
@@ -393,10 +404,7 @@ fn recovery(p: &Project, dir: &Path, name: &str, venv: &str, cfg: &Cfg) -> (Tier
                 p.other_requirements.join(", ")
             ));
         }
-        return rebuild(
-            Some(recreate("-r requirements.txt", "-r requirements.txt")),
-            cost,
-        );
+        return rebuild(Some(recreate("-r requirements.txt")), cost);
     }
     if !p.other_requirements.is_empty() {
         return rebuild(
@@ -414,9 +422,9 @@ fn recovery(p: &Project, dir: &Path, name: &str, venv: &str, cfg: &Cfg) -> (Tier
             "no uv.lock, so uv sync resolves the dependencies again (possibly to newer versions) and writes one".into(),
         );
     }
-    if p.pyproject || p.setup_py {
+    if p.pyproject || p.setup {
         return rebuild(
-            Some(recreate("-e .", "-e .")),
+            Some(recreate("-e .")),
             format!(
                 "recreates the venv with {py_text} and installs the project (editable assumed); its dependencies resolve again, possibly to newer versions"
             ),

@@ -251,24 +251,89 @@ fn recovery_follows_the_project_files() {
 }
 
 #[test]
-fn poetry_and_pipenv_venvs_not_named_dot_venv_get_no_command() {
+fn lockfile_venvs_not_named_dot_venv_are_recreated_and_installed_with_virtual_env() {
     let (_t, root) = tmp();
-    // Neither tool can be pointed at a venv named `venv`: running it would
-    // install somewhere else and leave this path missing.
+    // Run as is, Poetry and Pipenv install into their central env and pdm into
+    // .venv: the venv is recreated at its own path and made active instead.
     let p = venv(&root.join("p"), "venv", VENV_CFG, &["poetry.lock"], 2);
     let e = venv(&root.join("e"), "env", VENV_CFG, &["Pipfile.lock"], 2);
+    let d = venv(&root.join("d"), "venv", UV_CFG, &["pdm.lock"], 2);
     let found = findings(&root);
-    assert_eq!(paths(&found), [s(&e), s(&p)]);
-    for (f, tool, name) in [(&found[0], "pipenv", "env"), (&found[1], "poetry", "venv")] {
+    assert_eq!(paths(&found), [s(&d), s(&e), s(&p)]);
+    let expect = [
+        (
+            &d,
+            "pdm",
+            "uv venv --python 3.12 venv && VIRTUAL_ENV={} pdm install",
+        ),
+        (
+            &e,
+            "pipenv",
+            "python3.14 -m venv env && VIRTUAL_ENV={} pipenv sync",
+        ),
+        (
+            &p,
+            "poetry",
+            "python3.14 -m venv venv && VIRTUAL_ENV={} poetry install",
+        ),
+    ];
+    for (f, (v, tool, cmd)) in found.iter().zip(expect) {
         assert_eq!(f.tier, Tier::Rebuildable, "{}", f.path);
-        assert_eq!(f.recovery.how, None, "{}", f.path);
+        assert_eq!(
+            how(f),
+            format!(
+                "cd {} && {}",
+                s(v.parent().unwrap()),
+                cmd.replace("{}", s(v))
+            )
+        );
         assert!(
             f.recovery
                 .cost
-                .contains(&format!("{tool} cannot install into a venv named {name}")),
+                .contains(&format!("relies on {tool} using the active venv")),
             "{}",
             f.recovery.cost
         );
+    }
+}
+
+#[test]
+fn a_setup_cfg_with_metadata_is_a_project() {
+    let (_t, root) = tmp();
+    let build = "[build-system]\nrequires = [\"setuptools\"]\n";
+    let pip_e = "python3.14 -m venv .venv && .venv/bin/pip install -e .";
+    for (dir, cfg) in [
+        ("metadata", "[metadata]\nname = app\n"),
+        ("options", "[options]\ninstall_requires =\n    requests\n"),
+    ] {
+        venv(&root.join(dir), ".venv", VENV_CFG, &[], 2);
+        fs::write(root.join(dir).join("pyproject.toml"), build).unwrap();
+        fs::write(root.join(dir).join("setup.cfg"), cfg).unwrap();
+    }
+    // Only tool settings in setup.cfg, and old flit metadata: not a project.
+    let lint = venv(&root.join("lint-only"), ".venv", VENV_CFG, &[], 2);
+    fs::write(
+        root.join("lint-only/setup.cfg"),
+        "[flake8]\nmax-line-length = 100\n",
+    )
+    .unwrap();
+    let flit = venv(&root.join("old-flit"), ".venv", VENV_CFG, &[], 2);
+    fs::write(
+        root.join("old-flit/pyproject.toml"),
+        "[tool.flit.metadata]\nmodule = \"app\"\n",
+    )
+    .unwrap();
+
+    let found = findings(&root);
+    assert_eq!(found.len(), 4);
+    for f in &found {
+        let dir = Path::new(&f.path).parent().unwrap();
+        if f.path == s(&lint) || f.path == s(&flit) {
+            assert_eq!(f.tier, Tier::Review, "{}", f.path);
+        } else {
+            assert_eq!(f.tier, Tier::Rebuildable, "{}", f.path);
+            assert_eq!(how(f), format!("cd {} && {pip_e}", s(dir)));
+        }
     }
 }
 
