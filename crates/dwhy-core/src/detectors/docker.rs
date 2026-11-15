@@ -23,6 +23,8 @@ fn command(ctx: &DetectContext, args: &[&str]) -> Action {
     let mut argv = vec![
         ctx.tool_command("docker")
             .unwrap_or_else(|| "docker".into()),
+        "-H".into(),
+        format!("unix://{}", ctx.docker_socket.path),
     ];
     argv.extend(args.iter().map(|s| s.to_string()));
     Action {
@@ -184,6 +186,7 @@ fn build_cache(snap: &Snapshot, ctx: &DetectContext) -> Option<Finding> {
     let all: u64 = reclaimable.iter().map(|r| pos(r.size)).sum();
     let old: Vec<_> = reclaimable
         .iter()
+        .filter(|r| !matches!(r.kind.as_str(), "internal" | "frontend"))
         .filter(|r| {
             r.last_used_at
                 .as_deref()

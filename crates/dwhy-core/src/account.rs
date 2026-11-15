@@ -478,11 +478,8 @@ pub fn attach_docker(report: &mut ScanReport, usage: &DockerUsage) {
 pub fn attach_docker_hints(filesystems: &mut [FsReport], usage: &DockerUsage) {
     let image_bytes = usage.images.bytes;
     let rest = usage.total - image_bytes;
+    let split = usage.containerd_image_store;
     for fs in filesystems {
-        let has_containerd = fs.hints.iter().any(|h| {
-            h.kind == HintKind::Containerd && h.path.as_deref() == Some("/var/lib/containerd")
-        });
-        let split = usage.containerd_image_store && has_containerd;
         for h in &mut fs.hints {
             let path = h.path.as_deref().unwrap_or("");
             if h.kind == HintKind::Docker && Path::new(path) == Path::new(&usage.root_dir) {

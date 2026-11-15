@@ -276,12 +276,12 @@ pub fn run_with(
         };
         let selected = only.is_none_or(|o| o.iter().any(|n| n == info.name));
         match det {
-            _ if !selected => {
-                run.detail = format!("not selected (--detectors); {}", run.detail);
-            }
             None => {
                 run.status = DetectorAvailability::NotImplemented;
                 run.detail = format!("not implemented yet ({})", info.milestone);
+            }
+            _ if !selected => {
+                run.detail = format!("not selected (--detectors); {}", run.detail);
             }
             Some(_) if status == DetectorAvailability::Unavailable => {}
             Some(d) => {
@@ -460,6 +460,14 @@ mod tests {
         assert!(
             runs.iter()
                 .all(|r| !r.ran && r.status == DetectorAvailability::NotImplemented)
+        );
+
+        let only = vec!["cargo-target".to_string()];
+        let (_, runs) = run_with(&tree, &ctx(&[]), &[], Some(&only));
+        assert!(
+            runs.iter()
+                .all(|r| !r.ran && r.status == DetectorAvailability::NotImplemented),
+            "{runs:?}"
         );
     }
 

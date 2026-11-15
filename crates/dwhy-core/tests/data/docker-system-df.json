@@ -1,7 +1,7 @@
 {
   "LayersSize": 9000000000,
   "Images": [
-    {"Id": "sha256:aaaa000000000000000000000000000000000000000000000000000000000001", "RepoTags": ["app:latest"], "RepoDigests": ["app@sha256:01"], "Created": 1794000000, "Size": 3000000000, "SharedSize": 1000000000, "Containers": 1},
+    {"Id": "sha256:aaaa000000000000000000000000000000000000000000000000000000000001", "RepoTags": ["app:latest"], "RepoDigests": ["app@sha256:01"], "Created": 1794000000, "Size": 3000000000, "SharedSize": 1000000000, "Containers": 3},
     {"Id": "sha256:bbbb000000000000000000000000000000000000000000000000000000000002", "RepoTags": null, "RepoDigests": [], "Created": 1794500000, "Size": 2750000000, "SharedSize": 1630000000, "Containers": 0},
     {"Id": "sha256:cccc000000000000000000000000000000000000000000000000000000000003", "RepoTags": ["postgres:16-alpine"], "RepoDigests": ["postgres@sha256:03"], "Created": 1792000000, "Size": 420000000, "SharedSize": 0, "Containers": 0},
     {"Id": "sha256:dddd000000000000000000000000000000000000000000000000000000000004", "RepoTags": ["ci-runner:local", "ci-runner:v2"], "RepoDigests": ["ci-runner@sha256:04"], "Created": 1794600000, "Size": 2150000000, "SharedSize": 134000000, "Containers": 0},
@@ -10,8 +10,8 @@
   ],
   "Containers": [
     {"Id": "c1000000000000000000000000000000000000000000000000000000000000a1", "Names": ["/app-1"], "Image": "app:latest", "State": "running", "Status": "Up 3 hours", "Created": 1794600000, "SizeRw": 2900000, "Mounts": [{"Type": "volume", "Name": "app_data", "Destination": "/data"}, {"Type": "bind", "Source": "/srv", "Destination": "/srv"}]},
-    {"Id": "c2000000000000000000000000000000000000000000000000000000000000b2", "Names": ["/old-job"], "Image": "ci-runner:local", "State": "exited", "Status": "Exited (0) 3 days ago", "Created": 1794400000, "SizeRw": 500000000, "Mounts": [{"Type": "volume", "Name": "job_cache", "Destination": "/cache"}]},
-    {"Id": "c3000000000000000000000000000000000000000000000000000000000000c3", "Names": ["/never-started"], "Image": "alpine:latest", "State": "created", "Status": "Created", "Created": 1794400000, "SizeRw": 0, "Mounts": []}
+    {"Id": "c2000000000000000000000000000000000000000000000000000000000000b2", "Names": ["/old-job"], "Image": "app:latest", "State": "exited", "Status": "Exited (0) 3 days ago", "Created": 1794400000, "SizeRw": 500000000, "Mounts": [{"Type": "volume", "Name": "job_cache", "Destination": "/cache"}]},
+    {"Id": "c3000000000000000000000000000000000000000000000000000000000000c3", "Names": ["/never-started"], "Image": "app:latest", "State": "created", "Status": "Created", "Created": 1794400000, "SizeRw": 0, "Mounts": []}
   ],
   "Volumes": [
     {"Name": "app_data", "Driver": "local", "CreatedAt": "2026-11-01T10:00:00+11:00", "UsageData": {"Size": 2147483648, "RefCount": 1}},
@@ -24,6 +24,8 @@
     {"ID": "old1", " Parents": ["p"], "Type": "regular", "Description": "mount / from exec pip install", "InUse": false, "Shared": false, "Size": 800000000, "CreatedAt": "2026-11-04T13:12:35.182971468Z", "LastUsedAt": "2026-11-04T13:12:35.231986284Z", "UsageCount": 1},
     {"ID": "old-shared", "Type": "regular", "Description": "pulled from docker.io/library/python:3.12-slim", "InUse": false, "Shared": true, "Size": 100000000, "LastUsedAt": "2026-11-04T13:12:35Z", "UsageCount": 1},
     {"ID": "recent", "Type": "regular", "Description": "[6/7] COPY app ./app", "InUse": false, "Shared": false, "Size": 200000000, "LastUsedAt": "2026-11-14T12:00:00Z", "UsageCount": 2},
+    {"ID": "old-frontend", "Type": "frontend", "Description": "pulled from docker.io/docker/dockerfile:1", "InUse": false, "Shared": false, "Size": 30000000, "LastUsedAt": "2026-11-01T00:00:00Z", "UsageCount": 1},
+    {"ID": "old-internal", "Type": "internal", "Description": "local source for context", "InUse": false, "Shared": false, "Size": 10000000, "LastUsedAt": "2026-11-01T00:00:00Z", "UsageCount": 1},
     {"ID": "busy", "Type": "regular", "Description": "running build", "InUse": true, "Shared": false, "Size": 1000000000, "LastUsedAt": "2026-11-01T00:00:00Z", "UsageCount": 9}
   ]
 }

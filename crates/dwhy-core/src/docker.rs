@@ -25,6 +25,23 @@ pub struct SystemDf {
     pub build_cache: Option<Vec<BuildCacheRecord>>,
 }
 
+/// Parses a `GET /system/df` body. A body with none of the `Images`,
+/// `Containers`, `Volumes` and `BuildCache` keys is a schema diskwhy does not
+/// know, not an empty daemon (an empty list, or `null`, is fine).
+pub fn parse_system_df(body: &[u8]) -> Result<SystemDf, String> {
+    let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
+    if !["Images", "Containers", "Volumes", "BuildCache"]
+        .iter()
+        .any(|k| v.get(k).is_some())
+    {
+        return Err(
+            "the response has no Images, Containers, Volumes or BuildCache lists (unsupported API schema)"
+                .into(),
+        );
+    }
+    serde_json::from_value(v).map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct Image {
@@ -310,7 +327,7 @@ impl Source {
         self.cell
             .get_or_init(|| {
                 let api = self.api.as_ref().ok_or("no Docker socket configured")?;
-                let df: SystemDf = serde_json::from_slice(&api.get("/system/df")?)
+                let df = parse_system_df(&api.get("/system/df")?)
                     .map_err(|e| format!("docker API /system/df: {e}"))?;
                 let info: Info = serde_json::from_slice(&api.get("/info")?)
                     .map_err(|e| format!("docker API /info: {e}"))?;
@@ -393,6 +410,27 @@ mod tests {
         };
         assert!(api.get("/x").is_err());
         assert!(Source::none().get().is_err());
+    }
+
+    #[test]
+    fn unknown_system_df_schema_is_an_error_not_an_empty_daemon() {
+        let (_d, sock) = serve(
+            b"HTTP/1.0 200 OK\r\n\r\n{\"ImageUsage\":{\"TotalSize\":5,\"Reclaimable\":1},\"BuildCacheUsage\":{\"TotalSize\":2}}",
+        );
+        let e = Source::socket(&sock, Duration::from_secs(5))
+            .get()
+            .unwrap_err();
+        assert!(
+            e.contains("/system/df") && e.contains("unsupported API schema"),
+            "{e}"
+        );
+
+        let empty = parse_system_df(
+            br#"{"LayersSize":0,"Images":[],"Containers":null,"Volumes":null,"BuildCache":null}"#,
+        )
+        .unwrap();
+        assert!(empty.images.unwrap().is_empty());
+        assert!(empty.containers.is_none());
     }
 
     #[test]

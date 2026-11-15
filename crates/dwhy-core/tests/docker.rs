@@ -7,7 +7,7 @@ use std::sync::Arc;
 use dwhy_core::account;
 use dwhy_core::detect::{DetectContext, Detector, run_with};
 use dwhy_core::detectors::{DockerBuildCache, DockerContainer, DockerImage, DockerVolume};
-use dwhy_core::docker::{self, Info, Snapshot, Source, SystemDf};
+use dwhy_core::docker::{self, Info, Snapshot, Source};
 use dwhy_core::report::*;
 use dwhy_core::tree::ScanTree;
 
@@ -15,7 +15,7 @@ use dwhy_core::tree::ScanTree;
 const NOW: i64 = 1_794_700_000;
 
 fn snapshot(containerd: bool) -> Snapshot {
-    let df: SystemDf = serde_json::from_str(include_str!("data/docker-system-df.json")).unwrap();
+    let df = docker::parse_system_df(include_bytes!("data/docker-system-df.json")).unwrap();
     let driver_type = if containerd {
         "io.containerd.snapshotter.v1"
     } else {
@@ -95,6 +95,8 @@ fn images_unused_by_any_container() {
         argv(dangling),
         [
             "docker",
+            "-H",
+            "unix:///var/run/docker.sock",
             "image",
             "rm",
             "sha256:bbbb000000000000000000000000000000000000000000000000000000000002"
@@ -106,7 +108,15 @@ fn images_unused_by_any_container() {
     let multi = &found["docker://image/ci-runner:local"];
     assert_eq!(
         argv(multi),
-        ["docker", "image", "rm", "ci-runner:local", "ci-runner:v2"]
+        [
+            "docker",
+            "-H",
+            "unix:///var/run/docker.sock",
+            "image",
+            "rm",
+            "ci-runner:local",
+            "ci-runner:v2"
+        ]
     );
     assert_eq!(multi.bytes, 2_150_000_000 - 134_000_000);
     assert!(
@@ -133,7 +143,8 @@ fn build_cache_older_than_a_week() {
     assert_eq!(found.len(), 1);
     let f = &found[0];
     assert_eq!(f.path, "docker://build-cache");
-    // Only `old1`: `recent` was used yesterday, `old-shared` is shared, `busy` is in use.
+    // Only `old1`: `recent` was used yesterday, `old-shared` is shared, `busy` is in use,
+    // and a prune without `--all` keeps `old-frontend` and `old-internal`.
     assert_eq!(f.bytes, 800_000_000);
     assert!(
         f.reason
@@ -142,7 +153,7 @@ fn build_cache_older_than_a_week() {
         f.reason
     );
     assert!(
-        f.reason.contains("all reclaimable cache: 953.7M"),
+        f.reason.contains("all reclaimable cache: 991.8M"),
         "{}",
         f.reason
     );
@@ -150,6 +161,8 @@ fn build_cache_older_than_a_week() {
         argv(f),
         [
             "docker",
+            "-H",
+            "unix:///var/run/docker.sock",
             "builder",
             "prune",
             "--force",
@@ -175,6 +188,8 @@ fn stopped_containers_with_a_writable_layer() {
         argv(f),
         [
             "docker",
+            "-H",
+            "unix:///var/run/docker.sock",
             "container",
             "rm",
             "c2000000000000000000000000000000000000000000000000000000000000b2"
@@ -199,7 +214,21 @@ fn unused_and_large_in_use_volumes() {
 
     let orphan = &found["docker://volume/orphan_pg"];
     assert_eq!(orphan.bytes, 314_572_800);
-    assert_eq!(argv(orphan), ["docker", "volume", "rm", "orphan_pg"]);
+    assert_eq!(
+        argv(orphan),
+        [
+            "docker",
+            "-H",
+            "unix:///var/run/docker.sock",
+            "volume",
+            "rm",
+            "orphan_pg"
+        ]
+    );
+    assert_eq!(
+        orphan.action.text,
+        "docker -H unix:///var/run/docker.sock volume rm orphan_pg"
+    );
     assert!(orphan.guards.is_empty());
     assert!(orphan.recovery.cost.contains("data is gone"));
     assert!(
@@ -233,7 +262,7 @@ fn usage_totals_match_the_api() {
         2_147_483_648 + 52_428_800 + 314_572_800 + 5_242_880
     );
     assert_eq!((u.volumes.count, u.volumes.active), (5, 2));
-    assert_eq!(u.build_cache.bytes, 2_100_000_000);
+    assert_eq!(u.build_cache.bytes, 2_140_000_000);
     assert_eq!(
         u.total,
         u.images.bytes + u.containers.bytes + u.volumes.bytes + u.build_cache.bytes
@@ -294,6 +323,33 @@ fn docker_bytes_land_on_the_right_hints() {
     account::attach_docker_hints(&mut fs, &classic);
     assert_eq!(fs[0].hints[0].bytes, Some(classic.total));
     assert_eq!(fs[0].hints[1].bytes, None);
+
+    // containerd store with /var/lib/containerd on another filesystem: the
+    // docker root still holds only the non-image bytes.
+    let mut fs = fs_with_hints(&hints[..1]);
+    account::attach_docker_hints(&mut fs, &u);
+    assert_eq!(fs[0].hints[0].bytes, Some(u.total - u.images.bytes));
+    assert!(
+        fs[0].hints[0]
+            .detail
+            .contains("images are under /var/lib/containerd")
+    );
+}
+
+#[test]
+fn commands_name_the_measured_socket() {
+    let mut c = ctx();
+    c.docker_socket.path = "/run/user/1000/my docker.sock".into();
+    let found = by_path(DockerVolume.detect(&ScanTree::default(), &c).unwrap());
+    let orphan = &found["docker://volume/orphan_pg"];
+    assert_eq!(
+        argv(orphan)[..3],
+        ["docker", "-H", "unix:///run/user/1000/my docker.sock"]
+    );
+    assert_eq!(
+        orphan.action.text,
+        "docker -H 'unix:///run/user/1000/my docker.sock' volume rm orphan_pg"
+    );
 }
 
 #[test]
