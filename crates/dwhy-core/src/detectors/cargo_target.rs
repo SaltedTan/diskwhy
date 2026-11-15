@@ -1,0 +1,110 @@
+//! `cargo-target`: Cargo build output directories.
+//!
+//! A directory next to a `Cargo.toml` counts when it holds a `CACHEDIR.TAG`
+//! written by cargo (cargo tags every target dir it creates, renamed ones
+//! too), or when it is named `target` and holds cargo's `.rustc_info.json`
+//! (a target dir whose tag was removed). Some other `target/`, such as a
+//! downloaded prebuilt binary, matches neither.
+
+use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339};
+use crate::report::{Action, ActionKind, Finding, Recovery, Tier};
+use crate::tree::{Markers, ScanTree};
+use crate::units::human;
+
+use super::read_head;
+
+/// Target dirs smaller than this are not worth a finding.
+const MIN_BYTES: u64 = 1 << 20;
+
+/// The cachedir.tag signature (<https://bford.info/cachedir/>).
+const SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+pub struct CargoTarget;
+
+impl Detector for CargoTarget {
+    fn name(&self) -> &'static str {
+        "cargo-target"
+    }
+
+    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for id in tree.ids() {
+            let n = tree.node(id);
+            let tagged = n.markers.contains(Markers::CACHEDIR_TAG);
+            let rustc_info = n.markers.contains(Markers::RUSTC_INFO) && tree.name(id) == "target";
+            if !n.is_dir || !(tagged || rustc_info) {
+                continue;
+            }
+            let Some(parent) = tree.parent(id) else {
+                continue;
+            };
+            if !tree.node(parent).markers.contains(Markers::CARGO_TOML) {
+                continue;
+            }
+            if n.total.allocated < MIN_BYTES {
+                continue;
+            }
+            let path = tree.path(id);
+            if !(rustc_info || written_by_cargo(&path.join("CACHEDIR.TAG"))) {
+                continue;
+            }
+            let crate_dir = tree.path(parent);
+            let manifest = crate_dir.join("Cargo.toml");
+            let path_s = path.to_string_lossy().into_owned();
+            let action = match ctx.tool_command("cargo") {
+                Some(cargo) => {
+                    // --target-dir pins the clean to exactly this directory,
+                    // even if .cargo/config.toml points cargo elsewhere.
+                    let argv = vec![
+                        cargo,
+                        "clean".into(),
+                        "--manifest-path".into(),
+                        manifest.to_string_lossy().into_owned(),
+                        "--target-dir".into(),
+                        path_s.clone(),
+                    ];
+                    Action {
+                        kind: ActionKind::Command,
+                        text: argv.join(" "),
+                        argv: Some(argv),
+                    }
+                }
+                None => Action {
+                    kind: ActionKind::RemovePath,
+                    text: format!("remove {path_s} (cargo not found)"),
+                    argv: None,
+                },
+            };
+            out.push(Finding {
+                id: finding_id(self.name(), &path_s),
+                detector: self.name().into(),
+                probe: None,
+                bytes: n.total.allocated,
+                last_modified: Some(rfc3339(n.newest_mtime)),
+                growth: None,
+                tier: Tier::Rebuildable,
+                reason: format!(
+                    "Cargo build output of {} ({}); last written {} ago",
+                    crate_dir.display(),
+                    human(n.total.allocated),
+                    age(ctx.now, n.newest_mtime)
+                ),
+                guards: Vec::new(),
+                action,
+                recovery: Recovery {
+                    cost: "the next build recompiles the crate and all its dependencies".into(),
+                    how: Some("cargo build".into()),
+                },
+                path: path_s,
+            });
+        }
+        out
+    }
+}
+
+fn written_by_cargo(tag: &std::path::Path) -> bool {
+    let Some(head) = read_head(tag, 512) else {
+        return false;
+    };
+    head.starts_with(SIGNATURE) && head.windows(5).any(|w| w == b"cargo")
+}

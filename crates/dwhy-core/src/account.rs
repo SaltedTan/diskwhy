@@ -457,7 +457,9 @@ pub fn build_scan_report(
             error_count: result.error_count,
         },
         fs,
+        // Filled in by the caller from `detect::run`.
         findings: Vec::new(),
+        detectors: Vec::new(),
     }
 }
 

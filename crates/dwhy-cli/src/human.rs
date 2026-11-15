@@ -5,11 +5,17 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use dwhy_core::report::{
-    DetectorAvailability, DirEntry, DoctorReport, FsReport, ScanReport, SkipReason,
+    DetectorAvailability, DirEntry, DoctorReport, Finding, FsReport, ScanReport, SkipReason, Tier,
 };
 use dwhy_core::units::{human, thousands};
 
-pub fn render_scan(w: &mut impl Write, r: &ScanReport, depth: u32, top: usize) -> io::Result<()> {
+pub fn render_scan(
+    w: &mut impl Write,
+    r: &ScanReport,
+    depth: u32,
+    top: usize,
+    max_findings: usize,
+) -> io::Result<()> {
     let s = &r.scan;
     let t = &s.totals;
     writeln!(
@@ -84,6 +90,8 @@ pub fn render_scan(w: &mut impl Write, r: &ScanReport, depth: u32, top: usize) -
         )?;
     }
 
+    render_findings(w, r, max_findings)?;
+
     writeln!(w)?;
     writeln!(
         w,
@@ -97,9 +105,74 @@ pub fn render_scan(w: &mut impl Write, r: &ScanReport, depth: u32, top: usize) -
         depth,
         top,
     )?;
-    if r.findings.is_empty() {
-        writeln!(w)?;
-        writeln!(w, "findings: none yet (detectors arrive in M1)")?;
+    Ok(())
+}
+
+fn tier_name(t: Tier) -> &'static str {
+    match t {
+        Tier::Regenerable => "regenerable",
+        Tier::Rebuildable => "rebuildable",
+        Tier::Review => "review",
+        Tier::Blocked => "blocked",
+    }
+}
+
+fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result<()> {
+    if r.detectors.is_empty() {
+        return Ok(());
+    }
+    writeln!(w)?;
+    let total: u64 = r.findings.iter().map(|f| f.bytes).sum();
+    let ran = r.detectors.iter().filter(|d| d.ran).count();
+    writeln!(
+        w,
+        "findings: {} ({} reclaimable) from {ran} of {} detectors",
+        r.findings.len(),
+        human(total),
+        r.detectors.len()
+    )?;
+    let mut shown = 0;
+    for tier in [
+        Tier::Regenerable,
+        Tier::Rebuildable,
+        Tier::Review,
+        Tier::Blocked,
+    ] {
+        let in_tier: Vec<&Finding> = r.findings.iter().filter(|f| f.tier == tier).collect();
+        if in_tier.is_empty() {
+            continue;
+        }
+        let bytes: u64 = in_tier.iter().map(|f| f.bytes).sum();
+        writeln!(w, "  {} ({})", tier_name(tier), human(bytes))?;
+        for f in in_tier {
+            if shown == max {
+                break;
+            }
+            shown += 1;
+            writeln!(w, "  {:>8}  {:<13} {}", human(f.bytes), f.detector, f.path)?;
+            writeln!(w, "  {:>8}  {:<13} {}", "", "", f.reason)?;
+            writeln!(w, "  {:>8}  {:<13} → {}", "", "", f.action.text)?;
+        }
+    }
+    if r.findings.len() > shown {
+        writeln!(
+            w,
+            "  … {} more (--max-findings or --json lists them)",
+            r.findings.len() - shown
+        )?;
+    }
+    let unavailable: Vec<&str> = r
+        .detectors
+        .iter()
+        .filter(|d| !d.ran && d.status == DetectorAvailability::Unavailable)
+        .map(|d| d.name.as_str())
+        .collect();
+    if !unavailable.is_empty() {
+        writeln!(
+            w,
+            "  not run: {} (see `dwhy doctor`)",
+            unavailable.join(", ")
+        )?;
     }
     Ok(())
 }
@@ -298,6 +371,7 @@ pub fn render_doctor(w: &mut impl Write, d: &DoctorReport) -> io::Result<()> {
             DetectorAvailability::Available => "ok  ",
             DetectorAvailability::Degraded => "part",
             DetectorAvailability::Unavailable => "off ",
+            DetectorAvailability::NotImplemented => "todo",
         };
         writeln!(
             w,

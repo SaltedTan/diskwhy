@@ -133,6 +133,7 @@ expression: sample()
       "probe": "postgres-wal",
       "path": "docker://volume/example_postgres_data",
       "bytes": 33041965056,
+      "last_modified": "2026-11-13T02:10:00Z",
       "growth": {
         "bytes_per_day": 4939212390,
         "since": "2026-11-07T07:25:00Z"
@@ -154,6 +155,24 @@ expression: sample()
         "cost": "n/a",
         "how": null
       }
+    }
+  ],
+  "detectors": [
+    {
+      "name": "cargo-target",
+      "status": "available",
+      "detail": "uses `cargo` for removal",
+      "ran": true,
+      "findings": 6,
+      "elapsed_ms": 1
+    },
+    {
+      "name": "venv",
+      "status": "not_implemented",
+      "detail": "not implemented yet (M1)",
+      "ran": false,
+      "findings": 0,
+      "elapsed_ms": 0
     }
   ]
 }
