@@ -428,14 +428,22 @@ fn tox_and_nox_envs_are_recreated_without_running_tests() {
     fs::write(app.join("tox.ini"), "[tox]\nenv_list = py312\n").unwrap();
     // `docs` is outside env_list: a bare `tox` would not rebuild it.
     let docs = venv(&app.join(".tox"), "docs", VENV_CFG, &[], 2);
+    // tox's internal envs are not run envs: `-e` cannot rebuild them.
     let pkg = venv(&app.join(".tox"), ".pkg", VENV_CFG, &[], 2);
+    let wheel = venv(&app.join(".tox"), ".pkg-cpython312", VENV_CFG, &[], 2);
     let nox = venv(&app.join(".nox"), "tests-3-12", VENV_CFG, &[], 2);
     let found = findings(&root);
-    assert_eq!(paths(&found), [s(&nox), s(&pkg), s(&docs)]);
+    assert_eq!(paths(&found), [s(&nox), s(&pkg), s(&wheel), s(&docs)]);
+    assert!(
+        found[0].recovery.cost.contains("default sessions"),
+        "{}",
+        found[0].recovery.cost
+    );
     for (f, tool, cmd) in [
         (&found[0], "nox", "nox --install-only"),
         (&found[1], "tox", "tox --notest"),
-        (&found[2], "tox", "tox -e docs --notest"),
+        (&found[2], "tox", "tox --notest"),
+        (&found[3], "tox", "tox -e docs --notest"),
     ] {
         assert_eq!(f.tier, Tier::Rebuildable, "{}", f.path);
         assert_eq!(how(f), format!("cd '{}' && {cmd}", s(&app)));

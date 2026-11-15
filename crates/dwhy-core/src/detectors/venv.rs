@@ -25,9 +25,10 @@
 //!
 //! tox and nox envs (`<project>/.tox/<env>`, `<project>/.nox/<session>`) are
 //! `rebuildable`, recreated in the project without running tests:
-//! `tox -e <env> --notest` (`tox --notest` for the `.pkg` env) and
-//! `nox --install-only`, which reinstalls every session since its directory
-//! names do not map back to a session.
+//! `tox -e <env> --notest` (`tox --notest` for tox's internal envs, whose
+//! names start with `.`, such as `.pkg`) and `nox --install-only`, which
+//! reinstalls the default sessions since directory names do not map back to
+//! a session.
 //!
 //! Poetry's, Pipenv's and Hatch's central envs (`pypoetry/virtualenvs/<name>`,
 //! `.local/share/virtualenvs/<name>`, `hatch/env/virtual/<project>/<hash>/<env>`)
@@ -310,11 +311,12 @@ impl Venv {
             let (args, cost) = match (tool, name.as_ref()) {
                 ("nox", _) => (
                     " --install-only".to_string(),
-                    "reinstalls every nox session's env without running the sessions".to_string(),
+                    "reinstalls the envs of nox's default sessions without running them; a session outside the defaults needs `nox -s <session> --install-only`".to_string(),
                 ),
-                (_, ".pkg") => (
+                (_, n) if n.starts_with('.') => (
                     " --notest".to_string(),
-                    "recreates tox's packaging env without running tests".to_string(),
+                    "recreates tox's internal (packaging or provisioning) env without running tests"
+                        .to_string(),
                 ),
                 _ => (
                     format!(" -e {} --notest", shell_quote(&name)),
