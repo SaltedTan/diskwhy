@@ -146,6 +146,17 @@ fn worktree(repo: &Path, root: &Path, name: &str, mb: usize) -> PathBuf {
     wt
 }
 
+/// Whether git recorded worktree `wt` of `repo` with relative paths, in both
+/// the worktree's `.git` file and the repo's `gitdir` file. Only git 2.48 and
+/// later honour `worktree.useRelativePaths`.
+fn recorded_relative(repo: &Path, wt: &Path) -> bool {
+    let dot_git = fs::read_to_string(wt.join(".git")).unwrap();
+    let to_admin = dot_git.trim().strip_prefix("gitdir:").unwrap().trim();
+    let name = wt.file_name().unwrap();
+    let gitdir = fs::read_to_string(repo.join(".git/worktrees").join(name).join("gitdir")).unwrap();
+    Path::new(to_admin).is_relative() && Path::new(gitdir.trim()).is_relative()
+}
+
 fn findings(root: &Path, git: Option<&str>) -> Vec<Finding> {
     let mut f = GitWorktree.detect(&scan_tree(root), &ctx(git)).unwrap();
     f.sort_by(|a, b| a.path.cmp(&b.path));
@@ -263,10 +274,14 @@ fn worktrees_scanned_without_their_repos() {
     let a_old = worktree(&a, &wts, "a-old", 2);
     let a_gone = worktree(&a, &wts, "a-gone", 0);
     fs::remove_dir_all(&a_gone).unwrap();
-    // Recorded with relative paths: the `.git` file says `gitdir: ../../repo-b/...`.
+    // Recorded with relative paths where git supports them: the `.git` file
+    // says `gitdir: ../../repo-b/...`.
     let b = repo_named(&root, "repo-b");
     git(&b, &["config", "worktree.useRelativePaths", "true"]);
     let b_old = worktree(&b, &wts, "b-old", 2);
+    if !recorded_relative(&b, &b_old) {
+        eprintln!("git wrote absolute worktree paths; the relative case is not covered");
+    }
     age_tree(&a_old, 30);
     age_tree(&b_old, 30);
 
@@ -295,6 +310,10 @@ fn prunable_bytes_with_relative_paths() {
     git(&r, &["config", "worktree.useRelativePaths", "true"]);
     let gone = worktree(&r, &root, "wt-gone", 0);
     worktree(&r, &root, "wt-kept", 0);
+    if !recorded_relative(&r, &gone) {
+        eprintln!("skipped: git wrote absolute worktree paths (needs git 2.48 or later)");
+        return;
+    }
     fs::remove_dir_all(&gone).unwrap();
 
     let found = findings(&root, Some("git"));
