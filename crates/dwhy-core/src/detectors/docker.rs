@@ -4,7 +4,9 @@
 //! All four read one shared [`crate::docker::Snapshot`]. Findings use
 //! pseudo-paths (`docker://image/…`), which never nest with filesystem
 //! findings. They are `review` tier by default: being able to use the Docker
-//! socket is root-equivalent (docs/DESIGN.md).
+//! socket is root-equivalent (docs/DESIGN.md). The exception is build cache
+//! unused for [`BUILD_CACHE_AGE_HOURS`], which is `regenerable`: it is a cache,
+//! and the prune command is limited to those records.
 
 use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
 use crate::docker::{Container, Snapshot};
@@ -204,7 +206,7 @@ fn build_cache(snap: &Snapshot, ctx: &DetectContext) -> Option<Finding> {
         .max();
     let days = BUILD_CACHE_AGE_HOURS / 24;
     let until = format!("until={BUILD_CACHE_AGE_HOURS}h");
-    Some(finding(
+    let mut f = finding(
         "docker-build-cache",
         "docker://build-cache".into(),
         bytes,
@@ -217,10 +219,14 @@ fn build_cache(snap: &Snapshot, ctx: &DetectContext) -> Option<Finding> {
         ),
         command(ctx, &["builder", "prune", "--force", "--filter", &until]),
         Recovery {
-            cost: "the next `docker build` re-runs the steps that were cached".into(),
+            cost: "the next `docker build` re-runs the steps that were cached; steps that fetch \
+                   from the network (apt-get, curl) get what upstream serves then"
+                .into(),
             how: None,
         },
-    ))
+    );
+    f.tier = Tier::Regenerable;
+    Some(f)
 }
 
 pub struct DockerContainer;
