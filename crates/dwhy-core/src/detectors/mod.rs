@@ -5,6 +5,7 @@ mod docker;
 mod git_worktree;
 mod node_modules;
 mod user_cache;
+mod venv;
 
 use std::io::Read;
 use std::path::Path;
@@ -18,12 +19,14 @@ pub use docker::{
 pub use git_worktree::{GitWorktree, STALE_DAYS, WorktreeEntry, parse_porcelain};
 pub use node_modules::NodeModules;
 pub use user_cache::{RECENT_HOURS, UserCache};
+pub use venv::Venv;
 
 /// Every detector that is built, in catalog order.
 pub fn registry() -> Vec<Box<dyn Detector>> {
     vec![
         Box::new(CargoTarget),
         Box::new(NodeModules),
+        Box::new(Venv),
         Box::new(UserCache::from_system()),
         Box::new(GitWorktree),
         Box::new(DockerImage),
