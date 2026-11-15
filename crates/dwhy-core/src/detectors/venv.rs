@@ -14,23 +14,29 @@
 //! - `pyproject.toml` with a `[project]` or `[tool.poetry]` table, `setup.py`,
 //!   or `setup.cfg` with a `[metadata]` or `[options]` section next to a
 //!   `pyproject.toml` (pip builds neither alone), without a
-//!   lockfile: reinstall the project, which resolves dependencies again. A
-//!   `pyproject.toml` that only configures tools (`[tool.ruff]`) does not
-//!   count
+//!   lockfile: reinstall the project, which resolves dependencies again
+//!   (`uv sync` for a uv-made venv when there is a `[project]` table, which
+//!   uv needs). A `pyproject.toml` that only configures tools (`[tool.ruff]`)
+//!   does not count
 //!
 //! A venv with none of these next to it holds packages installed by hand, so
 //! removing it loses that list: it is reported as `review`, with the command
 //! to record its packages first.
 //!
-//! Poetry's and Pipenv's central envs (`pypoetry/virtualenvs/<name>`,
-//! `.local/share/virtualenvs/<name>`) belong to a project elsewhere, so they
-//! are `review`, with no command: the tool rebuilds them in that project.
+//! tox and nox envs (`<project>/.tox/<env>`, `<project>/.nox/<session>`) are
+//! `rebuildable`: running the tool in the project recreates them.
+//!
+//! Poetry's, Pipenv's and Hatch's central envs (`pypoetry/virtualenvs/<name>`,
+//! `.local/share/virtualenvs/<name>`, `hatch/env/virtual/<project>/<hash>/<env>`)
+//! belong to a project elsewhere, so they are `review`, with no command: the
+//! tool rebuilds them in that project.
 //!
 //! Skipped: venvs inside a cache directory (an ancestor holds `CACHEDIR.TAG`,
 //! as uv's cache does; `user-cache` reports the cache), the tools that
 //! `uv tool` and pipx install (`uv/tools/<name>`, `pipx/venvs/<name>`, and
 //! pipx's shared libraries `pipx/shared`), which are installed programs rather
-//! than project environments, and everything under a scan root that is itself
+//! than project environments, the envs `pipx run` keeps in `pipx/.cache`
+//! (pipx prunes them itself), and everything under a scan root that is itself
 //! inside a venv.
 //!
 //! The action is a path removal limited to the venv. uv hardlinks package
@@ -121,6 +127,8 @@ struct Project {
     other_requirements: Vec<String>,
     /// `pyproject.toml` declares a project.
     pyproject: bool,
+    /// `pyproject.toml` has a `[project]` table, as `uv sync` needs.
+    project_table: bool,
     /// `setup.py`, or a `setup.cfg` with project metadata next to a
     /// `pyproject.toml`.
     setup: bool,
@@ -142,6 +150,8 @@ impl Project {
             })
             .collect();
         other_requirements.sort();
+        let pyproject = dir.join("pyproject.toml");
+        let project_table = has_table(&pyproject, &[&["project"]]);
         Project {
             locks: LOCKS
                 .iter()
@@ -150,12 +160,10 @@ impl Project {
                 .collect(),
             requirements: is_file(&dir.join("requirements.txt")),
             other_requirements,
-            pyproject: has_table(
-                &dir.join("pyproject.toml"),
-                &[&["project"], &["tool", "poetry"]],
-            ),
+            pyproject: project_table || has_table(&pyproject, &[&["tool", "poetry"]]),
+            project_table,
             setup: is_file(&dir.join("setup.py"))
-                || (is_file(&dir.join("pyproject.toml"))
+                || (is_file(&pyproject)
                     && has_table(&dir.join("setup.cfg"), &[&["metadata"], &["options"]])),
         }
     }
@@ -224,28 +232,43 @@ fn in_cache(tree: &ScanTree, id: NodeId) -> bool {
         .any(|d| is_file(&d.join("CACHEDIR.TAG")))
 }
 
-/// The names of `p` and its three nearest ancestors.
-fn tail(p: &Path) -> [Option<&str>; 4] {
+/// The names of `p` and its five nearest ancestors.
+fn tail(p: &Path) -> [Option<&str>; 6] {
     let mut up = p.ancestors().map(|a| a.file_name().and_then(OsStr::to_str));
     std::array::from_fn(|_| up.next().flatten())
 }
 
-/// `uv/tools/<name>`, `pipx/venvs/<name>` or `pipx/shared`.
+/// `uv/tools/<name>`, `pipx/venvs/<name>`, `pipx/shared` or
+/// `pipx/.cache/<hash>`.
 fn is_tool_env(venv: &Path) -> bool {
     matches!(
         tail(venv),
-        [_, Some("tools"), Some("uv"), _]
-            | [_, Some("venvs"), Some("pipx"), _]
-            | [Some("shared"), Some("pipx"), _, _]
+        [_, Some("tools"), Some("uv"), ..]
+            | [_, Some("venvs" | ".cache"), Some("pipx"), ..]
+            | [Some("shared"), Some("pipx"), ..]
     )
 }
 
-/// The tool and its install command, for a venv in Poetry's or Pipenv's
-/// central directory.
+/// The tool and its install command, for a venv in Poetry's, Pipenv's or
+/// Hatch's central directory.
 fn central_env(venv: &Path) -> Option<(&'static str, &'static str)> {
     match tail(venv) {
-        [_, Some("virtualenvs"), Some("pypoetry"), _] => Some(("Poetry", "poetry install")),
-        [_, Some("virtualenvs"), Some("share"), Some(".local")] => Some(("Pipenv", "pipenv sync")),
+        [_, Some("virtualenvs"), Some("pypoetry"), ..] => Some(("Poetry", "poetry install")),
+        [_, Some("virtualenvs"), Some("share"), Some(".local"), ..] => {
+            Some(("Pipenv", "pipenv sync"))
+        }
+        [_, _, _, Some("virtual"), Some("env"), Some("hatch")] => {
+            Some(("Hatch", "hatch env create"))
+        }
+        _ => None,
+    }
+}
+
+/// `tox` or `nox`, for a venv in a project's `.tox` or `.nox`.
+fn runner_env(venv: &Path) -> Option<&'static str> {
+    match tail(venv) {
+        [_, Some(".tox"), ..] => Some("tox"),
+        [_, Some(".nox"), ..] => Some("nox"),
         _ => None,
     }
 }
@@ -278,6 +301,19 @@ impl Venv {
                     "{tool}-managed Python virtualenv in {}",
                     project_dir.display()
                 ),
+            )
+        } else if let Some(tool) = runner_env(&path) {
+            let project = project_dir.parent()?;
+            (
+                Tier::Rebuildable,
+                Recovery {
+                    cost: format!("{tool} recreates missing envs on its next run in the project"),
+                    how: Some(format!(
+                        "cd {} && {tool}",
+                        shell_quote(&project.to_string_lossy())
+                    )),
+                },
+                format!("{tool} environment for {}", project.display()),
             )
         } else {
             let project = Project::read(&project_dir);
@@ -419,7 +455,7 @@ fn recovery(p: &Project, dir: &Path, name: &str, venv: &str, cfg: &Cfg) -> (Tier
             ),
         );
     }
-    if p.pyproject && cfg.uv {
+    if p.project_table && cfg.uv {
         return rebuild(
             Some(format!("{cd}{uv_sync}")),
             "no uv.lock, so uv sync resolves the dependencies again (possibly to newer versions) and writes one".into(),

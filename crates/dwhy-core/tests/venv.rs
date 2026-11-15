@@ -377,7 +377,7 @@ fn a_pyproject_that_only_configures_tools_is_not_a_project() {
 }
 
 #[test]
-fn poetry_and_pipenv_central_envs_are_review_without_a_command() {
+fn central_tool_envs_are_review_without_a_command() {
     let (_t, root) = tmp();
     let poetry = venv(
         &root.join(".cache/pypoetry/virtualenvs"),
@@ -393,11 +393,19 @@ fn poetry_and_pipenv_central_envs_are_review_without_a_command() {
         &[],
         2,
     );
+    let hatch = venv(
+        &root.join(".local/share/hatch/env/virtual/app/AbCd1234"),
+        "app",
+        VENV_CFG,
+        &[],
+        2,
+    );
     let found = findings(&root);
-    assert_eq!(paths(&found), [s(&poetry), s(&pipenv)]);
+    assert_eq!(paths(&found), [s(&poetry), s(&hatch), s(&pipenv)]);
     for (f, tool, cmd) in [
         (&found[0], "Poetry", "poetry install"),
-        (&found[1], "Pipenv", "pipenv sync"),
+        (&found[1], "Hatch", "hatch env create"),
+        (&found[2], "Pipenv", "pipenv sync"),
     ] {
         assert_eq!(f.tier, Tier::Review, "{}", f.path);
         assert_eq!(f.recovery.how, None, "{}", f.path);
@@ -410,6 +418,52 @@ fn poetry_and_pipenv_central_envs_are_review_without_a_command() {
         assert!(f.recovery.cost.contains(cmd), "{}", f.recovery.cost);
         assert!(!f.recovery.cost.contains("by hand"), "{}", f.recovery.cost);
     }
+}
+
+#[test]
+fn tox_and_nox_envs_are_rebuilt_by_running_the_tool_in_the_project() {
+    let (_t, root) = tmp();
+    let app = root.join("my app");
+    fs::create_dir_all(&app).unwrap();
+    fs::write(app.join("tox.ini"), "[tox]\nenv_list = py312\n").unwrap();
+    let py = venv(&app.join(".tox"), "py312", VENV_CFG, &[], 2);
+    let pkg = venv(&app.join(".tox"), ".pkg", VENV_CFG, &[], 2);
+    let nox = venv(&app.join(".nox"), "tests-3-12", VENV_CFG, &[], 2);
+    let found = findings(&root);
+    assert_eq!(paths(&found), [s(&nox), s(&pkg), s(&py)]);
+    for (f, tool) in [(&found[0], "nox"), (&found[1], "tox"), (&found[2], "tox")] {
+        assert_eq!(f.tier, Tier::Rebuildable, "{}", f.path);
+        assert_eq!(how(f), format!("cd '{}' && {tool}", s(&app)));
+        assert!(
+            f.reason
+                .starts_with(&format!("{tool} environment for {}", s(&app))),
+            "{}",
+            f.reason
+        );
+        assert!(!f.recovery.cost.contains("by hand"), "{}", f.recovery.cost);
+    }
+}
+
+#[test]
+fn uv_sync_needs_a_project_table() {
+    let (_t, root) = tmp();
+    // Poetry 1 metadata only: uv sync would fail with no [project] table.
+    let v = venv(&root.join("app"), ".venv", UV_CFG, &[], 2);
+    fs::write(
+        root.join("app/pyproject.toml"),
+        "[build-system]\nrequires = [\"poetry-core\"]\n\n[tool.poetry]\nname = \"app\"\n",
+    )
+    .unwrap();
+    let found = findings(&root);
+    assert_eq!(paths(&found), [s(&v)]);
+    assert_eq!(found[0].tier, Tier::Rebuildable);
+    assert_eq!(
+        how(&found[0]),
+        format!(
+            "cd {} && uv venv --python 3.12 .venv && uv pip install --python .venv -e .",
+            s(&root.join("app"))
+        )
+    );
 }
 
 #[test]
@@ -494,6 +548,13 @@ fn ignores_lookalikes_caches_and_tool_envs() {
     venv(&root.join("share/uv/tools"), "ruff", UV_CFG, &[], 2);
     venv(&root.join("share/pipx/venvs"), "black", VENV_CFG, &[], 2);
     venv(&root.join("share/pipx"), "shared", VENV_CFG, &[], 2);
+    venv(
+        &root.join("share/pipx/.cache"),
+        "0123abcd",
+        VENV_CFG,
+        &[],
+        2,
+    );
     // pyvenv.cfg as a symlink or a directory: not a marker.
     let sym = venv(&root.join("sym"), ".venv", UV_CFG, &["uv.lock"], 2);
     fs::remove_file(sym.join("pyvenv.cfg")).unwrap();
