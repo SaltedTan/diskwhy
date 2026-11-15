@@ -74,6 +74,18 @@ pub struct TreeNode {
     pub markers: Markers,
     /// Newest mtime (seconds since the epoch) of the directory and anything in it, recursively.
     pub newest_mtime: i64,
+    /// Allocated bytes in `total` of hardlinked files that also have a link
+    /// outside this subtree (or outside the scan), so removing it would not
+    /// free them.
+    pub shared: u64,
+}
+
+impl TreeNode {
+    /// What removing this subtree is expected to free: `total.allocated`
+    /// minus `shared`.
+    pub fn freeable(&self) -> u64 {
+        self.total.allocated.saturating_sub(self.shared)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -243,6 +255,7 @@ mod tests {
             total: Totals::default(),
             markers: Markers::empty(),
             newest_mtime: 0,
+            shared: 0,
         }
     }
 

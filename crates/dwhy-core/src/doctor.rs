@@ -27,7 +27,15 @@ pub const TOOLS: &[(&str, &[&str])] = &[
         ],
     ),
     ("cargo", &["cargo-target (removal via `cargo clean`)"]),
-    ("go", &["user-cache: go build/module caches (`go clean`)"]),
+    ("go", &["user-cache: Go build/module caches (`go clean`)"]),
+    ("uv", &["user-cache: uv cache (`uv cache clean`)"]),
+    ("pip", &["user-cache: pip cache (`pip cache purge`)"]),
+    ("npm", &["user-cache: npm cache (`npm cache clean`)"]),
+    ("pnpm", &["user-cache: pnpm store (`pnpm store prune`)"]),
+    (
+        "yarn",
+        &["user-cache: Yarn classic cache (`yarn cache clean`)"],
+    ),
     ("journalctl", &["journald (root only)"]),
 ];
 
@@ -63,6 +71,12 @@ fn off_path_candidates(name: &str) -> Vec<PathBuf> {
             if let Some(h) = &home {
                 v.push(h.join(".local/go/bin/go"));
                 v.push(h.join("go/bin/go"));
+            }
+        }
+        "uv" => {
+            if let Some(h) = &home {
+                v.push(h.join(".local/bin/uv"));
+                v.push(h.join(".cargo/bin/uv"));
             }
         }
         "git" | "docker" | "journalctl" => {
@@ -219,7 +233,21 @@ mod tests {
         let d = doctor();
         assert_eq!(d.schema, report::SCHEMA);
         let names: Vec<_> = d.tools.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["git", "docker", "cargo", "go", "journalctl"]);
+        assert_eq!(
+            names,
+            [
+                "git",
+                "docker",
+                "cargo",
+                "go",
+                "uv",
+                "pip",
+                "npm",
+                "pnpm",
+                "yarn",
+                "journalctl"
+            ]
+        );
         assert_eq!(d.detectors.len(), CATALOG.len());
         assert_eq!(d.root, d.euid == 0);
     }

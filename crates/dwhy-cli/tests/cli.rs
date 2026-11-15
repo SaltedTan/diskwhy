@@ -210,7 +210,21 @@ fn doctor_json() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools, ["git", "docker", "cargo", "go", "journalctl"]);
+    assert_eq!(
+        tools,
+        [
+            "git",
+            "docker",
+            "cargo",
+            "go",
+            "uv",
+            "pip",
+            "npm",
+            "pnpm",
+            "yarn",
+            "journalctl"
+        ]
+    );
     assert!(v["detectors"].as_array().unwrap().len() >= 12);
     let text = dwhy(&["doctor"]);
     assert_eq!(text.status.code(), Some(0));

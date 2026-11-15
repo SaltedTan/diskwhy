@@ -195,7 +195,9 @@ struct Link {
     node: u32,
     dev: u64,
     leaf: Totals,
-    seen: u64,
+    nlink: u64,
+    /// The node of every link seen.
+    locs: Vec<NodeId>,
 }
 
 struct Shared<'a> {
@@ -226,17 +228,20 @@ impl Shared<'_> {
         let mut map = self.links[shard].lock().unwrap();
         match map.entry(key) {
             Entry::Vacant(v) => {
+                let mut locs = Vec::with_capacity(2);
+                locs.push(node);
                 v.insert(Link {
                     path,
                     node,
                     dev: key.0,
                     leaf: leaf_totals(st),
-                    seen: 1,
+                    nlink: nlink(st),
+                    locs,
                 });
             }
             Entry::Occupied(mut o) => {
                 let l = o.get_mut();
-                l.seen += 1;
+                l.locs.push(node);
                 if path < l.path {
                     l.path = path;
                     l.node = node;
@@ -309,6 +314,12 @@ fn bytes(st: &Stat) -> u64 {
 #[allow(clippy::unnecessary_cast)]
 fn mtime(st: &Stat) -> i64 {
     st.st_mtime as i64
+}
+
+/// Link count; `st_nlink` is narrower than u64 on some targets.
+#[allow(clippy::unnecessary_cast)]
+fn nlink(st: &Stat) -> u64 {
+    st.st_nlink as u64
 }
 
 fn is_dir(st: &Stat) -> bool {
@@ -396,6 +407,7 @@ pub fn scan(
                 total: Totals::default(),
                 markers: Markers::empty(),
                 newest_mtime: mtime(&st),
+                shared: 0,
             });
             if linked {
                 shared.add_link(&st, root.clone(), id);
@@ -407,13 +419,28 @@ pub fn scan(
 
     let mut nodes = shared.nodes.into_inner().unwrap();
     let mut per_dev = shared.per_dev.into_inner().unwrap();
+    // Per-node change in `shared`: a linked inode is shared by its attributed
+    // node and every ancestor strictly below the lowest common ancestor of
+    // all its links, or every ancestor when some link was not scanned.
+    let mut shared_delta = vec![0i64; nodes.len()];
     for shard in shared.links {
         for (_, l) in shard.into_inner().unwrap() {
+            let seen = l.locs.len() as u64;
             let mut t = l.leaf;
-            t.hardlinks_deduped = l.seen - 1;
-            t.hardlink_bytes_deduped = (l.seen - 1) * l.leaf.allocated;
+            t.hardlinks_deduped = seen - 1;
+            t.hardlink_bytes_deduped = (seen - 1) * l.leaf.allocated;
             nodes[l.node as usize].own += t;
             *per_dev.entry(l.dev).or_default() += t;
+            let b = l.leaf.allocated as i64;
+            shared_delta[l.node as usize] += b;
+            if seen >= l.nlink
+                && let Some(lca) = l
+                    .locs
+                    .iter()
+                    .try_fold(l.node, |a, &b| common_ancestor(&nodes, a, b))
+            {
+                shared_delta[lca as usize] -= b;
+            }
         }
     }
 
@@ -422,9 +449,11 @@ pub fn scan(
         n.total = n.own;
     }
     for i in (0..nodes.len()).rev() {
+        nodes[i].shared = shared_delta[i] as u64;
         let p = nodes[i].parent;
         if p != NO_PARENT {
             let (t, m) = (nodes[i].total, nodes[i].newest_mtime);
+            shared_delta[p as usize] += shared_delta[i];
             let parent = &mut nodes[p as usize];
             parent.total += t;
             parent.newest_mtime = parent.newest_mtime.max(m);
@@ -477,6 +506,25 @@ pub fn scan(
         elapsed: start.elapsed(),
         tree,
     })
+}
+
+/// The lowest node that is `a` or an ancestor of it and `b` or an ancestor of
+/// it; `None` when they lie under different roots.
+fn common_ancestor(nodes: &[TreeNode], mut a: NodeId, mut b: NodeId) -> Option<NodeId> {
+    while nodes[a as usize].depth > nodes[b as usize].depth {
+        a = nodes[a as usize].parent;
+    }
+    while nodes[b as usize].depth > nodes[a as usize].depth {
+        b = nodes[b as usize].parent;
+    }
+    while a != b {
+        a = nodes[a as usize].parent;
+        b = nodes[b as usize].parent;
+        if a == NO_PARENT || b == NO_PARENT {
+            return None;
+        }
+    }
+    Some(a)
 }
 
 /// Opens a directory without following a symlink that may have replaced it.
@@ -628,6 +676,7 @@ fn walk_dir(
         total: Totals::default(),
         markers,
         newest_mtime,
+        shared: 0,
     });
     for (p, m) in linked {
         sh.add_link(&m, p, id);

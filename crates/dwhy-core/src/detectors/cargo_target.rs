@@ -41,7 +41,8 @@ impl Detector for CargoTarget {
             if !tree.node(parent).markers.contains(Markers::CARGO_TOML) {
                 continue;
             }
-            if n.total.allocated < MIN_BYTES {
+            let bytes = n.freeable();
+            if bytes < MIN_BYTES {
                 continue;
             }
             let path = tree.path(id);
@@ -83,14 +84,22 @@ impl Detector for CargoTarget {
                 id: finding_id(self.name(), &path_s),
                 detector: self.name().into(),
                 probe: None,
-                bytes: n.total.allocated,
+                bytes,
                 last_modified: Some(rfc3339(n.newest_mtime)),
                 growth: None,
                 tier: Tier::Rebuildable,
                 reason: format!(
-                    "Cargo build output of {} ({}); last written {} ago",
+                    "Cargo build output of {} ({}{}); last written {} ago",
                     crate_dir.display(),
-                    human(n.total.allocated),
+                    human(bytes),
+                    if n.shared > 0 {
+                        format!(
+                            "; {} more is hardlinked elsewhere and is not freed",
+                            human(n.shared)
+                        )
+                    } else {
+                        String::new()
+                    },
                     age(ctx.now, n.newest_mtime)
                 ),
                 guards: Vec::new(),

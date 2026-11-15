@@ -329,3 +329,41 @@ fn run_reports_every_catalog_detector() {
     assert!(!venv.ran);
     assert_eq!(venv.status, DetectorAvailability::NotImplemented);
 }
+
+#[test]
+fn bytes_leave_out_files_hardlinked_outside_the_target_dir() {
+    let t = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    let target = cargo_crate(&root.join("app"), "target", 2, Some(CARGO_TAG));
+    // Linked outside: still alive after removing target/. The outside path
+    // sorts after target's, so the file is attributed to target/.
+    write(&target.join("debug/big"), 3 << 20);
+    fs::create_dir_all(root.join("zz-out")).unwrap();
+    fs::hard_link(target.join("debug/big"), root.join("zz-out/big")).unwrap();
+    // Linked inside: removing target/ frees it.
+    write(&target.join("debug/deps/libx.rlib"), 1 << 20);
+    fs::hard_link(
+        target.join("debug/deps/libx.rlib"),
+        target.join("debug/libx.rlib"),
+    )
+    .unwrap();
+
+    let tree = scan_tree(&root);
+    let node = tree.node(tree.find(&target).unwrap());
+    assert!(
+        node.shared >= 3 << 20 && node.shared < 4 << 20,
+        "shared = {}",
+        node.shared
+    );
+    let found = cargo_findings(&root, Some("/usr/bin/cargo"));
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].bytes, node.freeable());
+    assert_eq!(found[0].bytes, node.total.allocated - node.shared);
+    // The 2 MiB rlib and the internally linked 1 MiB file are both freed.
+    assert!(found[0].bytes >= 3 << 20, "{}", found[0].bytes);
+    assert!(
+        found[0].reason.contains("hardlinked elsewhere"),
+        "{}",
+        found[0].reason
+    );
+}

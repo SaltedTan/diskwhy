@@ -111,6 +111,54 @@ fn hardlinks_across_roots_are_counted_once() {
     let res = run(&[&a, &b], &opts());
     assert_eq!(res.totals().files, 1);
     assert_eq!(res.totals().hardlinks_deduped, 1);
+    // Removing either root alone leaves the other link.
+    let ra = res.tree.find(&a).unwrap();
+    assert_eq!(res.tree.node(ra).shared, alloc(&a.join("f")));
+}
+
+#[test]
+fn hardlinks_kept_alive_elsewhere_are_not_freeable() {
+    let t = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    for d in [".cache/uv", "code/app/.venv", "target/deps", "x"] {
+        fs::create_dir_all(r.join(d)).unwrap();
+    }
+    // A cache file also linked into a project venv: removing the cache keeps it.
+    write_file(&r.join(".cache/uv/blob"), 1 << 20);
+    fs::hard_link(r.join(".cache/uv/blob"), r.join("code/app/.venv/blob")).unwrap();
+    write_file(&r.join(".cache/uv/own"), 256 << 10);
+    // Links that all live inside one directory: removing it frees the file.
+    write_file(&r.join("target/a"), 512 << 10);
+    fs::hard_link(r.join("target/a"), r.join("target/deps/a")).unwrap();
+    // A link outside the scanned root: nothing scanned frees it.
+    write_file(&outside.path().join("f"), 128 << 10);
+    fs::hard_link(outside.path().join("f"), r.join("x/f")).unwrap();
+
+    let res = run(&[&r], &opts());
+    let node = |p: &str| res.tree.node(res.tree.find(&r.join(p)).unwrap());
+    let blob = alloc(&r.join(".cache/uv/blob"));
+    let uv = node(".cache/uv");
+    assert_eq!(uv.shared, blob);
+    assert_eq!(
+        uv.freeable(),
+        alloc(&r.join(".cache/uv")) + alloc(&r.join(".cache/uv/own"))
+    );
+    assert_eq!(node(".cache").shared, blob);
+    let target = node("target");
+    assert_eq!(target.shared, 0);
+    assert_eq!(
+        target.freeable(),
+        alloc(&r.join("target")) + alloc(&r.join("target/deps")) + alloc(&r.join("target/a"))
+    );
+    let f = alloc(&r.join("x/f"));
+    assert_eq!(node("x").shared, f);
+    assert_eq!(node("x").freeable(), alloc(&r.join("x")));
+    assert_eq!(
+        node("").shared,
+        f,
+        "only the outside link is shared at the root"
+    );
 }
 
 #[test]
