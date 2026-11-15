@@ -43,7 +43,7 @@ The idea is to automate what was done by hand on pc-ubuntu on 2026-11-13: 36G fr
 - **Report the gap.** If `df` used minus scanned bytes is larger than a threshold, show an "unaccounted N GB" item with the likely places (`/var/lib/docker`, `/var/log`, other users' homes) and the command to rerun with sudo.
 - **Running under sudo is supported, not required.** System detectors (journald vacuum, old snap revisions, old kernels, apt cache) are enabled only when running as root.
 - **Never touch other users' files** unless running as root *and* `--all-users` is passed.
-- **Docker** is used through its socket and CLI. Being in the `docker` group is already root-equivalent, so Docker findings default to the `review` tier.
+- **Docker** is used through its socket and CLI. Being in the `docker` group is already root-equivalent, so Docker findings default to the `review` tier. The exception is build cache unused for a week, which is `regenerable`: it is a cache, `docker builder prune --filter until=168h` removes only those records, and the cost is re-running build steps (issue #2).
 
 ### Recommendation: static binary
 
@@ -58,7 +58,7 @@ The idea is to automate what was done by hand on pc-ubuntu on 2026-11-13: 36G fr
 - **Probe.** Explains *why* something is big or growing, e.g. `postgres-wal`: the volume holds 29G of WAL but only 50MB of data, the archiver has 151 failures, and the last success was 6 days ago.
 - **Guard.** A check that runs before removal, ending in pass, warn or block, with evidence: `git-unpublished`, `git-dirty`, `in-use-cwd`, `in-use-open`, `container-mount`, `recent-write`, `git-ignored-only`.
 - **Risk tier.**
-  - `regenerable`: caches; fine to remove automatically
+  - `regenerable`: caches, including Docker build cache unused for a week; fine to remove automatically
   - `rebuildable`: costs time to restore, e.g. `target/`, venvs
   - `review`: models, worktrees, scratch dirs, volumes; needs a person
   - `blocked`: a guard failed; never applied

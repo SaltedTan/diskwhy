@@ -143,6 +143,13 @@ fn build_cache_older_than_a_week() {
     assert_eq!(found.len(), 1);
     let f = &found[0];
     assert_eq!(f.path, "docker://build-cache");
+    // The one Docker finding an agent may clear alone (issue #2).
+    assert_eq!(f.tier, Tier::Regenerable);
+    assert!(
+        f.recovery.cost.contains("re-runs the steps"),
+        "{}",
+        f.recovery.cost
+    );
     // Only `old1`: `recent` was used yesterday, `old-shared` is shared, `busy` is in use,
     // and a prune without `--all` keeps `old-frontend` and `old-internal`.
     assert_eq!(f.bytes, 800_000_000);
@@ -182,6 +189,7 @@ fn stopped_containers_with_a_writable_layer() {
     assert_eq!(found.len(), 1);
     let f = &found[0];
     assert_eq!(f.path, "docker://container/old-job");
+    assert_eq!(f.tier, Tier::Review);
     assert_eq!(f.bytes, 500_000_000);
     assert!(f.reason.contains("Exited (0) 3 days ago"), "{}", f.reason);
     assert_eq!(
@@ -389,6 +397,8 @@ fn one_fetch_shared_by_all_docker_detectors_and_errors_are_reported() {
         Some(&only),
     );
     assert_eq!(found.len(), 3 + 3);
+    // Images and volumes stay `review`: the socket is root-equivalent.
+    assert!(found.iter().all(|f| f.tier == Tier::Review), "{found:?}");
     let skipped = runs
         .iter()
         .find(|r| r.name == "docker-build-cache")
