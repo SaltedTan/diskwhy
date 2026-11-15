@@ -12,7 +12,8 @@
 //!   and the tool run with it active (`VIRTUAL_ENV`)
 //! - `requirements.txt`: recreate the venv with the same Python and install it
 //! - `pyproject.toml` with a `[project]` or `[tool.poetry]` table, `setup.py`,
-//!   or `setup.cfg` with a `[metadata]` or `[options]` section, without a
+//!   or `setup.cfg` with a `[metadata]` or `[options]` section next to a
+//!   `pyproject.toml` (pip builds neither alone), without a
 //!   lockfile: reinstall the project, which resolves dependencies again. A
 //!   `pyproject.toml` that only configures tools (`[tool.ruff]`) does not
 //!   count
@@ -120,7 +121,8 @@ struct Project {
     other_requirements: Vec<String>,
     /// `pyproject.toml` declares a project.
     pyproject: bool,
-    /// `setup.py`, or a `setup.cfg` with project metadata.
+    /// `setup.py`, or a `setup.cfg` with project metadata next to a
+    /// `pyproject.toml`.
     setup: bool,
 }
 
@@ -153,7 +155,8 @@ impl Project {
                 &[&["project"], &["tool", "poetry"]],
             ),
             setup: is_file(&dir.join("setup.py"))
-                || has_table(&dir.join("setup.cfg"), &[&["metadata"], &["options"]]),
+                || (is_file(&dir.join("pyproject.toml"))
+                    && has_table(&dir.join("setup.cfg"), &[&["metadata"], &["options"]])),
         }
     }
 

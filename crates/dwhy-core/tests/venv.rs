@@ -311,6 +311,9 @@ fn a_setup_cfg_with_metadata_is_a_project() {
         fs::write(root.join(dir).join("setup.cfg"), cfg).unwrap();
     }
     // Only tool settings in setup.cfg, and old flit metadata: not a project.
+    // Nor is a setup.cfg alone: pip needs a setup.py or pyproject.toml to build.
+    let lone = venv(&root.join("lone-cfg"), "venv", VENV_CFG, &[], 2);
+    fs::write(root.join("lone-cfg/setup.cfg"), "[metadata]\nname = app\n").unwrap();
     let lint = venv(&root.join("lint-only"), ".venv", VENV_CFG, &[], 2);
     fs::write(
         root.join("lint-only/setup.cfg"),
@@ -325,11 +328,12 @@ fn a_setup_cfg_with_metadata_is_a_project() {
     .unwrap();
 
     let found = findings(&root);
-    assert_eq!(found.len(), 4);
+    assert_eq!(found.len(), 5);
     for f in &found {
         let dir = Path::new(&f.path).parent().unwrap();
-        if f.path == s(&lint) || f.path == s(&flit) {
+        if [s(&lint), s(&flit), s(&lone)].contains(&f.path.as_str()) {
             assert_eq!(f.tier, Tier::Review, "{}", f.path);
+            assert!(how(f).ends_with("/bin/python -m pip freeze"), "{}", how(f));
         } else {
             assert_eq!(f.tier, Tier::Rebuildable, "{}", f.path);
             assert_eq!(how(f), format!("cd {} && {pip_e}", s(dir)));
