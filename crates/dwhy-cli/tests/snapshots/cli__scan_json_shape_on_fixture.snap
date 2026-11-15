@@ -1,0 +1,104 @@
+---
+source: crates/dwhy-cli/tests/cli.rs
+expression: v
+---
+{
+  "findings": [],
+  "fs": [
+    {
+      "avail": "[avail]",
+      "deleted_open": "[deleted_open]",
+      "fstype": "[fstype]",
+      "full_coverage": "[full_coverage]",
+      "hints": [],
+      "mount": "[mount]",
+      "rerun": null,
+      "scanned": "[scanned]",
+      "size": "[size]",
+      "source": "[source]",
+      "unaccounted": "[unaccounted]",
+      "unaccounted_large": false,
+      "used": "[used]"
+    }
+  ],
+  "generated_at": "[generated_at]",
+  "host": "[host]",
+  "root": "[root]",
+  "scan": {
+    "dirs": [
+      {
+        "allocated": "[allocated]",
+        "apparent": 5309,
+        "depth": 0,
+        "files": 2,
+        "path": "[root]"
+      },
+      {
+        "allocated": "[allocated]",
+        "apparent": 5300,
+        "depth": 1,
+        "files": 2,
+        "path": "[root]/a"
+      },
+      {
+        "allocated": "[allocated]",
+        "apparent": 300,
+        "depth": 2,
+        "files": 1,
+        "path": "[root]/a/deep"
+      },
+      {
+        "allocated": "[allocated]",
+        "apparent": 9,
+        "depth": 1,
+        "files": 0,
+        "path": "[root]/b"
+      }
+    ],
+    "elapsed_ms": "[elapsed_ms]",
+    "error_count": 0,
+    "errors": [],
+    "min_dir_bytes": 0,
+    "one_filesystem": true,
+    "roots": [
+      {
+        "mount": "[mount]",
+        "path": "[root]",
+        "totals": {
+          "allocated": "[allocated]",
+          "apparent": 5309,
+          "dirs": 4,
+          "files": 2,
+          "hardlink_bytes_deduped": "[hardlink_bytes_deduped]",
+          "hardlinks_deduped": 1,
+          "other": 0,
+          "symlinks": 1
+        }
+      }
+    ],
+    "skipped_mounts": [],
+    "totals": {
+      "allocated": "[allocated]",
+      "apparent": 5309,
+      "dirs": 4,
+      "files": 2,
+      "hardlink_bytes_deduped": "[hardlink_bytes_deduped]",
+      "hardlinks_deduped": 1,
+      "other": 0,
+      "symlinks": 1
+    },
+    "unreadable": {
+      "count": 0,
+      "dirs": [],
+      "entries_unknown": 0,
+      "known_bytes": "[known_bytes]",
+      "truncated": false
+    }
+  },
+  "schema": "diskwhy/v1",
+  "tool": {
+    "name": "diskwhy",
+    "version": "[version]"
+  },
+  "uid": "[uid]"
+}
