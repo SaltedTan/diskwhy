@@ -178,13 +178,25 @@ pub fn finding_id(detector: &str, path: &str) -> String {
     format!("f_{:012x}", h >> 16)
 }
 
+/// Quotes `s` for a POSIX shell when it holds anything outside a safe set.
+pub fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@=,".contains(&b))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 /// Drops filesystem findings whose path lies inside another finding's path,
 /// so no byte is offered twice; the outermost finding wins. Pseudo-paths
 /// such as `docker://...` never nest. Returns the survivors, largest first.
 pub fn outermost(mut findings: Vec<Finding>) -> Vec<Finding> {
     findings.sort_by(|a, b| {
-        a.path
-            .cmp(&b.path)
+        Path::new(&a.path)
+            .cmp(Path::new(&b.path))
             .then_with(|| a.detector.cmp(&b.detector))
     });
     let mut kept: Vec<Finding> = Vec::new();
@@ -340,6 +352,7 @@ mod tests {
             f("node-modules", "/p/scratch/app/node_modules", 10),
             f("stale-tree", "/p/scratch", 50),
             f("cargo-target", "/p/scratchy/target", 5),
+            f("cargo-target", "/p/scratch-x/target", 3),
             f("docker-volume", "docker://volume/v", 99),
             f("venv", "/q/.venv", 7),
         ]);
@@ -350,9 +363,20 @@ mod tests {
                 "docker://volume/v",
                 "/p/scratch",
                 "/q/.venv",
-                "/p/scratchy/target"
+                "/p/scratchy/target",
+                "/p/scratch-x/target"
             ]
         );
+    }
+
+    #[test]
+    fn shell_quoting() {
+        assert_eq!(shell_quote("/"), "/");
+        assert_eq!(shell_quote("--target-dir"), "--target-dir");
+        assert_eq!(shell_quote("/mnt/my disk"), "'/mnt/my disk'");
+        assert_eq!(shell_quote("/a'b"), r"'/a'\''b'");
+        assert_eq!(shell_quote("/x/$(echo x)"), "'/x/$(echo x)'");
+        assert_eq!(shell_quote(""), "''");
     }
 
     #[test]

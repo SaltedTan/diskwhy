@@ -6,7 +6,7 @@
 //! (a target dir whose tag was removed). Some other `target/`, such as a
 //! downloaded prebuilt binary, matches neither.
 
-use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339};
+use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
 use crate::report::{Action, ActionKind, Finding, Recovery, Tier};
 use crate::tree::{Markers, ScanTree};
 use crate::units::human;
@@ -65,13 +65,17 @@ impl Detector for CargoTarget {
                     ];
                     Action {
                         kind: ActionKind::Command,
-                        text: argv.join(" "),
+                        text: argv
+                            .iter()
+                            .map(|a| shell_quote(a))
+                            .collect::<Vec<_>>()
+                            .join(" "),
                         argv: Some(argv),
                     }
                 }
                 None => Action {
                     kind: ActionKind::RemovePath,
-                    text: format!("remove {path_s} (cargo not found)"),
+                    text: format!("remove {} (cargo not found)", shell_quote(&path_s)),
                     argv: None,
                 },
             };

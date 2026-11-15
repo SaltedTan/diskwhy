@@ -117,6 +117,40 @@ fn finds_a_tagged_target_dir() {
 }
 
 #[test]
+fn action_text_is_shell_quoted_but_argv_is_raw() {
+    let t = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    let crate_dir = root.join("my app $(echo x)");
+    let target = cargo_crate(&crate_dir, "target", 2, Some(CARGO_TAG));
+    let manifest = crate_dir.join("Cargo.toml");
+    let (manifest_s, target_s) = (manifest.to_str().unwrap(), target.to_str().unwrap());
+
+    let f = cargo_findings(&root, Some("/usr/bin/cargo"));
+    assert_eq!(f.len(), 1);
+    assert_eq!(
+        f[0].action.argv.as_deref().unwrap(),
+        &[
+            "cargo",
+            "clean",
+            "--manifest-path",
+            manifest_s,
+            "--target-dir",
+            target_s
+        ]
+    );
+    assert_eq!(
+        f[0].action.text,
+        format!("cargo clean --manifest-path '{manifest_s}' --target-dir '{target_s}'")
+    );
+
+    let f = cargo_findings(&root, None);
+    assert_eq!(
+        f[0].action.text,
+        format!("remove '{target_s}' (cargo not found)")
+    );
+}
+
+#[test]
 fn falls_back_to_path_removal_without_cargo() {
     let t = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(t.path()).unwrap();
