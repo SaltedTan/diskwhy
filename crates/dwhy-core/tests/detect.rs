@@ -55,6 +55,7 @@ fn ctx(cargo: Option<&str>) -> DetectContext {
             exists: false,
             accessible: false,
         },
+        docker: dwhy_core::docker::Source::none(),
     }
 }
 
@@ -76,7 +77,7 @@ fn cargo_crate(dir: &Path, target_name: &str, mb: usize, tag: Option<&str>) -> P
 
 fn cargo_findings(root: &Path, cargo: Option<&str>) -> Vec<Finding> {
     let tree = scan_tree(root);
-    let mut f = CargoTarget.detect(&tree, &ctx(cargo));
+    let mut f = CargoTarget.detect(&tree, &ctx(cargo)).unwrap();
     f.sort_by(|a, b| a.path.cmp(&b.path));
     f
 }
@@ -88,7 +89,9 @@ fn finds_a_tagged_target_dir() {
     let target = cargo_crate(&root.join("app"), "target", 2, Some(CARGO_TAG));
 
     let tree = scan_tree(&root);
-    let found = CargoTarget.detect(&tree, &ctx(Some("/usr/bin/cargo")));
+    let found = CargoTarget
+        .detect(&tree, &ctx(Some("/usr/bin/cargo")))
+        .unwrap();
     assert_eq!(found.len(), 1);
     let f = &found[0];
     assert_eq!(f.path, target.to_str().unwrap());
@@ -225,7 +228,7 @@ fn nested_target_dirs_yield_only_the_outermost() {
         Some(CARGO_TAG),
     );
     let tree = scan_tree(&root);
-    let raw = CargoTarget.detect(&tree, &ctx(Some("cargo")));
+    let raw = CargoTarget.detect(&tree, &ctx(Some("cargo"))).unwrap();
     assert_eq!(raw.len(), 2);
     let kept = detect::outermost(raw);
     assert_eq!(kept.len(), 1);
@@ -270,7 +273,7 @@ fn last_modified_is_the_newest_file_in_the_target() {
     let id = tree.find(&target).unwrap();
     let want = newer.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
     assert_eq!(tree.node(id).newest_mtime, want);
-    let f = CargoTarget.detect(&tree, &ctx(Some("cargo")));
+    let f = CargoTarget.detect(&tree, &ctx(Some("cargo"))).unwrap();
     assert_eq!(
         f[0].last_modified.as_deref(),
         Some(detect::rfc3339(want).as_str())

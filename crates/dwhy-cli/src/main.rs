@@ -17,7 +17,7 @@ use dwhy_core::account::{self, ReportEnv};
 use dwhy_core::detect::{self, DetectContext};
 use dwhy_core::mounts::{self, MountTable};
 use dwhy_core::scan::{self, Progress, ScanOptions};
-use dwhy_core::{doctor, system, units};
+use dwhy_core::{docker, doctor, system, units};
 
 pub const EXIT_OK: u8 = 0;
 pub const EXIT_ERROR: u8 = 1;
@@ -76,8 +76,11 @@ struct ScanArgs {
     #[arg(short, long)]
     quiet: bool,
     /// Only measure; do not run detectors.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "detectors")]
     no_detectors: bool,
+    /// Run only these detectors (comma-separated names, see `dwhy doctor`).
+    #[arg(long, value_delimiter = ',', value_name = "NAME,…")]
+    detectors: Option<Vec<String>>,
     /// Text output: findings listed before "… N more".
     #[arg(long, default_value_t = 20)]
     max_findings: usize,
@@ -127,6 +130,9 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
                 p.display()
             );
         }
+    }
+    if let Some(names) = &args.detectors {
+        detect::validate_selection(names)?;
     }
     let roots = scan::prepare_roots(&paths, one_fs)?;
     let mounts = MountTable::read().unwrap_or_default();
@@ -188,9 +194,18 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
     let mut report =
         account::build_scan_report(&result, &mounts, &env, &|p| mounts::statvfs(p).ok());
     if !args.no_detectors {
-        let (findings, runs) = detect::run(&result.tree, &DetectContext::from_system());
+        let ctx = DetectContext::from_system();
+        let (findings, runs) = detect::run_with(
+            &result.tree,
+            &ctx,
+            &dwhy_core::detectors::registry(),
+            args.detectors.as_deref(),
+        );
         report.findings = findings;
         report.detectors = runs;
+        if let Some(snap) = ctx.docker.fetched() {
+            account::attach_docker(&mut report, &docker::usage(&snap));
+        }
     }
 
     let mut out = std::io::stdout().lock();

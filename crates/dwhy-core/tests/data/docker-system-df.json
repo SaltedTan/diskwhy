@@ -1,0 +1,29 @@
+{
+  "LayersSize": 9000000000,
+  "Images": [
+    {"Id": "sha256:aaaa000000000000000000000000000000000000000000000000000000000001", "RepoTags": ["app:latest"], "RepoDigests": ["app@sha256:01"], "Created": 1794000000, "Size": 3000000000, "SharedSize": 1000000000, "Containers": 1},
+    {"Id": "sha256:bbbb000000000000000000000000000000000000000000000000000000000002", "RepoTags": null, "RepoDigests": [], "Created": 1794500000, "Size": 2750000000, "SharedSize": 1630000000, "Containers": 0},
+    {"Id": "sha256:cccc000000000000000000000000000000000000000000000000000000000003", "RepoTags": ["postgres:16-alpine"], "RepoDigests": ["postgres@sha256:03"], "Created": 1792000000, "Size": 420000000, "SharedSize": 0, "Containers": 0},
+    {"Id": "sha256:dddd000000000000000000000000000000000000000000000000000000000004", "RepoTags": ["ci-runner:local", "ci-runner:v2"], "RepoDigests": ["ci-runner@sha256:04"], "Created": 1794600000, "Size": 2150000000, "SharedSize": 134000000, "Containers": 0},
+    {"Id": "sha256:eeee000000000000000000000000000000000000000000000000000000000005", "RepoTags": ["counted:never"], "RepoDigests": [], "Created": 1794600000, "Size": 900000000, "SharedSize": -1, "Containers": -1},
+    {"Id": "sha256:ffff000000000000000000000000000000000000000000000000000000000006", "RepoTags": ["alpine:latest"], "RepoDigests": ["alpine@sha256:06"], "Created": 1790000000, "Size": 8000000, "SharedSize": 7900000, "Containers": 0}
+  ],
+  "Containers": [
+    {"Id": "c1000000000000000000000000000000000000000000000000000000000000a1", "Names": ["/app-1"], "Image": "app:latest", "State": "running", "Status": "Up 3 hours", "Created": 1794600000, "SizeRw": 2900000, "Mounts": [{"Type": "volume", "Name": "app_data", "Destination": "/data"}, {"Type": "bind", "Source": "/srv", "Destination": "/srv"}]},
+    {"Id": "c2000000000000000000000000000000000000000000000000000000000000b2", "Names": ["/old-job"], "Image": "ci-runner:local", "State": "exited", "Status": "Exited (0) 3 days ago", "Created": 1794400000, "SizeRw": 500000000, "Mounts": [{"Type": "volume", "Name": "job_cache", "Destination": "/cache"}]},
+    {"Id": "c3000000000000000000000000000000000000000000000000000000000000c3", "Names": ["/never-started"], "Image": "alpine:latest", "State": "created", "Status": "Created", "Created": 1794400000, "SizeRw": 0, "Mounts": []}
+  ],
+  "Volumes": [
+    {"Name": "app_data", "Driver": "local", "CreatedAt": "2026-11-01T10:00:00+11:00", "UsageData": {"Size": 2147483648, "RefCount": 1}},
+    {"Name": "job_cache", "Driver": "local", "CreatedAt": "2026-11-10T10:00:00Z", "UsageData": {"Size": 52428800, "RefCount": 1}},
+    {"Name": "orphan_pg", "Driver": "local", "CreatedAt": "2026-10-01T00:00:00Z", "UsageData": {"Size": 314572800, "RefCount": 0}},
+    {"Name": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "Driver": "local", "CreatedAt": "2026-11-12T00:00:00Z", "UsageData": {"Size": 5242880, "RefCount": 0}},
+    {"Name": "unsized", "Driver": "local", "CreatedAt": "2026-11-12T00:00:00Z", "UsageData": {"Size": -1, "RefCount": -1}}
+  ],
+  "BuildCache": [
+    {"ID": "old1", " Parents": ["p"], "Type": "regular", "Description": "mount / from exec pip install", "InUse": false, "Shared": false, "Size": 800000000, "CreatedAt": "2026-11-04T13:12:35.182971468Z", "LastUsedAt": "2026-11-04T13:12:35.231986284Z", "UsageCount": 1},
+    {"ID": "old-shared", "Type": "regular", "Description": "pulled from docker.io/library/python:3.12-slim", "InUse": false, "Shared": true, "Size": 100000000, "LastUsedAt": "2026-11-04T13:12:35Z", "UsageCount": 1},
+    {"ID": "recent", "Type": "regular", "Description": "[6/7] COPY app ./app", "InUse": false, "Shared": false, "Size": 200000000, "LastUsedAt": "2026-11-14T12:00:00Z", "UsageCount": 2},
+    {"ID": "busy", "Type": "regular", "Description": "running build", "InUse": true, "Shared": false, "Size": 1000000000, "LastUsedAt": "2026-11-01T00:00:00Z", "UsageCount": 9}
+  ]
+}

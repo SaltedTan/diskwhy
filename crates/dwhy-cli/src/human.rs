@@ -139,7 +139,7 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
         Tier::Blocked,
     ] {
         let in_tier: Vec<&Finding> = r.findings.iter().filter(|f| f.tier == tier).collect();
-        if in_tier.is_empty() {
+        if in_tier.is_empty() || shown == max {
             continue;
         }
         let bytes: u64 = in_tier.iter().map(|f| f.bytes).sum();
@@ -167,6 +167,14 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
         .filter(|d| !d.ran && d.status == DetectorAvailability::Unavailable)
         .map(|d| d.name.as_str())
         .collect();
+    for d in r.detectors.iter().filter(|d| d.error.is_some()) {
+        writeln!(
+            w,
+            "  failed: {}: {}",
+            d.name,
+            d.error.as_deref().unwrap_or("")
+        )?;
+    }
     if !unavailable.is_empty() {
         writeln!(
             w,

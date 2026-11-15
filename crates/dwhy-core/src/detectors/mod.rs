@@ -1,6 +1,7 @@
 //! Built detectors. Each one matches a [`crate::detect::CATALOG`] entry.
 
 mod cargo_target;
+mod docker;
 
 use std::io::Read;
 use std::path::Path;
@@ -8,10 +9,19 @@ use std::path::Path;
 use crate::detect::Detector;
 
 pub use cargo_target::CargoTarget;
+pub use docker::{
+    BUILD_CACHE_AGE_HOURS, DockerBuildCache, DockerContainer, DockerImage, DockerVolume,
+};
 
 /// Every detector that is built, in catalog order.
 pub fn registry() -> Vec<Box<dyn Detector>> {
-    vec![Box::new(CargoTarget)]
+    vec![
+        Box::new(CargoTarget),
+        Box::new(DockerImage),
+        Box::new(DockerBuildCache),
+        Box::new(DockerContainer),
+        Box::new(DockerVolume),
+    ]
 }
 
 /// Reads at most `limit` bytes of a regular file without following a symlink.

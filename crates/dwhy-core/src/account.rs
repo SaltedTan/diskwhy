@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use crate::detect::shell_quote;
 use crate::mounts::{FsStats, Mount, MountTable};
 use crate::report::{
-    self, DeletedOpen, DirEntry, FsReport, Hint, HintKind, RootReport, ScanErrorEntry, ScanReport,
-    ScanSummary, SkippedMount, Tool, Unreadable, UnreadableDir,
+    self, DeletedOpen, DirEntry, DockerUsage, FsReport, Hint, HintKind, RootReport, ScanErrorEntry,
+    ScanReport, ScanSummary, SkippedMount, Tool, Unreadable, UnreadableDir,
 };
 use crate::scan::{ScanResult, SkippedRecord, UnreadableRecord};
 use crate::system::{DeletedOpenScan, User};
@@ -461,6 +461,43 @@ pub fn build_scan_report(
         // Filled in by the caller from `detect::run`.
         findings: Vec::new(),
         detectors: Vec::new(),
+        docker: None,
+    }
+}
+
+/// Records Docker's own accounting in the report and puts its measured bytes
+/// on the matching unaccounted-space hints: image layers on the
+/// `/var/lib/containerd` hint when Docker uses the containerd image store,
+/// everything else on the hint for Docker's root dir.
+pub fn attach_docker(report: &mut ScanReport, usage: &DockerUsage) {
+    attach_docker_hints(&mut report.fs, usage);
+    report.docker = Some(usage.clone());
+}
+
+/// The hint half of [`attach_docker`].
+pub fn attach_docker_hints(filesystems: &mut [FsReport], usage: &DockerUsage) {
+    let image_bytes = usage.images.bytes;
+    let rest = usage.total - image_bytes;
+    for fs in filesystems {
+        let has_containerd = fs.hints.iter().any(|h| {
+            h.kind == HintKind::Containerd && h.path.as_deref() == Some("/var/lib/containerd")
+        });
+        let split = usage.containerd_image_store && has_containerd;
+        for h in &mut fs.hints {
+            let path = h.path.as_deref().unwrap_or("");
+            if h.kind == HintKind::Docker && Path::new(path) == Path::new(&usage.root_dir) {
+                h.bytes = Some(if split { rest } else { usage.total });
+                h.detail = if split {
+                    "Docker data root: containers, volumes and build cache, as measured by Docker (images are under /var/lib/containerd)".into()
+                } else {
+                    "Docker data root: images, containers, volumes and build cache, as measured by Docker".into()
+                };
+            } else if split && h.kind == HintKind::Containerd && path == "/var/lib/containerd" {
+                h.bytes = Some(image_bytes);
+                h.detail =
+                    "containerd content store: Docker's image layers, as measured by Docker".into();
+            }
+        }
     }
 }
 
