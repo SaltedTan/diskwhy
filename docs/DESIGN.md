@@ -48,7 +48,7 @@ The idea is to automate what was done by hand on pc-ubuntu on 2026-11-13: 36G fr
 ### Recommendation: static binary
 
 - **Ship static musl builds** (x86_64 and aarch64) as GitHub release assets. Rust makes this cheap, and ssh boxes run all sorts of glibc versions. A `.deb` and `cargo install` come later.
-- **No runtime dependencies are required.** It calls optional external tools (`git`, `docker`, `cargo`, `go`, `journalctl`) when they exist. A missing tool disables only its detectors, and `dwhy doctor` explains why.
+- **No runtime dependencies are required.** It calls optional external tools (`git`, `docker`, `cargo`, `go`, `journalctl` and the package managers whose caches `user-cache` reports; `dwhy doctor` lists them all) when they exist. A missing tool disables only its detectors, and `dwhy doctor` explains why.
 - **Shell out to `git`** instead of linking libgit2/gix. This matches git's own behaviour exactly (worktrees, submodules, safe.directory) and keeps the binary small.
 
 ## Main concepts

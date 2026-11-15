@@ -310,9 +310,9 @@ pub struct Finding {
     pub probe: Option<String>,
     /// Filesystem path, or a pseudo-path such as `docker://volume/<name>`.
     pub path: String,
-    /// What removing the finding is expected to free: allocated bytes under
-    /// `path`, each hardlinked file counted once, excluding files kept alive
-    /// by links elsewhere.
+    /// Allocated bytes under `path`, each hardlinked file counted once.
+    /// `user-cache` also leaves out files kept alive by links elsewhere, so
+    /// its figure is what removing the cache is expected to free.
     pub bytes: u64,
     /// Newest mtime under `path`, RFC 3339 (UTC).
     #[serde(default)]
