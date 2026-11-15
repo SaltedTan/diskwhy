@@ -393,6 +393,7 @@ impl Detector for UserCache {
                 detector: self.name().into(),
                 probe: None,
                 bytes,
+                nested_bytes: None,
                 last_modified: Some(rfc3339(n.newest_mtime)),
                 growth: None,
                 tier: if recent { Tier::Blocked } else { cache.tier },

@@ -56,7 +56,9 @@ pub struct ScanReport {
     pub scan: ScanSummary,
     pub fs: Vec<FsReport>,
     /// What each detector found, largest first. A finding whose path lies
-    /// inside another finding's path is dropped: the outermost finding wins.
+    /// inside another finding's path is dropped, unless its tier is cheaper
+    /// than the outer one's or the outer one is `blocked`; then both are kept
+    /// and the outer one's `nested_bytes` counts it.
     pub findings: Vec<Finding>,
     /// Every known detector, whether it ran, and why not.
     #[serde(default)]
@@ -315,6 +317,11 @@ pub struct Finding {
     /// out files kept alive by links outside it (`TreeNode::freeable`). For a
     /// pseudo-path such as `docker://…`: what the tool reports removal frees.
     pub bytes: u64,
+    /// Part of `bytes` held by other findings inside `path`, reported
+    /// separately (each byte counted once, by its outermost such finding).
+    /// `None` when there are none.
+    #[serde(default)]
+    pub nested_bytes: Option<u64>,
     /// Newest mtime under `path`, RFC 3339 (UTC).
     #[serde(default)]
     pub last_modified: Option<String>,

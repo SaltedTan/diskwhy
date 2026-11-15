@@ -2,6 +2,7 @@
 
 mod cargo_target;
 mod docker;
+mod git_worktree;
 mod node_modules;
 mod user_cache;
 
@@ -14,6 +15,7 @@ pub use cargo_target::CargoTarget;
 pub use docker::{
     BUILD_CACHE_AGE_HOURS, DockerBuildCache, DockerContainer, DockerImage, DockerVolume,
 };
+pub use git_worktree::{GitWorktree, STALE_DAYS, WorktreeEntry, parse_porcelain};
 pub use node_modules::NodeModules;
 pub use user_cache::{RECENT_HOURS, UserCache};
 
@@ -23,6 +25,7 @@ pub fn registry() -> Vec<Box<dyn Detector>> {
         Box::new(CargoTarget),
         Box::new(NodeModules),
         Box::new(UserCache::from_system()),
+        Box::new(GitWorktree),
         Box::new(DockerImage),
         Box::new(DockerBuildCache),
         Box::new(DockerContainer),

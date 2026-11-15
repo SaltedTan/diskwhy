@@ -121,6 +121,7 @@ fn sample() -> ScanReport {
             probe: Some("postgres-wal".into()),
             path: "docker://volume/example_postgres_data".into(),
             bytes: 33_041_965_056,
+            nested_bytes: None,
             last_modified: Some("2026-11-13T02:10:00Z".into()),
             growth: Some(Growth {
                 bytes_per_day: 4_939_212_390,
