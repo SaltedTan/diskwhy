@@ -6,19 +6,29 @@
 //! directory that holds the venv:
 //!
 //! - one lockfile (`uv.lock`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`):
-//!   that tool's install command; several: no command, the cost names them
+//!   that tool's install command, pinned to the venv; several: no command,
+//!   the cost names them. Poetry and Pipenv can only be told to install into
+//!   `.venv`, so a venv with another name gets no command
 //! - `requirements.txt`: recreate the venv with the same Python and install it
-//! - `pyproject.toml` or `setup.py` without a lockfile: reinstall the project,
-//!   which resolves dependencies again
+//! - `pyproject.toml` with a `[project]` or `[tool.poetry]` table, or
+//!   `setup.py`, without a lockfile: reinstall the project, which resolves
+//!   dependencies again. A `pyproject.toml` that only configures tools
+//!   (`[tool.ruff]`) does not count
 //!
 //! A venv with none of these next to it holds packages installed by hand, so
 //! removing it loses that list: it is reported as `review`, with the command
 //! to record its packages first.
 //!
+//! Poetry's and Pipenv's central envs (`pypoetry/virtualenvs/<name>`,
+//! `.local/share/virtualenvs/<name>`) belong to a project elsewhere, so they
+//! are `review`, with no command: the tool rebuilds them in that project.
+//!
 //! Skipped: venvs inside a cache directory (an ancestor holds `CACHEDIR.TAG`,
-//! as uv's cache does; `user-cache` reports the cache), and the tools that
-//! `uv tool` and pipx install (`uv/tools/<name>`, `pipx/venvs/<name>`), which
-//! are installed programs rather than project environments.
+//! as uv's cache does; `user-cache` reports the cache), the tools that
+//! `uv tool` and pipx install (`uv/tools/<name>`, `pipx/venvs/<name>`, and
+//! pipx's shared libraries `pipx/shared`), which are installed programs rather
+//! than project environments, and everything under a scan root that is itself
+//! inside a venv.
 //!
 //! The action is a path removal limited to the venv. uv hardlinks package
 //! files from its cache, so `bytes` is what removal frees (`freeable()`).
@@ -82,12 +92,31 @@ fn is_file(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file())
 }
 
+/// True if the `pyproject.toml` at `path` has a `[project]` or
+/// `[tool.poetry]` table, rather than only tool settings.
+fn declares_project(path: &Path) -> bool {
+    let Some(head) = read_head(path, 256 << 10) else {
+        return false;
+    };
+    String::from_utf8_lossy(&head).lines().any(|line| {
+        let Some(rest) = line.trim().strip_prefix('[') else {
+            return false;
+        };
+        let Some((key, _)) = rest.split_once(']') else {
+            return false;
+        };
+        let key: Vec<&str> = key.split('.').map(str::trim).collect();
+        key == ["project"] || key == ["tool", "poetry"]
+    })
+}
+
 /// The project files next to a venv, read from disk without following symlinks.
 struct Project {
     locks: Vec<(&'static str, &'static str, &'static str)>,
     requirements: bool,
     /// Other `requirements*.txt` files, sorted.
     other_requirements: Vec<String>,
+    /// `pyproject.toml` declares a project.
     pyproject: bool,
     setup_py: bool,
 }
@@ -116,7 +145,7 @@ impl Project {
                 .collect(),
             requirements: is_file(&dir.join("requirements.txt")),
             other_requirements,
-            pyproject: is_file(&dir.join("pyproject.toml")),
+            pyproject: declares_project(&dir.join("pyproject.toml")),
             setup_py: is_file(&dir.join("setup.py")),
         }
     }
@@ -139,7 +168,19 @@ impl Detector for Venv {
 
     fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
         let mut out = Vec::new();
-        let mut stack: Vec<NodeId> = tree.roots().to_vec();
+        // A root inside a venv belongs to that venv: nothing below it counts.
+        let mut stack: Vec<NodeId> = tree
+            .roots()
+            .iter()
+            .copied()
+            .filter(|&r| {
+                !tree
+                    .path(r)
+                    .ancestors()
+                    .skip(1)
+                    .any(|d| is_file(&d.join("pyvenv.cfg")))
+            })
+            .collect();
         while let Some(id) = stack.pop() {
             let n = tree.node(id);
             if !n.is_dir {
@@ -173,15 +214,30 @@ fn in_cache(tree: &ScanTree, id: NodeId) -> bool {
         .any(|d| is_file(&d.join("CACHEDIR.TAG")))
 }
 
-/// `uv/tools/<name>` or `pipx/venvs/<name>`.
+/// The names of `p` and its three nearest ancestors.
+fn tail(p: &Path) -> [Option<&str>; 4] {
+    let mut up = p.ancestors().map(|a| a.file_name().and_then(OsStr::to_str));
+    std::array::from_fn(|_| up.next().flatten())
+}
+
+/// `uv/tools/<name>`, `pipx/venvs/<name>` or `pipx/shared`.
 fn is_tool_env(venv: &Path) -> bool {
-    let parent = venv.parent();
-    let a = parent.and_then(Path::file_name);
-    let b = parent.and_then(Path::parent).and_then(Path::file_name);
     matches!(
-        (a, b),
-        (Some(a), Some(b)) if (a == "tools" && b == "uv") || (a == "venvs" && b == "pipx")
+        tail(venv),
+        [_, Some("tools"), Some("uv"), _]
+            | [_, Some("venvs"), Some("pipx"), _]
+            | [Some("shared"), Some("pipx"), _, _]
     )
+}
+
+/// The tool and its install command, for a venv in Poetry's or Pipenv's
+/// central directory.
+fn central_env(venv: &Path) -> Option<(&'static str, &'static str)> {
+    match tail(venv) {
+        [_, Some("virtualenvs"), Some("pypoetry"), _] => Some(("Poetry", "poetry install")),
+        [_, Some("virtualenvs"), Some("share"), Some(".local")] => Some(("Pipenv", "pipenv sync")),
+        _ => None,
+    }
 }
 
 impl Venv {
@@ -197,10 +253,35 @@ impl Venv {
             return None;
         }
         let cfg = read_cfg(&path.join("pyvenv.cfg"));
-        let project = Project::read(&project_dir);
         let path_s = path.to_string_lossy().into_owned();
         let name = path.file_name().unwrap_or(OsStr::new("")).to_string_lossy();
-        let (tier, recovery) = recovery(&project, &project_dir, &name, &path_s, &cfg);
+        let (tier, recovery, what) = if let Some((tool, cmd)) = central_env(&path) {
+            (
+                Tier::Review,
+                Recovery {
+                    cost: format!(
+                        "{tool} keeps this environment for a project elsewhere; {cmd} in that project rebuilds it, so check which project it belongs to first"
+                    ),
+                    how: None,
+                },
+                format!(
+                    "{tool}-managed Python virtualenv in {}",
+                    project_dir.display()
+                ),
+            )
+        } else {
+            let project = Project::read(&project_dir);
+            let (tier, recovery) = recovery(&project, &project_dir, &name, &path_s, &cfg);
+            let what = if project.is_empty() {
+                format!(
+                    "Python virtualenv in {} with no project file next to it",
+                    project_dir.display()
+                )
+            } else {
+                format!("Python virtualenv for {}", project_dir.display())
+            };
+            (tier, recovery, what)
+        };
 
         let made_by = if cfg.uv { "uv" } else { "venv/virtualenv" };
         let python = cfg
@@ -208,19 +289,7 @@ impl Venv {
             .as_deref()
             .map(|v| format!(", Python {v}"))
             .unwrap_or_default();
-        let mut reason = if project.is_empty() {
-            format!(
-                "Python virtualenv in {} with no project file next to it (created by {made_by}{python}; {}",
-                project_dir.display(),
-                human(bytes)
-            )
-        } else {
-            format!(
-                "Python virtualenv for {} (created by {made_by}{python}; {}",
-                project_dir.display(),
-                human(bytes)
-            )
-        };
+        let mut reason = format!("{what} (created by {made_by}{python}; {}", human(bytes));
         if n.shared > 0 {
             reason.push_str(&format!(
                 "; {} more is hardlinked elsewhere, e.g. from the uv cache, and is not freed",
@@ -282,17 +351,25 @@ fn recovery(p: &Project, dir: &Path, name: &str, venv: &str, cfg: &Cfg) -> (Tier
 
     match p.locks.as_slice() {
         [(file, tool, cmd)] => {
-            let how = if *tool == "uv" {
-                format!("{cd}{uv_sync}")
-            } else {
-                format!("{cd}{cmd}")
+            // Poetry and Pipenv default to a central env; they can be told
+            // to use the project's .venv, but no other name.
+            let how = match *tool {
+                "uv" => Some(uv_sync),
+                "poetry" | "pipenv" if name != ".venv" => None,
+                "poetry" => Some(format!("POETRY_VIRTUALENVS_IN_PROJECT=true {cmd}")),
+                "pipenv" => Some(format!("PIPENV_VENV_IN_PROJECT=1 {cmd}")),
+                _ => Some(cmd.to_string()),
             };
-            return rebuild(
-                Some(how),
+            let cost = if how.is_some() {
                 format!(
                     "{cmd} reinstalls the packages pinned in {file}, downloading what its cache no longer holds"
-                ),
-            );
+                )
+            } else {
+                format!(
+                    "{file} pins the packages, but {tool} cannot install into a venv named {name}, only into .venv or its own central env: recreate the venv with {py_text} and install them yourself"
+                )
+            };
+            return rebuild(how.map(|h| format!("{cd}{h}")), cost);
         }
         [] => {}
         many => {

@@ -68,7 +68,8 @@ fn tmp() -> (tempfile::TempDir, PathBuf) {
 }
 
 /// A venv at `dir/name` with `cfg` and `mb` MiB of packages, next to the
-/// given project files. Returns the venv path.
+/// given project files (a `pyproject.toml` declares a project). Returns the
+/// venv path.
 fn venv(dir: &Path, name: &str, cfg: &str, files: &[&str], mb: usize) -> PathBuf {
     let v = dir.join(name);
     write(
@@ -77,7 +78,12 @@ fn venv(dir: &Path, name: &str, cfg: &str, files: &[&str], mb: usize) -> PathBuf
     );
     fs::write(v.join("pyvenv.cfg"), cfg).unwrap();
     for f in files {
-        fs::write(dir.join(f), "x").unwrap();
+        let body = if *f == "pyproject.toml" {
+            "[project]\nname = \"app\"\n"
+        } else {
+            "x"
+        };
+        fs::write(dir.join(f), body).unwrap();
     }
     v
 }
@@ -174,10 +180,15 @@ fn recovery_follows_the_project_files() {
             "poetry",
             VENV_CFG,
             &["poetry.lock", "pyproject.toml"],
-            "poetry install",
+            "POETRY_VIRTUALENVS_IN_PROJECT=true poetry install",
         ),
         ("pdm", VENV_CFG, &["pdm.lock"], "pdm install"),
-        ("pipenv", VENV_CFG, &["Pipfile.lock"], "pipenv sync"),
+        (
+            "pipenv",
+            VENV_CFG,
+            &["Pipfile.lock"],
+            "PIPENV_VENV_IN_PROJECT=1 pipenv sync",
+        ),
         (
             "req-uv",
             UV_CFG,
@@ -191,6 +202,12 @@ fn recovery_follows_the_project_files() {
             "python3.14 -m venv .venv && .venv/bin/pip install -r requirements.txt",
         ),
         ("pyproject-uv", UV_CFG, &["pyproject.toml"], "uv sync"),
+        (
+            "pyproject-pip",
+            VENV_CFG,
+            &["pyproject.toml"],
+            "python3.14 -m venv .venv && .venv/bin/pip install -e .",
+        ),
         (
             "setup-py",
             VENV_CFG,
@@ -231,6 +248,99 @@ fn recovery_follows_the_project_files() {
         "{}",
         fresh.recovery.cost
     );
+}
+
+#[test]
+fn poetry_and_pipenv_venvs_not_named_dot_venv_get_no_command() {
+    let (_t, root) = tmp();
+    // Neither tool can be pointed at a venv named `venv`: running it would
+    // install somewhere else and leave this path missing.
+    let p = venv(&root.join("p"), "venv", VENV_CFG, &["poetry.lock"], 2);
+    let e = venv(&root.join("e"), "env", VENV_CFG, &["Pipfile.lock"], 2);
+    let found = findings(&root);
+    assert_eq!(paths(&found), [s(&e), s(&p)]);
+    for (f, tool, name) in [(&found[0], "pipenv", "env"), (&found[1], "poetry", "venv")] {
+        assert_eq!(f.tier, Tier::Rebuildable, "{}", f.path);
+        assert_eq!(f.recovery.how, None, "{}", f.path);
+        assert!(
+            f.recovery
+                .cost
+                .contains(&format!("{tool} cannot install into a venv named {name}")),
+            "{}",
+            f.recovery.cost
+        );
+    }
+}
+
+#[test]
+fn a_pyproject_that_only_configures_tools_is_not_a_project() {
+    let (_t, root) = tmp();
+    let ruff = "[tool.ruff]\nline-length = 100\n\n[tool.mypy]\nstrict = true\n";
+    // uv sync would fail with no [project] table: the packages were added by hand.
+    let a = venv(&root.join("tool-config"), ".venv", UV_CFG, &[], 2);
+    fs::write(root.join("tool-config/pyproject.toml"), ruff).unwrap();
+    // With setup.py next to it, that describes the project.
+    let b = venv(
+        &root.join("with-setup"),
+        ".venv",
+        VENV_CFG,
+        &["setup.py"],
+        2,
+    );
+    fs::write(root.join("with-setup/pyproject.toml"), ruff).unwrap();
+    // Poetry 1 declares the project in [tool.poetry].
+    let c = venv(&root.join("poetry1"), ".venv", VENV_CFG, &[], 2);
+    fs::write(
+        root.join("poetry1/pyproject.toml"),
+        "[build-system]\nrequires = [\"poetry-core\"]\n\n[ tool . poetry ]  # metadata\nname = \"x\"\n",
+    )
+    .unwrap();
+
+    let found = findings(&root);
+    assert_eq!(paths(&found), [s(&c), s(&a), s(&b)]);
+    assert_eq!(found[1].tier, Tier::Review);
+    assert_eq!(how(&found[1]), format!("uv pip freeze --python {}", s(&a)));
+    let pip_e = "python3.14 -m venv .venv && .venv/bin/pip install -e .";
+    for (f, dir) in [(&found[0], "poetry1"), (&found[2], "with-setup")] {
+        assert_eq!(f.tier, Tier::Rebuildable, "{}", f.path);
+        assert_eq!(how(f), format!("cd {} && {pip_e}", s(&root.join(dir))));
+    }
+}
+
+#[test]
+fn poetry_and_pipenv_central_envs_are_review_without_a_command() {
+    let (_t, root) = tmp();
+    let poetry = venv(
+        &root.join(".cache/pypoetry/virtualenvs"),
+        "app-AbCd1234-py3.12",
+        VENV_CFG,
+        &[],
+        2,
+    );
+    let pipenv = venv(
+        &root.join(".local/share/virtualenvs"),
+        "app-AbCd1234",
+        VENV_CFG,
+        &[],
+        2,
+    );
+    let found = findings(&root);
+    assert_eq!(paths(&found), [s(&poetry), s(&pipenv)]);
+    for (f, tool, cmd) in [
+        (&found[0], "Poetry", "poetry install"),
+        (&found[1], "Pipenv", "pipenv sync"),
+    ] {
+        assert_eq!(f.tier, Tier::Review, "{}", f.path);
+        assert_eq!(f.recovery.how, None, "{}", f.path);
+        assert!(
+            f.reason
+                .starts_with(&format!("{tool}-managed Python virtualenv in ")),
+            "{}",
+            f.reason
+        );
+        assert!(f.recovery.cost.contains(cmd), "{}", f.recovery.cost);
+        assert!(!f.recovery.cost.contains("by hand"), "{}", f.recovery.cost);
+    }
 }
 
 #[test]
@@ -314,6 +424,7 @@ fn ignores_lookalikes_caches_and_tool_envs() {
     // Installed tools.
     venv(&root.join("share/uv/tools"), "ruff", UV_CFG, &[], 2);
     venv(&root.join("share/pipx/venvs"), "black", VENV_CFG, &[], 2);
+    venv(&root.join("share/pipx"), "shared", VENV_CFG, &[], 2);
     // pyvenv.cfg as a symlink or a directory: not a marker.
     let sym = venv(&root.join("sym"), ".venv", UV_CFG, &["uv.lock"], 2);
     fs::remove_file(sym.join("pyvenv.cfg")).unwrap();
@@ -364,6 +475,8 @@ fn only_the_outermost_venv_is_reported() {
         2,
     );
     assert_eq!(paths(&findings(&root)), [s(&outer)]);
+    // Scanning inside the outer venv does not surface the vendored one.
+    assert!(findings(&outer.join("lib")).is_empty());
 }
 
 #[test]
