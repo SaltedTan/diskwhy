@@ -27,7 +27,7 @@ cargo is in `~/.cargo/bin`, which non-interactive shells may not have on PATH. U
 cargo fmt --all --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
-cargo build --release --target x86_64-unknown-linux-musl -p dwhy-cli   # static binary, as in CI
+cargo build --locked --release --target x86_64-unknown-linux-musl -p dwhy-cli   # static binary, as in CI
 ```
 
 CI (`.github/workflows/ci.yml`) runs exactly these checks. All of them must pass before you push.
