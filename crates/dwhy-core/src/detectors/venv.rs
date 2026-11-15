@@ -24,7 +24,10 @@
 //! to record its packages first.
 //!
 //! tox and nox envs (`<project>/.tox/<env>`, `<project>/.nox/<session>`) are
-//! `rebuildable`: running the tool in the project recreates them.
+//! `rebuildable`, recreated in the project without running tests:
+//! `tox -e <env> --notest` (`tox --notest` for the `.pkg` env) and
+//! `nox --install-only`, which reinstalls every session since its directory
+//! names do not map back to a session.
 //!
 //! Poetry's, Pipenv's and Hatch's central envs (`pypoetry/virtualenvs/<name>`,
 //! `.local/share/virtualenvs/<name>`, `hatch/env/virtual/<project>/<hash>/<env>`)
@@ -304,12 +307,26 @@ impl Venv {
             )
         } else if let Some(tool) = runner_env(&path) {
             let project = project_dir.parent()?;
+            let (args, cost) = match (tool, name.as_ref()) {
+                ("nox", _) => (
+                    " --install-only".to_string(),
+                    "reinstalls every nox session's env without running the sessions".to_string(),
+                ),
+                (_, ".pkg") => (
+                    " --notest".to_string(),
+                    "recreates tox's packaging env without running tests".to_string(),
+                ),
+                _ => (
+                    format!(" -e {} --notest", shell_quote(&name)),
+                    "recreates the tox env without running tests".to_string(),
+                ),
+            };
             (
                 Tier::Rebuildable,
                 Recovery {
-                    cost: format!("{tool} recreates missing envs on its next run in the project"),
+                    cost,
                     how: Some(format!(
-                        "cd {} && {tool}",
+                        "cd {} && {tool}{args}",
                         shell_quote(&project.to_string_lossy())
                     )),
                 },

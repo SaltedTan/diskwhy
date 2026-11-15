@@ -421,19 +421,29 @@ fn central_tool_envs_are_review_without_a_command() {
 }
 
 #[test]
-fn tox_and_nox_envs_are_rebuilt_by_running_the_tool_in_the_project() {
+fn tox_and_nox_envs_are_recreated_without_running_tests() {
     let (_t, root) = tmp();
     let app = root.join("my app");
     fs::create_dir_all(&app).unwrap();
     fs::write(app.join("tox.ini"), "[tox]\nenv_list = py312\n").unwrap();
-    let py = venv(&app.join(".tox"), "py312", VENV_CFG, &[], 2);
+    // `docs` is outside env_list: a bare `tox` would not rebuild it.
+    let docs = venv(&app.join(".tox"), "docs", VENV_CFG, &[], 2);
     let pkg = venv(&app.join(".tox"), ".pkg", VENV_CFG, &[], 2);
     let nox = venv(&app.join(".nox"), "tests-3-12", VENV_CFG, &[], 2);
     let found = findings(&root);
-    assert_eq!(paths(&found), [s(&nox), s(&pkg), s(&py)]);
-    for (f, tool) in [(&found[0], "nox"), (&found[1], "tox"), (&found[2], "tox")] {
+    assert_eq!(paths(&found), [s(&nox), s(&pkg), s(&docs)]);
+    for (f, tool, cmd) in [
+        (&found[0], "nox", "nox --install-only"),
+        (&found[1], "tox", "tox --notest"),
+        (&found[2], "tox", "tox -e docs --notest"),
+    ] {
         assert_eq!(f.tier, Tier::Rebuildable, "{}", f.path);
-        assert_eq!(how(f), format!("cd '{}' && {tool}", s(&app)));
+        assert_eq!(how(f), format!("cd '{}' && {cmd}", s(&app)));
+        assert!(
+            f.recovery.cost.contains("without running"),
+            "{}",
+            f.recovery.cost
+        );
         assert!(
             f.reason
                 .starts_with(&format!("{tool} environment for {}", s(&app))),
