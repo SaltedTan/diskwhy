@@ -42,7 +42,9 @@ enum Locate {
     /// `$CARGO_HOME` (default `~/.cargo`) joined with `<rel>`.
     Cargo(&'static str),
     /// `$HF_HOME` (default `<XDG_CACHE_HOME>/huggingface`) joined with
-    /// `<rel>`, unless one of the variables names the directory itself.
+    /// `<rel>`, unless one of the variables names the directory itself. A
+    /// variable naming the HF home or one of its ancestors (which hold the
+    /// login token) is ignored.
     HuggingFace(&'static [&'static str], &'static str),
 }
 
@@ -258,11 +260,14 @@ impl UserCache {
                 .var("CARGO_HOME")
                 .unwrap_or_else(|| home.join(".cargo"))
                 .join(rel),
-            Locate::HuggingFace(vars, rel) => self.first_var(vars).unwrap_or_else(|| {
-                self.var("HF_HOME")
-                    .unwrap_or_else(|| self.xdg_cache(home).join("huggingface"))
-                    .join(rel)
-            }),
+            Locate::HuggingFace(vars, rel) => {
+                let hf_home = self
+                    .var("HF_HOME")
+                    .unwrap_or_else(|| self.xdg_cache(home).join("huggingface"));
+                self.first_var(vars)
+                    .filter(|p| !hf_home.starts_with(p))
+                    .unwrap_or_else(|| hf_home.join(rel))
+            }
         }
     }
 }
@@ -351,19 +356,25 @@ impl Detector for UserCache {
                 continue;
             };
             let n = tree.node(id);
-            if !n.is_dir || n.total.allocated < MIN_BYTES {
+            let bytes = n.freeable();
+            if !n.is_dir || bytes < MIN_BYTES {
                 continue;
             }
             seen.push(dir.clone());
             let path = dir.to_string_lossy().into_owned();
             let recent = ctx.now - n.newest_mtime < RECENT_HOURS * 3600;
             let mut guards = Vec::new();
-            let mut reason = format!(
-                "{} ({}); last written {} ago",
-                cache.what,
-                human(n.total.allocated),
+            let mut reason = format!("{} ({}", cache.what, human(bytes));
+            if n.shared > 0 {
+                reason.push_str(&format!(
+                    "; {} more is hardlinked elsewhere, e.g. into virtualenvs, and is not freed",
+                    human(n.shared)
+                ));
+            }
+            reason.push_str(&format!(
+                "); last written {} ago",
                 age(ctx.now, n.newest_mtime)
-            );
+            ));
             if recent {
                 reason.push_str(&format!(
                     "; written in the last {RECENT_HOURS} hours, so not offered yet"
@@ -381,7 +392,7 @@ impl Detector for UserCache {
                 id: finding_id(self.name(), &path),
                 detector: self.name().into(),
                 probe: None,
-                bytes: n.total.allocated,
+                bytes,
                 last_modified: Some(rfc3339(n.newest_mtime)),
                 growth: None,
                 tier: if recent { Tier::Blocked } else { cache.tier },

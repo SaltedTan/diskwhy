@@ -366,3 +366,52 @@ fn non_utf8_variables_are_skipped() {
     paths.sort();
     assert_eq!(paths, [h.join(".cache/uv"), h.join("custom-gocache")]);
 }
+
+#[test]
+fn bytes_hardlinked_into_projects_are_not_counted() {
+    let d = tempfile::tempdir().unwrap();
+    let h = d.path();
+    write(&h.join(".cache/uv/archive-v0/x/lib.so"), 3 * MB);
+    write(&h.join(".cache/uv/wheels-v5/w"), 2 * MB);
+    fs::create_dir_all(h.join("code/app/.venv/lib")).unwrap();
+    fs::hard_link(
+        h.join(".cache/uv/archive-v0/x/lib.so"),
+        h.join("code/app/.venv/lib/lib.so"),
+    )
+    .unwrap();
+    // Everything in pip's cache is also used by the venv: nothing to free.
+    write(&h.join(".cache/pip/http-v2/a"), 3 * MB);
+    fs::hard_link(h.join(".cache/pip/http-v2/a"), h.join("code/app/.venv/a")).unwrap();
+    age_tree(h, 3);
+    let found = detect(h, &[], &[]);
+    let paths: Vec<&PathBuf> = found.keys().collect();
+    assert_eq!(paths, [&h.join(".cache/uv")]);
+    let uv = &found[&h.join(".cache/uv")];
+    assert!(
+        (2 * MB as u64..3 * MB as u64).contains(&uv.bytes),
+        "{}",
+        uv.bytes
+    );
+    assert!(uv.reason.contains("hardlinked elsewhere"), "{}", uv.reason);
+}
+
+#[test]
+fn hugging_face_overrides_never_cover_the_token() {
+    let d = tempfile::tempdir().unwrap();
+    let h = d.path();
+    write(
+        &h.join(".cache/huggingface/hub/models--a--b/blobs/x"),
+        2 * MB,
+    );
+    write(&h.join(".cache/huggingface/token"), 40);
+    write(&h.join(".cache/pip-other/big"), 2 * MB);
+    age_tree(h, 3);
+    let hf_home = h.join(".cache/huggingface");
+    let env = [
+        ("HF_HUB_CACHE", hf_home.display().to_string()),
+        ("HF_XET_CACHE", h.join(".cache").display().to_string()),
+    ];
+    let found = detect(h, &env, &[]);
+    let paths: Vec<&PathBuf> = found.keys().collect();
+    assert_eq!(paths, [&hf_home.join("hub")]);
+}
