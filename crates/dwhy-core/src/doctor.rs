@@ -5,6 +5,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use crate::detect::{CATALOG, DetectContext, availability};
 use crate::report::{
     self, DetectorAvailability, DetectorStatus, DockerSocket, DoctorReport, Tool, ToolStatus,
 };
@@ -28,32 +29,6 @@ pub const TOOLS: &[(&str, &[&str])] = &[
     ("cargo", &["cargo-target (removal via `cargo clean`)"]),
     ("go", &["user-cache: go build/module caches (`go clean`)"]),
     ("journalctl", &["journald (root only)"]),
-];
-
-#[derive(Debug, Clone, Copy)]
-enum Needs {
-    Nothing,
-    /// Works without the tool, but removal is not tool-native.
-    Prefers(&'static str),
-    Requires(&'static str),
-    Docker,
-    RootAnd(&'static str),
-}
-
-const DETECTORS: &[(&str, &str, Needs)] = &[
-    ("cargo-target", "M1", Needs::Prefers("cargo")),
-    ("node-modules", "M1", Needs::Nothing),
-    ("venv", "M1", Needs::Nothing),
-    ("user-cache", "M1", Needs::Prefers("go")),
-    ("git-worktree", "M1", Needs::Requires("git")),
-    ("stale-tree", "M1", Needs::Nothing),
-    ("tool-versions", "M1", Needs::Nothing),
-    ("trash", "M1", Needs::Nothing),
-    ("docker-image", "M1", Needs::Docker),
-    ("docker-build-cache", "M1", Needs::Docker),
-    ("docker-container", "M1", Needs::Docker),
-    ("docker-volume", "M1", Needs::Docker),
-    ("journald", "post-MVP", Needs::RootAnd("journalctl")),
 ];
 
 /// Resolves `name` on `path_var` the way a shell would (first executable hit).
@@ -99,7 +74,8 @@ fn off_path_candidates(name: &str) -> Vec<PathBuf> {
     v
 }
 
-fn docker_socket() -> DockerSocket {
+/// The Docker socket from `DOCKER_HOST` (unix only) or the default path.
+pub fn docker_socket() -> DockerSocket {
     let path = match env::var("DOCKER_HOST") {
         Ok(h) if h.starts_with("unix://") => h.trim_start_matches("unix://").to_string(),
         _ => "/var/run/docker.sock".to_string(),
@@ -119,13 +95,10 @@ fn docker_socket() -> DockerSocket {
     }
 }
 
-pub fn doctor() -> DoctorReport {
-    let uid = system::uid();
-    let euid = system::euid();
-    let root = euid == 0;
+/// The optional tools in [`TOOLS`]: where each is on `$PATH`, or found off it.
+pub fn resolve_tools() -> Vec<ToolStatus> {
     let path_var = env::var_os("PATH");
-
-    let tools: Vec<ToolStatus> = TOOLS
+    TOOLS
         .iter()
         .map(|(name, enables)| {
             let on_path = find_on_path(name, path_var.as_deref());
@@ -143,75 +116,36 @@ pub fn doctor() -> DoctorReport {
                 enables: enables.iter().map(|s| (*s).into()).collect(),
             }
         })
-        .collect();
-    let has = |n: &str| tools.iter().any(|t| t.name == n && t.path.is_some());
-    let off = |n: &str| {
-        tools
-            .iter()
-            .find(|t| t.name == n)
-            .and_then(|t| t.off_path.clone())
-    };
-    let missing = |n: &str| match off(n) {
-        Some(p) => format!("`{n}` is not on PATH (found at {p}; add its directory to PATH)"),
-        None => format!("`{n}` is not installed"),
-    };
+        .collect()
+}
 
+pub fn doctor() -> DoctorReport {
+    let ctx = DetectContext::from_system();
+    let uid = system::uid();
+    let euid = ctx.uid;
+    let root = ctx.root;
     let docker_group = system::group("docker")
         .map(|(gid, _)| system::in_group(gid))
         .unwrap_or(false);
-    let sock = docker_socket();
-
-    let detectors = DETECTORS
+    let built: Vec<&str> = crate::detectors::registry()
         .iter()
-        .map(|(name, milestone, needs)| {
-            let (status, detail) = match needs {
-                Needs::Nothing => (
-                    DetectorAvailability::Available,
-                    "no external tool needed".into(),
-                ),
-                Needs::Prefers(t) if has(t) => (
-                    DetectorAvailability::Available,
-                    format!("uses `{t}` for removal"),
-                ),
-                Needs::Prefers(t) => (
-                    DetectorAvailability::Degraded,
-                    format!(
-                        "{}; detection works, removal falls back to path removal",
-                        missing(t)
-                    ),
-                ),
-                Needs::Requires(t) if has(t) => {
-                    (DetectorAvailability::Available, format!("uses `{t}`"))
-                }
-                Needs::Requires(t) => (DetectorAvailability::Unavailable, missing(t)),
-                Needs::Docker if !has("docker") => {
-                    (DetectorAvailability::Unavailable, missing("docker"))
-                }
-                Needs::Docker if !sock.exists => (
-                    DetectorAvailability::Unavailable,
-                    format!("no Docker socket at {}", sock.path),
-                ),
-                Needs::Docker if !sock.accessible => (
-                    DetectorAvailability::Unavailable,
-                    format!(
-                        "cannot use {} (not root and not in the docker group)",
-                        sock.path
-                    ),
-                ),
-                Needs::Docker => (
-                    DetectorAvailability::Available,
-                    "uses the docker CLI and socket".into(),
-                ),
-                Needs::RootAnd(t) if !has(t) => (DetectorAvailability::Unavailable, missing(t)),
-                Needs::RootAnd(_) if !root => (
-                    DetectorAvailability::Unavailable,
-                    "system detector; run as root".into(),
-                ),
-                Needs::RootAnd(t) => (DetectorAvailability::Available, format!("uses `{t}`")),
+        .map(|d| d.name())
+        .collect();
+    let detectors = CATALOG
+        .iter()
+        .map(|info| {
+            let (status, detail) = availability(info, &ctx);
+            let (status, detail) = if built.contains(&info.name) {
+                (status, detail)
+            } else {
+                (
+                    DetectorAvailability::NotImplemented,
+                    format!("not implemented yet; when built: {detail}"),
+                )
             };
             DetectorStatus {
-                name: (*name).into(),
-                milestone: (*milestone).into(),
+                name: info.name.into(),
+                milestone: info.milestone.into(),
                 status,
                 detail,
             }
@@ -244,8 +178,8 @@ pub fn doctor() -> DoctorReport {
         euid,
         root,
         docker_group,
-        docker_socket: sock,
-        tools,
+        docker_socket: ctx.docker_socket,
+        tools: ctx.tools,
         detectors,
         notes,
     }
@@ -286,7 +220,7 @@ mod tests {
         assert_eq!(d.schema, report::SCHEMA);
         let names: Vec<_> = d.tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["git", "docker", "cargo", "go", "journalctl"]);
-        assert_eq!(d.detectors.len(), DETECTORS.len());
+        assert_eq!(d.detectors.len(), CATALOG.len());
         assert_eq!(d.root, d.euid == 0);
     }
 }

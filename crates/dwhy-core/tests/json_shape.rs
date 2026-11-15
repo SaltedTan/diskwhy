@@ -121,6 +121,7 @@ fn sample() -> ScanReport {
             probe: Some("postgres-wal".into()),
             path: "docker://volume/example_postgres_data".into(),
             bytes: 33_041_965_056,
+            last_modified: Some("2026-11-13T02:10:00Z".into()),
             growth: Some(Growth {
                 bytes_per_day: 4_939_212_390,
                 since: "2026-11-07T07:25:00Z".into(),
@@ -142,6 +143,24 @@ fn sample() -> ScanReport {
                 how: None,
             },
         }],
+        detectors: vec![
+            DetectorRun {
+                name: "cargo-target".into(),
+                status: DetectorAvailability::Available,
+                detail: "uses `cargo` for removal".into(),
+                ran: true,
+                findings: 6,
+                elapsed_ms: 1,
+            },
+            DetectorRun {
+                name: "venv".into(),
+                status: DetectorAvailability::NotImplemented,
+                detail: "not implemented yet (M1)".into(),
+                ran: false,
+                findings: 0,
+                elapsed_ms: 0,
+            },
+        ],
     }
 }
 

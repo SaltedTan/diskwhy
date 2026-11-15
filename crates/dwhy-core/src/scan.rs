@@ -33,6 +33,7 @@ use rustix::io::Errno;
 
 use crate::mounts::MountTable;
 pub use crate::report::{SkipReason, Totals, UnreadableReason};
+use crate::tree::{Markers, NO_PARENT, NodeId, ScanTree, TreeNode};
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -114,6 +115,8 @@ pub struct ScanResult {
     pub errors: Vec<(PathBuf, String)>,
     pub error_count: u64,
     pub elapsed: Duration,
+    /// Every directory scanned, for detectors.
+    pub tree: ScanTree,
 }
 
 impl ScanResult {
@@ -183,20 +186,6 @@ fn absolute_nofollow(p: &Path) -> io::Result<PathBuf> {
 }
 
 const LINK_SHARDS: usize = 64;
-const NO_PARENT: u32 = u32::MAX;
-
-/// One directory (or a non-directory root) of the in-memory tree. Children
-/// are always pushed after their parent, so a reverse pass over the arena
-/// sums subtrees.
-struct Node {
-    parent: u32,
-    depth: u32,
-    is_dir: bool,
-    /// Last path component; the full path for a root.
-    name: Box<OsStr>,
-    /// The directory inode plus its non-directory entries.
-    own: Totals,
-}
 
 /// An inode with more than one link. It is counted once and attributed to
 /// its lexicographically smallest path, so per-directory sizes do not depend
@@ -213,7 +202,7 @@ struct Shared<'a> {
     opts: &'a ScanOptions,
     mounts: &'a MountTable,
     mount_points: HashSet<&'a Path>,
-    nodes: Mutex<Vec<Node>>,
+    nodes: Mutex<Vec<TreeNode>>,
     links: Vec<Mutex<HashMap<(u64, u64), Link>>>,
     unreadable: Mutex<Vec<UnreadableRecord>>,
     skipped: Mutex<Vec<SkippedRecord>>,
@@ -224,7 +213,7 @@ struct Shared<'a> {
 }
 
 impl Shared<'_> {
-    fn push_node(&self, node: Node) -> u32 {
+    fn push_node(&self, node: TreeNode) -> NodeId {
         let mut nodes = self.nodes.lock().unwrap();
         let id = nodes.len() as u32;
         nodes.push(node);
@@ -316,6 +305,12 @@ fn bytes(st: &Stat) -> u64 {
     (st.st_blocks as u64).saturating_mul(512)
 }
 
+/// mtime in seconds; `st_mtime` is narrower than i64 on 32-bit targets.
+#[allow(clippy::unnecessary_cast)]
+fn mtime(st: &Stat) -> i64 {
+    st.st_mtime as i64
+}
+
 fn is_dir(st: &Stat) -> bool {
     FileType::from_raw_mode(st.st_mode) == FileType::Directory
 }
@@ -392,12 +387,15 @@ pub fn scan(
                 leaf_totals(&st)
             };
             shared.add_dev(st.st_dev, own);
-            let id = shared.push_node(Node {
+            let id = shared.push_node(TreeNode {
                 parent: NO_PARENT,
                 depth: 0,
                 is_dir: false,
                 name,
                 own,
+                total: Totals::default(),
+                markers: Markers::empty(),
+                newest_mtime: mtime(&st),
             });
             if linked {
                 shared.add_link(&st, root.clone(), id);
@@ -419,22 +417,31 @@ pub fn scan(
         }
     }
 
-    // Subtree sums: children always come after their parent.
-    let mut sums: Vec<Totals> = nodes.iter().map(|n| n.own).collect();
+    // Subtree sums and newest mtimes: children always come after their parent.
+    for n in nodes.iter_mut() {
+        n.total = n.own;
+    }
     for i in (0..nodes.len()).rev() {
         let p = nodes[i].parent;
         if p != NO_PARENT {
-            let t = sums[i];
-            sums[p as usize] += t;
+            let (t, m) = (nodes[i].total, nodes[i].newest_mtime);
+            let parent = &mut nodes[p as usize];
+            parent.total += t;
+            parent.newest_mtime = parent.newest_mtime.max(m);
         }
     }
+    let tree = ScanTree::new(nodes, root_nodes.iter().map(|r| r.2).collect());
 
-    let mut dirs: Vec<DirRecord> = (0..nodes.len())
-        .filter(|&i| nodes[i].is_dir && sums[i].allocated >= opts.min_dir_bytes)
+    let mut dirs: Vec<DirRecord> = tree
+        .ids()
+        .filter(|&i| {
+            let n = tree.node(i);
+            n.is_dir && n.total.allocated >= opts.min_dir_bytes
+        })
         .map(|i| DirRecord {
-            path: node_path(&nodes, i),
-            depth: nodes[i].depth,
-            totals: sums[i],
+            path: tree.path(i),
+            depth: tree.node(i).depth,
+            totals: tree.node(i).total,
         })
         .collect();
     dirs.sort_by(|a, b| {
@@ -458,7 +465,7 @@ pub fn scan(
             .map(|(path, dev, id)| RootResult {
                 path,
                 dev,
-                totals: sums[id as usize],
+                totals: tree.node(id).total,
             })
             .collect(),
         dirs,
@@ -468,23 +475,8 @@ pub fn scan(
         errors,
         error_count: shared.error_count.into_inner(),
         elapsed: start.elapsed(),
+        tree,
     })
-}
-
-fn node_path(nodes: &[Node], mut i: usize) -> PathBuf {
-    let mut parts: Vec<&OsStr> = Vec::new();
-    loop {
-        parts.push(&nodes[i].name);
-        match nodes[i].parent {
-            NO_PARENT => break,
-            p => i = p as usize,
-        }
-    }
-    let mut path = PathBuf::new();
-    for part in parts.into_iter().rev() {
-        path.push(part);
-    }
-    path
 }
 
 /// Opens a directory without following a symlink that may have replaced it.
@@ -518,6 +510,8 @@ fn walk_dir(
         dirs: 1,
         ..Totals::default()
     };
+    let mut markers = Markers::empty();
+    let mut newest_mtime = mtime(st);
     // Files bind-mounted from another filesystem (only when crossing).
     let mut foreign = Totals::default();
     let mut subdirs: Vec<(PathBuf, Stat)> = Vec::new();
@@ -573,6 +567,15 @@ fn walk_dir(
                         }
                     };
                     let child_dev = cst.st_dev;
+                    let ft = FileType::from_raw_mode(cst.st_mode);
+                    markers.insert(Markers::for_entry(
+                        nb,
+                        ft == FileType::RegularFile,
+                        ft == FileType::Directory,
+                    ));
+                    if ft != FileType::Directory {
+                        newest_mtime = newest_mtime.max(mtime(&cst));
+                    }
                     if is_dir(&cst) {
                         let child = path.join(OsStr::from_bytes(nb));
                         if let Some(reason) = sh.crosses_boundary(&child, child_dev, dev) {
@@ -616,12 +619,15 @@ fn walk_dir(
         .allocated
         .fetch_add(own.allocated, Ordering::Relaxed);
 
-    let id = sh.push_node(Node {
+    let id = sh.push_node(TreeNode {
         parent,
         depth,
         is_dir: true,
         name,
         own,
+        total: Totals::default(),
+        markers,
+        newest_mtime,
     });
     for (p, m) in linked {
         sh.add_link(&m, p, id);

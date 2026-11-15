@@ -50,6 +50,14 @@ fn normalize(v: &mut Value, root: &str) {
                     | "fstype"
                     | "source"
                     | "full_coverage"
+                    // Detector output that depends on the machine or the clock.
+                    | "status"
+                    | "detail"
+                    | "id"
+                    | "reason"
+                    | "action"
+                    | "last_modified"
+                    | "bytes"
                     | "deleted_open" => {
                         *val = Value::String(format!("[{k}]"));
                     }
@@ -90,6 +98,52 @@ fn scan_json_shape_on_fixture() {
         .sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
     normalize(&mut v, root_s);
     insta::assert_json_snapshot!(v);
+}
+
+const CARGO_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n";
+
+#[test]
+fn scan_json_findings_on_fixture() {
+    let t = tempfile::tempdir().unwrap();
+    let r = t.path();
+    fs::create_dir_all(r.join("app/target/debug")).unwrap();
+    fs::write(r.join("app/Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+    fs::write(r.join("app/target/CACHEDIR.TAG"), CARGO_TAG).unwrap();
+    fs::write(r.join("app/target/debug/app"), vec![1u8; 3 << 20]).unwrap();
+    let root = fs::canonicalize(r).unwrap();
+    let root_s = root.to_str().unwrap();
+
+    let out = dwhy(&["scan", root_s, "--json", "-q"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let findings = v["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert!(findings[0]["bytes"].as_u64().unwrap() >= 3 << 20);
+    let mut v = serde_json::json!({
+        "findings": v["findings"].take(),
+        "detectors": v["detectors"].take(),
+    });
+    normalize(&mut v, root_s);
+    insta::assert_json_snapshot!(v);
+
+    let text = dwhy(&["scan", root_s, "-q"]);
+    let s = String::from_utf8(text.stdout).unwrap();
+    assert!(s.contains("findings: 1 ("), "{s}");
+    assert!(s.contains("rebuildable"), "{s}");
+    assert!(
+        s.contains(&format!("cargo-target  {root_s}/app/target")),
+        "{s}"
+    );
+
+    let quiet = dwhy(&["scan", root_s, "--json", "-q", "--no-detectors"]);
+    let v: Value = serde_json::from_slice(&quiet.stdout).unwrap();
+    assert_eq!(v["findings"], Value::Array(vec![]));
+    assert_eq!(v["detectors"], Value::Array(vec![]));
 }
 
 #[test]

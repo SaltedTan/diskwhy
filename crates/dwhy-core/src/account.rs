@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::detect::shell_quote;
 use crate::mounts::{FsStats, Mount, MountTable};
 use crate::report::{
     self, DeletedOpen, DirEntry, FsReport, Hint, HintKind, RootReport, ScanErrorEntry, ScanReport,
@@ -457,7 +458,9 @@ pub fn build_scan_report(
             error_count: result.error_count,
         },
         fs,
+        // Filled in by the caller from `detect::run`.
         findings: Vec::new(),
+        detectors: Vec::new(),
     }
 }
 
@@ -482,17 +485,6 @@ fn unknown_mount(path: &Path) -> Mount {
             .unwrap_or_else(|| PathBuf::from("/")),
         fstype: "unknown".into(),
         source: "unknown".into(),
-    }
-}
-
-fn shell_quote(s: &str) -> String {
-    if !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@".contains(&b))
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
     }
 }
 
@@ -599,12 +591,5 @@ mod tests {
         assert_eq!(h[0].kind, HintKind::Docker);
         assert_eq!(h[1].kind, HintKind::DeletedOpen);
         assert_eq!(h.last().unwrap().kind, HintKind::FilesystemOverhead);
-    }
-
-    #[test]
-    fn shell_quoting() {
-        assert_eq!(shell_quote("/"), "/");
-        assert_eq!(shell_quote("/mnt/my disk"), "'/mnt/my disk'");
-        assert_eq!(shell_quote("/a'b"), r"'/a'\''b'");
     }
 }

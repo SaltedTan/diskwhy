@@ -3,6 +3,112 @@ source: crates/dwhy-cli/tests/cli.rs
 expression: v
 ---
 {
+  "detectors": [
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "findings": 0,
+      "name": "cargo-target",
+      "ran": true,
+      "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "findings": 0,
+      "name": "node-modules",
+      "ran": false,
+      "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "findings": 0,
+      "name": "venv",
+      "ran": false,
+      "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "findings": 0,
+      "name": "user-cache",
+      "ran": false,
+      "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "findings": 0,
+      "name": "git-worktree",
+      "ran": false,
+      "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "findings": 0,
+      "name": "stale-tree",
+      "ran": false,
+      "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "findings": 0,
+      "name": "tool-versions",
+      "ran": false,
+      "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "findings": 0,
+      "name": "trash",
+      "ran": false,
+      "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "findings": 0,
+      "name": "docker-image",
+      "ran": false,
+      "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "findings": 0,
+      "name": "docker-build-cache",
+      "ran": false,
+      "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "findings": 0,
+      "name": "docker-container",
+      "ran": false,
+      "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "findings": 0,
+      "name": "docker-volume",
+      "ran": false,
+      "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "findings": 0,
+      "name": "journald",
+      "ran": false,
+      "status": "[status]"
+    }
+  ],
   "findings": [],
   "fs": [
     {

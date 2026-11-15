@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use dwhy_core::account::{self, ReportEnv};
+use dwhy_core::detect::{self, DetectContext};
 use dwhy_core::mounts::{self, MountTable};
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::{doctor, system, units};
@@ -74,6 +75,12 @@ struct ScanArgs {
     /// No progress line on stderr.
     #[arg(short, long)]
     quiet: bool,
+    /// Only measure; do not run detectors.
+    #[arg(long)]
+    no_detectors: bool,
+    /// Text output: findings listed before "… N more".
+    #[arg(long, default_value_t = 20)]
+    max_findings: usize,
 }
 
 fn main() -> ExitCode {
@@ -178,14 +185,20 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
             .unwrap_or_else(|_| "dwhy".into()),
         docker_access: doctor::docker_access(),
     };
-    let report = account::build_scan_report(&result, &mounts, &env, &|p| mounts::statvfs(p).ok());
+    let mut report =
+        account::build_scan_report(&result, &mounts, &env, &|p| mounts::statvfs(p).ok());
+    if !args.no_detectors {
+        let (findings, runs) = detect::run(&result.tree, &DetectContext::from_system());
+        report.findings = findings;
+        report.detectors = runs;
+    }
 
     let mut out = std::io::stdout().lock();
     if args.json {
         serde_json::to_writer_pretty(&mut out, &report)?;
         writeln!(out)?;
     } else {
-        human::render_scan(&mut out, &report, args.depth, args.top)?;
+        human::render_scan(&mut out, &report, args.depth, args.top, args.max_findings)?;
     }
     Ok(EXIT_OK)
 }

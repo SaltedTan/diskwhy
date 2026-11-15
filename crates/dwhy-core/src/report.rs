@@ -55,8 +55,24 @@ pub struct ScanReport {
     pub generated_at: String,
     pub scan: ScanSummary,
     pub fs: Vec<FsReport>,
-    /// Detector output. Always empty in M0; detectors start in M1.
+    /// What each detector found, largest first. A finding whose path lies
+    /// inside another finding's path is dropped: the outermost finding wins.
     pub findings: Vec<Finding>,
+    /// Every known detector, whether it ran, and why not.
+    #[serde(default)]
+    pub detectors: Vec<DetectorRun>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectorRun {
+    pub name: String,
+    pub status: DetectorAvailability,
+    pub detail: String,
+    /// False when the detector is unavailable or not implemented yet.
+    pub ran: bool,
+    /// Findings it reported before the nesting rule was applied.
+    pub findings: u64,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -264,7 +280,11 @@ pub struct Finding {
     pub probe: Option<String>,
     /// Filesystem path, or a pseudo-path such as `docker://volume/<name>`.
     pub path: String,
+    /// Allocated bytes under `path`.
     pub bytes: u64,
+    /// Newest mtime under `path`, RFC 3339 (UTC).
+    #[serde(default)]
+    pub last_modified: Option<String>,
     pub growth: Option<Growth>,
     pub tier: Tier,
     pub reason: String,
@@ -380,4 +400,6 @@ pub enum DetectorAvailability {
     /// Can detect but not remove the tool-native way, or works with reduced evidence.
     Degraded,
     Unavailable,
+    /// Listed in the design but not built yet.
+    NotImplemented,
 }
