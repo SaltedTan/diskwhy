@@ -17,7 +17,8 @@
 //! - **locked** (`git worktree lock`): reported as `blocked` with a `locked`
 //!   guard, never offered, since someone locked it on purpose.
 //!
-//! Everything is `review`: a worktree can hold work that exists nowhere else.
+//! Everything else is `review`: a worktree can hold work that exists nowhere
+//! else.
 //! Bare repositories are not looked at yet.
 
 use std::collections::BTreeSet;
@@ -335,10 +336,11 @@ impl GitWorktree {
                 growth: None,
                 tier: Tier::Review,
                 reason: format!(
-                    "{} worktree{} of {} no longer exist on disk: {}",
+                    "{} worktree{} of {} no longer exist{} on disk: {}",
                     prunable.len(),
                     if prunable.len() == 1 { "" } else { "s" },
                     repo.display(),
+                    if prunable.len() == 1 { "s" } else { "" },
                     names.join(", ")
                 ),
                 guards: Vec::new(),
