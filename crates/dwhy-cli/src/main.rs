@@ -1,0 +1,203 @@
+//! `dwhy`: command-line front end for diskwhy.
+//!
+//! Exit codes (docs/DESIGN.md): 0 ok, 1 error (including usage errors),
+//! 2 items skipped by a guard or changed fingerprint, 3 refused by policy.
+
+mod human;
+
+use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use clap::{Args, Parser, Subcommand};
+use dwhy_core::account::{self, ReportEnv};
+use dwhy_core::mounts::{self, MountTable};
+use dwhy_core::scan::{self, Progress, ScanOptions};
+use dwhy_core::{doctor, system, units};
+
+pub const EXIT_OK: u8 = 0;
+pub const EXIT_ERROR: u8 = 1;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "dwhy",
+    version,
+    about = "Why is my disk filling up, and what is safe to remove?",
+    long_about = None,
+    after_help = "Exit codes: 0 ok, 1 error, 2 items skipped by a guard, 3 refused by policy."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Measure disk usage: sizes, unreadable directories, and space df counts but the scan cannot see.
+    Scan(ScanArgs),
+    /// Show permissions, optional tools on PATH, and which detectors they enable.
+    Doctor {
+        /// Print diskwhy/v1 JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Args, Debug)]
+struct ScanArgs {
+    /// Directories to scan (default: the current directory).
+    paths: Vec<PathBuf>,
+    /// Print diskwhy/v1 JSON instead of text.
+    #[arg(long)]
+    json: bool,
+    /// Stay on one filesystem (the default; accepted for du muscle memory).
+    #[arg(short = 'x', long = "one-file-system")]
+    one_file_system: bool,
+    /// Descend into other filesystems mounted below the roots (never into proc, sysfs, ...).
+    #[arg(long, conflicts_with = "one_file_system")]
+    cross_filesystems: bool,
+    /// Smallest directory to report [default: 1% of the scanned total, at most 100M].
+    #[arg(long, value_name = "SIZE", value_parser = units::parse_size)]
+    min_size: Option<u64>,
+    /// Text output: how many levels of the directory tree to show.
+    #[arg(long, default_value_t = 3)]
+    depth: u32,
+    /// Text output: largest children shown per directory.
+    #[arg(long, default_value_t = 8)]
+    top: usize,
+    /// Worker threads [default: one per CPU].
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+    /// No progress line on stderr.
+    #[arg(short, long)]
+    quiet: bool,
+}
+
+fn main() -> ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            // clap exits 2 on usage errors, but 2 means "skipped by a guard" here.
+            let code = if e.use_stderr() { EXIT_ERROR } else { EXIT_OK };
+            let _ = e.print();
+            return ExitCode::from(code);
+        }
+    };
+    let res = match cli.command {
+        Some(Command::Scan(args)) => run_scan(args),
+        Some(Command::Doctor { json }) => run_doctor(json),
+        None => {
+            Err("the TUI is not built yet (milestone M4); try `dwhy scan` or `dwhy --help`".into())
+        }
+    };
+    match res {
+        Ok(code) => ExitCode::from(code),
+        Err(e) => {
+            eprintln!("dwhy: error: {e}");
+            ExitCode::from(EXIT_ERROR)
+        }
+    }
+}
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+fn run_scan(args: ScanArgs) -> Result<u8> {
+    let paths = if args.paths.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        args.paths.clone()
+    };
+    let one_fs = !args.cross_filesystems;
+    for p in &paths {
+        if let Ok(md) = std::fs::symlink_metadata(p)
+            && md.file_type().is_symlink()
+        {
+            eprintln!(
+                "dwhy: warning: {} is a symlink; counting the link itself (symlinks are never followed)",
+                p.display()
+            );
+        }
+    }
+    let roots = scan::prepare_roots(&paths, one_fs)?;
+    let mounts = MountTable::read().unwrap_or_default();
+    let opts = ScanOptions {
+        one_filesystem: one_fs,
+        // Keep enough to pick a threshold after the scan.
+        min_dir_bytes: args.min_size.unwrap_or(1 << 20),
+        threads: args.threads,
+        ..ScanOptions::default()
+    };
+
+    let progress = Arc::new(Progress::default());
+    let done = Arc::new(AtomicBool::new(false));
+    let ticker = (!args.quiet && std::io::stderr().is_terminal()).then(|| {
+        let (progress, done) = (progress.clone(), done.clone());
+        std::thread::spawn(move || {
+            let mut err = std::io::stderr();
+            while !done.load(Ordering::Relaxed) {
+                let _ = write!(
+                    err,
+                    "\r\x1b[2Kscanning… {} entries, {}",
+                    units::thousands(progress.entries.load(Ordering::Relaxed)),
+                    units::human(progress.allocated.load(Ordering::Relaxed))
+                );
+                let _ = err.flush();
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let _ = write!(err, "\r\x1b[2K");
+            let _ = err.flush();
+        })
+    });
+    let result = scan::scan(&roots, &opts, &mounts, &progress);
+    done.store(true, Ordering::Relaxed);
+    if let Some(t) = ticker {
+        let _ = t.join();
+    }
+    let mut result = result?;
+
+    // Default threshold: 1% of what was scanned, between 1M and 100M.
+    let threshold = args
+        .min_size
+        .unwrap_or_else(|| (result.totals().allocated / 100).clamp(1 << 20, 100 << 20));
+    result.dirs.retain(|d| d.totals.allocated >= threshold);
+    result.min_dir_bytes = threshold;
+
+    let euid = system::euid();
+    let env = ReportEnv {
+        host: system::hostname(),
+        uid: euid,
+        root: euid == 0,
+        generated_at: system::now_rfc3339(),
+        users: system::users(),
+        deleted_open: system::deleted_open_files(),
+        exe: std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "dwhy".into()),
+        docker_access: doctor::docker_access(),
+    };
+    let report = account::build_scan_report(&result, &mounts, &env, &|p| mounts::statvfs(p).ok());
+
+    let mut out = std::io::stdout().lock();
+    if args.json {
+        serde_json::to_writer_pretty(&mut out, &report)?;
+        writeln!(out)?;
+    } else {
+        human::render_scan(&mut out, &report, args.depth, args.top)?;
+    }
+    Ok(EXIT_OK)
+}
+
+fn run_doctor(json: bool) -> Result<u8> {
+    let report = doctor::doctor();
+    let mut out = std::io::stdout().lock();
+    if json {
+        serde_json::to_writer_pretty(&mut out, &report)?;
+        writeln!(out)?;
+    } else {
+        human::render_doctor(&mut out, &report)?;
+    }
+    Ok(EXIT_OK)
+}

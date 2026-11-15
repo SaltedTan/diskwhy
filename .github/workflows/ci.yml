@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      # Runs as the unprivileged `runner` user, so the unreadable-directory tests are exercised.
+      - run: cargo test --locked --all-features
+
+  musl:
+    name: static build (x86_64-unknown-linux-musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+      - run: cargo build --locked --release --target x86_64-unknown-linux-musl -p dwhy-cli
+      - name: Check the binary is static and runs
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/dwhy
+          file "$bin"
+          file "$bin" | grep -Eq 'static(-pie)? linked'
+          "$bin" --version
+          "$bin" doctor
+          "$bin" scan . --json -q > /dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dwhy-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/dwhy
+          retention-days: 14
