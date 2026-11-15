@@ -1,0 +1,23 @@
+# Per-repo no-mistakes settings. Agent working rules live in AGENTS.md.
+
+# Commands run via `sh -c` in a clean worktree. cargo lives in ~/.cargo/bin,
+# which non-interactive shells on pc-ubuntu may not have on PATH. These mirror
+# the checks in .github/workflows/ci.yml; the full suite takes seconds.
+commands:
+  test: 'PATH="$HOME/.cargo/bin:$PATH" cargo test --locked --all-features'
+  lint: 'PATH="$HOME/.cargo/bin:$PATH"; cargo fmt --all --check && cargo clippy --locked --all-targets --all-features -- -D warnings'
+  format: 'PATH="$HOME/.cargo/bin:$PATH" cargo fmt --all'
+
+# The repo is all rights reserved until the public release (docs/COMMERCIAL.md);
+# automatic fixes must never add a licence. The CI workflow is changed by hand only.
+protected_paths:
+  - "LICENSE*"
+  - "COPYING*"
+  - ".github/**"
+
+document:
+  instructions: |
+    README.md is the introduction and usage summary. docs/DESIGN.md is the spec:
+    update it when behaviour it describes changes, but do not change a recorded
+    decision without the user. AGENTS.md holds working rules for agents. The
+    diskwhy/v1 JSON contract is documented in crates/dwhy-core/src/report.rs.
