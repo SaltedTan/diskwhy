@@ -14,6 +14,7 @@
 //! a running tool may be using it.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
@@ -189,20 +190,23 @@ pub struct UserCache {
 impl UserCache {
     /// Reads the process environment.
     pub fn from_system() -> UserCache {
-        UserCache::with_env(std::env::vars())
+        UserCache::with_env(std::env::vars_os())
     }
 
     /// Uses the given variables instead of the process environment.
+    /// Pairs whose name or value is not UTF-8 are skipped.
     pub fn with_env<I, K, V>(vars: I) -> UserCache
     where
         I: IntoIterator<Item = (K, V)>,
-        K: Into<String>,
-        V: Into<String>,
+        K: Into<OsString>,
+        V: Into<OsString>,
     {
         UserCache {
             env: vars
                 .into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
+                .filter_map(|(k, v)| {
+                    Some((k.into().into_string().ok()?, v.into().into_string().ok()?))
+                })
                 .collect(),
         }
     }

@@ -337,3 +337,32 @@ fn no_home_means_no_findings() {
             .is_empty()
     );
 }
+
+#[test]
+fn non_utf8_variables_are_skipped() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let d = tempfile::tempdir().unwrap();
+    let h = d.path();
+    write(&h.join("custom-gocache/aa/b"), 2 * MB);
+    write(&h.join(".cache/uv/blob"), 2 * MB);
+    age_tree(h, 3);
+    let bad = OsString::from_vec(vec![0xff, 0xfe]);
+    let mut uv_cache = h.join("bad-uv").into_os_string().into_vec();
+    uv_cache.push(0xff);
+    let env: Vec<(OsString, OsString)> = vec![
+        ("FOO".into(), bad.clone()),
+        (bad, "x".into()),
+        ("UV_CACHE_DIR".into(), OsString::from_vec(uv_cache)),
+        ("GOCACHE".into(), h.join("custom-gocache").into_os_string()),
+    ];
+    let tree = scan_tree(h);
+    let mut paths: Vec<PathBuf> = UserCache::with_env(env)
+        .detect(&tree, &ctx(h, &[]))
+        .unwrap()
+        .into_iter()
+        .map(|f| PathBuf::from(f.path))
+        .collect();
+    paths.sort();
+    assert_eq!(paths, [h.join(".cache/uv"), h.join("custom-gocache")]);
+}
