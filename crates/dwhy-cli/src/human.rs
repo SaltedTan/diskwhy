@@ -5,7 +5,8 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use dwhy_core::report::{
-    DetectorAvailability, DirEntry, DoctorReport, Finding, FsReport, ScanReport, SkipReason, Tier,
+    ActionKind, DetectorAvailability, DirEntry, DoctorReport, Finding, FsReport, ScanReport,
+    SkipReason, Tier,
 };
 use dwhy_core::units::{human, thousands};
 
@@ -117,18 +118,32 @@ fn tier_name(t: Tier) -> &'static str {
     }
 }
 
+/// What the findings' actions can free, and how many advice-only findings
+/// (such as an in-use volume) were left out of that total.
+fn reclaimable(findings: &[&Finding]) -> (String, String) {
+    let (advice, act): (Vec<&Finding>, Vec<&Finding>) = findings
+        .iter()
+        .partition(|f| f.action.kind == ActionKind::Advice);
+    let bytes: u64 = act.iter().map(|f| f.bytes).sum();
+    let note = if advice.is_empty() {
+        String::new()
+    } else {
+        format!("; {} in use, not counted", advice.len())
+    };
+    (human(bytes), note)
+}
+
 fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result<()> {
     if r.detectors.is_empty() {
         return Ok(());
     }
     writeln!(w)?;
-    let total: u64 = r.findings.iter().map(|f| f.bytes).sum();
+    let (total, note) = reclaimable(&r.findings.iter().collect::<Vec<_>>());
     let ran = r.detectors.iter().filter(|d| d.ran).count();
     writeln!(
         w,
-        "findings: {} ({} reclaimable) from {ran} of {} detectors",
+        "findings: {} ({total} reclaimable{note}) from {ran} of {} detectors",
         r.findings.len(),
-        human(total),
         r.detectors.len()
     )?;
     let mut shown = 0;
@@ -139,11 +154,11 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
         Tier::Blocked,
     ] {
         let in_tier: Vec<&Finding> = r.findings.iter().filter(|f| f.tier == tier).collect();
-        if in_tier.is_empty() {
+        if in_tier.is_empty() || shown == max {
             continue;
         }
-        let bytes: u64 = in_tier.iter().map(|f| f.bytes).sum();
-        writeln!(w, "  {} ({})", tier_name(tier), human(bytes))?;
+        let (bytes, note) = reclaimable(&in_tier);
+        writeln!(w, "  {} ({bytes}{note})", tier_name(tier))?;
         for f in in_tier {
             if shown == max {
                 break;
@@ -167,6 +182,14 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
         .filter(|d| !d.ran && d.status == DetectorAvailability::Unavailable)
         .map(|d| d.name.as_str())
         .collect();
+    for d in r.detectors.iter().filter(|d| d.error.is_some()) {
+        writeln!(
+            w,
+            "  failed: {}: {}",
+            d.name,
+            d.error.as_deref().unwrap_or("")
+        )?;
+    }
     if !unavailable.is_empty() {
         writeln!(
             w,
@@ -386,4 +409,109 @@ pub fn render_doctor(w: &mut impl Write, d: &DoctorReport) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dwhy_core::report::*;
+
+    fn finding(detector: &str, path: &str, bytes: u64, tier: Tier, kind: ActionKind) -> Finding {
+        Finding {
+            id: format!("f_{path}"),
+            detector: detector.into(),
+            probe: None,
+            path: path.into(),
+            bytes,
+            last_modified: None,
+            growth: None,
+            tier,
+            reason: "why".into(),
+            guards: vec![],
+            action: Action {
+                kind,
+                text: "what".into(),
+                argv: None,
+            },
+            recovery: Recovery {
+                cost: String::new(),
+                how: None,
+            },
+        }
+    }
+
+    fn report(findings: Vec<Finding>) -> ScanReport {
+        ScanReport {
+            schema: SCHEMA.into(),
+            tool: Tool::current(),
+            host: "h".into(),
+            uid: 1000,
+            root: false,
+            generated_at: "2026-11-15T00:00:00Z".into(),
+            scan: ScanSummary {
+                roots: vec![],
+                one_filesystem: true,
+                elapsed_ms: 0,
+                totals: Totals::default(),
+                dirs: vec![],
+                min_dir_bytes: 0,
+                unreadable: Unreadable::default(),
+                skipped_mounts: vec![],
+                errors: vec![],
+                error_count: 0,
+            },
+            fs: vec![],
+            findings,
+            detectors: vec![DetectorRun {
+                name: "docker-volume".into(),
+                status: DetectorAvailability::Available,
+                detail: String::new(),
+                ran: true,
+                findings: 0,
+                elapsed_ms: 0,
+                error: None,
+            }],
+            docker: None,
+        }
+    }
+
+    #[test]
+    fn in_use_findings_are_not_counted_as_reclaimable() {
+        let r = report(vec![
+            finding(
+                "docker-volume",
+                "docker://volume/pg",
+                50 << 30,
+                Tier::Review,
+                ActionKind::Advice,
+            ),
+            finding(
+                "docker-image",
+                "docker://image/old",
+                300 << 20,
+                Tier::Review,
+                ActionKind::Command,
+            ),
+            finding(
+                "cargo-target",
+                "/p/target",
+                200 << 20,
+                Tier::Rebuildable,
+                ActionKind::RemovePath,
+            ),
+        ]);
+        let mut out = Vec::new();
+        render_findings(&mut out, &r, 10).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[1],
+            "findings: 3 (500.0M reclaimable; 1 in use, not counted) from 1 of 1 detectors"
+        );
+        assert!(lines.contains(&"  rebuildable (200.0M)"), "{text}");
+        assert!(
+            lines.contains(&"  review (300.0M; 1 in use, not counted)"),
+            "{text}"
+        );
+    }
 }

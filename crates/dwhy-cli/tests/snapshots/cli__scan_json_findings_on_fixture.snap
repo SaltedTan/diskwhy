@@ -7,6 +7,7 @@ expression: v
     {
       "detail": "[detail]",
       "elapsed_ms": "[elapsed_ms]",
+      "error": null,
       "findings": 1,
       "name": "cargo-target",
       "ran": true,
@@ -15,6 +16,7 @@ expression: v
     {
       "detail": "[detail]",
       "elapsed_ms": "[elapsed_ms]",
+      "error": null,
       "findings": 0,
       "name": "node-modules",
       "ran": false,
@@ -23,6 +25,7 @@ expression: v
     {
       "detail": "[detail]",
       "elapsed_ms": "[elapsed_ms]",
+      "error": null,
       "findings": 0,
       "name": "venv",
       "ran": false,
@@ -31,6 +34,7 @@ expression: v
     {
       "detail": "[detail]",
       "elapsed_ms": "[elapsed_ms]",
+      "error": null,
       "findings": 0,
       "name": "user-cache",
       "ran": false,
@@ -39,6 +43,7 @@ expression: v
     {
       "detail": "[detail]",
       "elapsed_ms": "[elapsed_ms]",
+      "error": null,
       "findings": 0,
       "name": "git-worktree",
       "ran": false,
@@ -47,6 +52,7 @@ expression: v
     {
       "detail": "[detail]",
       "elapsed_ms": "[elapsed_ms]",
+      "error": null,
       "findings": 0,
       "name": "stale-tree",
       "ran": false,
@@ -55,6 +61,7 @@ expression: v
     {
       "detail": "[detail]",
       "elapsed_ms": "[elapsed_ms]",
+      "error": null,
       "findings": 0,
       "name": "tool-versions",
       "ran": false,
@@ -63,6 +70,7 @@ expression: v
     {
       "detail": "[detail]",
       "elapsed_ms": "[elapsed_ms]",
+      "error": null,
       "findings": 0,
       "name": "trash",
       "ran": false,
@@ -71,6 +79,7 @@ expression: v
     {
       "detail": "[detail]",
       "elapsed_ms": "[elapsed_ms]",
+      "error": null,
       "findings": 0,
       "name": "docker-image",
       "ran": false,
@@ -79,6 +88,7 @@ expression: v
     {
       "detail": "[detail]",
       "elapsed_ms": "[elapsed_ms]",
+      "error": null,
       "findings": 0,
       "name": "docker-build-cache",
       "ran": false,
@@ -87,6 +97,7 @@ expression: v
     {
       "detail": "[detail]",
       "elapsed_ms": "[elapsed_ms]",
+      "error": null,
       "findings": 0,
       "name": "docker-container",
       "ran": false,
@@ -95,6 +106,7 @@ expression: v
     {
       "detail": "[detail]",
       "elapsed_ms": "[elapsed_ms]",
+      "error": null,
       "findings": 0,
       "name": "docker-volume",
       "ran": false,
@@ -103,6 +115,7 @@ expression: v
     {
       "detail": "[detail]",
       "elapsed_ms": "[elapsed_ms]",
+      "error": null,
       "findings": 0,
       "name": "journald",
       "ran": false,

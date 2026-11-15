@@ -78,7 +78,15 @@ fn scan_json_shape_on_fixture() {
     let t = fixture();
     let root = fs::canonicalize(t.path()).unwrap();
     let root_s = root.to_str().unwrap();
-    let out = dwhy(&["scan", root_s, "--json", "--min-size", "0"]);
+    let out = dwhy(&[
+        "scan",
+        root_s,
+        "--json",
+        "--min-size",
+        "0",
+        "--detectors",
+        "cargo-target",
+    ]);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -113,7 +121,14 @@ fn scan_json_findings_on_fixture() {
     let root = fs::canonicalize(r).unwrap();
     let root_s = root.to_str().unwrap();
 
-    let out = dwhy(&["scan", root_s, "--json", "-q"]);
+    let out = dwhy(&[
+        "scan",
+        root_s,
+        "--json",
+        "-q",
+        "--detectors",
+        "cargo-target",
+    ]);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -131,7 +146,7 @@ fn scan_json_findings_on_fixture() {
     normalize(&mut v, root_s);
     insta::assert_json_snapshot!(v);
 
-    let text = dwhy(&["scan", root_s, "-q"]);
+    let text = dwhy(&["scan", root_s, "-q", "--detectors", "cargo-target"]);
     let s = String::from_utf8(text.stdout).unwrap();
     assert!(s.contains("findings: 1 ("), "{s}");
     assert!(s.contains("rebuildable"), "{s}");
@@ -172,6 +187,10 @@ fn exit_codes() {
             .code(),
         Some(1)
     );
+    // Unknown detector names are errors, not silently empty runs.
+    let out = dwhy(&["scan", ".", "--detectors", "cargo-target,nope"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown detector \"nope\""));
     // Help and version are not errors.
     assert_eq!(dwhy(&["--help"]).status.code(), Some(0));
     assert_eq!(dwhy(&["--version"]).status.code(), Some(0));

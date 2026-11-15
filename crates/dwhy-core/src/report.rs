@@ -61,6 +61,33 @@ pub struct ScanReport {
     /// Every known detector, whether it ran, and why not.
     #[serde(default)]
     pub detectors: Vec<DetectorRun>,
+    /// Docker's own accounting, when the Docker detectors could query the daemon.
+    #[serde(default)]
+    pub docker: Option<DockerUsage>,
+}
+
+/// From the Engine API (`GET /system/df`, `GET /info`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DockerUsage {
+    /// `DockerRootDir`, usually `/var/lib/docker`.
+    pub root_dir: String,
+    /// Images are stored by containerd (`/var/lib/containerd`), not under `root_dir`.
+    pub containerd_image_store: bool,
+    /// Image layers, counted once however many images share them.
+    pub images: UsageLine,
+    /// Containers' writable layers.
+    pub containers: UsageLine,
+    pub volumes: UsageLine,
+    pub build_cache: UsageLine,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageLine {
+    pub count: u64,
+    /// In use: images with containers, running containers, mounted volumes, in-use cache.
+    pub active: u64,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +100,9 @@ pub struct DetectorRun {
     /// Findings it reported before the nesting rule was applied.
     pub findings: u64,
     pub elapsed_ms: u64,
+    /// Set when the detector ran but failed (e.g. the Docker daemon did not answer).
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

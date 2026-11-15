@@ -3,9 +3,11 @@
 //! and the rule for nested findings.
 //!
 //! Detectors only read: they look at the [`ScanTree`] and may read small
-//! files or run read-only tool commands. They never remove anything.
+//! files, run read-only tool commands, or make read-only Docker API GETs
+//! (see [`crate::docker`]). They never remove anything.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::detectors;
@@ -66,12 +68,23 @@ pub struct DetectContext {
     pub now: i64,
     pub tools: Vec<ToolStatus>,
     pub docker_socket: DockerSocket,
+    /// The Docker snapshot, fetched once on first use.
+    pub docker: Arc<crate::docker::Source>,
 }
 
 impl DetectContext {
     /// The real system: euid, `$HOME`, the clock, tools on PATH, the Docker socket.
     pub fn from_system() -> DetectContext {
         let euid = crate::system::euid();
+        let docker_socket = crate::doctor::docker_socket();
+        let docker = if docker_socket.accessible {
+            crate::docker::Source::socket(
+                Path::new(&docker_socket.path),
+                crate::docker::DEFAULT_TIMEOUT,
+            )
+        } else {
+            crate::docker::Source::none()
+        };
         DetectContext {
             uid: euid,
             root: euid == 0,
@@ -81,7 +94,8 @@ impl DetectContext {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0),
             tools: crate::doctor::resolve_tools(),
-            docker_socket: crate::doctor::docker_socket(),
+            docker_socket,
+            docker,
         }
     }
 
@@ -160,7 +174,8 @@ pub fn availability(info: &DetectorInfo, ctx: &DetectContext) -> (DetectorAvaila
 pub trait Detector: Send + Sync {
     /// Must match a [`CATALOG`] entry.
     fn name(&self) -> &'static str;
-    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Vec<Finding>;
+    /// An `Err` is reported in the run's `error` and yields no findings.
+    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String>;
 }
 
 /// Stable across runs and machines: `f_` + 12 hex digits of FNV-1a over
@@ -218,13 +233,33 @@ pub fn outermost(mut findings: Vec<Finding>) -> Vec<Finding> {
 
 /// Runs every built detector whose requirements are met.
 pub fn run(tree: &ScanTree, ctx: &DetectContext) -> (Vec<Finding>, Vec<DetectorRun>) {
-    run_with(tree, ctx, &detectors::registry())
+    run_with(tree, ctx, &detectors::registry(), None)
 }
 
+/// Checks `--detectors` names against the catalog.
+pub fn validate_selection(names: &[String]) -> Result<(), String> {
+    match names
+        .iter()
+        .find(|n| !CATALOG.iter().any(|d| d.name == n.as_str()))
+    {
+        Some(bad) => Err(format!(
+            "unknown detector {bad:?}; known: {}",
+            CATALOG
+                .iter()
+                .map(|d| d.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Like [`run`], limited to the named detectors when `only` is given.
 pub fn run_with(
     tree: &ScanTree,
     ctx: &DetectContext,
     built: &[Box<dyn Detector>],
+    only: Option<&[String]>,
 ) -> (Vec<Finding>, Vec<DetectorRun>) {
     let mut all = Vec::new();
     let mut runs = Vec::new();
@@ -238,20 +273,30 @@ pub fn run_with(
             ran: false,
             findings: 0,
             elapsed_ms: 0,
+            error: None,
         };
+        let selected = only.is_none_or(|o| o.iter().any(|n| n == info.name));
         match det {
             None => {
                 run.status = DetectorAvailability::NotImplemented;
                 run.detail = format!("not implemented yet ({})", info.milestone);
             }
+            _ if !selected => {
+                run.detail = format!("not selected (--detectors); {}", run.detail);
+            }
             Some(_) if status == DetectorAvailability::Unavailable => {}
             Some(d) => {
                 let start = Instant::now();
-                let found = d.detect(tree, ctx);
+                let result = d.detect(tree, ctx);
                 run.ran = true;
-                run.findings = found.len() as u64;
                 run.elapsed_ms = start.elapsed().as_millis() as u64;
-                all.extend(found);
+                match result {
+                    Ok(found) => {
+                        run.findings = found.len() as u64;
+                        all.extend(found);
+                    }
+                    Err(e) => run.error = Some(e),
+                }
             }
         }
         runs.push(run);
@@ -307,6 +352,7 @@ mod tests {
                 exists: false,
                 accessible: false,
             },
+            docker: crate::docker::Source::none(),
         }
     }
 
@@ -409,12 +455,20 @@ mod tests {
     #[test]
     fn unbuilt_detectors_are_reported_not_run() {
         let tree = ScanTree::default();
-        let (found, runs) = run_with(&tree, &ctx(&[]), &[]);
+        let (found, runs) = run_with(&tree, &ctx(&[]), &[], None);
         assert!(found.is_empty());
         assert_eq!(runs.len(), CATALOG.len());
         assert!(
             runs.iter()
                 .all(|r| !r.ran && r.status == DetectorAvailability::NotImplemented)
+        );
+
+        let only = vec!["cargo-target".to_string()];
+        let (_, runs) = run_with(&tree, &ctx(&[]), &[], Some(&only));
+        assert!(
+            runs.iter()
+                .all(|r| !r.ran && r.status == DetectorAvailability::NotImplemented),
+            "{runs:?}"
         );
     }
 

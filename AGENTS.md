@@ -15,7 +15,8 @@ Working rules for coding agents in this repo. Humans: start at [README.md](READM
 crates/dwhy-core   engine: scan (walker), tree (the ScanTree detectors read: per-dir totals,
                    markers, newest mtime), mounts (mountinfo, statvfs), account (unaccounted + hints),
                    detect (Detector trait, CATALOG shared with doctor, finding IDs, nesting rule),
-                   detectors/ (one file per detector), doctor, system, units,
+                   detectors/ (one file per detector), docker (read-only Engine API client:
+                   GET /system/df and /info over the unix socket), doctor, system, units,
                    report (diskwhy/v1 serde types)
 crates/dwhy-cli    clap front end, text rendering (human.rs), exit codes; binary `dwhy`
 ```
@@ -52,9 +53,10 @@ Insta snapshots in `crates/*/tests/snapshots/` pin the shape. When a snapshot ch
 
 - Use `tempfile` fixtures and assert behaviour through public APIs or the `dwhy` binary. Never assert on the text of source code.
 - Tests that rely on permissions (mode 000 dirs) skip themselves when running as root. Restore permissions in a `Drop` guard so temp dirs can be cleaned up.
+- Docker detector tests use the fixed snapshot in `crates/dwhy-core/tests/data/docker-system-df.json`; never depend on the machine's daemon. CLI tests that check findings pass `--detectors cargo-target` so local Docker state can't leak into snapshots.
 - Mount tests read the real mount table (mounts under `/dev`) and skip when nothing is there. Don't mount anything.
 - Directory sizes must be deterministic. A hardlinked inode is attributed to its lexicographically smallest path, and tests rely on that.
-- Detectors only read: the `ScanTree`, small files opened with `O_NOFOLLOW`, and read-only tool commands. Every detector gets fixture tests for what it must find and for lookalikes it must ignore. A finding's `id` comes from `detect::finding_id` and must stay stable.
+- Detectors only read: the `ScanTree`, small files opened with `O_NOFOLLOW`, read-only tool commands, and read-only Docker API GETs. Every detector gets fixture tests for what it must find and for lookalikes it must ignore. A finding's `id` comes from `detect::finding_id` and must stay stable.
 
 ## Checking against du/df
 

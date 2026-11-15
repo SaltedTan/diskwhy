@@ -151,6 +151,7 @@ fn sample() -> ScanReport {
                 ran: true,
                 findings: 6,
                 elapsed_ms: 1,
+                error: None,
             },
             DetectorRun {
                 name: "venv".into(),
@@ -159,8 +160,43 @@ fn sample() -> ScanReport {
                 ran: false,
                 findings: 0,
                 elapsed_ms: 0,
+                error: None,
+            },
+            DetectorRun {
+                name: "docker-image".into(),
+                status: DetectorAvailability::Available,
+                detail: "uses the docker CLI and socket".into(),
+                ran: true,
+                findings: 0,
+                elapsed_ms: 120_000,
+                error: Some("docker API /system/df: no response within 120s".into()),
             },
         ],
+        docker: Some(DockerUsage {
+            root_dir: "/var/lib/docker".into(),
+            containerd_image_store: true,
+            images: UsageLine {
+                count: 30,
+                active: 16,
+                bytes: 22_426_296_039,
+            },
+            containers: UsageLine {
+                count: 33,
+                active: 33,
+                bytes: 648_278_016,
+            },
+            volumes: UsageLine {
+                count: 15,
+                active: 15,
+                bytes: 1_654_201_897,
+            },
+            build_cache: UsageLine {
+                count: 92,
+                active: 0,
+                bytes: 4_616_635_167,
+            },
+            total: 29_345_411_119,
+        }),
     }
 }
 

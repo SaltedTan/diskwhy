@@ -8,6 +8,7 @@
 pub mod account;
 pub mod detect;
 pub mod detectors;
+pub mod docker;
 pub mod doctor;
 pub mod mounts;
 pub mod report;

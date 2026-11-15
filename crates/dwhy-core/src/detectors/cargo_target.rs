@@ -26,7 +26,7 @@ impl Detector for CargoTarget {
         "cargo-target"
     }
 
-    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Vec<Finding> {
+    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
         let mut out = Vec::new();
         for id in tree.ids() {
             let n = tree.node(id);
@@ -102,7 +102,7 @@ impl Detector for CargoTarget {
                 path: path_s,
             });
         }
-        out
+        Ok(out)
     }
 }
 

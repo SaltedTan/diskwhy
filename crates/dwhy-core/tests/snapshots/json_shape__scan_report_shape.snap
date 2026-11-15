@@ -164,7 +164,8 @@ expression: sample()
       "detail": "uses `cargo` for removal",
       "ran": true,
       "findings": 6,
-      "elapsed_ms": 1
+      "elapsed_ms": 1,
+      "error": null
     },
     {
       "name": "venv",
@@ -172,7 +173,42 @@ expression: sample()
       "detail": "not implemented yet (M1)",
       "ran": false,
       "findings": 0,
-      "elapsed_ms": 0
+      "elapsed_ms": 0,
+      "error": null
+    },
+    {
+      "name": "docker-image",
+      "status": "available",
+      "detail": "uses the docker CLI and socket",
+      "ran": true,
+      "findings": 0,
+      "elapsed_ms": 120000,
+      "error": "docker API /system/df: no response within 120s"
     }
-  ]
+  ],
+  "docker": {
+    "root_dir": "/var/lib/docker",
+    "containerd_image_store": true,
+    "images": {
+      "count": 30,
+      "active": 16,
+      "bytes": 22426296039
+    },
+    "containers": {
+      "count": 33,
+      "active": 33,
+      "bytes": 648278016
+    },
+    "volumes": {
+      "count": 15,
+      "active": 15,
+      "bytes": 1654201897
+    },
+    "build_cache": {
+      "count": 92,
+      "active": 0,
+      "bytes": 4616635167
+    },
+    "total": 29345411119
+  }
 }
