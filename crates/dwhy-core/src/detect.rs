@@ -3,7 +3,8 @@
 //! and the rule for nested findings.
 //!
 //! Detectors only read: they look at the [`ScanTree`] and may read small
-//! files or run read-only tool commands. They never remove anything.
+//! files, run read-only tool commands, or make read-only Docker API GETs
+//! (see [`crate::docker`]). They never remove anything.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
