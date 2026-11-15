@@ -354,8 +354,17 @@ mod tests {
         std::thread::spawn(move || {
             for conn in l.incoming() {
                 let mut c = conn.unwrap();
+                // Read the whole request head (the client may send it in several
+                // writes): closing with unread bytes makes the client's read fail
+                // with ECONNRESET instead of seeing the reply.
+                let mut req = Vec::new();
                 let mut buf = [0u8; 1024];
-                let _ = c.read(&mut buf);
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match c.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
                 if reply.is_empty() {
                     std::thread::sleep(Duration::from_secs(5));
                 } else {

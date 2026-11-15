@@ -28,6 +28,16 @@ impl Markers {
     pub const DOT_GIT: Markers = Markers(1 << 4);
     /// Regular file `.rustc_info.json`, which cargo writes into a target dir.
     pub const RUSTC_INFO: Markers = Markers(1 << 5);
+    /// Regular file `package-lock.json` or `npm-shrinkwrap.json`.
+    pub const NPM_LOCK: Markers = Markers(1 << 6);
+    /// Regular file `pnpm-lock.yaml`.
+    pub const PNPM_LOCK: Markers = Markers(1 << 7);
+    /// Regular file `yarn.lock`.
+    pub const YARN_LOCK: Markers = Markers(1 << 8);
+    /// Regular file `bun.lock` or `bun.lockb`.
+    pub const BUN_LOCK: Markers = Markers(1 << 9);
+    /// Regular file `pnpm-workspace.yaml`.
+    pub const PNPM_WORKSPACE: Markers = Markers(1 << 10);
 
     pub const fn empty() -> Markers {
         Markers(0)
@@ -35,6 +45,16 @@ impl Markers {
 
     pub fn contains(self, other: Markers) -> bool {
         self.0 & other.0 == other.0
+    }
+
+    /// True if any marker in `other` is present.
+    pub fn intersects(self, other: Markers) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    /// The union of two marker sets.
+    pub const fn union(self, other: Markers) -> Markers {
+        Markers(self.0 | other.0)
     }
 
     pub fn insert(&mut self, other: Markers) {
@@ -51,6 +71,11 @@ impl Markers {
             b"pyvenv.cfg" if is_file => Markers::PYVENV_CFG,
             b".git" if is_file || is_dir => Markers::DOT_GIT,
             b".rustc_info.json" if is_file => Markers::RUSTC_INFO,
+            b"package-lock.json" | b"npm-shrinkwrap.json" if is_file => Markers::NPM_LOCK,
+            b"pnpm-lock.yaml" if is_file => Markers::PNPM_LOCK,
+            b"yarn.lock" if is_file => Markers::YARN_LOCK,
+            b"bun.lock" | b"bun.lockb" if is_file => Markers::BUN_LOCK,
+            b"pnpm-workspace.yaml" if is_file => Markers::PNPM_WORKSPACE,
             _ => Markers::empty(),
         }
     }
