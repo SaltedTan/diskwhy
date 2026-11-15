@@ -5,8 +5,8 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use dwhy_core::report::{
-    ActionKind, DetectorAvailability, DirEntry, DoctorReport, Finding, FsReport, ScanReport,
-    SkipReason, Tier,
+    ActionKind, DetectorAvailability, DirEntry, DoctorReport, Finding, FsReport, GuardStatus,
+    ScanReport, SkipReason, Tier,
 };
 use dwhy_core::units::{human, thousands};
 
@@ -118,18 +118,30 @@ fn tier_name(t: Tier) -> &'static str {
     }
 }
 
-/// What the findings' actions can free, and how many advice-only findings
-/// (such as an in-use volume) were left out of that total.
+/// What the findings' actions can free, and how many findings were left
+/// out of that total: advice-only ones (such as an in-use volume) and
+/// blocked ones (a guard such as `recent-write` failed).
 fn reclaimable(findings: &[&Finding]) -> (String, String) {
-    let (advice, act): (Vec<&Finding>, Vec<&Finding>) = findings
+    let advice = findings
         .iter()
-        .partition(|f| f.action.kind == ActionKind::Advice);
-    let bytes: u64 = act.iter().map(|f| f.bytes).sum();
-    let note = if advice.is_empty() {
-        String::new()
-    } else {
-        format!("; {} in use, not counted", advice.len())
-    };
+        .filter(|f| f.action.kind == ActionKind::Advice)
+        .count();
+    let blocked = findings
+        .iter()
+        .filter(|f| f.action.kind != ActionKind::Advice && f.tier == Tier::Blocked)
+        .count();
+    let bytes: u64 = findings
+        .iter()
+        .filter(|f| f.action.kind != ActionKind::Advice && f.tier != Tier::Blocked)
+        .map(|f| f.bytes)
+        .sum();
+    let mut note = String::new();
+    if advice > 0 {
+        note.push_str(&format!("; {advice} in use, not counted"));
+    }
+    if blocked > 0 {
+        note.push_str(&format!("; {blocked} blocked, not counted"));
+    }
     (human(bytes), note)
 }
 
@@ -157,8 +169,17 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
         if in_tier.is_empty() || shown == max {
             continue;
         }
-        let (bytes, note) = reclaimable(&in_tier);
-        writeln!(w, "  {} ({bytes}{note})", tier_name(tier))?;
+        if tier == Tier::Blocked {
+            let bytes: u64 = in_tier.iter().map(|f| f.bytes).sum();
+            writeln!(
+                w,
+                "  blocked ({}, not offered: a guard failed)",
+                human(bytes)
+            )?;
+        } else {
+            let (bytes, note) = reclaimable(&in_tier);
+            writeln!(w, "  {} ({bytes}{note})", tier_name(tier))?;
+        }
         for f in in_tier {
             if shown == max {
                 break;
@@ -167,6 +188,13 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
             writeln!(w, "  {:>8}  {:<13} {}", human(f.bytes), f.detector, f.path)?;
             writeln!(w, "  {:>8}  {:<13} {}", "", "", f.reason)?;
             writeln!(w, "  {:>8}  {:<13} → {}", "", "", f.action.text)?;
+            for g in f.guards.iter().filter(|g| g.status == GuardStatus::Block) {
+                writeln!(
+                    w,
+                    "  {:>8}  {:<13} blocked by {}: {}",
+                    "", "", g.name, g.detail
+                )?;
+            }
         }
     }
     if r.findings.len() > shown {
@@ -511,6 +539,49 @@ mod tests {
         assert!(lines.contains(&"  rebuildable (200.0M)"), "{text}");
         assert!(
             lines.contains(&"  review (300.0M; 1 in use, not counted)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn blocked_findings_are_shown_but_not_counted() {
+        let mut uv = finding(
+            "user-cache",
+            "/home/me/.cache/uv",
+            400 << 20,
+            Tier::Blocked,
+            ActionKind::Command,
+        );
+        uv.guards.push(GuardResult {
+            name: "recent-write".into(),
+            status: GuardStatus::Block,
+            detail: "last written 2 hours ago".into(),
+        });
+        let r = report(vec![
+            uv,
+            finding(
+                "user-cache",
+                "/home/me/go/pkg/mod",
+                100 << 20,
+                Tier::Regenerable,
+                ActionKind::Command,
+            ),
+        ]);
+        let mut out = Vec::new();
+        render_findings(&mut out, &r, 10).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[1],
+            "findings: 2 (100.0M reclaimable; 1 blocked, not counted) from 1 of 1 detectors"
+        );
+        assert!(lines.contains(&"  regenerable (100.0M)"), "{text}");
+        assert!(
+            lines.contains(&"  blocked (400.0M, not offered: a guard failed)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("blocked by recent-write: last written 2 hours ago"),
             "{text}"
         );
     }

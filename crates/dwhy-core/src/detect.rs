@@ -38,7 +38,7 @@ pub const CATALOG: &[DetectorInfo] = &[
     info("cargo-target", "M1", Needs::Prefers("cargo")),
     info("node-modules", "M1", Needs::Nothing),
     info("venv", "M1", Needs::Nothing),
-    info("user-cache", "M1", Needs::Prefers("go")),
+    info("user-cache", "M1", Needs::Nothing),
     info("git-worktree", "M1", Needs::Requires("git")),
     info("stale-tree", "M1", Needs::Nothing),
     info("tool-versions", "M1", Needs::Nothing),
