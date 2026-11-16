@@ -80,7 +80,8 @@ impl Trash {
     }
 
     /// Every trash directory of user `uid`, whether or not it exists.
-    fn candidates(&self, ctx: &DetectContext) -> BTreeSet<PathBuf> {
+    /// Mount roots are only looked at where the scan went.
+    fn candidates(&self, tree: &ScanTree, ctx: &DetectContext) -> BTreeSet<PathBuf> {
         let mut out = BTreeSet::new();
         if let Some(d) = self
             .xdg_data_home
@@ -104,8 +105,9 @@ impl Trash {
         for root in roots {
             out.insert(root.join(format!(".Trash-{}", ctx.uid)));
             let shared = root.join(".Trash");
-            if std::fs::symlink_metadata(&shared)
-                .is_ok_and(|m| m.is_dir() && m.permissions().mode() & 0o1000 != 0)
+            if is_dir(tree, &shared)
+                && std::fs::symlink_metadata(&shared)
+                    .is_ok_and(|m| m.is_dir() && m.permissions().mode() & 0o1000 != 0)
             {
                 out.insert(shared.join(ctx.uid.to_string()));
             }
@@ -121,7 +123,7 @@ impl Detector for Trash {
 
     fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
         let mut out = Vec::new();
-        for dir in self.candidates(ctx) {
+        for dir in self.candidates(tree, ctx) {
             let Some(id) = tree.find(&dir) else {
                 continue;
             };
@@ -133,7 +135,12 @@ impl Detector for Trash {
             if bytes < MIN_BYTES {
                 continue;
             }
-            let dates = deletion_dates(&dir.join("info"));
+            let info = dir.join("info");
+            let dates = if is_dir(tree, &info) {
+                deletion_dates(&info)
+            } else {
+                Vec::new()
+            };
             let path_s = dir.to_string_lossy().into_owned();
 
             let mut reason = format!("Trash {} ({}", dir.display(), human(bytes));
@@ -200,6 +207,11 @@ impl Detector for Trash {
         }
         Ok(out)
     }
+}
+
+/// Whether `path` is a directory in the scan (a symlink never is).
+fn is_dir(tree: &ScanTree, path: &Path) -> bool {
+    tree.find(path).is_some_and(|id| tree.node(id).is_dir)
 }
 
 /// Deletion times (seconds since the epoch) of the `.trashinfo` records in

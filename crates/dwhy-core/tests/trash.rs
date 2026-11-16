@@ -269,6 +269,24 @@ fn trash_without_records_is_review() {
 }
 
 #[test]
+fn a_symlinked_info_dir_is_not_followed() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let elsewhere = trash(&home.join("elsewhere"), &[("x", 10, 30), ("y", 10, 40)]);
+    let t = home_trash(home);
+    file(&t.join("files/z"), 2 * MB);
+    symlink(elsewhere.join("info"), t.join("info")).unwrap();
+    let found = detect(home);
+    assert_eq!(paths(&found), [s(&t)]);
+    assert_eq!(found[0].tier, Tier::Review);
+    assert!(
+        found[0].reason.contains("no trash records"),
+        "{}",
+        found[0].reason
+    );
+}
+
+#[test]
 fn small_or_unscanned_trash_is_ignored() {
     let home = tempfile::tempdir().unwrap();
     let home = home.path();
