@@ -9,7 +9,8 @@ use dwhy_core::account::{self, ReportEnv};
 use dwhy_core::docker::{self, Info};
 use dwhy_core::mounts::{FsStats, MountTable};
 use dwhy_core::report::{
-    Action, ActionKind, Finding, Recovery, SCHEMA, ScanReport, Snapshot, Tier,
+    Action, ActionKind, Finding, Recovery, SCHEMA, ScanReport, SkipReason, SkippedMount, Snapshot,
+    Tier,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions, ScanResult};
 use dwhy_core::snapshot::{self, Entry, KEEP_DAILY_SECS};
@@ -116,6 +117,11 @@ fn build_records_large_dirs_fs_findings_and_docker() {
     let mut rep = report_of(&res, &mounts);
     let root = r.to_string_lossy().into_owned();
     rep.findings = vec![finding(&format!("{root}/big"), 3 << 20)];
+    rep.scan.skipped_mounts = vec![SkippedMount {
+        path: format!("{root}/mnt"),
+        fstype: Some("ext4".into()),
+        reason: SkipReason::OtherFilesystem,
+    }];
     let dock = docker_fixture();
     let s = snapshot::build(&rep, &res.tree, Some(&dock), 1 << 20);
 
@@ -126,6 +132,7 @@ fn build_records_large_dirs_fs_findings_and_docker() {
     assert!(s.scan.one_filesystem);
     assert_eq!(s.scan.min_dir_bytes, 1 << 20);
     assert_eq!(s.scan.totals, rep.scan.totals);
+    assert_eq!(s.scan.skipped_mounts, vec![format!("{root}/mnt")]);
 
     // The hardlinked blob counts once, under big/ (the smallest path), so
     // links/ stays below the threshold; small/ is below it too.
@@ -182,6 +189,7 @@ fn sample(created_at: &str, roots: &[&str]) -> Snapshot {
             min_dir_bytes: snapshot::MIN_DIR_BYTES,
             totals: Default::default(),
             detectors: vec!["cargo-target".into()],
+            skipped_mounts: Vec::new(),
         },
         dirs: Vec::new(),
         fs: Vec::new(),
@@ -250,6 +258,25 @@ fn load_rejects_what_is_not_a_snapshot() {
     let saved = snapshot::save(&dir, &snap, 0).unwrap().snapshot;
     let err = snapshot::load(Path::new(&saved.path)).unwrap_err();
     assert!(err.contains("unsupported schema"), "{err}");
+}
+
+#[test]
+fn a_snapshot_saved_before_skipped_mounts_loads_as_skipping_none() {
+    let snap = sample("2026-11-16T06:00:00Z", &["/home/u"]);
+    let mut json = serde_json::to_value(&snap).unwrap();
+    json["scan"]
+        .as_object_mut()
+        .unwrap()
+        .remove("skipped_mounts");
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("old.json.gz");
+    let mut gz = flate2::write::GzEncoder::new(
+        fs::File::create(&path).unwrap(),
+        flate2::Compression::default(),
+    );
+    std::io::Write::write_all(&mut gz, json.to_string().as_bytes()).unwrap();
+    gz.finish().unwrap();
+    assert_eq!(snapshot::load(&path).unwrap(), snap);
 }
 
 fn entry(created: i64, scope: &str) -> Entry {

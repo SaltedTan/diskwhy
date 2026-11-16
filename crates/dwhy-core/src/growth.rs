@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::report::{
     Change, ChangeKind, DiffBase, DiffReport, Finding, Growth, SCHEMA, Snapshot, SnapshotDocker,
-    Tool,
+    SnapshotScan, Tool,
 };
 use crate::snapshot::parse_time;
 
@@ -30,14 +30,47 @@ fn delta(before: Option<u64>, after: Option<u64>) -> i64 {
     r.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
-fn within(path: &str, roots: &[String]) -> bool {
-    roots.iter().any(|r| Path::new(path).starts_with(r))
+/// Whether the scan walked `path`: it is under a root, and no mount point
+/// the walk skipped lies between that root and it.
+fn walked(path: &Path, scan: &SnapshotScan) -> bool {
+    let deepest = |v: &[String]| {
+        v.iter()
+            .filter(|a| path.starts_with(a))
+            .map(|a| Path::new(a).components().count())
+            .max()
+    };
+    match (deepest(&scan.roots), deepest(&scan.skipped_mounts)) {
+        (Some(root), Some(mount)) => root >= mount,
+        (root, _) => root.is_some(),
+    }
+}
+
+/// Mount points `side` skipped where `other` walked something it would
+/// otherwise compare.
+fn left_out<'a>(side: &'a SnapshotScan, other: &'a SnapshotScan) -> impl Iterator<Item = &'a str> {
+    side.skipped_mounts.iter().map(String::as_str).filter(|m| {
+        let m = Path::new(m);
+        other.roots.iter().any(|r| {
+            let r = Path::new(r);
+            let top = if r.starts_with(m) {
+                r
+            } else if m.starts_with(r) {
+                m
+            } else {
+                return false;
+            };
+            walked(top, other) && !walked(top, side)
+        })
+    })
 }
 
 /// Compares `old` with `new`, a snapshot of a fresh scan. `size_now` gives
 /// the current allocated size of a directory `new` does not record (one
 /// that shrank below its threshold), `None` when it no longer exists.
-/// Only paths inside the roots of both are compared.
+/// Only paths both scans walked are compared: inside the roots of both,
+/// and not at or below a mount point either skipped. Directories above a
+/// mount point one side skipped and the other walked are left out too:
+/// their totals cover different ground.
 pub fn diff(
     old: &Snapshot,
     old_id: Option<String>,
@@ -50,8 +83,24 @@ pub fn diff(
         (Some(n), Some(o)) => n - o,
         _ => 0,
     };
-    let both = |path: &str| within(path, &old.scan.roots) && within(path, &new.scan.roots);
+    let mut mounts: Vec<&str> = left_out(&old.scan, &new.scan)
+        .chain(left_out(&new.scan, &old.scan))
+        .collect();
+    mounts.sort_unstable();
+    mounts.dedup();
+    let both = |path: &str| {
+        let p = Path::new(path);
+        walked(p, &old.scan)
+            && walked(p, &new.scan)
+            && !mounts.iter().any(|m| Path::new(m).starts_with(p))
+    };
     let mut notes = Vec::new();
+    if !mounts.is_empty() {
+        notes.push(format!(
+            "not compared: paths at, below or above mount points one side did not enter: {}",
+            mounts.join(", ")
+        ));
+    }
     let change = |kind: ChangeKind, name: String, before: Option<u64>, after: Option<u64>| {
         let c = delta(before, after);
         Change {

@@ -119,11 +119,8 @@ struct DiffArgs {
     /// Leave out directories, Docker objects and findings that changed by less than this.
     #[arg(long, value_name = "SIZE", value_parser = units::parse_size, default_value = "10M")]
     min_change: u64,
-    /// Stay on one filesystem (the default with PATH; without, the snapshot's setting is used).
-    #[arg(short = 'x', long = "one-file-system")]
-    one_file_system: bool,
-    /// Descend into other filesystems mounted below the roots.
-    #[arg(long, conflicts_with = "one_file_system", requires = "paths")]
+    /// Descend into other filesystems mounted below the roots [without PATH: the snapshot's setting].
+    #[arg(long, requires = "paths")]
     cross_filesystems: bool,
     /// Only measure; do not run detectors (findings are not compared).
     #[arg(long, conflicts_with = "detectors")]

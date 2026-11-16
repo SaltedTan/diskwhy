@@ -135,7 +135,7 @@ pub fn render_diff(w: &mut impl Write, d: &DiffReport, top: usize) -> io::Result
         age(d.elapsed_secs),
         d.roots.join(" ")
     )?;
-    if !same_set(&d.since.roots, &d.roots) {
+    if !dwhy_core::snapshot::same_roots(&d.since.roots, &d.roots) {
         writeln!(
             w,
             "  the snapshot covers {}; only paths in both are compared",
@@ -212,16 +212,6 @@ pub fn render_diff(w: &mut impl Write, d: &DiffReport, top: usize) -> io::Result
         writeln!(w, "snapshot saved: {} ({})", snap.id, snap.path)?;
     }
     Ok(())
-}
-
-fn same_set(a: &[String], b: &[String]) -> bool {
-    let norm = |v: &[String]| {
-        let mut v = v.to_vec();
-        v.sort();
-        v.dedup();
-        v
-    };
-    norm(a) == norm(b)
 }
 
 fn label(c: &Change) -> String {

@@ -27,6 +27,7 @@ fn snap(created_at: &str, roots: &[&str], detectors: &[&str]) -> Snapshot {
             min_dir_bytes: 100 * M,
             totals: Default::default(),
             detectors: detectors.iter().map(|d| d.to_string()).collect(),
+            skipped_mounts: Vec::new(),
         },
         dirs: Vec::new(),
         fs: Vec::new(),
@@ -363,6 +364,126 @@ fn only_paths_inside_both_scans_are_compared() {
     );
     assert_eq!(d.since.roots, ["/h"]);
     assert_eq!(d.roots, ["/h/a", "/srv"]);
+}
+
+const HOME_NOTE: &str =
+    "not compared: paths at, below or above mount points one side did not enter: /home";
+
+/// The notes about mount points (Docker notes left out).
+fn mount_notes(d: &dwhy_core::report::DiffReport) -> Vec<&str> {
+    d.notes
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !n.starts_with("Docker"))
+        .collect()
+}
+
+fn skipping(mut s: Snapshot, mounts: &[&str]) -> Snapshot {
+    s.scan.skipped_mounts = mounts.iter().map(|m| m.to_string()).collect();
+    s
+}
+
+#[test]
+fn a_mount_the_snapshot_did_not_enter_is_not_reported_as_new() {
+    // `dwhy scan / --snapshot` with -x never enters /home, its own
+    // filesystem; `dwhy diff ~ --since <that id>` then rescans ~.
+    let mut old = skipping(
+        snap("2026-11-15T00:00:00Z", &["/"], &["cargo-target"]),
+        &["/home", "/proc"],
+    );
+    old.dirs = dirs(&[("/", 50 * G), ("/usr", 10 * G)]);
+    let mut new = snap("2026-11-16T00:00:00Z", &["/home/u"], &["cargo-target"]);
+    new.dirs = dirs(&[("/home/u", 5 * G), ("/home/u/.cache", 2 * G)]);
+    new.findings = vec![sfinding("f_t", "cargo-target", "/home/u/p/target", G)];
+
+    let d = growth::diff(&old, None, "f".into(), &new, &no_tree, 10 * M);
+    assert_eq!(rows(&d.dirs), []);
+    assert_eq!(rows(&d.findings), []);
+    assert_eq!(mount_notes(&d), [HOME_NOTE]);
+}
+
+#[test]
+fn a_mount_the_rescan_did_not_enter_is_not_reported_as_gone() {
+    // A snapshot of ~, then `dwhy diff / --since <id>` with -x: the
+    // rescan stops at /home and finds nothing below it.
+    let mut old = snap("2026-11-15T00:00:00Z", &["/home/u"], &["cargo-target"]);
+    old.dirs = dirs(&[("/home/u", 5 * G), ("/home/u/.cache", 2 * G)]);
+    old.findings = vec![sfinding("f_t", "cargo-target", "/home/u/p/target", G)];
+    let mut new = skipping(
+        snap("2026-11-16T00:00:00Z", &["/"], &["cargo-target"]),
+        &["/home"],
+    );
+    new.dirs = dirs(&[("/", 50 * G)]);
+
+    let d = growth::diff(&old, None, "f".into(), &new, &no_tree, 10 * M);
+    assert_eq!(rows(&d.dirs), []);
+    assert_eq!(rows(&d.findings), []);
+    assert_eq!(mount_notes(&d), [HOME_NOTE]);
+}
+
+#[test]
+fn a_mount_entered_on_one_side_only_leaves_out_the_dirs_above_it() {
+    // Same roots, but the snapshot was -x and the rescan crossed into
+    // /home. Both left out /proc, which changes nothing.
+    let mut old = skipping(
+        snap("2026-11-15T00:00:00Z", &["/"], &["cargo-target"]),
+        &["/home", "/proc"],
+    );
+    old.dirs = dirs(&[("/", 50 * G), ("/usr", 10 * G)]);
+    old.findings = vec![sfinding("f_u", "cargo-target", "/usr/src/x/target", G)];
+    let mut new = skipping(
+        snap("2026-11-16T00:00:00Z", &["/"], &["cargo-target"]),
+        &["/proc"],
+    );
+    new.dirs = dirs(&[("/", 82 * G), ("/usr", 12 * G), ("/home", 30 * G)]);
+    new.findings = vec![
+        sfinding("f_u", "cargo-target", "/usr/src/x/target", 2 * G),
+        sfinding("f_t", "cargo-target", "/home/u/p/target", G),
+    ];
+
+    let d = growth::diff(&old, None, "f".into(), &new, &no_tree, 10 * M);
+    assert_eq!(
+        rows(&d.dirs),
+        [("/usr", Some(10 * G), Some(12 * G), 2 * G as i64, false)]
+    );
+    assert_eq!(
+        rows(&d.findings),
+        [("/usr/src/x/target", Some(G), Some(2 * G), G as i64, false)]
+    );
+    assert_eq!(mount_notes(&d), [HOME_NOTE]);
+
+    // With the same mounts skipped on both sides, / is compared.
+    let mut new = skipping(new, &["/home", "/proc"]);
+    new.dirs = dirs(&[("/", 54 * G), ("/usr", 12 * G)]);
+    let d = growth::diff(&old, None, "f".into(), &new, &no_tree, 10 * M);
+    assert_eq!(
+        rows(&d.dirs),
+        [
+            ("/", Some(50 * G), Some(54 * G), 4 * G as i64, false),
+            ("/usr", Some(10 * G), Some(12 * G), 2 * G as i64, false)
+        ]
+    );
+    assert_eq!(mount_notes(&d), [] as [&str; 0]);
+}
+
+#[test]
+fn a_root_inside_a_skipped_mount_is_walked() {
+    // Roots / and /home with -x: the walk of / skips /home, which is
+    // walked as a root of its own.
+    let mut old = skipping(
+        snap("2026-11-15T00:00:00Z", &["/", "/home"], &["cargo-target"]),
+        &["/home"],
+    );
+    old.dirs = dirs(&[("/home/u", 5 * G)]);
+    let mut new = old.clone();
+    new.created_at = "2026-11-16T00:00:00Z".into();
+    new.dirs = dirs(&[("/home/u", 6 * G)]);
+    let d = growth::diff(&old, None, "f".into(), &new, &no_tree, 10 * M);
+    assert_eq!(
+        rows(&d.dirs),
+        [("/home/u", Some(5 * G), Some(6 * G), G as i64, false)]
+    );
+    assert_eq!(mount_notes(&d), [] as [&str; 0]);
 }
 
 #[test]

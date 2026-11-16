@@ -81,6 +81,12 @@ pub fn build(
                 .filter(|d| d.ran && d.error.is_none())
                 .map(|d| d.name.clone())
                 .collect(),
+            skipped_mounts: report
+                .scan
+                .skipped_mounts
+                .iter()
+                .map(|m| m.path.clone())
+                .collect(),
         },
         dirs,
         fs: report

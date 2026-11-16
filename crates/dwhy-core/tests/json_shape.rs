@@ -511,6 +511,7 @@ fn snapshot_shape() {
             min_dir_bytes: 104_857_600,
             totals,
             detectors: vec!["cargo-target".into(), "docker-volume".into()],
+            skipped_mounts: vec!["/home/u/mnt".into()],
         },
         dirs: vec![SnapshotDir {
             path: "/home/u".into(),

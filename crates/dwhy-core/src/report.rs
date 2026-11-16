@@ -626,6 +626,10 @@ pub struct SnapshotScan {
     /// Detectors that ran, so a finding missing later can be told apart
     /// from one whose detector did not run.
     pub detectors: Vec<String>,
+    /// Mount points under the roots that the walk did not enter, absolute.
+    /// Snapshots saved without it count as having skipped none.
+    #[serde(default)]
+    pub skipped_mounts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
