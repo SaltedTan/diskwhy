@@ -16,8 +16,9 @@
 //!   Codex (`$CODEX_HOME/packages/standalone/releases`, default `~/.codex`)
 //!   and the T3 runtime (`~/.t3/runtime/versions`), which keep old versions
 //!   only for rolling back; the version in use (what `~/.local/bin/claude`
-//!   or Codex's `current` link points to, T3's `activeVersion`) and the
-//!   newest are kept
+//!   or Codex's `current` link points to, T3's `activeVersion`, and any
+//!   version a running process executes from, read from `/proc/<pid>/exe`)
+//!   and the newest are kept
 //!
 //! A version is kept, and not reported, when it is the tool's default, is
 //! pinned by a project in the scan (`rust-toolchain.toml`, `rust-toolchain`,
@@ -43,8 +44,10 @@
 //! always removed by path. When the home directory is not in the scan, pins
 //! and venvs in projects there were not seen, which the recovery cost says.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -64,6 +67,8 @@ const MAX_SMALL_FILE: usize = 64 << 10;
 /// `tool-versions`. Holds the environment it resolves install locations from.
 pub struct ToolVersions {
     env: HashMap<String, String>,
+    /// Executables of running processes; `None` reads `/proc`.
+    running_exes: Option<Vec<PathBuf>>,
 }
 
 /// Version pins found in the scanned projects.
@@ -152,7 +157,36 @@ impl ToolVersions {
                     Some((k.into().into_string().ok()?, v.into().into_string().ok()?))
                 })
                 .collect(),
+            running_exes: None,
         }
+    }
+
+    /// Takes `exes` as the executables running processes run, instead of
+    /// reading `/proc`.
+    pub fn with_running_exes(mut self, exes: Vec<PathBuf>) -> ToolVersions {
+        self.running_exes = Some(exes);
+        self
+    }
+
+    /// The executable of every process whose `/proc/<pid>/exe` can be read
+    /// (other users' processes can't), without a ` (deleted)` suffix.
+    fn running_exes(&self) -> Vec<PathBuf> {
+        if let Some(exes) = &self.running_exes {
+            return exes.clone();
+        }
+        let Ok(rd) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        rd.flatten()
+            .filter(|e| e.file_name().as_bytes().iter().all(u8::is_ascii_digit))
+            .filter_map(|e| std::fs::read_link(e.path().join("exe")).ok())
+            .map(
+                |p| match p.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+                    Some(b) => PathBuf::from(OsStr::from_bytes(b)),
+                    None => p,
+                },
+            )
+            .collect()
     }
 
     /// An absolute path from `$name`; relative or empty values are ignored.
@@ -675,12 +709,13 @@ impl ToolVersions {
         }
     }
 
-    /// Claude Code, Codex and T3 runtime versions: the one in use and the
-    /// newest are kept.
+    /// Claude Code, Codex and T3 runtime versions: the one in use, any a
+    /// running process executes from, and the newest are kept.
     fn agent_clis(&self, tree: &ScanTree, ctx: &DetectContext, out: &mut Vec<Finding>) {
         let Some(home) = ctx.home.as_ref() else {
             return;
         };
+        let running = OnceCell::new();
         if let Some(data) = self.xdg_data(ctx) {
             // One executable file per version (a directory is accepted too).
             let dir = data.join("claude/versions");
@@ -695,6 +730,7 @@ impl ToolVersions {
                     current.as_deref(),
                     "Claude Code",
                     "the version ~/.local/bin/claude runs",
+                    &running,
                     out,
                 );
             }
@@ -710,6 +746,7 @@ impl ToolVersions {
             current.as_deref(),
             "Codex",
             "the release Codex's `current` link points to",
+            &running,
             out,
         );
         let t3 = home.join(".t3/runtime");
@@ -722,6 +759,7 @@ impl ToolVersions {
             current.as_deref(),
             "T3 runtime",
             "the active version in service-state.json",
+            &running,
             out,
         );
     }
@@ -732,6 +770,7 @@ impl ToolVersions {
         current: Option<&str>,
         tool: &str,
         current_desc: &str,
+        running: &OnceCell<Vec<PathBuf>>,
         out: &mut Vec<Finding>,
     ) {
         let mut keep = newest(installs);
@@ -739,14 +778,21 @@ impl ToolVersions {
             keep.insert(i);
         }
         for (i, t) in installs.iter().enumerate() {
-            if keep.contains(&i) {
+            if keep.contains(&i)
+                || running
+                    .get_or_init(|| self.running_exes())
+                    .iter()
+                    .any(|e| e.starts_with(&t.path))
+            {
                 continue;
             }
             out.extend(self.finding(
                 t,
                 Plan {
                     what: format!("{tool} version {}", t.name),
-                    why: format!("not {current_desc} and not the newest installed"),
+                    why: format!(
+                        "not {current_desc}, not run by any process, and not the newest installed"
+                    ),
                     action: remove(t),
                     cost: format!(
                         "{tool} keeps old versions only for rolling back an update, and downloads versions again as it updates"

@@ -65,12 +65,23 @@ fn detect_with(
     env: &[(&str, &str)],
     tools: &[(&str, &str)],
 ) -> Vec<Finding> {
-    let d = ToolVersions::with_env(env.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    let d = ToolVersions::with_env(env.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+        .with_running_exes(Vec::new());
+    run(&d, root, home, tools)
+}
+
+fn run(d: &ToolVersions, root: &Path, home: &Path, tools: &[(&str, &str)]) -> Vec<Finding> {
     let mut f = d
         .detect(&scan_tree(root), &ctx(home, tools))
         .expect("tool-versions never fails");
     f.sort_by(|a, b| a.path.cmp(&b.path));
     f
+}
+
+/// `home` scanned with `exes` as the running processes' executables.
+fn detect_running(home: &Path, exes: &[PathBuf]) -> Vec<Finding> {
+    let d = ToolVersions::with_env(Vec::<(String, String)>::new()).with_running_exes(exes.to_vec());
+    run(&d, home, home, &[])
 }
 
 fn detect(home: &Path) -> Vec<Finding> {
@@ -866,4 +877,118 @@ fn t3_runtime_versions_compare_numerically() {
         "{\"protocol\":3,\"activeVersion\":\"0.1.3-nightly.20261025.3682\"}",
     );
     assert_eq!(paths(&detect(home)), [s(&v("0.1.9-nightly.20261110.4500"))]);
+}
+
+/// Three T3 runtime versions; `activeVersion` names one no longer installed.
+fn t3_versions(home: &Path) -> impl Fn(&str) -> PathBuf {
+    let rt = home.join(".t3/runtime");
+    for n in ["0.1.8-nightly.1", "0.1.9-nightly.2", "0.1.10-nightly.3"] {
+        install(&rt.join("versions").join(n));
+    }
+    text(
+        &rt.join("service-state.json"),
+        "{\"activeVersion\":\"0.1.3-nightly.0\"}",
+    );
+    move |n: &str| rt.join("versions").join(n)
+}
+
+#[test]
+fn t3_version_a_process_runs_is_kept() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let v = t3_versions(home);
+    assert_eq!(
+        paths(&detect_running(home, &[])),
+        [s(&v("0.1.8-nightly.1")), s(&v("0.1.9-nightly.2"))]
+    );
+    // The service runs 0.1.8 though it is neither active nor the newest.
+    let found = detect_running(home, &[v("0.1.8-nightly.1").join("t3")]);
+    assert_eq!(paths(&found), [s(&v("0.1.9-nightly.2"))]);
+    assert!(
+        found[0].reason.contains("not run by any process"),
+        "{}",
+        found[0].reason
+    );
+}
+
+#[test]
+fn codex_release_a_process_runs_is_kept() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let sa = home.join(".codex/packages/standalone");
+    let rel = |v: &str| {
+        sa.join("releases")
+            .join(format!("{v}-x86_64-unknown-linux-musl"))
+    };
+    for v in ["0.160.0", "0.167.2", "0.169.0"] {
+        install(&rel(v));
+    }
+    symlink(rel("0.169.0"), sa.join("current")).unwrap();
+    let found = detect_running(home, &[rel("0.160.0").join("bin/codex")]);
+    assert_eq!(paths(&found), [s(&rel("0.167.2"))]);
+}
+
+#[test]
+fn claude_code_version_a_process_runs_is_kept() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let dir = home.join(".local/share/claude/versions");
+    for v in ["2.1.1", "2.1.10", "2.1.11", "2.1.12"] {
+        file(&dir.join(v), 2 * MB);
+    }
+    // A process still runs 2.1.10 after the update; 2.1.1 is not 2.1.10.
+    let found = detect_running(home, &[dir.join("2.1.10")]);
+    assert_eq!(
+        paths(&found),
+        [s(&dir.join("2.1.1")), s(&dir.join("2.1.11"))]
+    );
+}
+
+#[test]
+fn a_process_in_another_version_keeps_only_that_one() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let v = t3_versions(home);
+    let found = detect_running(
+        home,
+        &[
+            v("0.1.9-nightly.2").join("node_modules/.bin/helper"),
+            v("0.1.8-nightly.1-old").join("t3"),
+            home.join(".t3/runtime/versions"),
+            PathBuf::from("/usr/bin/t3"),
+        ],
+    );
+    assert_eq!(paths(&found), [s(&v("0.1.8-nightly.1"))]);
+}
+
+#[test]
+fn reads_running_processes_from_proc() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let v = t3_versions(home);
+    // Named sleep: a multi-call coreutils picks the command by name.
+    let exe = v("0.1.8-nightly.1").join("sleep");
+    fs::copy("/bin/sleep", &exe).unwrap();
+    let mut child = None;
+    for _ in 0..50 {
+        match std::process::Command::new(&exe).arg("60").spawn() {
+            Ok(c) => {
+                child = Some(c);
+                break;
+            }
+            // Another test thread may still hold the copy open across a fork.
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // A temp dir mounted noexec: nothing can run from it.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let mut child = child.expect("the copied executable never stopped being busy");
+    let d = ToolVersions::with_env(Vec::<(String, String)>::new());
+    let found = run(&d, home, home, &[]);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(paths(&found), [s(&v("0.1.9-nightly.2"))]);
 }
