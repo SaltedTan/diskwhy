@@ -782,3 +782,88 @@ fn run_with_via_the_registry() {
     assert!(run.ran);
     assert!(run.error.is_none());
 }
+
+#[test]
+fn claude_code_versions_keep_current_and_newest() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let dir = home.join(".local/share/claude/versions");
+    for v in ["2.1.9", "2.1.10", "2.1.11", "2.1.12"] {
+        file(&dir.join(v), 2 * MB);
+    }
+    // The launcher runs 2.1.10, not the newest.
+    fs::create_dir_all(home.join(".local/bin")).unwrap();
+    symlink(dir.join("2.1.10"), home.join(".local/bin/claude")).unwrap();
+    // A symlink and a non-version name are not versions.
+    symlink(dir.join("2.1.12"), dir.join("2.1.8")).unwrap();
+    file(&dir.join("notes"), 2 * MB);
+
+    let found = detect(home);
+    assert_eq!(
+        paths(&found),
+        [s(&dir.join("2.1.11")), s(&dir.join("2.1.9"))]
+    );
+    let f = &found[0];
+    assert_eq!(f.tier, Tier::Rebuildable);
+    assert_eq!(f.action.kind, ActionKind::RemovePath);
+    assert_eq!(f.action.text, format!("remove {}", f.path));
+    assert!(f.recovery.how.is_none());
+    assert!(f.bytes >= 2 * MB as u64, "{}", f.bytes);
+    assert!(
+        f.reason.starts_with("Claude Code version 2.1.11 ("),
+        "{}",
+        f.reason
+    );
+    assert!(
+        f.recovery.cost.contains("rolling back"),
+        "{}",
+        f.recovery.cost
+    );
+}
+
+#[test]
+fn codex_releases_follow_the_current_link_and_codex_home() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let ch = home.join("codex-home");
+    let sa = ch.join("packages/standalone");
+    let rel = |v: &str| {
+        sa.join("releases")
+            .join(format!("{v}-x86_64-unknown-linux-musl"))
+    };
+    for v in ["0.160.0", "0.167.2", "0.169.0"] {
+        install(&rel(v));
+    }
+    symlink(rel("0.160.0"), sa.join("current")).unwrap();
+    // Not Codex's when $CODEX_HOME points elsewhere.
+    install(&home.join(".codex/packages/standalone/releases/0.1.0-x86_64-unknown-linux-musl"));
+    install(&home.join(".codex/packages/standalone/releases/0.2.0-x86_64-unknown-linux-musl"));
+    let found = detect_with(home, home, &[("CODEX_HOME", &s(&ch))], &[]);
+    assert_eq!(paths(&found), [s(&rel("0.167.2"))]);
+    assert!(
+        found[0].reason.starts_with("Codex version 0.167.2-"),
+        "{}",
+        found[0].reason
+    );
+}
+
+#[test]
+fn t3_runtime_versions_compare_numerically() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let rt = home.join(".t3/runtime");
+    let v = |n: &str| rt.join("versions").join(n);
+    // 0.1.10 is newer than 0.1.9 even though it sorts first as text.
+    for n in [
+        "0.1.3-nightly.20261025.3682",
+        "0.1.9-nightly.20261110.4500",
+        "0.1.10-nightly.20261115.4749",
+    ] {
+        install(&v(n));
+    }
+    text(
+        &rt.join("service-state.json"),
+        "{\"protocol\":3,\"activeVersion\":\"0.1.3-nightly.20261025.3682\"}",
+    );
+    assert_eq!(paths(&detect(home)), [s(&v("0.1.9-nightly.20261110.4500"))]);
+}
