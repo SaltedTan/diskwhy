@@ -86,7 +86,7 @@ impl Detector for StaleTree {
                 continue;
             }
             for &child in tree.children(loc) {
-                if tree.node(child).is_dir && is_stale(child) {
+                if tree.node(child).is_dir && !locations.contains_key(&child) && is_stale(child) {
                     out.extend(self.finding(tree, ctx, child, Some(loc), origin));
                 }
             }
@@ -175,16 +175,19 @@ fn builtin_locations(tree: &ScanTree, home: &Path) -> Vec<NodeId> {
                     Some((dir, prefix)) => (home.join(dir), prefix),
                     None => (home.to_path_buf(), stem),
                 };
-                let Some(pid) = tree.find(&parent) else {
-                    continue;
-                };
-                for &child in tree.children(pid) {
-                    let name = tree.name(child).as_encoded_bytes();
-                    if tree.node(child).is_dir
+                let children = tree.find(&parent).map_or(&[][..], |pid| tree.children(pid));
+                let roots = tree
+                    .roots()
+                    .iter()
+                    .filter(|&&r| Path::new(tree.name(r)).parent() == Some(parent.as_path()));
+                for &id in children.iter().chain(roots) {
+                    let path = tree.path(id);
+                    let name = path.file_name().unwrap_or_default().as_encoded_bytes();
+                    if tree.node(id).is_dir
                         && name.len() > prefix.len()
                         && name.starts_with(prefix.as_bytes())
                     {
-                        out.push(child);
+                        out.push(id);
                     }
                 }
             }

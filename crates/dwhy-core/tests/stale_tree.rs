@@ -388,3 +388,35 @@ fn run_with_keeps_cheaper_findings_inside() {
     assert!(run.ran);
     assert_eq!(run.findings, 2);
 }
+
+#[test]
+fn glob_location_scanned_itself() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let loc = home.join(".t3/scratch-a");
+    let old = item(&loc.join("old"), 2 * MB, OLD);
+    file(&loc.join("fresh.txt"), 10);
+    assert_eq!(paths(&detect(&loc, Some(home))), [s(&old)]);
+}
+
+#[test]
+fn marked_location_inside_a_location_is_reported_once() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let loc = home.join("scratch");
+    file(&loc.join("fresh.txt"), 10);
+    let sandbox = loc.join("sandbox");
+    file(&sandbox.join(SCRATCH_MARKER), 0);
+    item(&sandbox, 2 * MB, OLD);
+
+    let found = detect(home, Some(home));
+    assert_eq!(paths(&found), [s(&sandbox)]);
+    assert!(
+        found[0].reason.starts_with(&format!(
+            "Scratch location {} (marked as scratch by .dwhy-scratch)",
+            sandbox.display()
+        )),
+        "{}",
+        found[0].reason
+    );
+}
