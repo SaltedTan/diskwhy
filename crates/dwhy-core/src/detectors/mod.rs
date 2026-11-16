@@ -17,7 +17,7 @@ use crate::detect::Detector;
 
 pub use cargo_target::CargoTarget;
 pub use docker::{
-    BUILD_CACHE_AGE_HOURS, DockerBuildCache, DockerContainer, DockerImage, DockerVolume,
+    BUILD_CACHE_AGE_HOURS, DockerBuildCache, DockerContainer, DockerImage, DockerVolume, object_id,
 };
 pub use git_worktree::{GitWorktree, STALE_DAYS, WorktreeEntry, parse_porcelain};
 pub use node_modules::NodeModules;

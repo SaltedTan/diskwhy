@@ -407,3 +407,52 @@ fn one_fetch_shared_by_all_docker_detectors_and_errors_are_reported() {
     assert!(skipped.detail.starts_with("not selected"));
     assert!(c.docker.fetched().is_some());
 }
+
+#[test]
+fn every_docker_finding_but_build_cache_has_an_object_id_for_plans() {
+    let snap = snapshot(true);
+    let c = ctx();
+    let mut found = Vec::new();
+    for d in [
+        &DockerImage as &dyn Detector,
+        &DockerContainer,
+        &DockerVolume,
+        &DockerBuildCache,
+    ] {
+        found.extend(d.detect(&ScanTree::default(), &c).unwrap());
+    }
+    assert!(found.len() > 5);
+    for f in &found {
+        let id = dwhy_core::detectors::object_id(&snap, &f.path);
+        if f.path == "docker://build-cache" {
+            assert_eq!(id, None);
+        } else {
+            let id = id.unwrap_or_else(|| panic!("no object id for {}", f.path));
+            if let Some(name) = f.path.strip_prefix("docker://volume/") {
+                assert!(id.starts_with(&format!("{name}@")), "{id}");
+            } else {
+                // The id is what the removal command names, or an id of
+                // the tagged image it removes.
+                assert!(!id.is_empty());
+            }
+        }
+    }
+    let dangling = dwhy_core::detectors::object_id(&snap, "docker://image/bbbb00000000").unwrap();
+    assert!(
+        dangling
+            .trim_start_matches("sha256:")
+            .starts_with("bbbb00000000")
+    );
+    let job = found
+        .iter()
+        .find(|f| f.path == "docker://container/old-job")
+        .unwrap();
+    assert_eq!(
+        Some(argv(job).last().unwrap().to_string()),
+        dwhy_core::detectors::object_id(&snap, &job.path)
+    );
+    assert_eq!(
+        dwhy_core::detectors::object_id(&snap, "docker://image/gone:latest"),
+        None
+    );
+}

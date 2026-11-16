@@ -45,6 +45,12 @@ fn normalize(v: &mut Value, root: &str) {
                     | "uid"
                     | "root"
                     | "generated_at"
+                    | "created_at"
+                    | "expires_at"
+                    | "dev"
+                    | "inode"
+                    | "newest_mtime"
+                    | "size_bucket"
                     | "version"
                     | "mount"
                     | "fstype"
@@ -263,4 +269,141 @@ fn listing(p: &Path) -> Vec<(String, u64, i64)> {
     }
     out.sort();
     out
+}
+
+/// A crate with a 3 MiB `target/` (a `rebuildable` cargo-target finding).
+fn cargo_fixture() -> (tempfile::TempDir, String) {
+    let t = tempfile::tempdir().unwrap();
+    let r = t.path();
+    fs::create_dir_all(r.join("app/target/debug")).unwrap();
+    fs::write(r.join("app/Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+    fs::write(r.join("app/target/CACHEDIR.TAG"), CARGO_TAG).unwrap();
+    fs::write(r.join("app/target/debug/app"), vec![1u8; 3 << 20]).unwrap();
+    let root = fs::canonicalize(r).unwrap().to_str().unwrap().to_string();
+    (t, root)
+}
+
+#[test]
+fn plan_json_on_fixture() {
+    let (_t, root) = cargo_fixture();
+    let out_dir = tempfile::tempdir().unwrap();
+    let file = out_dir.path().join("plan.json");
+    let before = listing(Path::new(&root));
+    let out = dwhy(&[
+        "plan",
+        &root,
+        "-q",
+        "--detectors",
+        "cargo-target",
+        "--tier",
+        "rebuildable",
+        "-o",
+        file.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(listing(Path::new(&root)), before, "plan writes nothing");
+    let printed: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let written: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    assert_eq!(printed, written);
+    assert_eq!(written["items"].as_array().unwrap().len(), 1);
+    let fp = &written["items"][0]["fingerprint"];
+    assert!(fp["inode"].as_u64().is_some() && fp["newest_mtime"].as_i64().is_some());
+    let mut v = written;
+    normalize(&mut v, &root);
+    insta::assert_json_snapshot!(v);
+}
+
+#[test]
+fn plan_selection_on_fixture() {
+    let (_t, root) = cargo_fixture();
+    let target = format!("{root}/app/target");
+
+    // Default: regenerable only, so the rebuildable target is left out.
+    let out = dwhy(&["plan", &root, "-q", "--detectors", "cargo-target"]);
+    assert_eq!(out.status.code(), Some(0));
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        s.contains("plan: nothing to remove (tier ≤ regenerable)"),
+        "{s}"
+    );
+    assert!(
+        s.contains("1 finding above regenerable not selected"),
+        "{s}"
+    );
+    assert!(s.contains("no plan file written"), "{s}");
+
+    // --select by path (relative to the working directory too) or by id.
+    let json = |args: &[&str]| -> Value {
+        let mut a = vec!["plan", &root, "-q", "--detectors", "cargo-target", "--json"];
+        a.extend(args);
+        let out = Command::new(env!("CARGO_BIN_EXE_dwhy"))
+            .args(&a)
+            .current_dir(format!("{root}/app"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let by_path = json(&["--select", &target]);
+    assert_eq!(by_path["items"][0]["finding"]["path"], target.as_str());
+    assert_eq!(by_path["selection"]["tier"], Value::Null);
+    let id = by_path["items"][0]["finding"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        json(&["--select", "target"])["items"][0]["finding"]["id"],
+        id.as_str()
+    );
+    assert_eq!(
+        json(&["--select", &id])["items"].as_array().unwrap().len(),
+        1
+    );
+
+    // Text output names the item and the command to apply it.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("p.json");
+    let out = dwhy(&[
+        "plan",
+        &root,
+        "-q",
+        "--detectors",
+        "cargo-target",
+        "--select",
+        &id,
+        "-o",
+        file.to_str().unwrap(),
+    ]);
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(s.contains("plan: 1 item, "), "{s}");
+    assert!(s.contains(&format!("cargo-target  {target}")), "{s}");
+    assert!(s.contains(&format!("{id} → ")), "{s}");
+    assert!(s.contains("dwhy apply "), "{s}");
+
+    // Naming nothing is an error, not an empty plan.
+    let out = dwhy(&[
+        "plan",
+        &root,
+        "-q",
+        "--detectors",
+        "cargo-target",
+        "--select",
+        "f_000000000000",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--select f_000000000000"));
+    // `blocked` is not a tier you can select.
+    let out = dwhy(&["plan", &root, "-q", "--tier", "blocked"]);
+    assert_eq!(out.status.code(), Some(1));
 }

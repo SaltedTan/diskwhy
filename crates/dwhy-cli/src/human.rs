@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use dwhy_core::report::{
-    ActionKind, DetectorAvailability, DirEntry, DoctorReport, Finding, FsReport, GuardStatus,
+    ActionKind, DetectorAvailability, DirEntry, DoctorReport, Finding, FsReport, GuardStatus, Plan,
     ScanReport, SkipReason, Tier,
 };
 use dwhy_core::units::{human, thousands};
@@ -106,6 +106,89 @@ pub fn render_scan(
         depth,
         top,
     )?;
+    Ok(())
+}
+
+/// Summary of a plan: its items by tier, what is blocked, and how to apply it.
+pub fn render_plan(
+    w: &mut impl Write,
+    p: &Plan,
+    written: Option<&Path>,
+    above: usize,
+) -> io::Result<()> {
+    let what = match (p.selection.tier, p.selection.select.len()) {
+        (Some(t), 0) => format!("tier ≤ {}", tier_name(t)),
+        (Some(t), n) => format!("{n} selected, tier ≤ {}", tier_name(t)),
+        (None, n) => format!("{n} selected"),
+    };
+    if p.items.is_empty() {
+        writeln!(w, "plan: nothing to remove ({what})")?;
+    } else {
+        writeln!(
+            w,
+            "plan: {} item{}, {} ({what}), expires {}",
+            p.items.len(),
+            if p.items.len() == 1 { "" } else { "s" },
+            human(p.bytes),
+            p.expires_at
+        )?;
+    }
+    for tier in [Tier::Regenerable, Tier::Rebuildable, Tier::Review] {
+        let in_tier: Vec<&Finding> = p
+            .items
+            .iter()
+            .map(|i| &i.finding)
+            .filter(|f| f.tier == tier)
+            .collect();
+        if in_tier.is_empty() {
+            continue;
+        }
+        writeln!(w, "  {}", tier_name(tier))?;
+        for f in in_tier {
+            writeln!(w, "  {:>8}  {:<13} {}", human(f.bytes), f.detector, f.path)?;
+            writeln!(w, "  {:>8}  {:<13} {} → {}", "", "", f.id, f.action.text)?;
+            for g in f.guards.iter().filter(|g| g.status == GuardStatus::Warn) {
+                writeln!(
+                    w,
+                    "  {:>8}  {:<13} warning, {}: {}",
+                    "", "", g.name, g.detail
+                )?;
+            }
+        }
+    }
+    if !p.blocked.is_empty() {
+        writeln!(w, "  blocked (not in the plan: a guard failed)")?;
+        for f in &p.blocked {
+            writeln!(w, "  {:>8}  {:<13} {}", human(f.bytes), f.detector, f.path)?;
+            for g in f.guards.iter().filter(|g| g.status == GuardStatus::Block) {
+                writeln!(
+                    w,
+                    "  {:>8}  {:<13} blocked by {}: {}",
+                    "", "", g.name, g.detail
+                )?;
+            }
+        }
+    }
+    if above > 0
+        && let Some(t) = p.selection.tier
+    {
+        writeln!(
+            w,
+            "  {above} finding{} above {} not selected (--tier or --select to include)",
+            if above == 1 { "" } else { "s" },
+            tier_name(t)
+        )?;
+    }
+    match written {
+        Some(path) if !p.items.is_empty() => writeln!(
+            w,
+            "wrote {}; apply it within an hour: dwhy apply {}",
+            path.display(),
+            dwhy_core::detect::shell_quote(&path.to_string_lossy())
+        )?,
+        Some(path) => writeln!(w, "wrote {}", path.display())?,
+        None => writeln!(w, "no plan file written (-o FILE writes one)")?,
+    }
     Ok(())
 }
 

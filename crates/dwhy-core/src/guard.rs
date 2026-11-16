@@ -247,7 +247,7 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
 /// Whether the git guards apply: not to tool-managed caches and tool
 /// versions, whose repositories are the tools' own checkouts (Cargo's git
 /// dependencies, uv's source builds, VS Code's servers).
-fn git_guarded(f: &Finding) -> bool {
+pub(crate) fn git_guarded(f: &Finding) -> bool {
     !matches!(f.detector.as_str(), "user-cache" | "tool-versions")
 }
 
@@ -568,6 +568,40 @@ impl RepoState {
             branch,
         })
     }
+}
+
+/// The commit id of HEAD (`"unborn"` before the first commit) and the
+/// entries of `git status --porcelain=v2 -z` with untracked files, for a
+/// plan's fingerprint of the work tree `dir`. The branch headers are left
+/// out: ahead/behind counts change with every fetch. Runs no filter driver
+/// or fsmonitor, like the guards.
+pub(crate) fn work_tree_state(git: &str, dir: &Path) -> Result<(String, String), String> {
+    let mut args = no_filters(git, dir)?;
+    args.extend(
+        [
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+            "--untracked-files=normal",
+            "--ignore-submodules=dirty",
+        ]
+        .map(String::from),
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let status = crate::gitcmd::run(git, dir, &args)?;
+    let mut head = None;
+    let mut entries = String::new();
+    for entry in status.split('\0') {
+        if let Some(oid) = entry.strip_prefix("# branch.oid ") {
+            head = Some(if oid == "(initial)" { "unborn" } else { oid }.to_string());
+        } else if !entry.starts_with("# ") && !entry.is_empty() {
+            entries.push_str(entry);
+            entries.push('\0');
+        }
+    }
+    let head = head.ok_or_else(|| "git status printed no HEAD".to_string())?;
+    Ok((head, entries))
 }
 
 /// Runs a git command that prints a count.

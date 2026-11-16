@@ -234,3 +234,147 @@ fn command_action_shape() {
     }
     "#);
 }
+
+fn plan_finding(id: &str, detector: &str, path: &str, tier: Tier, action: Action) -> Finding {
+    Finding {
+        id: id.into(),
+        detector: detector.into(),
+        probe: None,
+        path: path.into(),
+        bytes: 9_663_676_416,
+        nested_bytes: None,
+        last_modified: Some("2026-11-02T10:00:00Z".into()),
+        growth: None,
+        tier,
+        reason: "a reason".into(),
+        guards: vec![GuardResult {
+            name: "in-use-cwd".into(),
+            status: GuardStatus::Pass,
+            detail: "no process has its working directory in it".into(),
+        }],
+        action,
+        recovery: Recovery {
+            cost: "rebuild".into(),
+            how: Some("cargo build".into()),
+        },
+    }
+}
+
+fn plan_sample() -> Plan {
+    Plan {
+        schema: SCHEMA.into(),
+        tool: Tool {
+            name: "diskwhy".into(),
+            version: "0.0.1".into(),
+        },
+        host: "pc-ubuntu".into(),
+        uid: 1000,
+        created_at: "2026-11-16T04:00:00Z".into(),
+        expires_at: "2026-11-16T05:00:00Z".into(),
+        scan: PlanScan {
+            roots: vec!["/home/me".into()],
+            one_filesystem: true,
+            detectors: None,
+        },
+        selection: PlanSelection {
+            tier: Some(Tier::Rebuildable),
+            select: vec![],
+        },
+        items: vec![
+            PlanItem {
+                finding: plan_finding(
+                    "f_c2b7afdaa165",
+                    "cargo-target",
+                    "/home/me/x/target",
+                    Tier::Rebuildable,
+                    Action {
+                        kind: ActionKind::Command,
+                        text: "cargo clean --manifest-path /home/me/x/Cargo.toml --target-dir /home/me/x/target".into(),
+                        argv: Some(
+                            [
+                                "cargo",
+                                "clean",
+                                "--manifest-path",
+                                "/home/me/x/Cargo.toml",
+                                "--target-dir",
+                                "/home/me/x/target",
+                            ]
+                            .map(String::from)
+                            .to_vec(),
+                        ),
+                    },
+                ),
+                fingerprint: Fingerprint {
+                    dev: Some(66311),
+                    inode: Some(3_698_100),
+                    newest_mtime: Some(1_794_100_000),
+                    size_bucket: 133,
+                    git: None,
+                    docker_id: None,
+                },
+            },
+            PlanItem {
+                finding: plan_finding(
+                    "f_0a1b2c3d4e5f",
+                    "docker-image",
+                    "docker://image/old:latest",
+                    Tier::Review,
+                    Action {
+                        kind: ActionKind::Command,
+                        text: "docker image rm old:latest".into(),
+                        argv: Some(["docker", "image", "rm", "old:latest"].map(String::from).to_vec()),
+                    },
+                ),
+                fingerprint: Fingerprint {
+                    dev: None,
+                    inode: None,
+                    newest_mtime: None,
+                    size_bucket: 133,
+                    git: None,
+                    docker_id: Some("sha256:5bcecbbe34b6".into()),
+                },
+            },
+        ],
+        blocked: vec![plan_finding(
+            "f_1122334455aa",
+            "git-worktree",
+            "/home/me/.t3/worktrees/app/wip",
+            Tier::Blocked,
+            Action {
+                kind: ActionKind::Command,
+                text: "git -C /home/me/app worktree remove /home/me/.t3/worktrees/app/wip".into(),
+                argv: None,
+            },
+        )],
+        bytes: 19_327_352_832,
+    }
+}
+
+#[test]
+fn plan_shape() {
+    insta::assert_json_snapshot!(plan_sample());
+}
+
+#[test]
+fn plan_git_fingerprint_shape() {
+    let fp = Fingerprint {
+        dev: Some(1),
+        inode: Some(2),
+        newest_mtime: Some(3),
+        size_bucket: 4,
+        git: Some(GitFingerprint {
+            head: "89525f0cf72cb8083d8c4ae9c7a3f345e031dc7b".into(),
+            status_hash: "cbf29ce484222325".into(),
+        }),
+        docker_id: None,
+    };
+    insta::assert_json_snapshot!(fp);
+}
+
+#[test]
+fn plan_round_trips() {
+    let p = plan_sample();
+    let s = serde_json::to_string(&p).unwrap();
+    let back: Plan = serde_json::from_str(&s).unwrap();
+    assert_eq!(back, p);
+}

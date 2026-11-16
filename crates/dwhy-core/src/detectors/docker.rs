@@ -88,6 +88,42 @@ fn short_id(id: &str) -> String {
     id.trim_start_matches("sha256:").chars().take(12).collect()
 }
 
+/// The Docker object behind a finding's pseudo-path, for its fingerprint:
+/// the image or container id, or a volume's name and creation time (a
+/// volume has no id, and a volume recreated under the same name is another
+/// volume). `None` for build cache, which is many records, and for an
+/// object that is gone.
+pub fn object_id(snap: &Snapshot, path: &str) -> Option<String> {
+    if let Some(label) = path.strip_prefix("docker://image/") {
+        snap.images()
+            .iter()
+            .find(|img| {
+                match img
+                    .repo_tags
+                    .iter()
+                    .flatten()
+                    .find(|t| t.as_str() != "<none>:<none>")
+                {
+                    Some(tag) => tag == label,
+                    None => short_id(&img.id) == label,
+                }
+            })
+            .map(|img| img.id.clone())
+    } else if let Some(name) = path.strip_prefix("docker://container/") {
+        snap.containers()
+            .iter()
+            .find(|c| container_name(c) == name)
+            .map(|c| c.id.clone())
+    } else if let Some(name) = path.strip_prefix("docker://volume/") {
+        snap.volumes()
+            .iter()
+            .find(|v| v.name == name)
+            .map(|v| format!("{}@{}", v.name, v.created_at))
+    } else {
+        None
+    }
+}
+
 pub struct DockerImage;
 
 impl Detector for DockerImage {

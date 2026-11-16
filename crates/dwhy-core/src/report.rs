@@ -391,6 +391,94 @@ pub struct Recovery {
     pub how: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Plans (M2): written by `dwhy plan`, read by `dwhy apply`
+// ---------------------------------------------------------------------------
+
+/// A plan: the findings selected for removal, each with a fingerprint, and
+/// an expiry. `dwhy apply` does not take the plan's word for what to run:
+/// it rescans `scan.roots`, re-runs the detectors and guards, and acts only
+/// on the fresh finding with each item's id, skipping it when the fresh
+/// tier, action or fingerprint differs from the plan's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Plan {
+    pub schema: String,
+    pub tool: Tool,
+    pub host: String,
+    /// Effective uid the plan was made as; apply refuses another uid.
+    pub uid: u32,
+    /// RFC 3339, UTC.
+    pub created_at: String,
+    /// RFC 3339, UTC. apply refuses the plan after this.
+    pub expires_at: String,
+    /// What apply rescans and re-detects.
+    pub scan: PlanScan,
+    pub selection: PlanSelection,
+    /// Findings to remove, largest first. None is `blocked`.
+    pub items: Vec<PlanItem>,
+    /// Selected findings that a guard or detector blocked: listed so the
+    /// reason is visible, never applied.
+    pub blocked: Vec<Finding>,
+    /// What removing every item is expected to free, each byte counted once
+    /// (an item inside another item adds nothing).
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanScan {
+    /// Scan roots, absolute.
+    pub roots: Vec<String>,
+    /// True when the walk did not cross into other filesystems (`-x`).
+    pub one_filesystem: bool,
+    /// The detectors that ran (`--detectors`); `None` means all of them.
+    pub detectors: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanSelection {
+    /// Highest tier selected (`--tier`). `None` when `--select` named the
+    /// findings and no `--tier` was given.
+    pub tier: Option<Tier>,
+    /// Finding ids or paths given with `--select`.
+    pub select: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanItem {
+    /// The finding as detected, with its guard results.
+    pub finding: Finding,
+    pub fingerprint: Fingerprint,
+}
+
+/// What must not have changed between `plan` and `apply`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fingerprint {
+    /// `st_dev` of the finding's root (not following a symlink), for a
+    /// filesystem finding whose root exists.
+    pub dev: Option<u64>,
+    /// `st_ino` of the finding's root.
+    pub inode: Option<u64>,
+    /// Newest mtime under the root, seconds since the epoch.
+    pub newest_mtime: Option<i64>,
+    /// `bytes` in buckets of a quarter of a doubling (4 per power of two):
+    /// small changes in size do not count, large ones do.
+    pub size_bucket: u32,
+    /// For a finding whose root is a git work tree.
+    pub git: Option<GitFingerprint>,
+    /// For a Docker finding: the image or container id, or the volume name
+    /// and creation time.
+    pub docker_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitFingerprint {
+    /// Commit id of HEAD, or `"unborn"` before the first commit.
+    pub head: String,
+    /// FNV-1a (64-bit, hex) of `git status --porcelain=v2 -z` with
+    /// untracked files: any change to the work tree changes it.
+    pub status_hash: String,
+}
+
 /// Output of `dwhy doctor --json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DoctorReport {
