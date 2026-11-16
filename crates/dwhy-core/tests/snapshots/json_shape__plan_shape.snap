@@ -1,0 +1,146 @@
+---
+source: crates/dwhy-core/tests/json_shape.rs
+expression: plan_sample()
+---
+{
+  "schema": "diskwhy/v1",
+  "tool": {
+    "name": "diskwhy",
+    "version": "0.0.1"
+  },
+  "host": "pc-ubuntu",
+  "uid": 1000,
+  "created_at": "2026-11-16T04:00:00Z",
+  "expires_at": "2026-11-16T05:00:00Z",
+  "scan": {
+    "roots": [
+      "/home/me"
+    ],
+    "one_filesystem": true,
+    "detectors": null
+  },
+  "selection": {
+    "tier": "rebuildable",
+    "select": []
+  },
+  "items": [
+    {
+      "finding": {
+        "id": "f_c2b7afdaa165",
+        "detector": "cargo-target",
+        "probe": null,
+        "path": "/home/me/x/target",
+        "bytes": 9663676416,
+        "nested_bytes": null,
+        "last_modified": "2026-11-02T10:00:00Z",
+        "growth": null,
+        "tier": "rebuildable",
+        "reason": "a reason",
+        "guards": [
+          {
+            "name": "in-use-cwd",
+            "status": "pass",
+            "detail": "no process has its working directory in it"
+          }
+        ],
+        "action": {
+          "kind": "command",
+          "text": "cargo clean --manifest-path /home/me/x/Cargo.toml --target-dir /home/me/x/target",
+          "argv": [
+            "cargo",
+            "clean",
+            "--manifest-path",
+            "/home/me/x/Cargo.toml",
+            "--target-dir",
+            "/home/me/x/target"
+          ]
+        },
+        "recovery": {
+          "cost": "rebuild",
+          "how": "cargo build"
+        }
+      },
+      "fingerprint": {
+        "dev": 66311,
+        "inode": 3698100,
+        "newest_mtime": 1794100000,
+        "size_bucket": 133,
+        "git": null,
+        "docker_id": null
+      }
+    },
+    {
+      "finding": {
+        "id": "f_0a1b2c3d4e5f",
+        "detector": "docker-image",
+        "probe": null,
+        "path": "docker://image/old:latest",
+        "bytes": 9663676416,
+        "nested_bytes": null,
+        "last_modified": "2026-11-02T10:00:00Z",
+        "growth": null,
+        "tier": "review",
+        "reason": "a reason",
+        "guards": [
+          {
+            "name": "in-use-cwd",
+            "status": "pass",
+            "detail": "no process has its working directory in it"
+          }
+        ],
+        "action": {
+          "kind": "command",
+          "text": "docker image rm old:latest",
+          "argv": [
+            "docker",
+            "image",
+            "rm",
+            "old:latest"
+          ]
+        },
+        "recovery": {
+          "cost": "rebuild",
+          "how": "cargo build"
+        }
+      },
+      "fingerprint": {
+        "dev": null,
+        "inode": null,
+        "newest_mtime": null,
+        "size_bucket": 133,
+        "git": null,
+        "docker_id": "sha256:5bcecbbe34b6"
+      }
+    }
+  ],
+  "blocked": [
+    {
+      "id": "f_1122334455aa",
+      "detector": "git-worktree",
+      "probe": null,
+      "path": "/home/me/.t3/worktrees/app/wip",
+      "bytes": 9663676416,
+      "nested_bytes": null,
+      "last_modified": "2026-11-02T10:00:00Z",
+      "growth": null,
+      "tier": "blocked",
+      "reason": "a reason",
+      "guards": [
+        {
+          "name": "in-use-cwd",
+          "status": "pass",
+          "detail": "no process has its working directory in it"
+        }
+      ],
+      "action": {
+        "kind": "command",
+        "text": "git -C /home/me/app worktree remove /home/me/.t3/worktrees/app/wip"
+      },
+      "recovery": {
+        "cost": "rebuild",
+        "how": "cargo build"
+      }
+    }
+  ],
+  "bytes": 19327352832
+}

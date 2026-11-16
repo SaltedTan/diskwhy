@@ -1,0 +1,15 @@
+---
+source: crates/dwhy-core/tests/json_shape.rs
+expression: fp
+---
+{
+  "dev": 1,
+  "inode": 2,
+  "newest_mtime": 3,
+  "size_bucket": 4,
+  "git": {
+    "head": "89525f0cf72cb8083d8c4ae9c7a3f345e031dc7b",
+    "status_hash": "cbf29ce484222325"
+  },
+  "docker_id": null
+}
