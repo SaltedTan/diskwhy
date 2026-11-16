@@ -18,12 +18,22 @@
 //!   repository lives on, so only commits reachable from HEAD and from no
 //!   branch or remote are lost (block); unpushed commits on its branch stay
 //!   in the repository (warn).
-//! - `git-linked-worktrees`: a repository inside the finding has linked
-//!   worktrees outside it, which removing the repository would break.
+//! - `git-linked-worktrees`: a repository inside the finding has worktrees
+//!   outside it, which removing the repository would break: linked
+//!   worktrees, and work trees in the scan whose `.git` file points at it.
+//!
+//! Repositories are found from the scan tree: directories holding `.git`,
+//! and git directories without one (a bare repository, or the target of
+//! `--separate-git-dir`: a `HEAD` file plus `objects/` and `refs/`). A git
+//! directory gets `git-unpublished` and `git-linked-worktrees` only; no
+//! `git status` runs there. A `.git` file is resolved by reading it and the
+//! `commondir` it leads to, not by asking git.
 //!
 //! Git runs none of the repository's own programs: fsmonitor and every
-//! configured filter driver are switched off, and `git status` leaves
-//! submodules alone (each is checked as a repository of its own).
+//! configured filter driver are switched off, and `git status` does not look
+//! inside submodules (each is checked as a repository of its own), though a
+//! submodule checked out at a commit other than the recorded one still
+//! makes the superproject dirty.
 //!
 //! For a Docker volume, `container-mount`: mounted by a running container
 //! (block) or a stopped one (warn).
@@ -37,7 +47,8 @@
 //! missing or failing, Docker unreachable) blocks. A blocking guard moves
 //! the finding to the `blocked` tier.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::detect::DetectContext;
@@ -148,16 +159,29 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
     use rayon::prelude::*;
     let repos = repositories(tree);
     let git = ctx.tool_command("git");
-    let inside = |f: &Finding| -> Vec<&PathBuf> {
+    // The work trees in the scan that use each git directory through a
+    // `.git` file.
+    let mut users: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    for r in &repos {
+        if let Repo::WorkTree(dir) = r
+            && let Ok(common) = common_dir(&dir.join(".git"))
+        {
+            users.entry(common).or_default().push(dir.clone());
+        }
+    }
+    let inside = |f: &Finding| -> Vec<&Repo> {
         if !f.path.starts_with('/') || !git_guarded(f) {
             return Vec::new();
         }
         let root = Path::new(&f.path);
-        repos.iter().filter(|r| r.starts_with(root)).collect()
+        repos
+            .iter()
+            .filter(|r| r.path().starts_with(root))
+            .collect()
     };
     // Every repository any finding needs, with the outermost finding it is
     // in, read once and in parallel.
-    let mut needed: HashMap<&PathBuf, PathBuf> = HashMap::new();
+    let mut needed: HashMap<&Repo, PathBuf> = HashMap::new();
     for f in findings.iter() {
         for r in inside(f) {
             let root = PathBuf::from(&f.path);
@@ -167,7 +191,7 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
             }
         }
     }
-    let states: HashMap<&PathBuf, RepoState> = needed
+    let states: HashMap<&Repo, RepoState> = needed
         .par_iter()
         .map(|(r, outer)| (*r, RepoState::read(git.as_deref(), r, outer)))
         .collect();
@@ -177,10 +201,10 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
             let root = PathBuf::from(&f.path);
             results.push(in_use_cwd(&root, procs));
             results.push(in_use_open(&root, procs));
-            let mine: Vec<(&PathBuf, &RepoState)> =
+            let mine: Vec<(&Repo, &RepoState)> =
                 inside(f).into_iter().map(|r| (r, &states[r])).collect();
             if !mine.is_empty() {
-                results.extend(git_guards(&root, &mine));
+                results.extend(git_guards(&root, &mine, &users));
             }
         } else if let Some(name) = f.path.strip_prefix("docker://volume/") {
             results.push(container_mount(name, ctx));
@@ -204,10 +228,30 @@ fn git_guarded(f: &Finding) -> bool {
     !matches!(f.detector.as_str(), "user-cache" | "tool-versions")
 }
 
-/// Directories in the tree that hold a `.git` (a directory or a file),
-/// except those inside a cache (a directory above them holds
+/// What the git guards check. Work trees sort before git directories, so
+/// a repository found both ways is named by its work tree.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Repo {
+    /// A directory holding `.git` (a directory or a file).
+    WorkTree(PathBuf),
+    /// A git directory with no `.git` entry: a bare repository or the
+    /// target of `--separate-git-dir`.
+    GitDir(PathBuf),
+}
+
+impl Repo {
+    fn path(&self) -> &Path {
+        match self {
+            Repo::WorkTree(p) | Repo::GitDir(p) => p,
+        }
+    }
+}
+
+/// Work trees (directories holding `.git`) and git directories (a regular
+/// `HEAD` file plus `objects/` and `refs/`, other than `.git` itself) in
+/// the tree, except those inside a cache (a directory above them holds
 /// `CACHEDIR.TAG`): a tool's checkouts, such as uv's source builds.
-fn repositories(tree: &ScanTree) -> Vec<PathBuf> {
+fn repositories(tree: &ScanTree) -> Vec<Repo> {
     let in_cache = |mut id| {
         while let Some(p) = tree.parent(id) {
             if tree.node(p).markers.contains(Markers::CACHEDIR_TAG) {
@@ -217,13 +261,27 @@ fn repositories(tree: &ScanTree) -> Vec<PathBuf> {
         }
         false
     };
-    let mut out: Vec<PathBuf> = tree
+    let mut out: Vec<Repo> = tree
         .ids()
-        .filter(|&id| {
+        .filter_map(|id| {
             let n = tree.node(id);
-            n.is_dir && n.markers.contains(Markers::DOT_GIT) && !in_cache(id)
+            if !n.is_dir {
+                return None;
+            }
+            let repo = if n.markers.contains(Markers::DOT_GIT) {
+                Repo::WorkTree(tree.path(id))
+            } else if n.markers.contains(Markers::GIT_HEAD)
+                && tree.name(id) != OsStr::new(".git")
+                && ["objects", "refs"]
+                    .iter()
+                    .all(|c| tree.child_named(id, c).is_some())
+            {
+                Repo::GitDir(tree.path(id))
+            } else {
+                return None;
+            };
+            (!in_cache(id)).then_some(repo)
         })
-        .map(|id| tree.path(id))
         .collect();
     out.sort();
     out
@@ -324,19 +382,46 @@ enum RepoState {
 }
 
 impl RepoState {
-    /// Reads the repository at `dir`; `outer` is the outermost finding it
-    /// is in.
-    fn read(git: Option<&str>, dir: &Path, outer: &Path) -> RepoState {
+    /// Reads `repo`; `outer` is the outermost finding it is in.
+    fn read(git: Option<&str>, repo: &Repo, outer: &Path) -> RepoState {
         let Some(git) = git else {
             return RepoState::Failed("git is not installed".into());
         };
-        match Self::try_read(git, dir, outer) {
+        let read = match repo {
+            Repo::WorkTree(dir) => Self::read_work_tree(git, dir, outer),
+            Repo::GitDir(dir) => Self::read_git_dir(git, dir),
+        };
+        match read {
             Ok(s) => s,
             Err(e) => RepoState::Failed(e),
         }
     }
 
-    fn try_read(git: &str, dir: &Path, outer: &Path) -> Result<RepoState, String> {
+    /// A bare repository or separate git dir: no work tree to look at.
+    fn read_git_dir(git: &str, dir: &Path) -> Result<RepoState, String> {
+        Ok(RepoState::Read {
+            common: dir.to_path_buf(),
+            dirty: 0,
+            unpublished: count(
+                git,
+                dir,
+                &[
+                    "--git-dir=.",
+                    "rev-list",
+                    "--count",
+                    "--all",
+                    "--not",
+                    "--remotes",
+                ],
+            )?,
+            linked: linked_worktrees(dir),
+            lost: 0,
+            unpushed_kept: 0,
+            branch: None,
+        })
+    }
+
+    fn read_work_tree(git: &str, dir: &Path, outer: &Path) -> Result<RepoState, String> {
         let git_dir = dir.join(".git");
         let gitfile = !std::fs::symlink_metadata(&git_dir).is_ok_and(|m| m.is_dir());
         // One call for the changes, the branch and whether HEAD exists.
@@ -348,7 +433,7 @@ impl RepoState {
                 "--branch",
                 "-z",
                 "--untracked-files=normal",
-                "--ignore-submodules=all",
+                "--ignore-submodules=dirty",
             ]
             .map(String::from),
         );
@@ -369,19 +454,8 @@ impl RepoState {
                 dirty += 1;
             }
         }
-        let count = |args: &[&str]| -> Result<usize, String> {
-            let out = crate::gitcmd::run(git, dir, args)?;
-            out.trim()
-                .parse()
-                .map_err(|_| format!("unexpected git output: {}", out.trim()))
-        };
         let common = if gitfile {
-            let out = crate::gitcmd::run(
-                git,
-                dir,
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-            )?;
-            PathBuf::from(out.trim_end_matches('\n'))
+            common_dir(&git_dir)?
         } else {
             git_dir
         };
@@ -389,23 +463,35 @@ impl RepoState {
             // Everything local (branches, tags, stash, every worktree's
             // HEAD) that no remote branch has.
             (
-                count(&["rev-list", "--count", "--all", "--not", "--remotes"])?,
+                count(
+                    git,
+                    dir,
+                    &["rev-list", "--count", "--all", "--not", "--remotes"],
+                )?,
                 linked_worktrees(&common),
             )
         } else {
             (0, Vec::new())
         };
         let (lost, unpushed_kept) = if gitfile && has_head {
-            let lost = count(&[
-                "rev-list",
-                "--count",
-                "HEAD",
-                "--not",
-                "--branches",
-                "--remotes",
-            ])?;
+            let lost = count(
+                git,
+                dir,
+                &[
+                    "rev-list",
+                    "--count",
+                    "HEAD",
+                    "--not",
+                    "--branches",
+                    "--remotes",
+                ],
+            )?;
             let unpushed = if branch.is_some() {
-                count(&["rev-list", "--count", "HEAD", "--not", "--remotes"])?
+                count(
+                    git,
+                    dir,
+                    &["rev-list", "--count", "HEAD", "--not", "--remotes"],
+                )?
             } else {
                 0
             };
@@ -423,6 +509,42 @@ impl RepoState {
             branch,
         })
     }
+}
+
+/// Runs a git command that prints a count.
+fn count(git: &str, dir: &Path, args: &[&str]) -> Result<usize, String> {
+    let out = crate::gitcmd::run(git, dir, args)?;
+    out.trim()
+        .parse()
+        .map_err(|_| format!("unexpected git output: {}", out.trim()))
+}
+
+/// The git directory shared by all worktrees of the repository whose `.git`
+/// file is `dot_git`: the file's `gitdir:` target, or the `commondir` named
+/// there. Relative paths are resolved as git does, against the directory
+/// holding the file.
+fn common_dir(dot_git: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let first_line = |p: &Path| -> Result<PathBuf, String> {
+        let text = crate::detectors::read_head(p, 4096)
+            .ok_or_else(|| format!("cannot read {}", p.display()))?;
+        let line = text.split(|&b| b == b'\n').next().unwrap_or_default();
+        Ok(PathBuf::from(OsStr::from_bytes(line.trim_ascii_end())))
+    };
+    let line = first_line(dot_git)?;
+    let target = line
+        .as_os_str()
+        .as_bytes()
+        .strip_prefix(b"gitdir: ")
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| format!("{} is not a gitfile", dot_git.display()))?;
+    let base = dot_git.parent().unwrap_or(Path::new("/"));
+    let gitdir = normalize(&base.join(OsStr::from_bytes(target)));
+    let commondir = gitdir.join("commondir");
+    if std::fs::symlink_metadata(&commondir).is_err() {
+        return Ok(gitdir);
+    }
+    Ok(normalize(&gitdir.join(first_line(&commondir)?)))
 }
 
 /// `-c` options switching off every filter driver in the repository's
@@ -506,14 +628,22 @@ fn list(dirs: &[String]) -> String {
     s
 }
 
-fn git_guards(root: &Path, repos: &[(&PathBuf, &RepoState)]) -> Vec<GuardResult> {
+/// `users` maps a git directory to the work trees in the scan that use it.
+fn git_guards(
+    root: &Path,
+    repos: &[(&Repo, &RepoState)],
+    users: &HashMap<PathBuf, Vec<PathBuf>>,
+) -> Vec<GuardResult> {
     let mut failed = Vec::new();
     let mut dirty = Vec::new();
     let mut lost = Vec::new();
     let mut kept = Vec::new();
     let mut linked_out = Vec::new();
-    for (dir, state) in repos {
-        let d = dir.display();
+    // A repository going with the finding is reported once, under its
+    // first work tree, however many of its work trees are inside.
+    let mut gone: HashSet<&PathBuf> = HashSet::new();
+    for (repo, state) in repos {
+        let d = repo.path().display();
         match state {
             RepoState::Failed(e) => failed.push(format!("{d}: {e}")),
             RepoState::Read {
@@ -529,13 +659,21 @@ fn git_guards(root: &Path, repos: &[(&PathBuf, &RepoState)]) -> Vec<GuardResult>
                     dirty.push(format!("{d} ({n_dirty} changed or untracked)"));
                 }
                 if common.starts_with(root) {
+                    if !gone.insert(common) {
+                        continue;
+                    }
                     if *unpublished > 0 {
                         lost.push(format!("{d} ({} on no remote)", commits(*unpublished)));
                     }
-                    for w in linked {
-                        if !w.starts_with(root) {
-                            linked_out.push(format!("{} (of {d})", w.display()));
-                        }
+                    let mut outside: Vec<&PathBuf> = linked
+                        .iter()
+                        .chain(users.get(common).into_iter().flatten())
+                        .filter(|w| !w.starts_with(root))
+                        .collect();
+                    outside.sort();
+                    outside.dedup();
+                    for w in outside {
+                        linked_out.push(format!("{} (of {d})", w.display()));
                     }
                 } else {
                     if *n_lost > 0 {
@@ -552,8 +690,21 @@ fn git_guards(root: &Path, repos: &[(&PathBuf, &RepoState)]) -> Vec<GuardResult>
             }
         }
     }
-    let n = repos.len();
-    let checked = format!("{n} git worktree{} checked", if n == 1 { "" } else { "s" });
+    let trees = repos
+        .iter()
+        .filter(|(r, _)| matches!(r, Repo::WorkTree(_)))
+        .count();
+    let dirs = repos.len() - trees;
+    let checked = [
+        (trees, "git worktree", "git worktrees"),
+        (dirs, "git directory", "git directories"),
+    ]
+    .into_iter()
+    .filter(|(n, ..)| *n > 0)
+    .map(|(n, one, many)| format!("{n} {}", if n == 1 { one } else { many }))
+    .collect::<Vec<_>>()
+    .join(" and ")
+        + " checked";
     let result = |name: &str, block: &[String], what: &str| {
         if !failed.is_empty() {
             GuardResult {

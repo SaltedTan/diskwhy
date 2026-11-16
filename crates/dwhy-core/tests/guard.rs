@@ -360,6 +360,119 @@ fn submodule_whose_git_dir_goes_with_the_finding_blocks() {
 }
 
 #[test]
+fn submodule_moved_off_its_recorded_commit_is_dirty() {
+    let (_t, b) = base();
+    pushed_repo(&b, "lib");
+    let proj = pushed_repo(&b, "proj");
+    let url = b.join("lib-remote.git");
+    git(
+        &proj,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            url.to_str().unwrap(),
+            "lib",
+        ],
+    );
+    git(&proj, &["commit", "-q", "-m", "add lib"]);
+    git(&proj, &["push", "-q"]);
+    // The submodule moves to a new, pushed commit; the superproject has not
+    // recorded it.
+    let lib = proj.join("lib");
+    commit(&lib, "newer");
+    git(&lib, &["push", "-q"]);
+    let (tier, g) = guards(&b, &proj);
+    assert_eq!(tier, Tier::Blocked, "{g:?}");
+    assert_eq!(
+        get(&g, "git-unpublished").status,
+        GuardStatus::Pass,
+        "{g:?}"
+    );
+    let d = get(&g, "git-dirty");
+    assert_eq!(d.status, GuardStatus::Block);
+    assert!(
+        d.detail
+            .contains(&format!("{} (1 changed or untracked)", proj.display())),
+        "{}",
+        d.detail
+    );
+}
+
+#[test]
+fn bare_repositories() {
+    let (_t, b) = base();
+    // Holds a commit pushed from `app` and is nobody's clone: no remote has
+    // it.
+    pushed_repo(&b, "app");
+    let bare = b.join("app-remote.git");
+    let (tier, g) = guards(&b, &bare);
+    assert_eq!(tier, Tier::Blocked, "{g:?}");
+    let u = get(&g, "git-unpublished");
+    assert_eq!(u.status, GuardStatus::Block);
+    assert!(
+        u.detail
+            .contains(&format!("{} (1 commit on no remote)", bare.display())),
+        "{}",
+        u.detail
+    );
+    assert_eq!(get(&g, "git-dirty").detail, "1 git directory checked");
+
+    // A bare clone whose branch is on its remote loses nothing.
+    let mirror = b.join("mirror.git");
+    fs::create_dir_all(&mirror).unwrap();
+    git(&mirror, &["init", "-q", "--bare"]);
+    git(
+        &mirror,
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+    );
+    git(&mirror, &["fetch", "-q", "origin", "main:main"]);
+    let (tier, g) = guards(&b, &mirror);
+    assert_eq!(tier, Tier::Review, "{g:?}");
+    assert_eq!(get(&g, "git-unpublished").status, GuardStatus::Pass);
+}
+
+#[test]
+fn separate_git_dir_as_its_own_finding_blocks() {
+    let (_t, b) = base();
+    let scratch = b.join("scratch");
+    let work = scratch.join("proj");
+    let gitdir = scratch.join("proj.git");
+    fs::create_dir_all(&work).unwrap();
+    git(
+        &work,
+        &["init", "-q", "--separate-git-dir", gitdir.to_str().unwrap()],
+    );
+    commit(&work, "a");
+    // Stale-tree reports each scratch subdirectory on its own.
+    let mut f = vec![
+        finding(&work.to_string_lossy(), Tier::Review),
+        finding(&gitdir.to_string_lossy(), Tier::Review),
+    ];
+    guard::check(&mut f, &scan_tree(&b), &ctx(), &Processes::default());
+    assert_eq!(
+        get(&f[0].guards, "git-unpublished").status,
+        GuardStatus::Warn,
+        "{:?}",
+        f[0].guards
+    );
+    let g = &f[1].guards;
+    assert_eq!(f[1].tier, Tier::Blocked, "{g:?}");
+    let u = get(g, "git-unpublished");
+    assert_eq!(u.status, GuardStatus::Block);
+    assert!(u.detail.contains("1 commit on no remote"), "{}", u.detail);
+    let l = get(g, "git-linked-worktrees");
+    assert_eq!(l.status, GuardStatus::Block);
+    assert!(
+        l.detail.contains(&format!("{} (of", work.display())),
+        "{}",
+        l.detail
+    );
+}
+
+#[test]
 fn separate_git_dir_inside_the_finding_blocks() {
     let (_t, b) = base();
     let scratch = b.join("scratch/try-1");
