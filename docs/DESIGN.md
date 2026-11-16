@@ -15,7 +15,7 @@ The idea is to automate what was done by hand on pc-ubuntu on 2026-11-13: 36G fr
 
 ## What sets it apart from gdu, lysosome, Mole and others
 
-1. **Growth, not just size.** Each run keeps a snapshot, so the next run can show what grew and how fast. A live `--watch` mode measures growth rate within one session, and probes look for known runaway patterns. No background job is needed.
+1. **Growth, not just size.** A scan can keep a snapshot (`--snapshot`), so a later run can show what grew and how fast. A live `--watch` mode measures growth rate within one session, and probes look for known runaway patterns. No background job is needed.
 2. **Accounting for hidden space.** It reports the gap between what `df` says is used and what the scan could see (e.g. "70G you can't read — rerun with sudo"). It lists Docker images, volumes and build cache by name, and counts each hardlinked file once, so sizes reflect what deleting actually frees.
 3. **Safety checks that look at real state**, not just name patterns:
    - commits that exist on no remote (not only unpushed relative to the upstream branch), in nested repos too
