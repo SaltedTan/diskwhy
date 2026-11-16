@@ -38,6 +38,8 @@ impl Markers {
     pub const BUN_LOCK: Markers = Markers(1 << 9);
     /// Regular file `pnpm-workspace.yaml`.
     pub const PNPM_WORKSPACE: Markers = Markers(1 << 10);
+    /// Regular file `.dwhy-scratch`: the directory is a scratch location.
+    pub const SCRATCH: Markers = Markers(1 << 11);
 
     pub const fn empty() -> Markers {
         Markers(0)
@@ -76,6 +78,7 @@ impl Markers {
             b"yarn.lock" if is_file => Markers::YARN_LOCK,
             b"bun.lock" | b"bun.lockb" if is_file => Markers::BUN_LOCK,
             b"pnpm-workspace.yaml" if is_file => Markers::PNPM_WORKSPACE,
+            b".dwhy-scratch" if is_file => Markers::SCRATCH,
             _ => Markers::empty(),
         }
     }
@@ -312,8 +315,11 @@ mod tests {
         m.insert(Markers::for_entry(b"Cargo.toml", true, false));
         m.insert(Markers::for_entry(b"CACHEDIR.TAG", false, false)); // a symlink: ignored
         m.insert(Markers::for_entry(b".git", false, true));
+        m.insert(Markers::for_entry(b".dwhy-scratch", false, true)); // a directory: ignored
         assert!(m.contains(Markers::CARGO_TOML));
         assert!(m.contains(Markers::DOT_GIT));
         assert!(!m.contains(Markers::CACHEDIR_TAG));
+        assert!(!m.contains(Markers::SCRATCH));
+        assert!(Markers::for_entry(b".dwhy-scratch", true, false).contains(Markers::SCRATCH));
     }
 }

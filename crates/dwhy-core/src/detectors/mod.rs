@@ -4,6 +4,7 @@ mod cargo_target;
 mod docker;
 mod git_worktree;
 mod node_modules;
+mod stale_tree;
 mod user_cache;
 mod venv;
 
@@ -18,6 +19,7 @@ pub use docker::{
 };
 pub use git_worktree::{GitWorktree, STALE_DAYS, WorktreeEntry, parse_porcelain};
 pub use node_modules::NodeModules;
+pub use stale_tree::{SCRATCH_LOCATIONS, SCRATCH_MARKER, SCRATCH_STALE_DAYS, StaleTree};
 pub use user_cache::{RECENT_HOURS, UserCache};
 pub use venv::Venv;
 
@@ -29,6 +31,7 @@ pub fn registry() -> Vec<Box<dyn Detector>> {
         Box::new(Venv),
         Box::new(UserCache::from_system()),
         Box::new(GitWorktree),
+        Box::new(StaleTree),
         Box::new(DockerImage),
         Box::new(DockerBuildCache),
         Box::new(DockerContainer),
