@@ -6,10 +6,10 @@ use std::path::Path;
 
 use dwhy_core::apply::{self, tier_name};
 use dwhy_core::report::{
-    ActionKind, ApplyOutcome, ApplyReport, DetectorAvailability, DirEntry, DoctorReport, Finding,
-    FsReport, GuardStatus, Plan, ScanReport, SkipReason, Tier,
+    ActionKind, ApplyOutcome, ApplyReport, Change, ChangeKind, DetectorAvailability, DiffReport,
+    DirEntry, DoctorReport, Finding, FsReport, GuardStatus, Plan, ScanReport, SkipReason, Tier,
 };
-use dwhy_core::units::{human, thousands};
+use dwhy_core::units::{age, human, signed, thousands};
 
 pub fn render_scan(
     w: &mut impl Write,
@@ -121,6 +121,108 @@ pub fn render_scan(
         writeln!(w)?;
     }
     Ok(())
+}
+
+/// What grew since a snapshot: filesystems, then directories, Docker and
+/// findings, each fastest growth first; `top` entries per section.
+pub fn render_diff(w: &mut impl Write, d: &DiffReport, top: usize) -> io::Result<()> {
+    let base = d.since.id.as_deref().unwrap_or(&d.since.path);
+    writeln!(
+        w,
+        "dwhy diff · {} · since {} ({} ago) · {}",
+        d.host,
+        base,
+        age(d.elapsed_secs),
+        d.roots.join(" ")
+    )?;
+    if !dwhy_core::snapshot::same_roots(&d.since.roots, &d.roots) {
+        writeln!(
+            w,
+            "  the snapshot covers {}; only paths in both are compared",
+            d.since.roots.join(" ")
+        )?;
+    }
+    let sections: [(&str, &[Change]); 4] = [
+        ("filesystems (df used)", &d.fs),
+        (
+            "directories (the deepest that holds most of each change)",
+            &d.dirs,
+        ),
+        ("docker", &d.docker),
+        ("findings", &d.findings),
+    ];
+    for (i, (title, list)) in sections.into_iter().enumerate() {
+        writeln!(w)?;
+        if list.is_empty() {
+            if i == 0 {
+                writeln!(w, "{title}: none in both scans")?;
+            } else if i == 2 && !d.docker_compared {
+                writeln!(w, "{title}: not compared (see note)")?;
+            } else {
+                writeln!(
+                    w,
+                    "{title}: nothing changed by {} or more",
+                    human(d.min_change)
+                )?;
+            }
+            continue;
+        }
+        writeln!(w, "{title}:")?;
+        for c in list.iter().take(top) {
+            let change = if c.at_least {
+                format!("≥{}", signed(c.change))
+            } else {
+                signed(c.change)
+            };
+            let span = match (c.before, c.after) {
+                (Some(b), Some(a)) => format!("{} → {}", human(b), human(a)),
+                (None, Some(a)) if c.at_least => format!(
+                    "was under {}, now {}",
+                    human(d.since.min_dir_bytes),
+                    human(a)
+                ),
+                (None, Some(a)) => format!("new, {}", human(a)),
+                (Some(b), None) => format!("gone, was {}", human(b)),
+                (None, None) => String::new(),
+            };
+            writeln!(
+                w,
+                "  {:>9}  {:>12}  {}  ({span})",
+                change,
+                format!("{}/day", signed(c.bytes_per_day)),
+                label(c)
+            )?;
+        }
+        if list.len() > top {
+            writeln!(
+                w,
+                "  … {} more (--top or --json lists them)",
+                list.len() - top
+            )?;
+        }
+    }
+    if !d.notes.is_empty() {
+        writeln!(w)?;
+    }
+    for n in &d.notes {
+        writeln!(w, "note: {n}")?;
+    }
+    if let Some(snap) = &d.snapshot {
+        writeln!(w)?;
+        writeln!(w, "snapshot saved: {} ({})", snap.id, snap.path)?;
+    }
+    Ok(())
+}
+
+fn label(c: &Change) -> String {
+    match c.kind {
+        ChangeKind::Fs | ChangeKind::Dir => c.name.clone(),
+        ChangeKind::Image => format!("image {}", c.name),
+        ChangeKind::Container => format!("container {}", c.name),
+        ChangeKind::Volume => format!("volume {}", c.name),
+        ChangeKind::BuildCache => "build cache".into(),
+        ChangeKind::Finding => format!("{} {}", c.detector.as_deref().unwrap_or("finding"), c.name),
+    }
 }
 
 /// Summary of a plan: its items by tier, what is blocked, and how to apply it.
@@ -358,7 +460,13 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
                 break;
             }
             shown += 1;
-            writeln!(w, "  {:>8}  {:<13} {}", human(f.bytes), f.detector, f.path)?;
+            write!(w, "  {:>8}  {:<13} {}", human(f.bytes), f.detector, f.path)?;
+            match &f.growth {
+                Some(g) if g.bytes_per_day != 0 => {
+                    writeln!(w, "  ({}/day)", signed(g.bytes_per_day))?
+                }
+                _ => writeln!(w)?,
+            }
             writeln!(w, "  {:>8}  {:<13} {}", "", "", f.reason)?;
             writeln!(w, "  {:>8}  {:<13} → {}", "", "", f.action.text)?;
             for g in f.guards.iter().filter(|g| g.status == GuardStatus::Block) {

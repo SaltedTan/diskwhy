@@ -6,7 +6,7 @@
 //! the scan tree detectors read ([`tree`]). M2: guards ([`guard`]) run before
 //! removal, plans ([`plan`]) select findings for it, and [`apply`] carries a
 //! plan out with [`remove`] or the tools' own commands. M3: [`snapshot`]s
-//! record scans so later runs can tell what grew.
+//! record scans so later runs can tell what grew ([`growth`]).
 
 pub mod account;
 pub mod apply;
@@ -15,6 +15,7 @@ pub mod detectors;
 pub mod docker;
 pub mod doctor;
 mod gitcmd;
+pub mod growth;
 pub mod guard;
 pub mod mounts;
 pub mod plan;

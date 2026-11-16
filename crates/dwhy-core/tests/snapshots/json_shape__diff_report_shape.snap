@@ -1,0 +1,124 @@
+---
+source: crates/dwhy-core/tests/json_shape.rs
+expression: "DiffReport\n{\n    schema: SCHEMA.into(), tool: Tool\n    { name: \"diskwhy\".into(), version: \"0.0.1\".into(), }, host:\n    \"pc-ubuntu\".into(), uid: 1000, generated_at:\n    \"2026-11-16T06:00:00Z\".into(), since: DiffBase\n    {\n        id: Some(\"20261114T060000Z-0123abcd\".into()), path:\n        \"/home/u/.local/state/diskwhy/snapshots/20261114T060000Z-0123abcd.json.gz\".into(),\n        created_at: \"2026-11-14T06:00:00Z\".into(), roots:\n        vec![\"/home/u\".into()], one_filesystem: true, min_dir_bytes:\n        104_857_600,\n    }, roots: vec![\"/home/u\".into()], one_filesystem: true, elapsed_secs:\n    172_800, min_change: 10_485_760, fs:\n    vec![change(ChangeKind::Fs, \"/\", Some(350_000_000_000),\n    Some(360_777_252_864))], dirs:\n    vec![new_dir,\n    change(ChangeKind::Dir, \"/home/u/gone\", Some(209_715_200), None),],\n    docker_compared: true, docker:\n    vec![change(ChangeKind::Volume, \"example_postgres_data\",\n    Some(23_163_179_008), Some(33_041_965_056)), image,\n    change(ChangeKind::BuildCache, \"build cache\", Some(500_000_000),\n    Some(0)),], findings: vec![finding], notes:\n    vec![\"findings not compared (detector ran on one side only): go-build\".into()],\n    snapshot:\n    Some(SavedSnapshot\n    {\n        id: \"20261116T060000Z-0123abcd\".into(), path:\n        \"/home/u/.local/state/diskwhy/snapshots/20261116T060000Z-0123abcd.json.gz\".into(),\n        pruned: 0,\n    }),\n}"
+---
+{
+  "schema": "diskwhy/v1",
+  "tool": {
+    "name": "diskwhy",
+    "version": "0.0.1"
+  },
+  "host": "pc-ubuntu",
+  "uid": 1000,
+  "generated_at": "2026-11-16T06:00:00Z",
+  "since": {
+    "id": "20261114T060000Z-0123abcd",
+    "path": "/home/u/.local/state/diskwhy/snapshots/20261114T060000Z-0123abcd.json.gz",
+    "created_at": "2026-11-14T06:00:00Z",
+    "roots": [
+      "/home/u"
+    ],
+    "one_filesystem": true,
+    "min_dir_bytes": 104857600
+  },
+  "roots": [
+    "/home/u"
+  ],
+  "one_filesystem": true,
+  "elapsed_secs": 172800,
+  "min_change": 10485760,
+  "fs": [
+    {
+      "kind": "fs",
+      "name": "/",
+      "id": null,
+      "detector": null,
+      "before": 350000000000,
+      "after": 360777252864,
+      "change": 10777252864,
+      "at_least": false,
+      "bytes_per_day": 5388626432
+    }
+  ],
+  "dirs": [
+    {
+      "kind": "dir",
+      "name": "/home/u/new",
+      "id": null,
+      "detector": null,
+      "before": null,
+      "after": 262144000,
+      "change": 157286400,
+      "at_least": true,
+      "bytes_per_day": 78643200
+    },
+    {
+      "kind": "dir",
+      "name": "/home/u/gone",
+      "id": null,
+      "detector": null,
+      "before": 209715200,
+      "after": null,
+      "change": -209715200,
+      "at_least": false,
+      "bytes_per_day": -104857600
+    }
+  ],
+  "docker_compared": true,
+  "docker": [
+    {
+      "kind": "volume",
+      "name": "example_postgres_data",
+      "id": null,
+      "detector": null,
+      "before": 23163179008,
+      "after": 33041965056,
+      "change": 9878786048,
+      "at_least": false,
+      "bytes_per_day": 4939393024
+    },
+    {
+      "kind": "image",
+      "name": "postgres:16-alpine",
+      "id": "sha256:6d03d5821c0d",
+      "detector": null,
+      "before": null,
+      "after": 440401920,
+      "change": 440401920,
+      "at_least": false,
+      "bytes_per_day": 220200960
+    },
+    {
+      "kind": "build-cache",
+      "name": "build cache",
+      "id": null,
+      "detector": null,
+      "before": 500000000,
+      "after": 0,
+      "change": -500000000,
+      "at_least": false,
+      "bytes_per_day": -250000000
+    }
+  ],
+  "findings": [
+    {
+      "kind": "finding",
+      "name": "docker://volume/example_postgres_data",
+      "id": "f_7c1e",
+      "detector": "docker-volume",
+      "before": 23163179008,
+      "after": 33041965056,
+      "change": 9878786048,
+      "at_least": false,
+      "bytes_per_day": 4939393024
+    }
+  ],
+  "notes": [
+    "findings not compared (detector ran on one side only): go-build"
+  ],
+  "snapshot": {
+    "id": "20261116T060000Z-0123abcd",
+    "path": "/home/u/.local/state/diskwhy/snapshots/20261116T060000Z-0123abcd.json.gz",
+    "pruned": 0
+  }
+}

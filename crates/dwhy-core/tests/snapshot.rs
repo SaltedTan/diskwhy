@@ -9,7 +9,8 @@ use dwhy_core::account::{self, ReportEnv};
 use dwhy_core::docker::{self, Info};
 use dwhy_core::mounts::{FsStats, MountTable};
 use dwhy_core::report::{
-    Action, ActionKind, Finding, Recovery, SCHEMA, ScanReport, Snapshot, Tier,
+    Action, ActionKind, Finding, Recovery, SCHEMA, ScanReport, SkipReason, SkippedMount, Snapshot,
+    Tier,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions, ScanResult};
 use dwhy_core::snapshot::{self, Entry, KEEP_DAILY_SECS};
@@ -116,6 +117,11 @@ fn build_records_large_dirs_fs_findings_and_docker() {
     let mut rep = report_of(&res, &mounts);
     let root = r.to_string_lossy().into_owned();
     rep.findings = vec![finding(&format!("{root}/big"), 3 << 20)];
+    rep.scan.skipped_mounts = vec![SkippedMount {
+        path: format!("{root}/mnt"),
+        fstype: Some("ext4".into()),
+        reason: SkipReason::OtherFilesystem,
+    }];
     let dock = docker_fixture();
     let s = snapshot::build(&rep, &res.tree, Some(&dock), 1 << 20);
 
@@ -126,6 +132,7 @@ fn build_records_large_dirs_fs_findings_and_docker() {
     assert!(s.scan.one_filesystem);
     assert_eq!(s.scan.min_dir_bytes, 1 << 20);
     assert_eq!(s.scan.totals, rep.scan.totals);
+    assert_eq!(s.scan.skipped_mounts, vec![format!("{root}/mnt")]);
 
     // The hardlinked blob counts once, under big/ (the smallest path), so
     // links/ stays below the threshold; small/ is below it too.
@@ -182,6 +189,7 @@ fn sample(created_at: &str, roots: &[&str]) -> Snapshot {
             min_dir_bytes: snapshot::MIN_DIR_BYTES,
             totals: Default::default(),
             detectors: vec!["cargo-target".into()],
+            skipped_mounts: Vec::new(),
         },
         dirs: Vec::new(),
         fs: Vec::new(),
@@ -250,6 +258,25 @@ fn load_rejects_what_is_not_a_snapshot() {
     let saved = snapshot::save(&dir, &snap, 0).unwrap().snapshot;
     let err = snapshot::load(Path::new(&saved.path)).unwrap_err();
     assert!(err.contains("unsupported schema"), "{err}");
+}
+
+#[test]
+fn a_snapshot_saved_before_skipped_mounts_loads_as_skipping_none() {
+    let snap = sample("2026-11-16T06:00:00Z", &["/home/u"]);
+    let mut json = serde_json::to_value(&snap).unwrap();
+    json["scan"]
+        .as_object_mut()
+        .unwrap()
+        .remove("skipped_mounts");
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("old.json.gz");
+    let mut gz = flate2::write::GzEncoder::new(
+        fs::File::create(&path).unwrap(),
+        flate2::Compression::default(),
+    );
+    std::io::Write::write_all(&mut gz, json.to_string().as_bytes()).unwrap();
+    gz.finish().unwrap();
+    assert_eq!(snapshot::load(&path).unwrap(), snap);
 }
 
 fn entry(created: i64, scope: &str) -> Entry {
@@ -372,4 +399,108 @@ fn a_pruning_failure_does_not_unsave_the_snapshot() {
         snapshot::load(Path::new(&saved.snapshot.path)).unwrap(),
         snap
     );
+}
+
+#[test]
+fn since_parses_last_ids_durations_times_and_files() {
+    use snapshot::{Since, parse_since};
+    assert_eq!(parse_since("last"), Ok(Since::Last));
+    assert_eq!(
+        parse_since("20261116T060000Z-0123abcd"),
+        Ok(Since::Id("20261116T060000Z-0123abcd".into()))
+    );
+    assert_eq!(parse_since("24h"), Ok(Since::Age(DAY)));
+    assert_eq!(parse_since("7d"), Ok(Since::Age(7 * DAY)));
+    assert_eq!(
+        parse_since("2026-11-16T06:00:00Z"),
+        snapshot::parse_time("2026-11-16T06:00:00Z")
+            .map(Since::At)
+            .ok_or(String::new())
+    );
+    assert_eq!(
+        parse_since("./old.json.gz"),
+        Ok(Since::File("./old.json.gz".into()))
+    );
+    assert_eq!(
+        parse_since("x.json.gz"),
+        Ok(Since::File("x.json.gz".into()))
+    );
+    for bad in ["yesterday", "3y", "", "2026-11-16"] {
+        assert!(parse_since(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn find_picks_the_newest_matching_snapshot() {
+    use snapshot::{Since, find};
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    let t0 = snapshot::parse_time("2026-11-16T00:00:00Z").unwrap();
+    let at = |secs: i64| {
+        time::OffsetDateTime::from_unix_timestamp(t0 + secs)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let now = t0 + 5 * 3600;
+    let save = |s: &Snapshot| snapshot::save(dir, s, now).unwrap().snapshot.id;
+    let h = sample(&at(0), &["/h"]);
+    let ids_h: Vec<String> = [0, 3600, 3 * 3600]
+        .iter()
+        .map(|&off| save(&sample(&at(off), &["/h"])))
+        .collect();
+    let id_srv = save(&sample(&at(4 * 3600), &["/srv"]));
+    let mut other = sample(&at(4 * 3600 + 60), &["/h"]);
+    other.host = "otherhost".into();
+    let id_other = save(&other);
+    // Newest of all, with a snapshot name but not a snapshot inside.
+    let scope_h = snapshot::scope("testhost", 1000, &["/h".to_string()], true);
+    fs::write(
+        dir.join(format!("20261116T043000Z-{scope_h}.json.gz")),
+        b"garbage",
+    )
+    .unwrap();
+
+    let roots = vec!["/h".to_string()];
+    let h_roots = Some((roots.as_slice(), true));
+    let pick = |since: &Since, roots: Option<(&[String], bool)>| {
+        find(dir, since, "testhost", 1000, roots, now).map(|f| f.id.unwrap())
+    };
+    // Unreadable and other-host snapshots are skipped.
+    assert_eq!(pick(&Since::Last, h_roots), Ok(ids_h[2].clone()));
+    // Without roots: the newest of this host and uid, whatever its roots.
+    assert_eq!(pick(&Since::Last, None), Ok(id_srv.clone()));
+    // At least 2h old: taken by 03:00.
+    assert_eq!(pick(&Since::Age(2 * 3600), h_roots), Ok(ids_h[2].clone()));
+    assert_eq!(pick(&Since::Age(3 * 3600), h_roots), Ok(ids_h[1].clone()));
+    assert_eq!(pick(&Since::At(t0 + 1800), h_roots), Ok(ids_h[0].clone()));
+    // -x matters, and so do the roots.
+    assert!(pick(&Since::Last, Some((roots.as_slice(), false))).is_err());
+    let err = pick(&Since::At(t0 - 1), h_roots).unwrap_err();
+    assert!(err.contains("no snapshot of /h"), "{err}");
+    // An id or a file is taken whatever its roots...
+    assert_eq!(
+        pick(&Since::Id(id_srv.clone()), h_roots),
+        Ok(id_srv.clone())
+    );
+    let f = find(
+        dir,
+        &Since::File(dir.join(format!("{}.json.gz", ids_h[0]))),
+        "testhost",
+        1000,
+        None,
+        now,
+    )
+    .unwrap();
+    assert_eq!(f.id.as_deref(), Some(ids_h[0].as_str()));
+    assert_eq!(f.snapshot, h);
+    // ...but not from another host or uid.
+    let err = pick(&Since::Id(id_other), None).unwrap_err();
+    assert!(err.contains("host \"otherhost\""), "{err}");
+    let err = find(dir, &Since::Id(ids_h[0].clone()), "testhost", 0, None, now).unwrap_err();
+    assert!(err.contains("uid 1000"), "{err}");
+
+    // Nothing in a missing directory.
+    let err = find(&dir.join("none"), &Since::Last, "testhost", 1000, None, now).unwrap_err();
+    assert!(err.contains("dwhy scan --snapshot"), "{err}");
 }

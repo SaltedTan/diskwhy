@@ -19,9 +19,10 @@ use dwhy_core::detect::{self, DetectContext};
 use dwhy_core::guard::Processes;
 use dwhy_core::mounts::{self, MountTable};
 use dwhy_core::plan::{self, Selection};
-use dwhy_core::report::{ActionKind, Plan, PlanScan, Tier};
+use dwhy_core::report::{ActionKind, Plan, PlanScan, SavedSnapshot, ScanReport, Tier};
 use dwhy_core::scan::{self, Progress, ScanOptions};
-use dwhy_core::{docker, doctor, snapshot, system, units};
+use dwhy_core::tree::ScanTree;
+use dwhy_core::{docker, doctor, growth, snapshot, system, units};
 
 pub const EXIT_OK: u8 = 0;
 pub const EXIT_ERROR: u8 = 1;
@@ -49,6 +50,8 @@ enum Command {
     Plan(PlanArgs),
     /// Carry out a plan: re-detect, re-run the guards, and remove what the tier policy allows.
     Apply(ApplyArgs),
+    /// Show what grew since a snapshot (`scan --snapshot`): rescans now and compares.
+    Diff(DiffArgs),
     /// Show permissions, optional tools on PATH, and which detectors they enable.
     Doctor {
         /// Print diskwhy/v1 JSON instead of text.
@@ -97,6 +100,43 @@ struct ScanArgs {
     /// Save a snapshot for `dwhy diff` under ~/.local/state/diskwhy/snapshots (old ones are pruned).
     #[arg(long)]
     snapshot: bool,
+}
+
+#[derive(Args, Debug)]
+struct DiffArgs {
+    /// Directories to rescan [default: the roots of the snapshot compared with].
+    paths: Vec<PathBuf>,
+    /// Snapshot to compare with: last, an id, a file, a duration (24h, 7d: the newest at
+    /// least that old) or an RFC 3339 time (the newest taken by then).
+    #[arg(long, default_value = "last", value_name = "WHEN")]
+    since: String,
+    /// Also save the fresh scan as a snapshot.
+    #[arg(long)]
+    snapshot: bool,
+    /// Print diskwhy/v1 JSON instead of text.
+    #[arg(long)]
+    json: bool,
+    /// Leave out directories, Docker objects and findings that changed by less than this.
+    #[arg(long, value_name = "SIZE", value_parser = units::parse_size, default_value = "10M")]
+    min_change: u64,
+    /// Descend into other filesystems mounted below the roots [without PATH: the snapshot's setting].
+    #[arg(long, requires = "paths")]
+    cross_filesystems: bool,
+    /// Only measure; do not run detectors (findings are not compared).
+    #[arg(long, conflicts_with = "detectors")]
+    no_detectors: bool,
+    /// Run only these detectors (comma-separated names, see `dwhy doctor`).
+    #[arg(long, value_delimiter = ',', value_name = "NAME,…")]
+    detectors: Option<Vec<String>>,
+    /// Text output: entries listed per section.
+    #[arg(long, default_value_t = 15)]
+    top: usize,
+    /// Worker threads [default: one per CPU].
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+    /// No progress line on stderr.
+    #[arg(short, long)]
+    quiet: bool,
 }
 
 /// Tiers `--tier` accepts (`blocked` is never selected).
@@ -191,6 +231,7 @@ fn main() -> ExitCode {
         Some(Command::Scan(args)) => run_scan(args),
         Some(Command::Plan(args)) => run_plan(args),
         Some(Command::Apply(args)) => run_apply(args),
+        Some(Command::Diff(args)) => run_diff(args),
         Some(Command::Doctor { json }) => run_doctor(json),
         None => {
             Err("the TUI is not built yet (milestone M4); try `dwhy scan` or `dwhy --help`".into())
@@ -229,6 +270,62 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
     result.dirs.retain(|d| d.totals.allocated >= threshold);
     result.min_dir_bytes = threshold;
 
+    let mut report = scan_report(&result, &mounts);
+    let docker_snap = if args.no_detectors {
+        None
+    } else {
+        detect_into(&mut report, &result.tree, args.detectors.as_deref())
+    };
+
+    // Growth on findings, from a snapshot of the same roots old enough for
+    // a meaningful rate. Best effort: without one, findings have no growth.
+    if !report.findings.is_empty()
+        && let Some(dir) = snapshot::default_dir()
+    {
+        let roots: Vec<String> = report.scan.roots.iter().map(|r| r.path.clone()).collect();
+        if let Ok(found) = snapshot::find(
+            &dir,
+            &snapshot::Since::Age(growth::MIN_AGE_SECS),
+            &report.host,
+            report.uid,
+            Some((&roots, report.scan.one_filesystem)),
+            now_secs(),
+        ) {
+            growth::fill_growth(&mut report.findings, &found.snapshot, &report.generated_at);
+        }
+    }
+
+    // The report is still printed when the snapshot cannot be saved.
+    let mut save_error = None;
+    if args.snapshot {
+        let snap = snapshot::build(
+            &report,
+            &result.tree,
+            docker_snap.as_deref(),
+            snapshot::MIN_DIR_BYTES,
+        );
+        match save_snapshot(&snap) {
+            Ok(saved) => report.snapshot = Some(saved),
+            Err(e) => save_error = Some(e),
+        }
+    }
+
+    let mut out = std::io::stdout().lock();
+    if args.json {
+        serde_json::to_writer_pretty(&mut out, &report)?;
+        writeln!(out)?;
+    } else {
+        human::render_scan(&mut out, &report, args.depth, args.top, args.max_findings)?;
+    }
+    if let Some(e) = save_error {
+        eprintln!("dwhy: error: snapshot not saved: {e}");
+        return Ok(EXIT_ERROR);
+    }
+    Ok(EXIT_OK)
+}
+
+/// The scan report for a finished walk, before detectors run.
+fn scan_report(result: &scan::ScanResult, mounts: &MountTable) -> ScanReport {
     let euid = system::euid();
     let env = ReportEnv {
         host: system::hostname(),
@@ -242,57 +339,123 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
             .unwrap_or_else(|_| "dwhy".into()),
         docker_access: doctor::docker_access(),
     };
-    let mut report =
-        account::build_scan_report(&result, &mounts, &env, &|p| mounts::statvfs(p).ok());
-    let mut docker_snap = None;
-    if !args.no_detectors {
-        let ctx = DetectContext::from_system();
-        let (findings, runs) = detect::run_with(
-            &result.tree,
-            &ctx,
-            &dwhy_core::detectors::registry(),
-            args.detectors.as_deref(),
-        );
-        report.findings = findings;
-        report.detectors = runs;
-        if let Some(snap) = ctx.docker.fetched() {
-            account::attach_docker(&mut report, &docker::usage(&snap));
-            docker_snap = Some(snap);
-        }
-    }
+    account::build_scan_report(result, mounts, &env, &|p| mounts::statvfs(p).ok())
+}
 
-    // The report is still printed when the snapshot cannot be saved.
+/// Runs the detectors (all, or `only`) and puts their findings and Docker's
+/// totals in `report`. Returns the Docker state when it was fetched.
+fn detect_into(
+    report: &mut ScanReport,
+    tree: &ScanTree,
+    only: Option<&[String]>,
+) -> Option<Arc<docker::Snapshot>> {
+    let ctx = DetectContext::from_system();
+    let (findings, runs) = detect::run_with(tree, &ctx, &dwhy_core::detectors::registry(), only);
+    report.findings = findings;
+    report.detectors = runs;
+    let snap = ctx.docker.fetched()?;
+    account::attach_docker(report, &docker::usage(&snap));
+    Some(snap)
+}
+
+/// Saves `snap` in the snapshot directory, warning when pruning failed.
+fn save_snapshot(snap: &dwhy_core::report::Snapshot) -> std::result::Result<SavedSnapshot, String> {
+    let dir = snapshot::default_dir().ok_or_else(|| {
+        "cannot place snapshots: neither XDG_STATE_HOME nor HOME is an absolute path".to_string()
+    })?;
+    let saved = snapshot::save(&dir, snap, now_secs())?;
+    if let Some(e) = saved.prune_error {
+        eprintln!("dwhy: warning: old snapshots not pruned: {e}");
+    }
+    Ok(saved.snapshot)
+}
+
+fn run_diff(args: DiffArgs) -> Result<u8> {
+    if let Some(names) = &args.detectors {
+        detect::validate_selection(names)?;
+    }
+    let since = snapshot::parse_since(&args.since)?;
+    let dir = match (snapshot::default_dir(), &since) {
+        (Some(d), _) => d,
+        (None, snapshot::Since::File(_)) => PathBuf::new(),
+        (None, _) => {
+            return Err(
+                "cannot find snapshots: neither XDG_STATE_HOME nor HOME is an absolute path".into(),
+            );
+        }
+    };
+    let host = system::hostname();
+    let uid = system::euid();
+    // With PATH, compare with a snapshot of those roots; without, with the
+    // newest of any roots, and rescan its roots.
+    let given = if args.paths.is_empty() {
+        None
+    } else {
+        let one_fs = !args.cross_filesystems;
+        let roots: Vec<String> = scan::prepare_roots(&args.paths, one_fs)?
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        Some((roots, one_fs))
+    };
+    let found = snapshot::find(
+        &dir,
+        &since,
+        &host,
+        uid,
+        given.as_ref().map(|(r, x)| (r.as_slice(), *x)),
+        now_secs(),
+    )?;
+    let (roots, one_fs) = given.unwrap_or_else(|| {
+        (
+            found.snapshot.scan.roots.clone(),
+            found.snapshot.scan.one_filesystem,
+        )
+    });
+    let roots: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
+
+    let mounts = MountTable::read().unwrap_or_default();
+    // The snapshot records directories from the tree; no list is needed.
+    let result = measure(&roots, one_fs, u64::MAX, args.threads, args.quiet, &mounts)?;
+    let mut report = scan_report(&result, &mounts);
+    let docker_snap = if args.no_detectors {
+        None
+    } else {
+        detect_into(&mut report, &result.tree, args.detectors.as_deref())
+    };
+    let fresh = snapshot::build(
+        &report,
+        &result.tree,
+        docker_snap.as_deref(),
+        snapshot::MIN_DIR_BYTES,
+    );
+    let tree = &result.tree;
+    let size_now = |p: &str| {
+        tree.find(std::path::Path::new(p))
+            .filter(|&id| tree.node(id).is_dir)
+            .map(|id| tree.node(id).total.allocated)
+    };
+    let mut d = growth::diff(
+        &found.snapshot,
+        found.id,
+        found.path.to_string_lossy().into_owned(),
+        &fresh,
+        &size_now,
+        args.min_change,
+    );
     let mut save_error = None;
     if args.snapshot {
-        let snap = snapshot::build(
-            &report,
-            &result.tree,
-            docker_snap.as_deref(),
-            snapshot::MIN_DIR_BYTES,
-        );
-        match snapshot::default_dir()
-            .ok_or_else(|| {
-                "cannot place snapshots: neither XDG_STATE_HOME nor HOME is an absolute path"
-                    .to_string()
-            })
-            .and_then(|dir| snapshot::save(&dir, &snap, now_secs()))
-        {
-            Ok(saved) => {
-                if let Some(e) = saved.prune_error {
-                    eprintln!("dwhy: warning: old snapshots not pruned: {e}");
-                }
-                report.snapshot = Some(saved.snapshot);
-            }
+        match save_snapshot(&fresh) {
+            Ok(saved) => d.snapshot = Some(saved),
             Err(e) => save_error = Some(e),
         }
     }
-
     let mut out = std::io::stdout().lock();
     if args.json {
-        serde_json::to_writer_pretty(&mut out, &report)?;
+        serde_json::to_writer_pretty(&mut out, &d)?;
         writeln!(out)?;
     } else {
-        human::render_scan(&mut out, &report, args.depth, args.top, args.max_findings)?;
+        human::render_diff(&mut out, &d, args.top)?;
     }
     if let Some(e) = save_error {
         eprintln!("dwhy: error: snapshot not saved: {e}");

@@ -81,6 +81,12 @@ pub fn build(
                 .filter(|d| d.ran && d.error.is_none())
                 .map(|d| d.name.clone())
                 .collect(),
+            skipped_mounts: report
+                .scan
+                .skipped_mounts
+                .iter()
+                .map(|m| m.path.clone())
+                .collect(),
         },
         dirs,
         fs: report
@@ -441,6 +447,172 @@ pub fn load(path: &Path) -> Result<Snapshot, String> {
         .map_err(|e| format!("{}: not a diskwhy snapshot: {e}", path.display()))?;
     check_schema(&snap.schema).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(snap)
+}
+
+/// Which snapshot to compare with (`diff --since`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Since {
+    /// The newest.
+    Last,
+    /// The newest at least this many seconds old.
+    Age(i64),
+    /// The newest taken at or before this time (seconds since the epoch).
+    At(i64),
+    /// A snapshot in the snapshot directory, by id.
+    Id(String),
+    /// A snapshot file anywhere.
+    File(PathBuf),
+}
+
+/// Parses `last`, a snapshot id, a duration (`24h`, `7d`), an RFC 3339
+/// time, or a path to a snapshot file (one containing `/` or ending in
+/// `.json.gz`).
+pub fn parse_since(s: &str) -> Result<Since, String> {
+    if s == "last" {
+        return Ok(Since::Last);
+    }
+    if parse_id(s).is_some() {
+        return Ok(Since::Id(s.to_string()));
+    }
+    if s.starts_with(|c: char| c.is_ascii_digit())
+        && let Ok(secs) = crate::units::parse_duration(s)
+    {
+        return Ok(Since::Age(secs));
+    }
+    if let Some(t) = parse_time(s) {
+        return Ok(Since::At(t));
+    }
+    if s.contains('/') || s.ends_with(SUFFIX) {
+        return Ok(Since::File(PathBuf::from(s)));
+    }
+    Err(format!(
+        "--since {s:?}: expected last, a snapshot id or file, a duration such as 24h or 7d, \
+         or an RFC 3339 time"
+    ))
+}
+
+/// A snapshot picked to compare with.
+#[derive(Debug, Clone)]
+pub struct Found {
+    /// Its id, when its file has a snapshot name.
+    pub id: Option<String>,
+    pub path: PathBuf,
+    pub snapshot: Snapshot,
+}
+
+/// Roots in any order, duplicates ignored.
+pub fn same_roots(a: &[String], b: &[String]) -> bool {
+    fn norm(v: &[String]) -> Vec<&str> {
+        let mut v: Vec<&str> = v.iter().map(String::as_str).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+    norm(a) == norm(b)
+}
+
+/// Finds the snapshot `since` names in `dir`. It must be of `host` and
+/// `uid`. With `roots` (and `one_filesystem`), `last`, a duration or a time
+/// pick only snapshots of exactly those roots; without, any. An id or file
+/// is taken whatever its roots. Snapshots that cannot be read are skipped
+/// when picking the newest.
+pub fn find(
+    dir: &Path,
+    since: &Since,
+    host: &str,
+    uid: u32,
+    roots: Option<(&[String], bool)>,
+    now: i64,
+) -> Result<Found, String> {
+    let check = |s: &Snapshot, path: &Path| {
+        if s.host != host {
+            Err(format!(
+                "{} is a snapshot of host {:?}, not {host:?}",
+                path.display(),
+                s.host
+            ))
+        } else if s.uid != uid {
+            Err(format!(
+                "{} is a snapshot taken as uid {}, not {uid}",
+                path.display(),
+                s.uid
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    let cutoff = match since {
+        Since::Id(id) => {
+            let path = dir.join(format!("{id}{SUFFIX}"));
+            let snapshot = load(&path)?;
+            check(&snapshot, &path)?;
+            return Ok(Found {
+                id: Some(id.clone()),
+                path,
+                snapshot,
+            });
+        }
+        Since::File(path) => {
+            let snapshot = load(path)?;
+            check(&snapshot, path)?;
+            let id = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(SUFFIX))
+                .filter(|n| parse_id(n).is_some())
+                .map(str::to_string);
+            return Ok(Found {
+                id,
+                path: path.clone(),
+                snapshot,
+            });
+        }
+        Since::Last => i64::MAX,
+        Since::Age(secs) => now.saturating_sub(*secs),
+        Since::At(t) => *t,
+    };
+    let want = roots.map(|(r, x)| scope(host, uid, r, x));
+    let mut first_err = None;
+    for e in list(dir)?.iter().rev() {
+        if e.created > cutoff || want.as_ref().is_some_and(|w| *w != e.scope) {
+            continue;
+        }
+        let s = match load(&e.path) {
+            Ok(s) => s,
+            Err(err) => {
+                first_err.get_or_insert(err);
+                continue;
+            }
+        };
+        let fits = s.host == host
+            && s.uid == uid
+            && roots
+                .is_none_or(|(r, x)| same_roots(r, &s.scan.roots) && s.scan.one_filesystem == x);
+        if fits {
+            return Ok(Found {
+                id: Some(e.id.clone()),
+                path: e.path.clone(),
+                snapshot: s,
+            });
+        }
+    }
+    let which = match since {
+        Since::Age(secs) => format!(" at least {} old", crate::units::age(*secs)),
+        Since::At(_) => " that old".to_string(),
+        _ => String::new(),
+    };
+    let of = match roots {
+        Some((r, _)) => format!(" of {}", r.join(" ")),
+        None => String::new(),
+    };
+    let mut msg = format!(
+        "no snapshot{of}{which} in {}; save one with `dwhy scan --snapshot`",
+        dir.display()
+    );
+    if let Some(e) = first_err {
+        msg.push_str(&format!(" (some could not be read: {e})"));
+    }
+    Err(msg)
 }
 
 #[cfg(test)]
