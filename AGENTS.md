@@ -18,8 +18,10 @@ crates/dwhy-core   engine: scan (walker), tree (the ScanTree detectors read: per
                    detectors/ (one file per detector), docker (read-only Engine API client:
                    GET /system/df and /info over the unix socket), guard (pre-removal checks:
                    processes, git, container mounts; run at plan and apply, never in scan),
-                   plan (selection, fingerprints, expiry), gitcmd (how diskwhy runs git),
-                   doctor, system, units, report (diskwhy/v1 serde types, plan included)
+                   plan (selection, fingerprints, expiry), apply (re-detect, tier policy, run
+                   ready items, audit log), remove (path removal: no symlinks, one filesystem),
+                   gitcmd (how diskwhy runs git), doctor, system, units,
+                   report (diskwhy/v1 serde types: scan, plan, apply report, audit record)
 crates/dwhy-cli    clap front end, text rendering (human.rs), exit codes; binary `dwhy`
 ```
 

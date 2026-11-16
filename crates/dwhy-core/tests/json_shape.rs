@@ -378,3 +378,98 @@ fn plan_round_trips() {
     let back: Plan = serde_json::from_str(&s).unwrap();
     assert_eq!(back, p);
 }
+
+fn apply_item(outcome: ApplyOutcome, detail: &str) -> ApplyItem {
+    ApplyItem {
+        id: "f_c2b7afdaa165".into(),
+        detector: "cargo-target".into(),
+        path: "/home/me/x/target".into(),
+        tier: Tier::Rebuildable,
+        bytes: 9_663_676_416,
+        action: Action {
+            kind: ActionKind::RemovePath,
+            text: "remove /home/me/x/target (cargo not found)".into(),
+            argv: None,
+        },
+        outcome,
+        detail: detail.into(),
+        guards: vec![GuardResult {
+            name: "in-use-cwd".into(),
+            status: GuardStatus::Pass,
+            detail: "no process has its working directory in it".into(),
+        }],
+    }
+}
+
+#[test]
+fn apply_report_shape() {
+    let r = ApplyReport {
+        schema: SCHEMA.into(),
+        tool: Tool {
+            name: "diskwhy".into(),
+            version: "0.0.1".into(),
+        },
+        host: "pc-ubuntu".into(),
+        uid: 1000,
+        generated_at: "2026-11-16T04:10:00Z".into(),
+        plan_created_at: "2026-11-16T04:00:00Z".into(),
+        dry_run: false,
+        max_tier: Tier::Rebuildable,
+        confirm: vec!["f_1122334455aa".into()],
+        items: vec![
+            apply_item(
+                ApplyOutcome::Removed,
+                "removed 3 files and 2 directories, 9.0G",
+            ),
+            apply_item(
+                ApplyOutcome::Failed,
+                "cannot remove /home/me/x/target/f: Permission denied (os error 13)",
+            ),
+            apply_item(
+                ApplyOutcome::Skipped,
+                "changed since the plan: newest mtime",
+            ),
+            apply_item(
+                ApplyOutcome::Refused,
+                "review items need a person's --confirm f_c2b7afdaa165",
+            ),
+            apply_item(ApplyOutcome::WouldRemove, "ready"),
+        ],
+        freed: 9_663_676_416,
+    };
+    insta::assert_json_snapshot!(r);
+    let back: ApplyReport = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+    assert_eq!(back, r);
+}
+
+#[test]
+fn audit_record_shape() {
+    let start = AuditRecord {
+        schema: SCHEMA.into(),
+        time: "2026-11-16T04:10:00.123456789Z".into(),
+        host: "pc-ubuntu".into(),
+        uid: 1000,
+        pid: 4242,
+        event: AuditEvent::Start,
+        plan_created_at: "2026-11-16T04:00:00Z".into(),
+        id: "f_c2b7afdaa165".into(),
+        detector: "cargo-target".into(),
+        path: "/home/me/x/target".into(),
+        tier: Tier::Rebuildable,
+        bytes: 9_663_676_416,
+        action: Action {
+            kind: ActionKind::Command,
+            text: "cargo clean".into(),
+            argv: Some(vec!["cargo".into(), "clean".into()]),
+        },
+        outcome: None,
+        detail: None,
+    };
+    let end = AuditRecord {
+        event: AuditEvent::End,
+        outcome: Some(ApplyOutcome::Removed),
+        detail: Some("ran cargo clean".into()),
+        ..start.clone()
+    };
+    insta::assert_json_snapshot!(vec![start, end]);
+}

@@ -480,6 +480,99 @@ pub struct GitFingerprint {
     pub status_hash: String,
 }
 
+// ---------------------------------------------------------------------------
+// Apply (M2): `dwhy apply --json` and the audit log
+// ---------------------------------------------------------------------------
+
+/// Output of `dwhy apply --json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApplyReport {
+    pub schema: String,
+    pub tool: Tool,
+    pub host: String,
+    pub uid: u32,
+    /// RFC 3339, UTC.
+    pub generated_at: String,
+    /// `created_at` of the plan applied.
+    pub plan_created_at: String,
+    /// `--dry-run`: nothing was removed; ready items are `would_remove`.
+    pub dry_run: bool,
+    /// `--max-tier`.
+    pub max_tier: Tier,
+    /// `--confirm`: review items a person confirmed.
+    pub confirm: Vec<String>,
+    /// One per plan item, in plan order.
+    pub items: Vec<ApplyItem>,
+    /// What the removed items were expected to free (their `bytes`, an item
+    /// inside another removed item counted once).
+    pub freed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApplyItem {
+    pub id: String,
+    pub detector: String,
+    pub path: String,
+    /// The tier detected at apply time (the plan's when the finding is gone).
+    pub tier: Tier,
+    pub bytes: u64,
+    /// The action run or that would run: the one detected at apply time,
+    /// never taken from the plan file.
+    pub action: Action,
+    pub outcome: ApplyOutcome,
+    /// Why it was skipped or refused, what failed, or what was removed.
+    pub detail: String,
+    /// Guard results at apply time (empty when the guards did not run).
+    pub guards: Vec<GuardResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyOutcome {
+    Removed,
+    /// The action ran and failed (exit 1).
+    Failed,
+    /// A guard blocked it, its fingerprint, tier or action changed, or it is
+    /// gone (exit 2).
+    Skipped,
+    /// Above `--max-tier`, or a `review` item without `--confirm` (exit 3).
+    Refused,
+    /// `--dry-run`: it would have been removed.
+    WouldRemove,
+}
+
+/// One line of `~/.local/state/diskwhy/audit.jsonl`. A removal writes a
+/// `start` line before it runs and an `end` line with its outcome after; a
+/// skipped or refused item gets one `end` line. Dry runs write nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditRecord {
+    pub schema: String,
+    /// RFC 3339, UTC.
+    pub time: String,
+    pub host: String,
+    pub uid: u32,
+    /// Process id of the `dwhy apply` that wrote it.
+    pub pid: u32,
+    pub event: AuditEvent,
+    pub plan_created_at: String,
+    pub id: String,
+    pub detector: String,
+    pub path: String,
+    pub tier: Tier,
+    pub bytes: u64,
+    pub action: Action,
+    /// Set on `end`.
+    pub outcome: Option<ApplyOutcome>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEvent {
+    Start,
+    End,
+}
+
 /// Output of `dwhy doctor --json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DoctorReport {

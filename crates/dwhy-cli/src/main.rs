@@ -14,17 +14,19 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use dwhy_core::account::{self, ReportEnv};
+use dwhy_core::apply::{self, Audit, Check, Policy};
 use dwhy_core::detect::{self, DetectContext};
 use dwhy_core::guard::Processes;
 use dwhy_core::mounts::{self, MountTable};
 use dwhy_core::plan::{self, Selection};
-use dwhy_core::report::{ActionKind, PlanScan, Tier};
+use dwhy_core::report::{ActionKind, Plan, PlanScan, Tier};
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::{docker, doctor, system, units};
 
 pub const EXIT_OK: u8 = 0;
 pub const EXIT_ERROR: u8 = 1;
 pub const EXIT_SKIPPED: u8 = 2;
+pub const EXIT_REFUSED: u8 = 3;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -45,6 +47,8 @@ enum Command {
     Scan(ScanArgs),
     /// Select findings for removal and write a plan for `dwhy apply` (guards run, nothing is removed).
     Plan(PlanArgs),
+    /// Carry out a plan: re-detect, re-run the guards, and remove what the tier policy allows.
+    Apply(ApplyArgs),
     /// Show permissions, optional tools on PATH, and which detectors they enable.
     Doctor {
         /// Print diskwhy/v1 JSON instead of text.
@@ -143,6 +147,33 @@ struct PlanArgs {
     quiet: bool,
 }
 
+#[derive(Args, Debug)]
+struct ApplyArgs {
+    /// Plan file written by `dwhy plan -o`.
+    plan: PathBuf,
+    /// Highest tier to remove (review items need --confirm instead).
+    #[arg(long, value_enum, default_value = "regenerable")]
+    max_tier: TierArg,
+    /// Review items a person confirmed, by id (comma-separated or repeated).
+    #[arg(long, value_delimiter = ',', value_name = "ID,…")]
+    confirm: Vec<String>,
+    /// Remove without asking (required when there is no terminal).
+    #[arg(short, long)]
+    yes: bool,
+    /// Show what would be removed; remove nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Print diskwhy/v1 JSON instead of text.
+    #[arg(long)]
+    json: bool,
+    /// Worker threads for the rescan [default: one per CPU].
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+    /// No progress line on stderr.
+    #[arg(short, long)]
+    quiet: bool,
+}
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(c) => c,
@@ -156,6 +187,7 @@ fn main() -> ExitCode {
     let res = match cli.command {
         Some(Command::Scan(args)) => run_scan(args),
         Some(Command::Plan(args)) => run_plan(args),
+        Some(Command::Apply(args)) => run_apply(args),
         Some(Command::Doctor { json }) => run_doctor(json),
         None => {
             Err("the TUI is not built yet (milestone M4); try `dwhy scan` or `dwhy --help`".into())
@@ -305,6 +337,144 @@ fn run_plan(args: PlanArgs) -> Result<u8> {
     } else {
         EXIT_OK
     })
+}
+
+fn run_apply(args: ApplyArgs) -> Result<u8> {
+    let text = std::fs::read_to_string(&args.plan)
+        .map_err(|e| format!("cannot read {}: {e}", args.plan.display()))?;
+    let plan = plan::parse(&text)?;
+    if let Some(names) = &plan.scan.detectors {
+        detect::validate_selection(names)?;
+    }
+    if let Some(bad) = args
+        .confirm
+        .iter()
+        .find(|c| !plan.items.iter().any(|i| i.finding.id == **c))
+    {
+        return Err(format!("--confirm {bad}: not an item of this plan").into());
+    }
+    let env = apply::Env::from_system();
+    if let Err(e) = plan::usable(&plan, &env.host, env.uid, now_secs()) {
+        eprintln!("dwhy: refused: {e}");
+        return Ok(EXIT_REFUSED);
+    }
+    let ask = !args.yes && !args.dry_run;
+    if ask && !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        eprintln!(
+            "dwhy: refused: no terminal to confirm on; pass --yes to remove without asking, or --dry-run to preview"
+        );
+        return Ok(EXIT_REFUSED);
+    }
+    let policy = Policy {
+        max_tier: args.max_tier.into(),
+        confirm: args.confirm.clone(),
+    };
+    let mut checks = survey(&plan, &policy, args.threads, args.quiet)?;
+    if args.dry_run {
+        let r = apply::report(&plan, &checks, &policy, true, &env);
+        print_apply(&r, args.json, None)?;
+        return Ok(apply::exit_code(&r));
+    }
+    let ready: Vec<&Check> = checks.iter().filter(|c| c.ready()).collect();
+    if ask && !ready.is_empty() {
+        let preview = apply::report(&plan, &checks, &policy, true, &env);
+        let mut err = std::io::stderr().lock();
+        human::render_apply(&mut err, &preview, None, true)?;
+        let bytes = apply::total_bytes(ready.iter().map(|c| &c.item));
+        write!(
+            err,
+            "remove {} item{} ({})? [y/N] ",
+            ready.len(),
+            if ready.len() == 1 { "" } else { "s" },
+            units::human(bytes)
+        )?;
+        err.flush()?;
+        drop(err);
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
+            eprintln!("nothing removed");
+            return Ok(EXIT_OK);
+        }
+        // Check again right before removing: time has passed at the prompt.
+        if let Err(e) = plan::usable(&plan, &env.host, env.uid, now_secs()) {
+            eprintln!("dwhy: refused: {e}");
+            return Ok(EXIT_REFUSED);
+        }
+        let again = survey(&plan, &policy, args.threads, args.quiet)?;
+        for (c, a) in checks.iter_mut().zip(again) {
+            // Only what was shown may run; it must still be ready.
+            if c.ready() {
+                *c = a;
+            }
+        }
+    }
+    let path = Audit::default_path()
+        .ok_or("cannot place the audit log: neither XDG_STATE_HOME nor HOME is set")?;
+    let mut audit = Audit::open(&path)?;
+    let mounts = MountTable::read().map_err(|e| format!("cannot read the mount table: {e}"))?;
+    let quiet = args.quiet;
+    let mut status: Option<StatusLine> = None;
+    apply::execute(&plan, &mut checks, &mut audit, &mounts, &env, &mut |item| {
+        drop(status.take());
+        status = status_line(quiet, &format!("removing {}…", item.path));
+    });
+    drop(status);
+    let r = apply::report(&plan, &checks, &policy, false, &env);
+    print_apply(&r, args.json, Some(audit.path()))?;
+    Ok(apply::exit_code(&r))
+}
+
+/// Rescans the plan's roots, re-runs its detectors, and decides each item.
+fn survey(plan: &Plan, policy: &Policy, threads: usize, quiet: bool) -> Result<Vec<Check>> {
+    let mounts = MountTable::read().unwrap_or_default();
+    let roots: Vec<PathBuf> = plan.scan.roots.iter().map(PathBuf::from).collect();
+    let result = measure(
+        &roots,
+        plan.scan.one_filesystem,
+        u64::MAX,
+        threads,
+        quiet,
+        &mounts,
+    )?;
+    let ctx = DetectContext::from_system();
+    let (findings, _) = detect::run_with(
+        &result.tree,
+        &ctx,
+        &dwhy_core::detectors::registry(),
+        plan.scan.detectors.as_deref(),
+    );
+    let _status = status_line(quiet, "checking guards…");
+    Ok(apply::evaluate(
+        plan,
+        findings,
+        &result.tree,
+        &ctx,
+        &Processes::read(),
+        policy,
+    ))
+}
+
+fn print_apply(
+    r: &dwhy_core::report::ApplyReport,
+    json: bool,
+    audit: Option<&std::path::Path>,
+) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    if json {
+        serde_json::to_writer_pretty(&mut out, r)?;
+        writeln!(out)?;
+    } else {
+        human::render_apply(&mut out, r, audit, false)?;
+    }
+    Ok(())
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Shows `msg` on a terminal stderr until dropped.

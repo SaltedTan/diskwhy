@@ -1,0 +1,709 @@
+//! Apply: safe path removal, the tier policy, re-checks against the plan,
+//! and the audit log. Everything removed lives in a temp dir.
+
+use std::fs;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use dwhy_core::apply::{self, Audit, Check, Env, Policy};
+use dwhy_core::detect::{DetectContext, finding_id};
+use dwhy_core::docker::Source;
+use dwhy_core::guard::{Proc, Processes};
+use dwhy_core::mounts::MountTable;
+use dwhy_core::plan::{self, Selection};
+use dwhy_core::remove::remove_tree;
+use dwhy_core::report::{
+    Action, ActionKind, ApplyOutcome, AuditEvent, AuditRecord, DockerSocket, Finding, Plan,
+    PlanScan, Recovery, Tier, ToolStatus,
+};
+use dwhy_core::scan::{self, Progress, ScanOptions};
+use dwhy_core::tree::ScanTree;
+
+fn base() -> (tempfile::TempDir, PathBuf) {
+    let t = tempfile::tempdir().unwrap();
+    let p = fs::canonicalize(t.path()).unwrap();
+    (t, p)
+}
+
+fn no_mounts() -> MountTable {
+    MountTable::default()
+}
+
+fn write(p: &Path, body: &str) {
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    fs::write(p, body).unwrap();
+}
+
+/// Restores write permission so a test failure leaves a removable temp dir.
+struct Writable(PathBuf);
+
+impl Drop for Writable {
+    fn drop(&mut self) {
+        let mut stack = vec![self.0.clone()];
+        while let Some(d) = stack.pop() {
+            let _ = fs::set_permissions(&d, fs::Permissions::from_mode(0o755));
+            if let Ok(rd) = fs::read_dir(&d) {
+                for e in rd.flatten() {
+                    if e.file_type().is_ok_and(|t| t.is_dir()) {
+                        stack.push(e.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_root() -> bool {
+    rustix_euid() == 0
+}
+
+fn rustix_euid() -> u32 {
+    // The test binary's uid, read from /proc to avoid another dependency.
+    let s = fs::read_to_string("/proc/self/status").unwrap();
+    s.lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|u| u.parse().ok())
+        .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// remove_tree
+// ---------------------------------------------------------------------------
+
+#[test]
+fn removes_a_tree_and_only_that_tree() {
+    let (_t, b) = base();
+    let root = b.join("target");
+    write(&root.join("debug/deep/a"), "aaaa");
+    write(&root.join("b"), "b");
+    write(&b.join("outside/keep"), "keep");
+    write(&b.join("sibling-target/x"), "x");
+    // Symlinks inside, to a file and a directory outside: unlinked, not followed.
+    symlink(b.join("outside/keep"), root.join("link-to-file")).unwrap();
+    symlink(b.join("outside"), root.join("debug/link-to-dir")).unwrap();
+    // A hardlink to a file outside: the outside name keeps the data.
+    fs::hard_link(b.join("outside/keep"), root.join("hard")).unwrap();
+
+    let r = remove_tree(&root, None, &no_mounts()).unwrap();
+    assert!(!root.exists());
+    assert_eq!(fs::read_to_string(b.join("outside/keep")).unwrap(), "keep");
+    assert!(b.join("sibling-target/x").exists());
+    assert_eq!((r.files, r.dirs), (5, 3), "{r:?}");
+}
+
+#[test]
+fn a_symlink_root_is_refused() {
+    let (_t, b) = base();
+    write(&b.join("real/data"), "d");
+    symlink(b.join("real"), b.join("target")).unwrap();
+    let err = remove_tree(&b.join("target"), None, &no_mounts()).unwrap_err();
+    assert!(err.contains("is a symlink"), "{err}");
+    assert!(b.join("real/data").exists());
+    assert!(fs::symlink_metadata(b.join("target")).is_ok());
+}
+
+#[test]
+fn a_symlink_in_the_path_is_refused() {
+    let (_t, b) = base();
+    write(&b.join("real/target/data"), "d");
+    symlink(b.join("real"), b.join("via")).unwrap();
+    let err = remove_tree(&b.join("via/target"), None, &no_mounts()).unwrap_err();
+    assert!(err.contains("symlinks are never followed"), "{err}");
+    assert!(b.join("real/target/data").exists());
+}
+
+#[test]
+fn another_inode_than_the_plans_is_refused() {
+    let (_t, b) = base();
+    let root = b.join("cache");
+    write(&root.join("f"), "f");
+    let err = remove_tree(&root, Some((1, 2)), &no_mounts()).unwrap_err();
+    assert!(err.contains("not the inode the plan recorded"), "{err}");
+    assert!(root.join("f").exists());
+}
+
+#[test]
+fn a_mount_point_inside_is_refused_before_anything_is_removed() {
+    let (_t, b) = base();
+    let root = b.join("scratch");
+    write(&root.join("a/file"), "x");
+    write(&root.join("mnt/inner"), "y");
+    let table = MountTable::parse(&format!(
+        "36 35 98:0 / {} rw,noatime - ext4 /dev/sdb1 rw\n",
+        root.join("mnt").display()
+    ));
+    let err = remove_tree(&root, None, &table).unwrap_err();
+    assert!(
+        err.contains("refusing to cross a filesystem boundary"),
+        "{err}"
+    );
+    assert!(root.join("a/file").exists() && root.join("mnt/inner").exists());
+    // The root being a mount point itself counts too.
+    let table = MountTable::parse(&format!(
+        "36 35 98:0 / {} rw - ext4 /dev/sdb1 rw\n",
+        root.display()
+    ));
+    assert!(remove_tree(&root, None, &table).is_err());
+    assert!(root.join("a/file").exists());
+}
+
+#[test]
+fn read_only_directories_of_ours_are_removed() {
+    if is_root() {
+        return;
+    }
+    let (_t, b) = base();
+    let root = b.join("go-mod");
+    write(&root.join("pkg@v1/file.go"), "package x");
+    write(&root.join("locked/secret"), "s");
+    let _w = Writable(root.clone());
+    fs::set_permissions(root.join("pkg@v1"), fs::Permissions::from_mode(0o555)).unwrap();
+    fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    remove_tree(&root, None, &no_mounts()).unwrap();
+    assert!(!root.exists());
+}
+
+#[test]
+fn a_single_file_root_is_removed() {
+    let (_t, b) = base();
+    let f = b.join("dir/file.bin");
+    write(&f, "data");
+    let r = remove_tree(&f, None, &no_mounts()).unwrap();
+    assert_eq!(r.files, 1);
+    assert!(!f.exists() && b.join("dir").exists());
+}
+
+// ---------------------------------------------------------------------------
+// evaluate / execute
+// ---------------------------------------------------------------------------
+
+fn scan_tree(root: &Path) -> ScanTree {
+    let roots = scan::prepare_roots(&[root.to_path_buf()], true).unwrap();
+    let opts = ScanOptions {
+        min_dir_bytes: 0,
+        threads: 2,
+        ..ScanOptions::default()
+    };
+    scan::scan(
+        &roots,
+        &opts,
+        &MountTable::read().unwrap(),
+        &Progress::default(),
+    )
+    .unwrap()
+    .tree
+}
+
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+fn ctx() -> DetectContext {
+    DetectContext {
+        uid: 1000,
+        root: false,
+        home: None,
+        now: now(),
+        tools: vec![ToolStatus {
+            name: "git".into(),
+            path: Some("/usr/bin/git".into()),
+            off_path: None,
+            enables: vec![],
+        }],
+        docker_socket: DockerSocket {
+            path: "/nonexistent".into(),
+            exists: false,
+            accessible: false,
+        },
+        docker: Source::none(),
+    }
+}
+
+fn finding(detector: &str, path: &Path, tier: Tier) -> Finding {
+    let path = path.to_string_lossy().into_owned();
+    Finding {
+        id: finding_id(detector, &path),
+        detector: detector.into(),
+        probe: None,
+        path: path.clone(),
+        bytes: 4096,
+        nested_bytes: None,
+        last_modified: None,
+        growth: None,
+        tier,
+        reason: String::new(),
+        guards: Vec::new(),
+        action: Action {
+            kind: ActionKind::RemovePath,
+            text: format!("remove {path}"),
+            argv: None,
+        },
+        recovery: Recovery {
+            cost: String::new(),
+            how: None,
+        },
+    }
+}
+
+/// The three tiers a plan can hold, each a directory with a file in it.
+fn fixture(b: &Path) -> Vec<Finding> {
+    for d in ["cache", "target", "scratch"] {
+        write(&b.join(d).join("file"), d);
+    }
+    vec![
+        finding("user-cache", &b.join("cache"), Tier::Regenerable),
+        finding("cargo-target", &b.join("target"), Tier::Rebuildable),
+        finding("stale-tree", &b.join("scratch"), Tier::Review),
+    ]
+}
+
+fn make_plan(b: &Path, findings: Vec<Finding>) -> Plan {
+    plan::build(
+        findings,
+        &Selection {
+            tier: Some(Tier::Review),
+            select: vec![],
+        },
+        &scan_tree(b),
+        &ctx(),
+        &Processes::default(),
+        "host".into(),
+        PlanScan {
+            roots: vec![b.to_string_lossy().into_owned()],
+            one_filesystem: true,
+            detectors: None,
+        },
+    )
+    .unwrap()
+}
+
+fn evaluate(b: &Path, plan: &Plan, fresh: Vec<Finding>, policy: &Policy) -> Vec<Check> {
+    apply::evaluate(
+        plan,
+        fresh,
+        &scan_tree(b),
+        &ctx(),
+        &Processes::default(),
+        policy,
+    )
+}
+
+fn outcomes(checks: &[Check]) -> Vec<(&str, ApplyOutcome)> {
+    checks
+        .iter()
+        .map(|c| (c.item.detector.as_str(), c.item.outcome))
+        .collect()
+}
+
+fn policy(max: Tier, confirm: &[&str]) -> Policy {
+    Policy {
+        max_tier: max,
+        confirm: confirm.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[test]
+fn default_policy_allows_regenerable_only() {
+    let (_t, b) = base();
+    let found = fixture(&b);
+    let plan = make_plan(&b, found.clone());
+    let checks = evaluate(&b, &plan, found, &Policy::default());
+    let mut got = outcomes(&checks);
+    got.sort_by_key(|(d, _)| *d);
+    assert_eq!(
+        got,
+        [
+            ("cargo-target", ApplyOutcome::Refused),
+            ("stale-tree", ApplyOutcome::Refused),
+            ("user-cache", ApplyOutcome::WouldRemove),
+        ]
+    );
+    let refused = checks
+        .iter()
+        .find(|c| c.item.detector == "cargo-target")
+        .unwrap();
+    assert!(refused.item.detail.contains("above --max-tier regenerable"));
+    let review = checks
+        .iter()
+        .find(|c| c.item.detector == "stale-tree")
+        .unwrap();
+    assert!(
+        review.item.detail.contains("--confirm"),
+        "{}",
+        review.item.detail
+    );
+}
+
+#[test]
+fn max_tier_and_confirm() {
+    let (_t, b) = base();
+    let found = fixture(&b);
+    let plan = make_plan(&b, found.clone());
+    let review_id = found[2].id.clone();
+
+    let checks = evaluate(&b, &plan, found.clone(), &policy(Tier::Rebuildable, &[]));
+    let ready: Vec<&str> = checks
+        .iter()
+        .filter(|c| c.ready())
+        .map(|c| c.item.detector.as_str())
+        .collect();
+    assert_eq!(ready.len(), 2);
+    assert!(!ready.contains(&"stale-tree"));
+
+    // --max-tier review alone still refuses a review item.
+    let checks = evaluate(&b, &plan, found.clone(), &policy(Tier::Review, &[]));
+    assert!(
+        checks
+            .iter()
+            .any(|c| c.item.detector == "stale-tree" && c.item.outcome == ApplyOutcome::Refused)
+    );
+
+    // --confirm alone lets that review item through, but no rebuildable one.
+    let checks = evaluate(&b, &plan, found, &policy(Tier::Regenerable, &[&review_id]));
+    let mut got = outcomes(&checks);
+    got.sort_by_key(|(d, _)| *d);
+    assert_eq!(
+        got,
+        [
+            ("cargo-target", ApplyOutcome::Refused),
+            ("stale-tree", ApplyOutcome::WouldRemove),
+            ("user-cache", ApplyOutcome::WouldRemove),
+        ]
+    );
+}
+
+#[test]
+fn a_changed_fingerprint_skips_the_item() {
+    let (_t, b) = base();
+    let found = fixture(&b);
+    let plan = make_plan(&b, found.clone());
+    // Something writes into the cache after the plan.
+    write(&b.join("cache/new"), "new");
+    fs::File::open(b.join("cache/new"))
+        .unwrap()
+        .set_modified(SystemTime::now() + std::time::Duration::from_secs(5))
+        .unwrap();
+    let checks = evaluate(&b, &plan, found, &Policy::default());
+    let c = checks
+        .iter()
+        .find(|c| c.item.detector == "user-cache")
+        .unwrap();
+    assert_eq!(c.item.outcome, ApplyOutcome::Skipped);
+    assert!(c.item.detail.contains("newest mtime"), "{}", c.item.detail);
+}
+
+#[test]
+fn a_replaced_root_skips_the_item() {
+    let (_t, b) = base();
+    let found = fixture(&b);
+    let plan = make_plan(&b, found.clone());
+    // Keep the old inode alive so the new directory cannot reuse it.
+    fs::rename(b.join("cache"), b.join("cache.old")).unwrap();
+    write(&b.join("cache/file"), "cache");
+    let checks = evaluate(&b, &plan, found, &Policy::default());
+    let c = &checks
+        .iter()
+        .find(|c| c.item.detector == "user-cache")
+        .unwrap()
+        .item;
+    assert_eq!(c.outcome, ApplyOutcome::Skipped);
+    assert!(c.detail.contains("inode"), "{}", c.detail);
+}
+
+#[test]
+fn the_plans_action_and_tier_are_not_trusted() {
+    let (_t, b) = base();
+    let found = fixture(&b);
+    let mut plan = make_plan(&b, found.clone());
+    // An edited plan: the rebuildable target claims to be regenerable, and
+    // the cache's action is swapped for another command.
+    for item in &mut plan.items {
+        if item.finding.detector == "cargo-target" {
+            item.finding.tier = Tier::Regenerable;
+        }
+        if item.finding.detector == "user-cache" {
+            item.finding.action = Action {
+                kind: ActionKind::Command,
+                text: "rm -rf ~".into(),
+                argv: Some(vec!["rm".into(), "-rf".into(), "/".into()]),
+            };
+        }
+    }
+    let checks = evaluate(&b, &plan, found, &Policy::default());
+    for c in checks.iter().filter(|c| c.item.detector != "stale-tree") {
+        assert_eq!(c.item.outcome, ApplyOutcome::Skipped, "{:?}", c.item);
+        assert!(c.item.detail.starts_with("changed:"), "{}", c.item.detail);
+        // What the report shows is the action detected now.
+        assert_eq!(c.item.action.kind, ActionKind::RemovePath);
+    }
+}
+
+#[test]
+fn gone_or_now_blocked_findings_are_skipped() {
+    let (_t, b) = base();
+    let found = fixture(&b);
+    let plan = make_plan(&b, found.clone());
+    // The cache is no longer detected; the target is blocked by a detector.
+    let mut fresh: Vec<Finding> = found
+        .into_iter()
+        .filter(|f| f.detector != "user-cache")
+        .collect();
+    fresh[0].tier = Tier::Blocked;
+    let checks = evaluate(&b, &plan, fresh, &policy(Tier::Rebuildable, &[]));
+    let get = |d: &str| &checks.iter().find(|c| c.item.detector == d).unwrap().item;
+    assert_eq!(get("user-cache").outcome, ApplyOutcome::Skipped);
+    assert!(get("user-cache").detail.starts_with("gone"));
+    assert_eq!(get("cargo-target").outcome, ApplyOutcome::Skipped);
+    assert!(get("cargo-target").detail.starts_with("blocked"));
+}
+
+#[test]
+fn guards_run_again_at_apply() {
+    let (_t, b) = base();
+    let found = fixture(&b);
+    let plan = make_plan(&b, found.clone());
+    let procs = Processes {
+        procs: vec![Proc {
+            pid: 777,
+            name: "pip".into(),
+            cwd: Some(b.join("cache")),
+            open: vec![],
+        }],
+        unreadable: 0,
+    };
+    let checks = apply::evaluate(
+        &plan,
+        found,
+        &scan_tree(&b),
+        &ctx(),
+        &procs,
+        &Policy::default(),
+    );
+    let c = &checks
+        .iter()
+        .find(|c| c.item.detector == "user-cache")
+        .unwrap()
+        .item;
+    assert_eq!(c.outcome, ApplyOutcome::Skipped);
+    assert!(
+        c.detail.contains("in-use-cwd") && c.detail.contains("pip (pid 777)"),
+        "{}",
+        c.detail
+    );
+    assert!(c.guards.iter().any(|g| g.name == "in-use-cwd"));
+}
+
+fn env() -> Env {
+    Env {
+        host: "host".into(),
+        uid: 1000,
+        now: || "2026-11-16T05:00:00Z".to_string(),
+    }
+}
+
+fn audit_lines(p: &Path) -> Vec<AuditRecord> {
+    fs::read_to_string(p)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn execute_removes_ready_items_and_audits_everything() {
+    let (_t, b) = base();
+    let found = fixture(&b);
+    let plan = make_plan(&b, found.clone());
+    let mut checks = evaluate(&b, &plan, found, &Policy::default());
+    let (_s, state) = base();
+    let log = state.join("diskwhy/audit.jsonl");
+    let mut audit = Audit::open(&log).unwrap();
+    let mut seen = Vec::new();
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |i| seen.push(i.path.clone()),
+    );
+    assert!(!b.join("cache").exists(), "the regenerable cache is gone");
+    assert!(b.join("target/file").exists() && b.join("scratch/file").exists());
+    assert_eq!(seen, [b.join("cache").to_string_lossy()]);
+
+    let r = apply::report(&plan, &checks, &Policy::default(), false, &env());
+    assert_eq!(apply::exit_code(&r), 3, "two refused");
+    assert_eq!(r.freed, 4096);
+
+    let lines = audit_lines(&log);
+    let events: Vec<(AuditEvent, Option<ApplyOutcome>, &str)> = lines
+        .iter()
+        .map(|l| (l.event, l.outcome, l.detector.as_str()))
+        .collect();
+    assert_eq!(events.len(), 4, "{events:?}");
+    assert!(events.contains(&(AuditEvent::End, Some(ApplyOutcome::Refused), "cargo-target")));
+    assert!(events.contains(&(AuditEvent::End, Some(ApplyOutcome::Refused), "stale-tree")));
+    let start = events
+        .iter()
+        .position(|e| *e == (AuditEvent::Start, None, "user-cache"))
+        .unwrap();
+    assert_eq!(
+        events[start + 1],
+        (AuditEvent::End, Some(ApplyOutcome::Removed), "user-cache")
+    );
+    let mode = fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    // A second run appends.
+    let mut audit = Audit::open(&log).unwrap();
+    apply::execute(
+        &plan,
+        &mut [],
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |_| {},
+    );
+    assert_eq!(audit_lines(&log).len(), 4);
+}
+
+#[test]
+fn deepest_items_run_first_and_commands_report_failure() {
+    let (_t, b) = base();
+    write(&b.join("scratch/app/target/file"), "t");
+    let outer = finding("stale-tree", &b.join("scratch"), Tier::Review);
+    let mut inner = finding(
+        "cargo-target",
+        &b.join("scratch/app/target"),
+        Tier::Rebuildable,
+    );
+    // A tool-native command that fails.
+    inner.action = Action {
+        kind: ActionKind::Command,
+        text: "false".into(),
+        argv: Some(vec!["false".into()]),
+    };
+    let found = vec![outer.clone(), inner];
+    let plan = make_plan(&b, found.clone());
+    let mut checks = evaluate(&b, &plan, found, &policy(Tier::Rebuildable, &[&outer.id]));
+    assert!(checks.iter().all(|c| c.ready()), "{:?}", outcomes(&checks));
+    let (_s, state) = base();
+    let mut audit = Audit::open(&state.join("a.jsonl")).unwrap();
+    let mut seen = Vec::new();
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |i| seen.push(i.detector.clone()),
+    );
+    assert_eq!(seen, ["cargo-target", "stale-tree"]);
+    let get = |d: &str| &checks.iter().find(|c| c.item.detector == d).unwrap().item;
+    assert_eq!(get("cargo-target").outcome, ApplyOutcome::Failed);
+    assert!(
+        get("cargo-target").detail.contains("false failed"),
+        "{}",
+        get("cargo-target").detail
+    );
+    assert_eq!(get("stale-tree").outcome, ApplyOutcome::Removed);
+    assert!(!b.join("scratch").exists());
+    let r = apply::report(&plan, &checks, &Policy::default(), false, &env());
+    assert_eq!(apply::exit_code(&r), 1);
+}
+
+#[test]
+fn an_item_inside_another_is_counted_once() {
+    let (_t, b) = base();
+    write(&b.join("scratch/app/target/file"), "t");
+    write(&b.join("scratch/notes"), "n");
+    // The nesting rule: the outer finding's bytes already hold the inner's.
+    let mut outer = finding("stale-tree", &b.join("scratch"), Tier::Review);
+    outer.bytes = 10_000;
+    outer.nested_bytes = Some(9_000);
+    let mut inner = finding(
+        "cargo-target",
+        &b.join("scratch/app/target"),
+        Tier::Rebuildable,
+    );
+    inner.bytes = 9_000;
+    let found = vec![outer.clone(), inner];
+    let plan = make_plan(&b, found.clone());
+    assert_eq!(plan.bytes, 10_000);
+    let pol = policy(Tier::Rebuildable, &[&outer.id]);
+    let mut checks = evaluate(&b, &plan, found, &pol);
+    assert!(checks.iter().all(|c| c.ready()), "{:?}", outcomes(&checks));
+
+    let preview = apply::report(&plan, &checks, &pol, true, &env());
+    let would = preview
+        .items
+        .iter()
+        .filter(|i| i.outcome == ApplyOutcome::WouldRemove);
+    assert_eq!(would.clone().count(), 2);
+    assert_eq!(apply::total_bytes(would), 10_000, "not 19 000");
+    assert_eq!(apply::total_bytes(checks.iter().map(|c| &c.item)), 10_000);
+
+    let (_s, state) = base();
+    let mut audit = Audit::open(&state.join("a.jsonl")).unwrap();
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |_| {},
+    );
+    assert!(!b.join("scratch").exists());
+    let r = apply::report(&plan, &checks, &pol, false, &env());
+    assert!(
+        r.items.iter().all(|i| i.outcome == ApplyOutcome::Removed),
+        "{:?}",
+        r.items
+    );
+    assert_eq!(r.freed, 10_000);
+}
+
+#[test]
+fn a_removal_whose_audit_line_cannot_be_written_does_not_run() {
+    if !Path::new("/dev/full").exists() {
+        return;
+    }
+    let (_t, b) = base();
+    let found = fixture(&b);
+    let plan = make_plan(&b, found.clone());
+    let mut checks = evaluate(&b, &plan, found, &Policy::default());
+    // Every write to /dev/full fails with ENOSPC.
+    let mut audit = Audit::open(Path::new("/dev/full")).unwrap();
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |_| {},
+    );
+    assert!(b.join("cache/file").exists(), "nothing removed");
+    let c = &checks
+        .iter()
+        .find(|c| c.item.detector == "user-cache")
+        .unwrap()
+        .item;
+    assert_eq!(c.outcome, ApplyOutcome::Failed);
+    assert!(
+        c.detail.starts_with("not run: cannot write the audit log"),
+        "{}",
+        c.detail
+    );
+}
+
+#[test]
+fn the_audit_log_is_not_followed_through_a_symlink() {
+    let (_t, b) = base();
+    write(&b.join("elsewhere"), "");
+    symlink(b.join("elsewhere"), b.join("audit.jsonl")).unwrap();
+    assert!(Audit::open(&b.join("audit.jsonl")).is_err());
+}
