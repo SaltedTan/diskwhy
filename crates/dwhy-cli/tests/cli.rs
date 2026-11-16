@@ -361,6 +361,154 @@ fn cargo_fixture() -> (tempfile::TempDir, String) {
     (t, root)
 }
 
+/// Runs dwhy with its state (snapshots) in `state`.
+fn dwhy_in(state: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_dwhy"))
+        .args(args)
+        .env("XDG_STATE_HOME", state)
+        .output()
+        .expect("run dwhy")
+}
+
+#[test]
+fn diff_reports_growth_since_a_snapshot() {
+    let (_t, root) = cargo_fixture();
+    let target = format!("{root}/app/target");
+    let state = tempfile::tempdir().unwrap();
+    let st = state.path();
+    let det = ["-q", "--detectors", "cargo-target"];
+
+    // No snapshot yet.
+    let out = dwhy_in(st, &[&["diff", &root][..], &det].concat());
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("no snapshot of") && err.contains("dwhy scan --snapshot"),
+        "{err}"
+    );
+
+    let out = dwhy_in(
+        st,
+        &[&["scan", &root, "--json", "--snapshot"][..], &det].concat(),
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let id = json_of(&out)["snapshot"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    fs::write(format!("{target}/debug/more"), vec![3u8; 1 << 20]).unwrap();
+    let before = listing(Path::new(&root));
+
+    // Without PATH: the newest snapshot's roots are rescanned.
+    let out = dwhy_in(
+        st,
+        &[&["diff", "--json", "--min-change", "0"][..], &det].concat(),
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["schema"], "diskwhy/v1");
+    assert_eq!(v["since"]["id"], id.as_str());
+    assert_eq!(v["roots"], serde_json::json!([root]));
+    assert_eq!(v["docker_compared"], false);
+    let f = &v["findings"][0];
+    assert_eq!(f["kind"], "finding");
+    assert_eq!(f["name"], target.as_str());
+    assert_eq!(f["detector"], "cargo-target");
+    assert!(f["change"].as_i64().unwrap() >= 1 << 20, "{f}");
+    assert!(f["bytes_per_day"].as_i64().unwrap() > 0, "{f}");
+    assert_eq!(v["findings"].as_array().unwrap().len(), 1);
+    assert!(v.get("snapshot").is_none());
+
+    // The default --min-change (10M) hides a 1M change.
+    let out = dwhy_in(st, &[&["diff", "--json"][..], &det].concat());
+    assert_eq!(json_of(&out)["findings"], serde_json::json!([]));
+
+    // By id, as text, saving the fresh scan too.
+    let out = dwhy_in(
+        st,
+        &[
+            &[
+                "diff",
+                &root,
+                "--since",
+                &id,
+                "--min-change",
+                "0",
+                "--snapshot",
+            ][..],
+            &det,
+        ]
+        .concat(),
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("dwhy diff · "), "{text}");
+    assert!(text.contains(&format!("since {id}")), "{text}");
+    assert!(text.contains(&format!("cargo-target {target}")), "{text}");
+    assert!(text.contains("docker: not compared"), "{text}");
+    assert!(text.contains("snapshot saved: "), "{text}");
+    let saved = fs::read_dir(st.join("diskwhy/snapshots")).unwrap().count();
+    assert_eq!(saved, 2);
+
+    // diff reads the tree and writes only its own state.
+    assert_eq!(listing(Path::new(&root)), before);
+
+    let out = dwhy_in(st, &["diff", "--since", "yesterday", "-q"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--since \"yesterday\""));
+}
+
+#[test]
+fn scan_shows_growth_from_a_snapshot_an_hour_old() {
+    let (_t, root) = cargo_fixture();
+    let target = format!("{root}/app/target");
+    let state = tempfile::tempdir().unwrap();
+    let st = state.path();
+    let scan = |extra: &[&str]| {
+        dwhy_in(
+            st,
+            &[
+                &["scan", &root, "-q", "--detectors", "cargo-target"][..],
+                extra,
+            ]
+            .concat(),
+        )
+    };
+    let out = scan(&["--json", "--snapshot"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    let path = v["snapshot"]["path"].as_str().unwrap().to_string();
+    assert_eq!(v["findings"][0]["growth"], Value::Null);
+
+    // A snapshot seconds old gives no rate.
+    let v = json_of(&scan(&["--json"]));
+    assert_eq!(v["findings"][0]["growth"], Value::Null);
+
+    // Make it two hours old, from when the finding was 1 MiB smaller.
+    let mut snap = dwhy_core::snapshot::load(Path::new(&path)).unwrap();
+    let then = dwhy_core::snapshot::parse_time(&snap.created_at).unwrap() - 7200;
+    snap.created_at = time::OffsetDateTime::from_unix_timestamp(then)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let f = snap.findings.iter_mut().find(|f| f.path == target).unwrap();
+    f.bytes -= 1 << 20;
+    fs::remove_file(&path).unwrap();
+    dwhy_core::snapshot::save(Path::new(&path).parent().unwrap(), &snap, then + 7200).unwrap();
+
+    let v = json_of(&scan(&["--json"]));
+    let g = &v["findings"][0]["growth"];
+    assert_eq!(g["since"], snap.created_at.as_str());
+    // 1 MiB in two hours, give or take the seconds between the scans.
+    let rate = g["bytes_per_day"].as_i64().unwrap();
+    assert!((11 << 20..=12 << 20).contains(&rate), "{rate}");
+
+    let out = scan(&[]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("M/day)"), "{text}");
+}
+
 #[test]
 fn plan_json_on_fixture() {
     let (_t, root) = cargo_fixture();

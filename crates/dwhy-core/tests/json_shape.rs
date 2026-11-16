@@ -568,3 +568,95 @@ fn snapshot_shape() {
         }],
     });
 }
+
+#[test]
+fn diff_report_shape() {
+    let change = |kind, name: &str, before: Option<u64>, after: Option<u64>| {
+        let c = after.unwrap_or(0) as i64 - before.unwrap_or(0) as i64;
+        Change {
+            kind,
+            name: name.into(),
+            id: None,
+            detector: None,
+            before,
+            after,
+            change: c,
+            at_least: false,
+            bytes_per_day: c / 2,
+        }
+    };
+    let mut new_dir = change(ChangeKind::Dir, "/home/u/new", None, Some(262_144_000));
+    new_dir.change = 157_286_400;
+    new_dir.bytes_per_day = 78_643_200;
+    new_dir.at_least = true;
+    let mut image = change(
+        ChangeKind::Image,
+        "postgres:16-alpine",
+        None,
+        Some(440_401_920),
+    );
+    image.id = Some("sha256:6d03d5821c0d".into());
+    let mut finding = change(
+        ChangeKind::Finding,
+        "docker://volume/example_postgres_data",
+        Some(23_163_179_008),
+        Some(33_041_965_056),
+    );
+    finding.id = Some("f_7c1e".into());
+    finding.detector = Some("docker-volume".into());
+    insta::assert_json_snapshot!(DiffReport {
+        schema: SCHEMA.into(),
+        tool: Tool {
+            name: "diskwhy".into(),
+            version: "0.0.1".into(),
+        },
+        host: "pc-ubuntu".into(),
+        uid: 1000,
+        generated_at: "2026-11-16T06:00:00Z".into(),
+        since: DiffBase {
+            id: Some("20261114T060000Z-0123abcd".into()),
+            path: "/home/u/.local/state/diskwhy/snapshots/20261114T060000Z-0123abcd.json.gz".into(),
+            created_at: "2026-11-14T06:00:00Z".into(),
+            roots: vec!["/home/u".into()],
+            one_filesystem: true,
+            min_dir_bytes: 104_857_600,
+        },
+        roots: vec!["/home/u".into()],
+        one_filesystem: true,
+        elapsed_secs: 172_800,
+        min_change: 10_485_760,
+        fs: vec![change(
+            ChangeKind::Fs,
+            "/",
+            Some(350_000_000_000),
+            Some(360_777_252_864)
+        )],
+        dirs: vec![
+            new_dir,
+            change(ChangeKind::Dir, "/home/u/gone", Some(209_715_200), None),
+        ],
+        docker_compared: true,
+        docker: vec![
+            change(
+                ChangeKind::Volume,
+                "example_postgres_data",
+                Some(23_163_179_008),
+                Some(33_041_965_056)
+            ),
+            image,
+            change(
+                ChangeKind::BuildCache,
+                "build cache",
+                Some(500_000_000),
+                Some(0)
+            ),
+        ],
+        findings: vec![finding],
+        notes: vec!["findings not compared (detector ran on one side only): go-build".into()],
+        snapshot: Some(SavedSnapshot {
+            id: "20261116T060000Z-0123abcd".into(),
+            path: "/home/u/.local/state/diskwhy/snapshots/20261116T060000Z-0123abcd.json.gz".into(),
+            pruned: 0,
+        }),
+    });
+}

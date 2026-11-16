@@ -691,6 +691,104 @@ pub struct SnapshotFinding {
     pub tier: Tier,
 }
 
+// ---------------------------------------------------------------------------
+// Growth (M3): `dwhy diff`
+// ---------------------------------------------------------------------------
+
+/// Output of `dwhy diff --json`: what changed between a saved snapshot and
+/// a fresh scan. Each list is ranked by `bytes_per_day`, fastest growth
+/// first and fastest shrinkage last.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiffReport {
+    pub schema: String,
+    pub tool: Tool,
+    pub host: String,
+    pub uid: u32,
+    /// When the fresh scan ran, RFC 3339 (UTC).
+    pub generated_at: String,
+    /// The snapshot compared with.
+    pub since: DiffBase,
+    /// Roots of the fresh scan, absolute.
+    pub roots: Vec<String>,
+    pub one_filesystem: bool,
+    /// Seconds between the snapshot and the fresh scan.
+    pub elapsed_secs: i64,
+    /// Directories, Docker objects and findings that changed by less than
+    /// this many bytes are left out.
+    pub min_change: u64,
+    /// `df` used per filesystem in both, whether it changed or not.
+    pub fs: Vec<Change>,
+    /// Directories, each change attributed to the deepest directory that
+    /// holds most of it: a directory is left out when one directory below it
+    /// changed by more than half as much in the same direction. Entries can
+    /// still nest when a change is spread over several directories.
+    pub dirs: Vec<Change>,
+    /// False when one side has no Docker figures (see `notes`).
+    pub docker_compared: bool,
+    /// Docker images, containers and volumes (by id or name; ones whose size
+    /// the daemon did not compute are left out), and build cache.
+    pub docker: Vec<Change>,
+    /// Findings matched by id. A finding only on one side is listed only
+    /// when its detector ran on both.
+    pub findings: Vec<Change>,
+    /// What could not be compared, and why.
+    pub notes: Vec<String>,
+    /// The snapshot `--snapshot` saved of the fresh scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SavedSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffBase {
+    /// The snapshot's id, when it was found in the snapshot directory or its
+    /// file has a snapshot name.
+    pub id: Option<String>,
+    pub path: String,
+    pub created_at: String,
+    pub roots: Vec<String>,
+    pub one_filesystem: bool,
+    /// Smallest directory the snapshot recorded.
+    pub min_dir_bytes: u64,
+}
+
+/// How one thing's size changed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Change {
+    pub kind: ChangeKind,
+    /// A path, mount point, image tag, container or volume name.
+    pub name: String,
+    /// Finding, image or container id.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// The detector, for findings.
+    #[serde(default)]
+    pub detector: Option<String>,
+    /// `None`: not there, or (for a directory) below the snapshot's
+    /// `min_dir_bytes` and so not recorded.
+    pub before: Option<u64>,
+    /// `None`: gone.
+    pub after: Option<u64>,
+    /// `after - before`, absent sides counting 0. A directory new above the
+    /// snapshot's threshold counts that threshold as its size before, so its
+    /// change is a lower bound (`at_least`).
+    pub change: i64,
+    pub at_least: bool,
+    pub bytes_per_day: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChangeKind {
+    /// `df` used of a filesystem.
+    Fs,
+    Dir,
+    Image,
+    Container,
+    Volume,
+    BuildCache,
+    Finding,
+}
+
 /// Output of `dwhy doctor --json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DoctorReport {
