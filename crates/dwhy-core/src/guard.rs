@@ -26,8 +26,14 @@
 //! and git directories without one (a bare repository, or the target of
 //! `--separate-git-dir`: a `HEAD` file plus `objects/` and `refs/`). A git
 //! directory gets `git-unpublished` and `git-linked-worktrees` only; no
-//! `git status` runs there. A `.git` file is resolved by reading it and the
-//! `commondir` it leads to, not by asking git.
+//! `git status` runs there. A git directory whose `HEAD` the enclosing work
+//! tree tracks (a test fixture of a source tree) is part of that
+//! repository's history and is not checked on its own; an untracked or
+//! ignored one is. A bare or mirror clone has no remote-tracking refs, so
+//! every commit in it counts as on no remote and it blocks; linked
+//! worktrees of such a clone warn about their whole branch for the same
+//! reason. A `.git` file is resolved by reading it and the `commondir` it
+//! leads to, not by asking git.
 //!
 //! Git runs none of the repository's own programs: fsmonitor and every
 //! configured filter driver are switched off, and `git status` does not look
@@ -157,8 +163,25 @@ fn strip_deleted(s: &str) -> &str {
 /// scanned paths (git repositories are found through it).
 pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, procs: &Processes) {
     use rayon::prelude::*;
-    let repos = repositories(tree);
+    let mut repos = repositories(tree);
     let git = ctx.tool_command("git");
+    if let Some(git) = git.as_deref() {
+        let roots: Vec<&Path> = findings
+            .iter()
+            .filter(|f| f.path.starts_with('/') && git_guarded(f))
+            .map(|f| Path::new(&f.path))
+            .collect();
+        let tracked: HashSet<Repo> = repos
+            .par_iter()
+            .filter(|r| {
+                matches!(r, Repo::GitDir(_))
+                    && roots.iter().any(|root| r.path().starts_with(root))
+                    && tracked_by_work_tree(git, r.path(), &repos)
+            })
+            .cloned()
+            .collect();
+        repos.retain(|r| !tracked.contains(r));
+    }
     // The work trees in the scan that use each git directory through a
     // `.git` file.
     let mut users: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
@@ -287,6 +310,41 @@ fn repositories(tree: &ScanTree) -> Vec<Repo> {
     out
 }
 
+/// Whether the work tree around the git directory `dir` tracks its `HEAD`:
+/// a test fixture of a source tree, kept by that repository's history.
+fn tracked_by_work_tree(git: &str, dir: &Path, repos: &[Repo]) -> bool {
+    let Some(work_tree) = repos
+        .iter()
+        .filter_map(|r| match r {
+            Repo::WorkTree(w) if dir.starts_with(w) => Some(w),
+            _ => None,
+        })
+        .max_by_key(|w| w.as_os_str().len())
+    else {
+        return false;
+    };
+    let Some(head) = dir
+        .strip_prefix(work_tree)
+        .ok()
+        .and_then(|rel| rel.join("HEAD").to_str().map(String::from))
+    else {
+        return false;
+    };
+    crate::gitcmd::run(
+        git,
+        work_tree,
+        &[
+            "--literal-pathspecs",
+            "ls-files",
+            "-z",
+            "--error-unmatch",
+            "--",
+            &head,
+        ],
+    )
+    .is_ok()
+}
+
 fn named(procs: &[&Proc]) -> String {
     list(
         &procs
@@ -407,6 +465,7 @@ impl RepoState {
                 dir,
                 &[
                     "--git-dir=.",
+                    "--work-tree=.",
                     "rev-list",
                     "--count",
                     "--all",

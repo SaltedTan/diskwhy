@@ -420,18 +420,122 @@ fn bare_repositories() {
     );
     assert_eq!(get(&g, "git-dirty").detail, "1 git directory checked");
 
-    // A bare clone whose branch is on its remote loses nothing.
-    let mirror = b.join("mirror.git");
-    fs::create_dir_all(&mirror).unwrap();
-    git(&mirror, &["init", "-q", "--bare"]);
+    // A bare repository with a remote-tracking ref for its branch loses
+    // nothing.
+    let tracking = b.join("tracking.git");
+    fs::create_dir_all(&tracking).unwrap();
+    git(&tracking, &["init", "-q", "--bare"]);
     git(
-        &mirror,
+        &tracking,
         &["remote", "add", "origin", bare.to_str().unwrap()],
     );
-    git(&mirror, &["fetch", "-q", "origin", "main:main"]);
-    let (tier, g) = guards(&b, &mirror);
+    git(&tracking, &["fetch", "-q", "origin", "main:main"]);
+    let (tier, g) = guards(&b, &tracking);
     assert_eq!(tier, Tier::Review, "{g:?}");
     assert_eq!(get(&g, "git-unpublished").status, GuardStatus::Pass);
+
+    // `git clone --bare` keeps no remote-tracking refs, so git cannot tell
+    // its commits are on the remote: it blocks.
+    let clone = b.join("clone.git");
+    git(
+        &b,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            bare.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    );
+    let (tier, g) = guards(&b, &clone);
+    assert_eq!(tier, Tier::Blocked, "{g:?}");
+    let u = get(&g, "git-unpublished");
+    assert_eq!(u.status, GuardStatus::Block);
+    assert!(u.detail.contains("1 commit on no remote"), "{}", u.detail);
+}
+
+#[test]
+fn removed_submodule_leaves_nothing_to_block() {
+    let (_t, b) = base();
+    pushed_repo(&b, "lib");
+    let proj = pushed_repo(&b, "proj");
+    let url = b.join("lib-remote.git");
+    git(
+        &proj,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            url.to_str().unwrap(),
+            "lib",
+        ],
+    );
+    git(&proj, &["commit", "-q", "-m", "add lib"]);
+    // `git rm` leaves .git/modules/lib behind, its work tree gone.
+    git(&proj, &["rm", "-q", "lib"]);
+    git(&proj, &["commit", "-q", "-m", "drop lib"]);
+    git(&proj, &["push", "-q"]);
+    assert!(proj.join(".git/modules/lib/HEAD").exists());
+    let (tier, g) = guards(&b, &proj);
+    assert_eq!(tier, Tier::Review, "{g:?}");
+    assert_eq!(get(&g, "git-unpublished").status, GuardStatus::Pass);
+}
+
+/// A pushed repository `proj` holding a bare clone with one commit at
+/// `proj/tests/fixture.git`, which no remote-tracking ref covers.
+fn repo_with_fixture(b: &Path, src_base: &Path) -> (PathBuf, PathBuf) {
+    let src = src_base.join("src");
+    fs::create_dir_all(&src).unwrap();
+    git(&src, &["init", "-q"]);
+    commit(&src, "fixture-file");
+    let proj = pushed_repo(b, "proj");
+    let fixture = proj.join("tests/fixture.git");
+    git(
+        b,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            src.to_str().unwrap(),
+            fixture.to_str().unwrap(),
+        ],
+    );
+    (proj, fixture)
+}
+
+#[test]
+fn tracked_fixture_git_dirs_are_part_of_the_repository() {
+    let (_t, b) = base();
+    let (_t2, b2) = base();
+    let (proj, _) = repo_with_fixture(&b, &b2);
+    git(&proj, &["add", "tests"]);
+    git(&proj, &["commit", "-q", "-m", "fixture"]);
+    git(&proj, &["push", "-q"]);
+    let (tier, g) = guards(&b, &proj);
+    assert_eq!(tier, Tier::Review, "{g:?}");
+    assert_eq!(get(&g, "git-dirty").detail, "1 git worktree checked");
+
+    // Ignored instead of tracked: nothing else keeps its commit.
+    let (_t, b) = base();
+    let (_t2, b2) = base();
+    let (proj, fixture) = repo_with_fixture(&b, &b2);
+    write(&proj.join(".gitignore"), "tests/fixture.git/\n");
+    git(&proj, &["add", ".gitignore"]);
+    git(&proj, &["commit", "-q", "-m", "ignore"]);
+    git(&proj, &["push", "-q"]);
+    let (tier, g) = guards(&b, &proj);
+    assert_eq!(tier, Tier::Blocked, "{g:?}");
+    assert_eq!(get(&g, "git-dirty").status, GuardStatus::Pass, "{g:?}");
+    let u = get(&g, "git-unpublished");
+    assert_eq!(u.status, GuardStatus::Block);
+    assert!(
+        u.detail
+            .contains(&format!("{} (1 commit on no remote)", fixture.display())),
+        "{}",
+        u.detail
+    );
 }
 
 #[test]
