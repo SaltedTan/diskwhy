@@ -28,13 +28,31 @@ pub const TOOLS: &[(&str, &[&str])] = &[
     ),
     ("cargo", &["cargo-target (removal via `cargo clean`)"]),
     ("go", &["user-cache: Go build/module caches (`go clean`)"]),
-    ("uv", &["user-cache: uv cache (`uv cache clean`)"]),
+    (
+        "uv",
+        &[
+            "user-cache: uv cache (`uv cache clean`)",
+            "tool-versions: uv Pythons (`uv python uninstall`)",
+        ],
+    ),
     ("pip", &["user-cache: pip cache (`pip cache purge`)"]),
     ("npm", &["user-cache: npm cache (`npm cache clean`)"]),
     ("pnpm", &["user-cache: pnpm store (`pnpm store prune`)"]),
     (
         "yarn",
         &["user-cache: Yarn classic cache (`yarn cache clean`)"],
+    ),
+    (
+        "rustup",
+        &["tool-versions: Rust toolchains (`rustup toolchain uninstall`)"],
+    ),
+    (
+        "pyenv",
+        &["tool-versions: pyenv Pythons (`pyenv uninstall`)"],
+    ),
+    (
+        "fnm",
+        &["tool-versions: fnm Node versions (`fnm uninstall`)"],
     ),
     ("journalctl", &["journald (root only)"]),
 ];
@@ -71,6 +89,31 @@ fn off_path_candidates(name: &str) -> Vec<PathBuf> {
             if let Some(h) = &home {
                 v.push(h.join(".local/go/bin/go"));
                 v.push(h.join("go/bin/go"));
+            }
+        }
+        "rustup" => {
+            if let Some(ch) = env::var_os("CARGO_HOME") {
+                v.push(PathBuf::from(ch).join("bin/rustup"));
+            }
+            if let Some(h) = &home {
+                v.push(h.join(".cargo/bin/rustup"));
+            }
+        }
+        "pyenv" => {
+            if let Some(r) = env::var_os("PYENV_ROOT") {
+                v.push(PathBuf::from(r).join("bin/pyenv"));
+            }
+            if let Some(h) = &home {
+                v.push(h.join(".pyenv/bin/pyenv"));
+            }
+        }
+        "fnm" => {
+            if let Some(d) = env::var_os("FNM_DIR") {
+                v.push(PathBuf::from(d).join("fnm"));
+            }
+            if let Some(h) = &home {
+                v.push(h.join(".local/share/fnm/fnm"));
+                v.push(h.join(".cargo/bin/fnm"));
             }
         }
         "uv" => {
@@ -245,6 +288,9 @@ mod tests {
                 "npm",
                 "pnpm",
                 "yarn",
+                "rustup",
+                "pyenv",
+                "fnm",
                 "journalctl"
             ]
         );
