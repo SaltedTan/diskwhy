@@ -14,14 +14,14 @@ Each item that M1 covers is reproduced in a temp home by `crates/dwhy-core/tests
 | 4 | Rust `target/` in `~/projects/lspcheck` and two lspcheck worktrees | `cargo clean` | | `cargo-target` | `rebuildable` |
 | 5 | Old Claude Code (`~/.local/share/claude/versions/2.1.318`, `2.1.319`), Codex (`~/.codex/packages/standalone/releases/0.167.2-…`) and T3 runtime (`~/.t3/runtime/versions/0.1.3-nightly.*`) versions | `rm` | | `tool-versions` | `rebuildable` |
 | 6 | Desktop trash | `rm files/* info/*` | | `trash` | `review`; `blocked` (recent-delete) when something was trashed in the last 7 days |
-| 7 | Old `bmc-*` and `bmc-inbox-ci:<sha>` images, `rclone`, dangling images, 2 exited containers, build cache older than 72h | `docker rmi`, `docker rm`, `docker image prune`, `docker builder prune --filter until=72h` | ~10–14G | `docker-image`, `docker-container`, `docker-build-cache` | images and containers `review`; build cache unused for a week `regenerable`, younger `review` |
+| 7 | Old `bmc-*` and `bmc-inbox-ci:<sha>` images, `rclone`, dangling images, 2 exited containers, build cache older than 72h | `docker rmi`, `docker rm`, `docker image prune`, `docker builder prune --filter until=72h` | ~10–14G | `docker-image`, `docker-container`, `docker-build-cache` | images and containers `review`; build cache unused for a week `regenerable`; cache used in the last week is not offered (it only counts in the reason's total of reclaimable cache) |
 | 8 | 131 `~/.t3/scratch-virgil` dirs untouched since Nov 5 | `rm` | ~22G with row 9 | `stale-tree` | `review` (nothing written for 7 days) |
 | 9 | 81 T3 worktrees that were clean, fully pushed and had no commit since Nov 6 | `git worktree remove` | | `git-worktree` | `review` (nothing written for 14 days; whether a worktree is clean and pushed is for the M2 guards) |
 | 10 | `.venv` of 4 TTS engines and of `ep03-gpu-roofline` | `rm` | 46G with rows 11, 12 | `venv` | `rebuildable` with a project file, `review` without |
 | 11 | Old ninfer build and download in `~/opt/ninfer-all` | `rm` | | not M1 (see below) | — |
 | 12 | Models `~/models/ornith-1.5-35b-a3b`, `~/models/capy-qwen3.8-27b-gsq3` | `rm` | | not M1 (see below) | — |
 
-Differences in thresholds: the cleanup removed worktrees with no commit for a week, where `git-worktree` waits 14 days without writes; and it pruned build cache older than 72 hours, where `docker-build-cache` offers it as `regenerable` after a week (younger cache is `review`).
+Differences in thresholds: the cleanup removed worktrees with no commit for a week, where `git-worktree` waits 14 days without writes; and it pruned build cache older than 72 hours, where `docker-build-cache` offers it as `regenerable` after a week (cache used in the last week is not offered; it only counts in the finding reason's total of reclaimable cache).
 
 ## Not covered by M1
 
