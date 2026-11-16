@@ -272,7 +272,8 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
         );
         match snapshot::default_dir()
             .ok_or_else(|| {
-                "cannot place snapshots: neither XDG_STATE_HOME nor HOME is set".to_string()
+                "cannot place snapshots: neither XDG_STATE_HOME nor HOME is an absolute path"
+                    .to_string()
             })
             .and_then(|dir| snapshot::save(&dir, &snap, now_secs()))
         {
@@ -444,7 +445,7 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
         }
     }
     let path = Audit::default_path()
-        .ok_or("cannot place the audit log: neither XDG_STATE_HOME nor HOME is set")?;
+        .ok_or("cannot place the audit log: neither XDG_STATE_HOME nor HOME is an absolute path")?;
     let mut audit = Audit::open(&path)?;
     let mounts = MountTable::read().map_err(|e| format!("cannot read the mount table: {e}"))?;
     let quiet = args.quiet;

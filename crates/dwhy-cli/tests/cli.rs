@@ -320,7 +320,9 @@ fn scan_snapshot_refuses_a_relative_home() {
             .expect("run dwhy");
         assert_eq!(out.status.code(), Some(1), "HOME={home:?}");
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("cannot place snapshots"),
+            String::from_utf8_lossy(&out.stderr).contains(
+                "cannot place snapshots: neither XDG_STATE_HOME nor HOME is an absolute path"
+            ),
             "HOME={home:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
