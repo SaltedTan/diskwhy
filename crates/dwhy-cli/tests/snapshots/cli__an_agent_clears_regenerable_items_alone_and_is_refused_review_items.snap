@@ -1,0 +1,54 @@
+---
+source: crates/dwhy-cli/tests/cli.rs
+expression: r
+---
+{
+  "confirm": [],
+  "dry_run": false,
+  "freed": "[freed]",
+  "generated_at": "[generated_at]",
+  "host": "[host]",
+  "items": [
+    {
+      "action": "[action]",
+      "bytes": "[bytes]",
+      "detail": "[detail]",
+      "detector": "user-cache",
+      "guards": [
+        {
+          "detail": "[detail]",
+          "name": "in-use-cwd",
+          "status": "[status]"
+        },
+        {
+          "detail": "[detail]",
+          "name": "in-use-open",
+          "status": "[status]"
+        }
+      ],
+      "id": "[id]",
+      "outcome": "removed",
+      "path": "[root]/home/.cache/pip",
+      "tier": "regenerable"
+    },
+    {
+      "action": "[action]",
+      "bytes": "[bytes]",
+      "detail": "[detail]",
+      "detector": "stale-tree",
+      "guards": [],
+      "id": "[id]",
+      "outcome": "refused",
+      "path": "[root]/home/scratch",
+      "tier": "review"
+    }
+  ],
+  "max_tier": "regenerable",
+  "plan_created_at": "[plan_created_at]",
+  "schema": "diskwhy/v1",
+  "tool": {
+    "name": "diskwhy",
+    "version": "[version]"
+  },
+  "uid": "[uid]"
+}

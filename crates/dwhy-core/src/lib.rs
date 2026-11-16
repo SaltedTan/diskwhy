@@ -3,10 +3,12 @@
 //! M0: the read-only scanner ([`scan`]), filesystem accounting
 //! ([`account`]), `doctor` checks, and the `diskwhy/v1` JSON types
 //! ([`report`]), plus the detector framework ([`detect`], [`detectors`]) and
-//! the scan tree detectors read ([`tree`]). Guards ([`guard`]) run before removal,
-//! and plans ([`plan`]) select findings for it (M2).
+//! the scan tree detectors read ([`tree`]). M2: guards ([`guard`]) run before
+//! removal, plans ([`plan`]) select findings for it, and [`apply`] carries a
+//! plan out with [`remove`] or the tools' own commands.
 
 pub mod account;
+pub mod apply;
 pub mod detect;
 pub mod detectors;
 pub mod docker;
@@ -15,6 +17,7 @@ mod gitcmd;
 pub mod guard;
 pub mod mounts;
 pub mod plan;
+pub mod remove;
 pub mod report;
 pub mod scan;
 pub mod system;

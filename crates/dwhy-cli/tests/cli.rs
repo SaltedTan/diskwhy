@@ -47,6 +47,10 @@ fn normalize(v: &mut Value, root: &str) {
                     | "generated_at"
                     | "created_at"
                     | "expires_at"
+                    | "plan_created_at"
+                    | "time"
+                    | "pid"
+                    | "freed"
                     | "dev"
                     | "inode"
                     | "newest_mtime"
@@ -466,4 +470,333 @@ fn plan_exits_2_only_when_a_selected_finding_is_blocked() {
     assert_eq!(code, Some(0), "{v}");
     assert_eq!(v["blocked"][0]["path"], target.as_str());
     assert!(file.exists());
+}
+
+// ---------------------------------------------------------------------------
+// apply: real removal happens only inside these temp dirs.
+// ---------------------------------------------------------------------------
+
+/// A fake home with a 3 MiB pip cache (regenerable, untouched for 3 days)
+/// and a 2 MiB scratch dir (review, untouched for 30 days), plus a state dir, an empty
+/// PATH dir and a dir for plan files, all outside the home.
+struct Home {
+    _t: tempfile::TempDir,
+    base: std::path::PathBuf,
+}
+
+impl Home {
+    fn new() -> Home {
+        let t = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(t.path()).unwrap();
+        for d in ["home", "state", "bin", "plans"] {
+            fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let h = Home { _t: t, base };
+        let pip = h.home().join(".cache/pip/http/blob");
+        let scratch = h.home().join("scratch/old/blob");
+        // Different sizes, so the plan's order (largest first) is fixed.
+        for (f, size) in [(&pip, 3 << 20), (&scratch, 2 << 20)] {
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, vec![7u8; size]).unwrap();
+        }
+        age_tree(&h.home().join(".cache"), 3 * 86_400);
+        age_tree(&h.home().join("scratch"), 30 * 86_400);
+        h
+    }
+    fn home(&self) -> std::path::PathBuf {
+        self.base.join("home")
+    }
+    fn plan_file(&self, name: &str) -> String {
+        self.base
+            .join("plans")
+            .join(name)
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+    fn audit(&self) -> std::path::PathBuf {
+        self.base.join("state/diskwhy/audit.jsonl")
+    }
+    /// Runs dwhy with only this home's environment and no tools on PATH.
+    fn dwhy(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_dwhy"))
+            .args(args)
+            .env_clear()
+            .env("HOME", self.home())
+            .env("PATH", self.base.join("bin"))
+            .env("XDG_STATE_HOME", self.base.join("state"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run dwhy")
+    }
+    /// `dwhy plan` of the home with the two detectors the fixture feeds
+    /// (never Docker or the machine's own caches).
+    fn plan(&self, name: &str, extra: &[&str]) -> String {
+        let file = self.plan_file(name);
+        let home = self.home();
+        let mut args = vec![
+            "plan",
+            home.to_str().unwrap(),
+            "-q",
+            "--detectors",
+            "user-cache,stale-tree",
+            "-o",
+            &file,
+        ];
+        args.extend(extra);
+        let out = self.dwhy(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        file
+    }
+}
+
+/// Sets the mtime of everything under `p` (and `p`) to `secs` ago.
+fn age_tree(p: &Path, secs: u64) {
+    let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+    let mut all = Vec::new();
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        if d.is_dir() {
+            for e in fs::read_dir(&d).unwrap() {
+                stack.push(e.unwrap().path());
+            }
+        }
+        all.push(d);
+    }
+    // Children before parents, so setting a file's time never touches a
+    // directory already set.
+    for f in all.iter().rev() {
+        fs::File::open(f).unwrap().set_modified(t).unwrap();
+    }
+}
+
+fn json_of(out: &Output) -> Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{e}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+fn audit_events(h: &Home) -> Vec<(String, String, String)> {
+    fs::read_to_string(h.audit())
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            let v: Value = serde_json::from_str(l).unwrap();
+            (
+                v["event"].as_str().unwrap().to_string(),
+                v["detector"].as_str().unwrap().to_string(),
+                v["outcome"].as_str().unwrap_or("-").to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn an_agent_clears_regenerable_items_alone_and_is_refused_review_items() {
+    let h = Home::new();
+    let pip = h.home().join(".cache/pip");
+    let scratch = h.home().join("scratch");
+    let plan = h.plan("all.json", &["--tier", "review"]);
+    let p: Value = serde_json::from_slice(&fs::read(&plan).unwrap()).unwrap();
+    assert_eq!(p["items"].as_array().unwrap().len(), 2, "{p}");
+
+    // An agent: --yes, default --max-tier regenerable.
+    let out = h.dwhy(&["apply", &plan, "--yes", "--json", "-q"]);
+    assert_eq!(out.status.code(), Some(3), "the review item is refused");
+    assert!(!pip.exists(), "the regenerable pip cache is removed");
+    assert!(scratch.join("old/blob").exists(), "the review item is not");
+    let mut r = json_of(&out);
+    assert_eq!(r["dry_run"], false);
+    assert!(r["freed"].as_u64().unwrap() >= 2 << 20);
+    let root = h.base.to_str().unwrap().to_string();
+    normalize(&mut r, &root);
+    insta::assert_json_snapshot!(r);
+
+    let mut events = audit_events(&h);
+    events.sort();
+    assert_eq!(
+        events,
+        [
+            ("end".into(), "stale-tree".into(), "refused".into()),
+            ("end".into(), "user-cache".into(), "removed".into()),
+            ("start".into(), "user-cache".into(), "-".into()),
+        ]
+    );
+
+    // A person confirms the review item by id.
+    let id = p["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["finding"]["detector"] == "stale-tree")
+        .unwrap()["finding"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plan2 = h.plan("review.json", &["--select", &id]);
+    let out = h.dwhy(&["apply", &plan2, "--yes", "--confirm", &id, "-q"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(!scratch.exists());
+    assert!(text.contains("removed 1 item, freed about"), "{text}");
+    assert!(text.contains("audit log: "), "{text}");
+    assert!(h.home().exists());
+}
+
+#[test]
+fn apply_refuses_without_a_terminal_an_expired_plan_and_another_host() {
+    let h = Home::new();
+    let pip = h.home().join(".cache/pip/http/blob");
+    let plan = h.plan("p.json", &[]);
+
+    // No --yes and no terminal: refused, nothing removed.
+    let out = h.dwhy(&["apply", &plan]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no terminal to confirm on"));
+    assert!(pip.exists());
+
+    let edit = |name: &str, f: &dyn Fn(&mut Value)| -> String {
+        let mut v: Value = serde_json::from_slice(&fs::read(&plan).unwrap()).unwrap();
+        f(&mut v);
+        let file = h.plan_file(name);
+        fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
+        file
+    };
+    let expired = edit("expired.json", &|v| {
+        v["created_at"] = "2026-01-01T00:00:00Z".into();
+        v["expires_at"] = "2026-01-01T01:00:00Z".into();
+    });
+    let out = h.dwhy(&["apply", &expired, "--yes"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("expired"));
+    // --dry-run does not get around expiry either.
+    assert_eq!(
+        h.dwhy(&["apply", &expired, "--dry-run"]).status.code(),
+        Some(3)
+    );
+    let elsewhere = edit("elsewhere.json", &|v| v["host"] = "some-other-host".into());
+    let out = h.dwhy(&["apply", &elsewhere, "--yes"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("some-other-host"));
+    assert!(pip.exists());
+    assert!(
+        !h.audit().exists(),
+        "refusing the whole plan writes nothing"
+    );
+
+    // Errors: an id not in the plan, a file that is not a plan.
+    assert_eq!(
+        h.dwhy(&["apply", &plan, "--yes", "--confirm", "f_000000000000"])
+            .status
+            .code(),
+        Some(1)
+    );
+    let junk = h.plan_file("junk.json");
+    fs::write(&junk, "{}").unwrap();
+    assert_eq!(h.dwhy(&["apply", &junk, "--yes"]).status.code(), Some(1));
+    assert_eq!(
+        h.dwhy(&["apply", "/definitely/not/here.json"])
+            .status
+            .code(),
+        Some(1)
+    );
+    assert!(pip.exists());
+}
+
+#[test]
+fn dry_run_shows_everything_and_removes_nothing() {
+    let h = Home::new();
+    let plan = h.plan("p.json", &["--tier", "review"]);
+    let out = h.dwhy(&["apply", &plan, "--dry-run", "--json", "-q"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "the review item would be refused"
+    );
+    let r = json_of(&out);
+    assert_eq!(r["dry_run"], true);
+    let mut outcomes: Vec<&str> = r["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["outcome"].as_str().unwrap())
+        .collect();
+    outcomes.sort();
+    assert_eq!(outcomes, ["refused", "would_remove"]);
+    assert!(h.home().join(".cache/pip/http/blob").exists());
+    assert!(h.home().join("scratch/old/blob").exists());
+    assert!(!h.audit().exists(), "dry runs write nothing");
+
+    let text = h.dwhy(&["apply", &plan, "--dry-run", "-q"]);
+    let s = String::from_utf8_lossy(&text.stdout);
+    assert!(s.contains("would remove"), "{s}");
+    assert!(s.contains("nothing removed"), "{s}");
+    assert!(s.contains("--confirm"), "{s}");
+}
+
+#[test]
+fn an_item_that_changed_since_the_plan_is_skipped() {
+    let (_t, root) = cargo_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let plan = dir.path().join("p.json");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_dwhy"))
+            .args(args)
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("PATH", bin.path())
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .unwrap()
+    };
+    let out = run(&[
+        "plan",
+        &root,
+        "-q",
+        "--detectors",
+        "cargo-target",
+        "--tier",
+        "rebuildable",
+        "-o",
+        plan.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0));
+    let new = Path::new(&root).join("app/target/debug/new");
+    fs::write(&new, vec![0u8; 4096]).unwrap();
+    fs::File::open(&new)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+        .unwrap();
+    let out = run(&[
+        "apply",
+        plan.to_str().unwrap(),
+        "--yes",
+        "--max-tier",
+        "rebuildable",
+        "--json",
+        "-q",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    let r = json_of(&out);
+    assert_eq!(r["items"][0]["outcome"], "skipped");
+    assert!(
+        r["items"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("changed since the plan: newest mtime"),
+        "{r}"
+    );
+    assert!(Path::new(&root).join("app/target/debug/app").exists());
 }

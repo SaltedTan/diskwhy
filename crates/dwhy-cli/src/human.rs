@@ -5,8 +5,8 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use dwhy_core::report::{
-    ActionKind, DetectorAvailability, DirEntry, DoctorReport, Finding, FsReport, GuardStatus, Plan,
-    ScanReport, SkipReason, Tier,
+    ActionKind, ApplyOutcome, ApplyReport, DetectorAvailability, DirEntry, DoctorReport, Finding,
+    FsReport, GuardStatus, Plan, ScanReport, SkipReason, Tier,
 };
 use dwhy_core::units::{human, thousands};
 
@@ -188,6 +188,86 @@ pub fn render_plan(
         )?,
         Some(path) => writeln!(w, "wrote {}", path.display())?,
         None => writeln!(w, "no plan file written (-o FILE writes one)")?,
+    }
+    Ok(())
+}
+
+/// The items of an apply, and a summary line unless `items_only` (the
+/// preview before the y/N question, which says the rest).
+pub fn render_apply(
+    w: &mut impl Write,
+    r: &ApplyReport,
+    audit: Option<&Path>,
+    items_only: bool,
+) -> io::Result<()> {
+    let label = |o: ApplyOutcome| match o {
+        ApplyOutcome::Removed => "removed",
+        ApplyOutcome::Failed => "FAILED",
+        ApplyOutcome::Skipped => "skipped",
+        ApplyOutcome::Refused => "refused",
+        ApplyOutcome::WouldRemove => "would remove",
+    };
+    for i in &r.items {
+        writeln!(
+            w,
+            "  {:<12} {:>8}  {:<13} {}",
+            label(i.outcome),
+            human(i.bytes),
+            i.detector,
+            i.path
+        )?;
+        let note = match i.outcome {
+            ApplyOutcome::WouldRemove => format!("{} → {}", tier_name(i.tier), i.action.text),
+            _ => i.detail.clone(),
+        };
+        writeln!(w, "  {:<12} {:>8}  {:<13} {note}", "", "", "")?;
+    }
+    if items_only {
+        return Ok(());
+    }
+    let count = |o| r.items.iter().filter(|i| i.outcome == o).count();
+    let mut rest = Vec::new();
+    for (o, word) in [
+        (ApplyOutcome::Failed, "failed"),
+        (ApplyOutcome::Refused, "refused"),
+        (ApplyOutcome::Skipped, "skipped"),
+    ] {
+        let n = count(o);
+        if n > 0 {
+            rest.push(format!("{n} {word}"));
+        }
+    }
+    let rest = if rest.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", rest.join(", "))
+    };
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    if r.dry_run {
+        let n = count(ApplyOutcome::WouldRemove);
+        let bytes: u64 = r
+            .items
+            .iter()
+            .filter(|i| i.outcome == ApplyOutcome::WouldRemove)
+            .map(|i| i.bytes)
+            .sum();
+        writeln!(
+            w,
+            "would remove {n} item{} ({}){rest}; nothing removed",
+            plural(n),
+            human(bytes)
+        )?;
+    } else {
+        let n = count(ApplyOutcome::Removed);
+        writeln!(
+            w,
+            "removed {n} item{}, freed about {}{rest}",
+            plural(n),
+            human(r.freed)
+        )?;
+    }
+    if let Some(p) = audit {
+        writeln!(w, "audit log: {}", p.display())?;
     }
     Ok(())
 }
