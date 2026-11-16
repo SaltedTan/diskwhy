@@ -18,7 +18,13 @@
 //! `.python-version`, `.nvmrc`, `.node-version`) or a rustup override, is the
 //! Python a scanned venv was made from, or is the newest one installed of its
 //! kind. A pin like `3.12` or `20` keeps the newest matching version, which is
-//! what the tools resolve it to. For VS Code Server the most recently used
+//! what the tools resolve it to; a Python pin without a variant matches only
+//! plain builds, and `3.13t` only free-threaded ones. uv's default is the
+//! install an unversioned `python` or `python3` shim in uv's bin dir runs.
+//! Node LTS pins are resolved by codename (`lts/iron` keeps the newest 20.x)
+//! and `lts/*` keeps the newest even major; when any Node pin in the scan or
+//! nvm alias cannot be resolved, nothing is reported for that tool. For VS
+//! Code Server the most recently used
 //! server (first in `cli/servers/lru.json`) and its `code-<commit>` CLI are
 //! kept. Go toolchains that `GOTOOLCHAIN` downloads live in the module cache,
 //! which `user-cache` reports.
@@ -251,6 +257,10 @@ impl ToolVersions {
         // Minor-version links (cpython-3.12-linux-x86_64-gnu -> the newest
         // 3.12 install), which venvs made by recent uv versions point at.
         let links = symlinks_in(&root);
+        let install_of = |name: &str| {
+            let target = links.get(name).map_or(name, String::as_str);
+            installs.iter().position(|t| t.name == target)
+        };
         let mut keep = newest(&installs);
         for p in &pins.venv_pythons {
             let Ok(rest) = p.strip_prefix(&root) else {
@@ -259,12 +269,16 @@ impl ToolVersions {
             let Some(first) = rest.components().next() else {
                 continue;
             };
-            let name = first.as_os_str().to_string_lossy();
-            let target = links
-                .get(name.as_ref())
-                .map_or(name.as_ref(), String::as_str);
-            if let Some(i) = installs.iter().position(|t| t.name == target) {
-                keep.insert(i);
+            keep.extend(install_of(&first.as_os_str().to_string_lossy()));
+        }
+        // uv's default: what the unversioned `python`/`python3` shims run.
+        let shims = self.uv_shims(ctx, &root);
+        for (shim, target) in &shims {
+            if matches!(
+                Path::new(shim).file_name().and_then(|n| n.to_str()),
+                Some("python" | "python3")
+            ) {
+                keep.extend(install_of(target));
             }
         }
         let mut requests = pins.python.clone();
@@ -278,7 +292,6 @@ impl ToolVersions {
         keep.extend(resolve_python(&installs, &requests, "cpython"));
 
         let uv = ctx.tool_command("uv");
-        let shims = self.uv_shims(ctx, &root);
         for (i, t) in installs.iter().enumerate() {
             if keep.contains(&i) {
                 continue;
@@ -299,9 +312,7 @@ impl ToolVersions {
                     .to_string();
             let mine: Vec<&String> = shims
                 .iter()
-                .filter(|(_, target)| {
-                    target == &t.name || links.get(target.as_str()) == Some(&t.name)
-                })
+                .filter(|(_, target)| install_of(target) == Some(i))
                 .map(|(shim, _)| shim)
                 .collect();
             if !mine.is_empty() {
@@ -375,7 +386,7 @@ impl ToolVersions {
             return;
         };
         let versions = root.join("versions");
-        let installs = installs_in(tree, &versions, plain_group);
+        let installs = installs_in(tree, &versions, version_group);
         if installs.is_empty() {
             return;
         }
@@ -443,14 +454,6 @@ impl ToolVersions {
         }
         let alias_dir = root.join("alias");
         let mut keep = newest(&installs);
-        // The default must resolve, or nothing is reported: it is the
-        // version every new shell uses.
-        if let Some(default) = read_text(&alias_dir.join("default")) {
-            match nvm_resolve(&installs, &alias_dir, default.trim(), 0) {
-                Some(r) => keep.extend(r),
-                None => return,
-            }
-        }
         let mut requests: Vec<String> = pins.node.clone();
         if let Ok(rd) = std::fs::read_dir(&alias_dir) {
             for e in rd.flatten() {
@@ -461,8 +464,13 @@ impl ToolVersions {
                 }
             }
         }
+        // Every alias (the default included) and pin must resolve, or
+        // nothing is reported: the version it names could be any of them.
         for r in &requests {
-            keep.extend(nvm_resolve(&installs, &alias_dir, r, 0).unwrap_or_default());
+            match node_resolve(&installs, Some(&alias_dir), r, 0) {
+                Some(r) => keep.extend(r),
+                None => return,
+            }
         }
         for (i, t) in installs.iter().enumerate() {
             if keep.contains(&i) {
@@ -511,7 +519,10 @@ impl ToolVersions {
             }
         }
         for r in &pins.node {
-            keep.extend(node_request(&installs, r));
+            match node_resolve(&installs, None, r, 0) {
+                Some(r) => keep.extend(r),
+                None => return,
+            }
         }
         let fnm = ctx.tool_command("fnm");
         for (i, t) in installs.iter().enumerate() {
@@ -557,12 +568,18 @@ impl ToolVersions {
             .tools
             .iter()
             .find(|t| t.name == "go")
-            .and_then(|t| t.path.clone().or_else(|| t.off_path.clone()));
+            .and_then(|t| t.path.clone().or_else(|| t.off_path.clone()))
+            .map(PathBuf::from);
+        let go_real = go_on_path
+            .as_deref()
+            .and_then(|p| std::fs::canonicalize(p).ok());
         for (i, t) in installs.iter().enumerate() {
+            let in_sdk = |go: &Option<PathBuf>, sdk: &Path| {
+                go.as_deref().is_some_and(|p| p.starts_with(sdk))
+            };
             if t.group.is_none()
-                || go_on_path
-                    .as_deref()
-                    .is_some_and(|p| Path::new(p).starts_with(&t.path))
+                || in_sdk(&go_on_path, &t.path)
+                || std::fs::canonicalize(&t.path).is_ok_and(|sdk| in_sdk(&go_real, &sdk))
             {
                 keep.insert(i);
             }
@@ -865,16 +882,12 @@ fn uv_group(name: &str) -> Option<(String, Vec<u64>)> {
     ))
 }
 
-/// Names like `3.12.3`, `v20.1.0`, `pypy3.10-7.3.15`: the text before the
-/// first number and after it make the group.
-fn plain_group(name: &str) -> Option<(String, Vec<u64>)> {
-    version_group(name)
-}
-
 fn node_group(name: &str) -> Option<(String, Vec<u64>)> {
     num_version(name).map(|v| (String::new(), v))
 }
 
+/// Names like `3.12.3`, `v20.1.0`, `pypy3.10-7.3.15`: the text before the
+/// first number and after it make the group.
 fn version_group(name: &str) -> Option<(String, Vec<u64>)> {
     let start = name.find(|c: char| c.is_ascii_digit())?;
     let digits: String = name[start..]
@@ -947,8 +960,8 @@ fn newest_by_mtime(items: &[Install]) -> Option<usize> {
     (0..items.len()).max_by_key(|&i| (items[i].newest_mtime, items[i].name.clone()))
 }
 
-/// The newest install in a group compatible with `group_hint` whose
-/// version starts with `req`.
+/// The newest install in a group `accept` allows whose version starts
+/// with `req`.
 fn newest_matching(
     installs: &[Install],
     req: &[u64],
@@ -1004,44 +1017,85 @@ fn resolve_python(installs: &[Install], requests: &[String], default_impl: &str)
         let Some(req) = num_version(digits.trim_end_matches('.')) else {
             continue;
         };
+        // Only builds of the requested variant: none for `3.13`, the
+        // free-threaded ones for `3.13t`.
+        let (uv_variant, pyenv_suffix) = match &rest[digits.len()..] {
+            "t" | "+freethreaded" => ("freethreaded", "t"),
+            tail => (tail.trim_start_matches('+'), tail),
+        };
+        let uv_group = format!("{imp}+{uv_variant}-");
+        let pyenv_group = format!("{imp}#{pyenv_suffix}");
         out.extend(newest_matching(installs, &req, |g| {
-            // uv groups start with "<impl>+", pyenv groups with "<prefix>#".
-            g.starts_with(&format!("{imp}+")) || g.starts_with(&format!("{imp}#"))
+            g.starts_with(&uv_group) || g == pyenv_group
         }));
     }
     out
 }
 
-/// A Node request: `v20.1.0`, `20`, `20.1`. Anything else keeps nothing.
-fn node_request(installs: &[Install], r: &str) -> Option<usize> {
-    let req = num_version(r.trim())?;
-    newest_matching(installs, &req, |_| true)
-}
+/// Node LTS codenames and their major versions.
+const NODE_LTS: &[(&str, u64)] = &[
+    ("argon", 4),
+    ("boron", 6),
+    ("carbon", 8),
+    ("dubnium", 10),
+    ("erbium", 12),
+    ("fermium", 14),
+    ("gallium", 16),
+    ("hydrogen", 18),
+    ("iron", 20),
+    ("jod", 22),
+    ("krypton", 24),
+];
 
-/// What an nvm alias or request resolves to. `None` when it can't be
-/// resolved (so nothing should be reported); an empty list for `system`.
-fn nvm_resolve(installs: &[Install], alias_dir: &Path, r: &str, depth: u8) -> Option<Vec<usize>> {
+/// What a Node request (`v20.1.0`, `20`, `lts/iron`, `lts/*`, or an nvm
+/// alias in `alias_dir`) resolves to. `None` when it can't be resolved (so
+/// nothing should be reported); an empty list for `system`.
+fn node_resolve(
+    installs: &[Install],
+    alias_dir: Option<&Path>,
+    r: &str,
+    depth: u8,
+) -> Option<Vec<usize>> {
     if depth > 5 || r.is_empty() || r.starts_with('/') || r.split('/').any(|c| c == "..") {
         return None;
     }
+    let newest_with = |req: &[u64]| -> Vec<usize> {
+        newest_matching(installs, req, |_| true)
+            .into_iter()
+            .collect()
+    };
     match r {
         "system" | "iojs" | "none" => return Some(Vec::new()),
-        "node" | "stable" => {
-            return Some(
-                newest_matching(installs, &[], |_| true)
-                    .into_iter()
-                    .collect(),
-            );
-        }
+        "node" | "stable" => return Some(newest_with(&[])),
         _ => {}
     }
-    if num_version(r).is_some() {
-        return Some(node_request(installs, r).into_iter().collect());
+    if let Some(req) = num_version(r) {
+        return Some(newest_with(&req));
     }
-    // Another alias: alias/<name>, or alias/lts/<name> (lts/* included).
-    let file = alias_dir.join(r);
-    let text = read_text(&file)?;
-    nvm_resolve(installs, alias_dir, text.trim(), depth + 1)
+    // An nvm alias: alias/<name>, or alias/lts/<name> (lts/* included).
+    if let Some(text) = alias_dir.and_then(|d| read_text(&d.join(r))) {
+        return node_resolve(installs, alias_dir, text.trim(), depth + 1);
+    }
+    let lower = r.to_ascii_lowercase();
+    if matches!(lower.as_str(), "lts" | "lts/*" | "lts/latest") {
+        // LTS lines are the even majors.
+        return Some(
+            installs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| {
+                    let (_, v) = t.group.as_ref()?;
+                    v.first().is_some_and(|m| m % 2 == 0).then_some((v, i))
+                })
+                .max()
+                .map(|(_, i)| i)
+                .into_iter()
+                .collect(),
+        );
+    }
+    let codename = lower.strip_prefix("lts/")?;
+    let (_, major) = NODE_LTS.iter().find(|(n, _)| *n == codename)?;
+    Some(newest_with(&[*major]))
 }
 
 /// Symlinks in `dir`: link name → the first component of its target after

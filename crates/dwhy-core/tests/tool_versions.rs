@@ -354,6 +354,90 @@ fn uv_pythons_venvs_pins_and_shims() {
 }
 
 #[test]
+fn uv_default_shim_keeps_its_python() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let root = uv_root(home);
+    let k = |v: &str| format!("cpython-{v}-linux-x86_64-gnu");
+    for v in ["3.9.1", "3.10.1", "3.12.1"] {
+        install(&root.join(k(v)));
+    }
+    symlink(
+        root.join(k("3.10.1")),
+        root.join("cpython-3.10-linux-x86_64-gnu"),
+    )
+    .unwrap();
+    // `uv python install --default 3.10`: python3 runs 3.10 through the
+    // minor-version link; python3.9 is only a versioned shim.
+    let bin = home.join(".local/bin");
+    fs::create_dir_all(&bin).unwrap();
+    symlink(
+        root.join("cpython-3.10-linux-x86_64-gnu/bin/python3.10"),
+        bin.join("python3"),
+    )
+    .unwrap();
+    symlink(
+        root.join(k("3.9.1")).join("bin/python3.9"),
+        bin.join("python3.9"),
+    )
+    .unwrap();
+    let found = detect(home);
+    assert_eq!(paths(&found), [s(&root.join(k("3.9.1")))]);
+    assert!(
+        found[0]
+            .recovery
+            .cost
+            .contains(&format!("also removes {}", bin.join("python3.9").display())),
+        "{}",
+        found[0].recovery.cost
+    );
+}
+
+/// uv installs 3.13.1, 3.14.0 and free-threaded 3.13.2 and 3.14.0, with
+/// one project pinning `pin`.
+fn uv_variants(pin: &str) -> (Vec<String>, impl Fn(&str) -> String) {
+    let home = tempfile::tempdir().unwrap();
+    let root = uv_root(home.path());
+    let k = move |v: &str| s(&root.join(format!("cpython-{v}-linux-x86_64-gnu")));
+    for v in [
+        "3.13.1",
+        "3.14.0",
+        "3.13.2+freethreaded",
+        "3.14.0+freethreaded",
+    ] {
+        install(Path::new(&k(v)));
+    }
+    text(
+        &home.path().join("code/p/.python-version"),
+        &format!("{pin}\n"),
+    );
+    (paths(&detect(home.path())), k)
+}
+
+#[test]
+fn uv_python_pins_match_only_their_variant() {
+    // uv resolves `3.13` to the plain build, `3.13t` to the free-threaded one.
+    let (found, k) = uv_variants("3.13");
+    assert_eq!(found, [k("3.13.2+freethreaded")]);
+    let (found, k) = uv_variants("3.13t");
+    assert_eq!(found, [k("3.13.1")]);
+}
+
+#[test]
+fn pyenv_python_pins_match_only_their_variant() {
+    for (pin, reported) in [("3.13", "3.13.2t"), ("3.13t", "3.13.1")] {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let versions = home.join(".pyenv/versions");
+        for v in ["3.13.1", "3.14.0", "3.13.2t", "3.14.0t"] {
+            install(&versions.join(v));
+        }
+        text(&home.join("code/p/.python-version"), &format!("{pin}\n"));
+        assert_eq!(paths(&detect(home)), [s(&versions.join(reported))], "{pin}");
+    }
+}
+
+#[test]
 fn uv_python_install_dir_from_env() {
     let home = tempfile::tempdir().unwrap();
     let home = home.path();
@@ -433,8 +517,23 @@ fn nvm_with_an_unresolvable_default_reports_nothing() {
     for n in ["v16.20.2", "v20.18.0"] {
         install(&root.join("versions/node").join(n));
     }
-    text(&root.join("alias/default"), "lts/hydrogen\n");
+    text(&root.join("alias/default"), "lts/zzz\n");
     assert_eq!(paths(&detect(home)), Vec::<String>::new());
+}
+
+#[test]
+fn nvm_project_lts_pin_without_an_alias_file_uses_the_codename() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let root = home.join(".nvm");
+    let v = |n: &str| root.join("versions/node").join(n);
+    for n in ["v20.18.0", "v22.10.0", "v22.11.0", "v23.1.0"] {
+        install(&v(n));
+    }
+    text(&root.join("alias/default"), "23\n");
+    // jod is the 22.x LTS line; nvm has no alias/lts/jod file here.
+    text(&home.join("code/web/.nvmrc"), "lts/jod\n");
+    assert_eq!(paths(&detect(home)), [s(&v("v20.18.0")), s(&v("v22.10.0"))]);
 }
 
 #[test]
@@ -462,6 +561,49 @@ fn fnm_versions_and_aliases() {
     );
 }
 
+fn fnm_home(home: &Path, versions: &[&str]) -> PathBuf {
+    let root = home.join(".local/share/fnm");
+    for n in versions {
+        install(&root.join("node-versions").join(n).join("installation"));
+    }
+    root.join("node-versions")
+}
+
+#[test]
+fn fnm_lts_codename_pin() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let v = fnm_home(home, &["v18.20.4", "v20.17.0", "v20.18.0", "v23.1.0"]);
+    // iron is the 20.x LTS line (nodejs.org release schedule).
+    text(&home.join("code/x/.nvmrc"), "lts/Iron\n");
+    assert_eq!(
+        paths(&detect(home)),
+        [s(&v.join("v18.20.4")), s(&v.join("v20.17.0"))]
+    );
+}
+
+#[test]
+fn fnm_lts_star_pin_keeps_the_newest_even_major() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let v = fnm_home(home, &["v18.20.4", "v20.18.0", "v22.11.0", "v23.1.0"]);
+    text(&home.join("code/x/.nvmrc"), "lts/*\n");
+    assert_eq!(
+        paths(&detect(home)),
+        [s(&v.join("v18.20.4")), s(&v.join("v20.18.0"))]
+    );
+}
+
+#[test]
+fn fnm_with_an_unknown_lts_codename_reports_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    fnm_home(home, &["v18.20.4", "v20.18.0", "v23.1.0"]);
+    text(&home.join("code/x/.nvmrc"), "lts/zzz\n");
+    text(&home.join("code/y/.nvmrc"), "20\n");
+    assert_eq!(paths(&detect(home)), Vec::<String>::new());
+}
+
 #[test]
 fn go_sdks() {
     let home = tempfile::tempdir().unwrap();
@@ -482,6 +624,21 @@ fn go_sdks() {
         found[0].recovery.how.as_deref(),
         Some("go install golang.org/dl/go1.20.14@latest && go1.20.14 download")
     );
+}
+
+#[test]
+fn go_on_path_through_a_symlink_keeps_its_sdk() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let sdk = home.join("sdk");
+    for n in ["go1.20.14", "go1.21.5", "go1.22.0"] {
+        install(&sdk.join(n));
+    }
+    file(&sdk.join("go1.21.5/bin/go"), 10);
+    fs::create_dir_all(home.join("bin")).unwrap();
+    symlink(sdk.join("go1.21.5/bin/go"), home.join("bin/go")).unwrap();
+    let found = detect_with(home, home, &[], &[("go", &s(&home.join("bin/go")))]);
+    assert_eq!(paths(&found), [s(&sdk.join("go1.20.14"))]);
 }
 
 const C1: &str = "1111111111111111111111111111111111111111";
