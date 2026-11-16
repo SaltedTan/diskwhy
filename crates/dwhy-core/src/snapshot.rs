@@ -328,10 +328,15 @@ pub fn to_prune(entries: &[Entry], now: i64) -> Vec<&Entry> {
 }
 
 /// Deletes the snapshots in `dir` the retention policy no longer keeps,
-/// never `keep`. Returns how many were deleted.
-pub fn prune(dir: &Path, now: i64, keep: &str) -> Result<u64, String> {
-    let entries = list(dir)?;
+/// never `keep`. Returns how many were deleted and, when any could not be
+/// listed or deleted, the first error (it keeps going after one).
+pub fn prune(dir: &Path, now: i64, keep: &str) -> (u64, Option<String>) {
+    let entries = match list(dir) {
+        Ok(e) => e,
+        Err(e) => return (0, Some(e)),
+    };
     let mut n = 0;
+    let mut first_err = None;
     for e in to_prune(&entries, now) {
         if e.id == keep {
             continue;
@@ -339,10 +344,13 @@ pub fn prune(dir: &Path, now: i64, keep: &str) -> Result<u64, String> {
         match fs::remove_file(&e.path) {
             Ok(()) => n += 1,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(format!("cannot prune {}: {err}", e.path.display())),
+            Err(err) => {
+                first_err
+                    .get_or_insert_with(|| format!("cannot prune {}: {err}", e.path.display()));
+            }
         }
     }
-    Ok(n)
+    (n, first_err)
 }
 
 /// A saved snapshot, and why pruning failed when it did (the snapshot is
@@ -407,10 +415,7 @@ pub fn save(dir: &Path, snap: &Snapshot, now: i64) -> Result<Saved, String> {
     }
     let _ = fs::remove_file(&tmp);
     let (id, path) = linked.ok_or_else(|| format!("too many snapshots named {base}"))?;
-    let (pruned, prune_error) = match prune(dir, now, &id) {
-        Ok(n) => (n, None),
-        Err(e) => (0, Some(e)),
-    };
+    let (pruned, prune_error) = prune(dir, now, &id);
     Ok(Saved {
         snapshot: SavedSnapshot {
             id,
