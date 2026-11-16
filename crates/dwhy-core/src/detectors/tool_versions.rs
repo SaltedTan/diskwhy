@@ -12,6 +12,13 @@
 //! - Go SDKs from `golang.org/dl` (`~/sdk/go*`)
 //! - VS Code Server versions (`~/.vscode-server`, `~/.vscode-server-insiders`,
 //!   or `$VSCODE_AGENT_FOLDER`)
+//! - self-updating agent CLIs: Claude Code (`~/.local/share/claude/versions`),
+//!   Codex (`$CODEX_HOME/packages/standalone/releases`, default `~/.codex`)
+//!   and the T3 runtime (`~/.t3/runtime/versions`), which keep old versions
+//!   only for rolling back; the version in use (what `~/.local/bin/claude`
+//!   or Codex's `current` link points to, T3's `activeVersion`, and any
+//!   version a running process executes from, read from `/proc/<pid>/exe`)
+//!   and the newest are kept
 //!
 //! A version is kept, and not reported, when it is the tool's default, is
 //! pinned by a project in the scan (`rust-toolchain.toml`, `rust-toolchain`,
@@ -37,8 +44,10 @@
 //! always removed by path. When the home directory is not in the scan, pins
 //! and venvs in projects there were not seen, which the recovery cost says.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -58,6 +67,8 @@ const MAX_SMALL_FILE: usize = 64 << 10;
 /// `tool-versions`. Holds the environment it resolves install locations from.
 pub struct ToolVersions {
     env: HashMap<String, String>,
+    /// Executables of running processes; `None` reads `/proc`.
+    running_exes: Option<Vec<PathBuf>>,
 }
 
 /// Version pins found in the scanned projects.
@@ -120,6 +131,7 @@ impl Detector for ToolVersions {
         self.fnm(tree, ctx, &pins, home_scanned, &mut out);
         self.go_sdk(tree, ctx, &mut out);
         self.vscode(tree, ctx, &mut out);
+        self.agent_clis(tree, ctx, &mut out);
         Ok(out)
     }
 }
@@ -145,7 +157,36 @@ impl ToolVersions {
                     Some((k.into().into_string().ok()?, v.into().into_string().ok()?))
                 })
                 .collect(),
+            running_exes: None,
         }
+    }
+
+    /// Takes `exes` as the executables running processes run, instead of
+    /// reading `/proc`.
+    pub fn with_running_exes(mut self, exes: Vec<PathBuf>) -> ToolVersions {
+        self.running_exes = Some(exes);
+        self
+    }
+
+    /// The executable of every process whose `/proc/<pid>/exe` can be read
+    /// (other users' processes can't), without a ` (deleted)` suffix.
+    fn running_exes(&self) -> Vec<PathBuf> {
+        if let Some(exes) = &self.running_exes {
+            return exes.clone();
+        }
+        let Ok(rd) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        rd.flatten()
+            .filter(|e| e.file_name().as_bytes().iter().all(u8::is_ascii_digit))
+            .filter_map(|e| std::fs::read_link(e.path().join("exe")).ok())
+            .map(
+                |p| match p.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+                    Some(b) => PathBuf::from(OsStr::from_bytes(b)),
+                    None => p,
+                },
+            )
+            .collect()
     }
 
     /// An absolute path from `$name`; relative or empty values are ignored.
@@ -668,6 +709,100 @@ impl ToolVersions {
         }
     }
 
+    /// Claude Code, Codex and T3 runtime versions: the one in use, any a
+    /// running process executes from, and the newest are kept.
+    fn agent_clis(&self, tree: &ScanTree, ctx: &DetectContext, out: &mut Vec<Finding>) {
+        let Some(home) = ctx.home.as_ref() else {
+            return;
+        };
+        let running = OnceCell::new();
+        if let Some(data) = self.xdg_data(ctx) {
+            // One executable file per version (a directory is accepted too).
+            let dir = data.join("claude/versions");
+            if is_scanned_dir(tree, &dir) {
+                let group = |name: &str| num_version(name).map(|v| (String::new(), v));
+                let mut installs = only_grouped(installs_in(tree, &dir, group));
+                installs.extend(files_in(&dir, group));
+                installs.sort_by(|a, b| a.name.cmp(&b.name));
+                let current = link_name(&home.join(".local/bin/claude"));
+                self.agent_versions(
+                    &installs,
+                    current.as_deref(),
+                    "Claude Code",
+                    "the version ~/.local/bin/claude runs",
+                    &running,
+                    out,
+                );
+            }
+        }
+        let codex = self
+            .var("CODEX_HOME")
+            .unwrap_or_else(|| home.join(".codex"))
+            .join("packages/standalone");
+        let installs = only_grouped(installs_in(tree, &codex.join("releases"), version_group));
+        let current = link_name(&codex.join("current"));
+        self.agent_versions(
+            &installs,
+            current.as_deref(),
+            "Codex",
+            "the release Codex's `current` link points to",
+            &running,
+            out,
+        );
+        let t3 = home.join(".t3/runtime");
+        let installs = only_grouped(installs_in(tree, &t3.join("versions"), dotted_group));
+        let current = read_text(&t3.join("service-state.json"))
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v.get("activeVersion")?.as_str().map(String::from));
+        self.agent_versions(
+            &installs,
+            current.as_deref(),
+            "T3 runtime",
+            "the active version in service-state.json",
+            &running,
+            out,
+        );
+    }
+
+    fn agent_versions(
+        &self,
+        installs: &[Install],
+        current: Option<&str>,
+        tool: &str,
+        current_desc: &str,
+        running: &OnceCell<Vec<PathBuf>>,
+        out: &mut Vec<Finding>,
+    ) {
+        let mut keep = newest(installs);
+        if let Some(i) = current.and_then(|c| installs.iter().position(|t| t.name == c)) {
+            keep.insert(i);
+        }
+        for (i, t) in installs.iter().enumerate() {
+            if keep.contains(&i)
+                || running
+                    .get_or_init(|| self.running_exes())
+                    .iter()
+                    .any(|e| e.starts_with(&t.path))
+            {
+                continue;
+            }
+            out.extend(self.finding(
+                t,
+                Plan {
+                    what: format!("{tool} version {}", t.name),
+                    why: format!(
+                        "not {current_desc}, not run by any process, and not the newest installed"
+                    ),
+                    action: remove(t),
+                    cost: format!(
+                        "{tool} keeps old versions only for rolling back an update, and downloads versions again as it updates"
+                    ),
+                    how: None,
+                },
+            ));
+        }
+    }
+
     fn vscode_finding(&self, t: &Install, kind: &str, kept: Option<&String>) -> Option<Finding> {
         let why = match kept {
             Some(k) => format!("not the most recently used one ({k})"),
@@ -1139,18 +1274,24 @@ fn symlinks_in(dir: &Path) -> HashMap<String, String> {
 
 /// `code-<commit>` regular files directly in the VS Code Server folder.
 fn cli_files(root: &Path) -> Vec<Install> {
-    let Ok(rd) = std::fs::read_dir(root) else {
+    files_in(root, |name| {
+        let commit = name.strip_prefix("code-")?;
+        is_commit(commit).then(|| (String::new(), Vec::new()))
+    })
+}
+
+/// Regular files with a single link directly in `dir` that `group`
+/// accepts, sized from lstat (the scan tree holds directories only).
+fn files_in(dir: &Path, group: impl Fn(&str) -> Option<(String, Vec<u64>)>) -> Vec<Install> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out = Vec::new();
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let Some(commit) = name.strip_prefix("code-") else {
+        let Some(g) = group(&name) else {
             continue;
         };
-        if !is_commit(commit) {
-            continue;
-        }
         let Ok(md) = std::fs::symlink_metadata(e.path()) else {
             continue;
         };
@@ -1163,11 +1304,39 @@ fn cli_files(root: &Path) -> Vec<Install> {
             bytes: md.blocks() * 512,
             shared: 0,
             newest_mtime: md.mtime(),
-            group: None,
+            group: Some(g),
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+fn is_scanned_dir(tree: &ScanTree, path: &Path) -> bool {
+    tree.find(path).is_some_and(|id| tree.node(id).is_dir)
+}
+
+/// The file name a symlink points to.
+fn link_name(link: &Path) -> Option<String> {
+    let target = std::fs::read_link(link).ok()?;
+    Some(target.file_name()?.to_string_lossy().into_owned())
+}
+
+/// Every number in the name, in order; the letters make the group
+/// (`0.1.10-nightly.20261115.4749` is [0, 1, 10, 20261115, 4749] in
+/// `nightly`).
+fn dotted_group(name: &str) -> Option<(String, Vec<u64>)> {
+    let nums: Vec<u64> = name
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
+    if nums.is_empty() {
+        return None;
+    }
+    Some((
+        name.chars().filter(char::is_ascii_alphabetic).collect(),
+        nums,
+    ))
 }
 
 fn is_commit(s: &str) -> bool {
