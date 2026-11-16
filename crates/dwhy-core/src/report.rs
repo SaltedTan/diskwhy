@@ -474,8 +474,9 @@ pub struct Fingerprint {
 pub struct GitFingerprint {
     /// Commit id of HEAD, or `"unborn"` before the first commit.
     pub head: String,
-    /// FNV-1a (64-bit, hex) of `git status --porcelain=v2 -z` with
-    /// untracked files: any change to the work tree changes it.
+    /// FNV-1a (64-bit, hex) of the entries of `git status --porcelain=v2 -z`
+    /// with untracked files, branch headers left out: any change to the work
+    /// tree changes it, a fetch does not.
     pub status_hash: String,
 }
 

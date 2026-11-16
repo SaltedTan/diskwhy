@@ -1,11 +1,11 @@
-//! Plans (docs/DESIGN.md "Plan"): the findings selected for removal, each
+//! Plans (docs/DESIGN.md "Plans"): the findings selected for removal, each
 //! with a fingerprint, and an expiry an hour after the plan is made.
 //!
 //! A plan selects by tier ceiling (`--tier`, `regenerable` when nothing is
 //! named) and by finding id or path (`--select`); with both, a finding must
 //! match both. The guards run on the selected findings only, and a finding
-//! they block, or one a detector already marked `blocked`, goes to the
-//! plan's `blocked` list instead of its items.
+//! they block, or one a detector already marked `blocked` that `--select`
+//! names, goes to the plan's `blocked` list instead of its items.
 //!
 //! The fingerprint records what must not change before `apply`: the root's
 //! device and inode, the newest mtime under it, its size in quarter-doubling
