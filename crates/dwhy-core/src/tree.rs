@@ -40,6 +40,9 @@ impl Markers {
     pub const PNPM_WORKSPACE: Markers = Markers(1 << 10);
     /// Regular file `.dwhy-scratch`: the directory is a scratch location.
     pub const SCRATCH: Markers = Markers(1 << 11);
+    /// Regular file pinning a tool version: `rust-toolchain.toml`,
+    /// `rust-toolchain`, `.python-version`, `.nvmrc` or `.node-version`.
+    pub const TOOL_PIN: Markers = Markers(1 << 12);
 
     pub const fn empty() -> Markers {
         Markers(0)
@@ -79,6 +82,15 @@ impl Markers {
             b"bun.lock" | b"bun.lockb" if is_file => Markers::BUN_LOCK,
             b"pnpm-workspace.yaml" if is_file => Markers::PNPM_WORKSPACE,
             b".dwhy-scratch" if is_file => Markers::SCRATCH,
+            b"rust-toolchain.toml"
+            | b"rust-toolchain"
+            | b".python-version"
+            | b".nvmrc"
+            | b".node-version"
+                if is_file =>
+            {
+                Markers::TOOL_PIN
+            }
             _ => Markers::empty(),
         }
     }

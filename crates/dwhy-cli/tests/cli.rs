@@ -222,6 +222,9 @@ fn doctor_json() {
             "npm",
             "pnpm",
             "yarn",
+            "rustup",
+            "pyenv",
+            "fnm",
             "journalctl"
         ]
     );
