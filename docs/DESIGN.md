@@ -35,6 +35,7 @@ The idea is to automate what was done by hand on pc-ubuntu on 2026-11-13: 36G fr
 | Background job | None in the MVP. Snapshots are taken when you run it. An optional systemd timer can come later |
 | Agent authority | May apply a plan, limited by `--max-tier` and config (default for agents: the `regenerable` tier only) |
 | Independence | Its own scanner; gdu and ncdu are not used |
+| Scratch dirs (`stale-tree`) | Both a built-in list and per-directory opt-in, with no config file in the MVP: `~/scratch`, `~/tmp`, `~/.t3/scratch` and `~/.t3/scratch-*`, plus any directory holding a `.dwhy-scratch` file. Stale means nothing written for 7 days. A location stale as a whole is one finding, otherwise each stale subdirectory is. `/tmp` and `/var/tmp` are left to systemd-tmpfiles, and `~/Downloads` is not scratch. The post-MVP TOML config extends the list and sets the age |
 | Licence | Undecided; repo is private and all rights reserved until the public release. Planned: core under MIT OR Apache-2.0, see docs/COMMERCIAL.md |
 
 ### Recommendation: root vs user
@@ -150,4 +151,3 @@ Duplicate finding, a GUI or web UI, Windows/macOS (keep code portable where it's
 
 - Licence and paid tier: see docs/COMMERCIAL.md.
 - Final name and binary name.
-- Whether `stale-tree` (scratch dirs) needs per-directory rules in config, given how specific `~/.t3/scratch-virgil` is.
