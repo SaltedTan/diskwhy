@@ -325,9 +325,9 @@ fn run_reports_every_catalog_detector() {
     let cargo = runs.iter().find(|r| r.name == "cargo-target").unwrap();
     assert!(cargo.ran);
     assert_eq!(cargo.findings, 1);
-    let trash = runs.iter().find(|r| r.name == "trash").unwrap();
-    assert!(!trash.ran);
-    assert_eq!(trash.status, DetectorAvailability::NotImplemented);
+    let journald = runs.iter().find(|r| r.name == "journald").unwrap();
+    assert!(!journald.ran);
+    assert_eq!(journald.status, DetectorAvailability::NotImplemented);
 }
 
 #[test]
