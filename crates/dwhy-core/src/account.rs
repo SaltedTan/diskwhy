@@ -462,6 +462,7 @@ pub fn build_scan_report(
         findings: Vec::new(),
         detectors: Vec::new(),
         docker: None,
+        snapshot: None,
     }
 }
 

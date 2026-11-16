@@ -107,6 +107,19 @@ pub fn render_scan(
         depth,
         top,
     )?;
+    if let Some(snap) = &r.snapshot {
+        writeln!(w)?;
+        write!(w, "snapshot saved: {} ({})", snap.id, snap.path)?;
+        if snap.pruned > 0 {
+            write!(
+                w,
+                "; pruned {} older snapshot{}",
+                snap.pruned,
+                if snap.pruned == 1 { "" } else { "s" }
+            )?;
+        }
+        writeln!(w)?;
+    }
     Ok(())
 }
 
@@ -661,6 +674,7 @@ mod tests {
                 error: None,
             }],
             docker: None,
+            snapshot: None,
         }
     }
 

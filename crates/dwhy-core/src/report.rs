@@ -66,6 +66,19 @@ pub struct ScanReport {
     /// Docker's own accounting, when the Docker detectors could query the daemon.
     #[serde(default)]
     pub docker: Option<DockerUsage>,
+    /// The snapshot `--snapshot` saved; absent without `--snapshot`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SavedSnapshot>,
+}
+
+/// Where `scan --snapshot` saved its snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSnapshot {
+    /// The file name without `.json.gz`; what `diff --since` accepts.
+    pub id: String,
+    pub path: String,
+    /// Older snapshots deleted by the retention policy while saving.
+    pub pruned: u64,
 }
 
 /// From the Engine API (`GET /system/df`, `GET /info`).
@@ -571,6 +584,111 @@ pub struct AuditRecord {
 pub enum AuditEvent {
     Start,
     End,
+}
+
+// ---------------------------------------------------------------------------
+// Snapshots (M3): written by `dwhy scan --snapshot`, read by `dwhy diff`
+// ---------------------------------------------------------------------------
+
+/// A compact record of one scan, kept so later runs can tell what grew.
+/// Stored as gzip-compressed JSON in
+/// `$XDG_STATE_HOME/diskwhy/snapshots/<id>.json.gz`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub schema: String,
+    pub tool: Tool,
+    pub host: String,
+    /// Effective uid the scan ran as.
+    pub uid: u32,
+    /// RFC 3339, UTC.
+    pub created_at: String,
+    pub scan: SnapshotScan,
+    /// Directories whose recursive allocated size (each hardlinked file
+    /// counted once) is at least `scan.min_dir_bytes`, largest first.
+    pub dirs: Vec<SnapshotDir>,
+    /// `df` figures per filesystem the scan touched.
+    pub fs: Vec<SnapshotFs>,
+    /// Docker objects and their sizes, when the Docker detectors queried the daemon.
+    pub docker: Option<SnapshotDocker>,
+    /// Every finding of the scan, largest first.
+    pub findings: Vec<SnapshotFinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotScan {
+    /// Scan roots, absolute.
+    pub roots: Vec<String>,
+    pub one_filesystem: bool,
+    /// Smallest directory recorded in `dirs`.
+    pub min_dir_bytes: u64,
+    /// Totals over all roots.
+    pub totals: Totals,
+    /// Detectors that ran, so a finding missing later can be told apart
+    /// from one whose detector did not run.
+    pub detectors: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotDir {
+    pub path: String,
+    pub allocated: u64,
+    pub apparent: u64,
+    /// Files (non-directories) below it, recursively.
+    pub files: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotFs {
+    pub mount: String,
+    pub fstype: String,
+    /// As in [`FsReport`].
+    pub size: u64,
+    pub used: u64,
+    pub avail: u64,
+    pub scanned: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotDocker {
+    /// Totals as in [`ScanReport::docker`] (build cache is recorded only here).
+    pub usage: DockerUsage,
+    pub images: Vec<SnapshotImage>,
+    pub containers: Vec<SnapshotContainer>,
+    pub volumes: Vec<SnapshotVolume>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotImage {
+    pub id: String,
+    pub tags: Vec<String>,
+    /// The image's size, layers shared with other images included.
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotContainer {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    pub state: String,
+    /// Writable layer; `None` when the daemon did not compute it.
+    pub bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotVolume {
+    pub name: String,
+    /// `None` when the daemon did not compute it.
+    pub bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotFinding {
+    pub id: String,
+    pub detector: String,
+    pub path: String,
+    pub bytes: u64,
+    pub tier: Tier,
 }
 
 /// Output of `dwhy doctor --json`.

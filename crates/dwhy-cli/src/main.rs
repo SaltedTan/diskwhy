@@ -21,7 +21,7 @@ use dwhy_core::mounts::{self, MountTable};
 use dwhy_core::plan::{self, Selection};
 use dwhy_core::report::{ActionKind, Plan, PlanScan, Tier};
 use dwhy_core::scan::{self, Progress, ScanOptions};
-use dwhy_core::{docker, doctor, system, units};
+use dwhy_core::{docker, doctor, snapshot, system, units};
 
 pub const EXIT_OK: u8 = 0;
 pub const EXIT_ERROR: u8 = 1;
@@ -94,6 +94,9 @@ struct ScanArgs {
     /// Text output: findings listed before "… N more".
     #[arg(long, default_value_t = 20)]
     max_findings: usize,
+    /// Save a snapshot for `dwhy diff` under ~/.local/state/diskwhy/snapshots (old ones are pruned).
+    #[arg(long)]
+    snapshot: bool,
 }
 
 /// Tiers `--tier` accepts (`blocked` is never selected).
@@ -241,6 +244,7 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
     };
     let mut report =
         account::build_scan_report(&result, &mounts, &env, &|p| mounts::statvfs(p).ok());
+    let mut docker_snap = None;
     if !args.no_detectors {
         let ctx = DetectContext::from_system();
         let (findings, runs) = detect::run_with(
@@ -253,6 +257,27 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
         report.detectors = runs;
         if let Some(snap) = ctx.docker.fetched() {
             account::attach_docker(&mut report, &docker::usage(&snap));
+            docker_snap = Some(snap);
+        }
+    }
+
+    // The report is still printed when the snapshot cannot be saved.
+    let mut save_error = None;
+    if args.snapshot {
+        let snap = snapshot::build(
+            &report,
+            &result.tree,
+            docker_snap.as_deref(),
+            snapshot::MIN_DIR_BYTES,
+        );
+        match snapshot::default_dir()
+            .ok_or_else(|| {
+                "cannot place snapshots: neither XDG_STATE_HOME nor HOME is set".to_string()
+            })
+            .and_then(|dir| snapshot::save(&dir, &snap, now_secs()))
+        {
+            Ok(saved) => report.snapshot = Some(saved),
+            Err(e) => save_error = Some(e),
         }
     }
 
@@ -262,6 +287,10 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
         writeln!(out)?;
     } else {
         human::render_scan(&mut out, &report, args.depth, args.top, args.max_findings)?;
+    }
+    if let Some(e) = save_error {
+        eprintln!("dwhy: error: snapshot not saved: {e}");
+        return Ok(EXIT_ERROR);
     }
     Ok(EXIT_OK)
 }

@@ -229,11 +229,7 @@ impl Audit {
     /// `$XDG_STATE_HOME/diskwhy/audit.jsonl`, else
     /// `$HOME/.local/state/diskwhy/audit.jsonl`.
     pub fn default_path() -> Option<PathBuf> {
-        let state = std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-        Some(state.join("diskwhy/audit.jsonl"))
+        Some(crate::system::state_dir()?.join("audit.jsonl"))
     }
 
     /// Opens `path` for appending, creating it (mode 0600) and its

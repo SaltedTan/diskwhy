@@ -22,6 +22,17 @@ pub fn euid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
+/// diskwhy's own state: `$XDG_STATE_HOME/diskwhy`, else
+/// `$HOME/.local/state/diskwhy`. A relative `XDG_STATE_HOME` is ignored, as
+/// the XDG spec says.
+pub fn state_dir() -> Option<PathBuf> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(state.join("diskwhy"))
+}
+
 pub fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)

@@ -257,6 +257,55 @@ fn scan_is_read_only() {
     assert_eq!(listing(t.path()), before);
 }
 
+#[test]
+fn scan_snapshot_writes_only_under_the_state_dir() {
+    let t = fixture();
+    let root = fs::canonicalize(t.path()).unwrap();
+    let root_s = root.to_str().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let before = listing(&root);
+    let run = |state: &Path, extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_dwhy"))
+            .args(["scan", root_s, "-q", "--detectors", "cargo-target"])
+            .args(extra)
+            .env("XDG_STATE_HOME", state)
+            .output()
+            .expect("run dwhy")
+    };
+
+    // Without --snapshot nothing is written.
+    let out = run(state.path(), &["--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(json_of(&out).get("snapshot").is_none());
+    assert!(!state.path().join("diskwhy").exists());
+
+    let out = run(state.path(), &["--json", "--snapshot"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    let dir = state.path().join("diskwhy/snapshots");
+    let id = v["snapshot"]["id"].as_str().unwrap();
+    let path = Path::new(v["snapshot"]["path"].as_str().unwrap());
+    assert_eq!(path, dir.join(format!("{id}.json.gz")));
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    let snap = dwhy_core::snapshot::load(path).unwrap();
+    assert_eq!(snap.scan.roots, vec![root_s.to_string()]);
+    assert_eq!(snap.scan.detectors, vec!["cargo-target".to_string()]);
+    assert_eq!(snap.created_at, v["generated_at"].as_str().unwrap());
+    assert_eq!(listing(&root), before);
+
+    let out = run(state.path(), &["--snapshot"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("snapshot saved: "));
+
+    // When it cannot be saved, the report is still printed and dwhy exits 1.
+    let file = state.path().join("not-a-dir");
+    fs::write(&file, b"").unwrap();
+    let out = run(&file, &["--json", "--snapshot"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(json_of(&out).get("snapshot").is_none());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("snapshot not saved"));
+}
+
 /// (path, size, mtime) of everything under `p`.
 fn listing(p: &Path) -> Vec<(String, u64, i64)> {
     use std::os::unix::fs::MetadataExt;
