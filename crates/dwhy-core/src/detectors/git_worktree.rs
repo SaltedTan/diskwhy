@@ -23,7 +23,6 @@
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
 use crate::report::{Action, ActionKind, Finding, GuardResult, GuardStatus, Recovery, Tier};
@@ -176,32 +175,8 @@ fn resolve(base: &Path, path: &str) -> PathBuf {
 }
 
 fn list(git: &str, repo: &Path) -> Result<Vec<WorktreeEntry>, String> {
-    let out = Command::new(git)
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(repo)
-        .args(["worktree", "list", "--porcelain"])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("cannot run {git}: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(err
-            .lines()
-            .next()
-            .unwrap_or("git failed")
-            .trim()
-            .to_string());
-    }
-    Ok(parse_porcelain(&String::from_utf8_lossy(&out.stdout)))
+    let out = crate::gitcmd::run(git, repo, &["worktree", "list", "--porcelain"])?;
+    Ok(parse_porcelain(&out))
 }
 
 fn git_action(git: &str, repo: &Path, args: &[&str]) -> Action {

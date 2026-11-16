@@ -43,6 +43,9 @@ impl Markers {
     /// Regular file pinning a tool version: `rust-toolchain.toml`,
     /// `rust-toolchain`, `.python-version`, `.nvmrc` or `.node-version`.
     pub const TOOL_PIN: Markers = Markers(1 << 12);
+    /// Regular file `HEAD`, as in a git directory (bare repository or
+    /// separate git dir).
+    pub const GIT_HEAD: Markers = Markers(1 << 13);
 
     pub const fn empty() -> Markers {
         Markers(0)
@@ -82,6 +85,7 @@ impl Markers {
             b"bun.lock" | b"bun.lockb" if is_file => Markers::BUN_LOCK,
             b"pnpm-workspace.yaml" if is_file => Markers::PNPM_WORKSPACE,
             b".dwhy-scratch" if is_file => Markers::SCRATCH,
+            b"HEAD" if is_file => Markers::GIT_HEAD,
             b"rust-toolchain.toml"
             | b"rust-toolchain"
             | b".python-version"
