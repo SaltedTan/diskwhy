@@ -407,3 +407,63 @@ fn plan_selection_on_fixture() {
     let out = dwhy(&["plan", &root, "-q", "--tier", "blocked"]);
     assert_eq!(out.status.code(), Some(1));
 }
+
+/// A child process, killed when dropped.
+struct Child(std::process::Child);
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn plan_exits_2_only_when_a_selected_finding_is_blocked() {
+    let (_t, root) = cargo_fixture();
+    let target = format!("{root}/app/target");
+    let Ok(child) = Command::new("sleep")
+        .arg("600")
+        .current_dir(format!("{target}/debug"))
+        .spawn()
+    else {
+        eprintln!("skipping: cannot run sleep");
+        return;
+    };
+    let _child = Child(child);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("p.json");
+    let plan = |args: &[&str]| {
+        let mut a = vec![
+            "plan",
+            &root,
+            "-q",
+            "--detectors",
+            "cargo-target",
+            "--json",
+            "-o",
+            file.to_str().unwrap(),
+        ];
+        a.extend(args);
+        let out = dwhy(&a);
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        (out.status.code(), v)
+    };
+
+    // Named by --select and blocked by the sleeping process: exit 2, and the
+    // plan is still written.
+    let (code, v) = plan(&["--select", &target]);
+    assert_eq!(code, Some(2), "{v}");
+    assert!(v["items"].as_array().unwrap().is_empty());
+    assert_eq!(v["blocked"][0]["path"], target.as_str());
+    assert_eq!(v["blocked"][0]["tier"], "blocked");
+    let written: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    assert_eq!(written, v);
+
+    // Reached only by the tier ceiling: still listed, but exit 0.
+    fs::remove_file(&file).unwrap();
+    let (code, v) = plan(&["--tier", "rebuildable"]);
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(v["blocked"][0]["path"], target.as_str());
+    assert!(file.exists());
+}

@@ -18,12 +18,13 @@ use dwhy_core::detect::{self, DetectContext};
 use dwhy_core::guard::Processes;
 use dwhy_core::mounts::{self, MountTable};
 use dwhy_core::plan::{self, Selection};
-use dwhy_core::report::{PlanScan, Tier};
+use dwhy_core::report::{ActionKind, PlanScan, Tier};
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::{docker, doctor, system, units};
 
 pub const EXIT_OK: u8 = 0;
 pub const EXIT_ERROR: u8 = 1;
+pub const EXIT_SKIPPED: u8 = 2;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -262,7 +263,9 @@ fn run_plan(args: PlanArgs) -> Result<u8> {
     let above = sel.ceiling().map_or(0, |c| {
         findings
             .iter()
-            .filter(|f| f.tier > c && f.tier != Tier::Blocked)
+            .filter(|f| {
+                f.tier > c && f.tier != Tier::Blocked && f.action.kind != ActionKind::Advice
+            })
             .count()
     });
     let status = status_line(args.quiet, "checking guards…");
@@ -297,7 +300,11 @@ fn run_plan(args: PlanArgs) -> Result<u8> {
     } else {
         human::render_plan(&mut out, &plan, args.output.as_deref(), above)?;
     }
-    Ok(EXIT_OK)
+    Ok(if plan::selected_blocked(&plan) {
+        EXIT_SKIPPED
+    } else {
+        EXIT_OK
+    })
 }
 
 /// Shows `msg` on a terminal stderr until dropped.

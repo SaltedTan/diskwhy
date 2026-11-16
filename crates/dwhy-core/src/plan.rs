@@ -18,7 +18,7 @@
 //! widen what apply may do.
 
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::detect::{DetectContext, rfc3339};
 use crate::guard::{self, Processes};
@@ -58,26 +58,22 @@ impl Selection {
 }
 
 /// Whether `entry` (a `--select` value) names `f`: its id, its path as
-/// written, or a relative path that resolves to it.
+/// written, or a relative path that resolves to it (resolved the way scan
+/// roots are: parent canonicalized, a final symlink not followed).
 fn matches(f: &Finding, entry: &str) -> bool {
     if f.id == entry || f.path == entry {
         return true;
     }
-    f.path.starts_with('/') && absolute(entry).is_some_and(|p| p == Path::new(&f.path))
+    f.path.starts_with('/')
+        && crate::scan::absolute_nofollow(Path::new(entry)).is_ok_and(|p| p == Path::new(&f.path))
 }
 
-/// `entry` made absolute, with the parent canonicalized but not a final
-/// symlink (scan roots are made absolute the same way).
-fn absolute(entry: &str) -> Option<PathBuf> {
-    let abs = std::path::absolute(entry).ok()?;
-    match (abs.parent(), abs.file_name()) {
-        (Some(parent), Some(name)) => Some(
-            std::fs::canonicalize(parent)
-                .map(|p| p.join(name))
-                .unwrap_or(abs.clone()),
-        ),
-        _ => Some(abs),
-    }
+/// Whether a finding that `--select` named ended up in the plan's `blocked`
+/// list. A finding only the tier ceiling picked does not count.
+pub fn selected_blocked(plan: &Plan) -> bool {
+    plan.blocked
+        .iter()
+        .any(|f| plan.selection.select.iter().any(|s| matches(f, s)))
 }
 
 /// Splits `findings` into the selected ones that may go into a plan and the
@@ -332,7 +328,7 @@ pub fn usable(plan: &Plan, host: &str, uid: u32, now: i64) -> Result<(), Unusabl
             TTL_SECS / 60
         )));
     }
-    if created > now + 300 {
+    if created > now {
         return Err(Unusable::Expired(format!(
             "the plan was created in the future ({})",
             plan.created_at

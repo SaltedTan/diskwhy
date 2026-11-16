@@ -282,6 +282,56 @@ fn guard_blocked_finding_moves_to_blocked() {
 }
 
 #[test]
+fn only_a_named_blocked_finding_counts_as_selected_blocked() {
+    let (_t, b) = base();
+    let busy = dir(&b.join("cache"));
+    let procs = Processes {
+        procs: vec![Proc {
+            pid: 4242,
+            name: "uv".into(),
+            cwd: Some(busy.clone()),
+            open: vec![],
+        }],
+        unreadable: 0,
+    };
+    // Picked by the default ceiling: listed as blocked, not a skip.
+    let by_tier = build(&b, tiers(&b), &Selection::default(), &procs);
+    assert_eq!(by_tier.blocked.len(), 1);
+    assert!(!plan::selected_blocked(&by_tier));
+
+    // Named by --select, by id or by path: a skip.
+    let found = tiers(&b);
+    let cache = found.iter().find(|f| f.detector == "user-cache").unwrap();
+    for entry in [cache.id.clone(), busy.to_string_lossy().into_owned()] {
+        let sel = Selection {
+            tier: None,
+            select: vec![entry],
+        };
+        let p = build(&b, found.clone(), &sel, &procs);
+        assert!(p.items.is_empty());
+        assert!(plan::selected_blocked(&p));
+    }
+
+    // A detector-blocked finding named by --select is a skip too.
+    let trash = found.iter().find(|f| f.detector == "trash").unwrap();
+    let sel = Selection {
+        tier: None,
+        select: vec![trash.id.clone()],
+    };
+    assert!(plan::selected_blocked(&build(
+        &b,
+        found.clone(),
+        &sel,
+        &Processes::default()
+    )));
+
+    // Nothing blocked: no skip.
+    let p = build(&b, found, &Selection::default(), &Processes::default());
+    assert!(p.blocked.is_empty());
+    assert!(!plan::selected_blocked(&p));
+}
+
+#[test]
 fn guard_results_are_kept_on_items() {
     let (_t, b) = base();
     let p = build(&b, tiers(&b), &Selection::default(), &Processes::default());
@@ -341,8 +391,10 @@ fn fingerprint_tracks_inode_mtime_and_size() {
     let fp2 = fingerprint_of(&b, &f);
     assert_eq!(plan::differences(&fp, &fp2), ["newest mtime"]);
 
-    // A replaced directory has another inode.
-    fs::remove_dir_all(&d).unwrap();
+    // A replaced directory has another inode. The old one stays alive
+    // until then so the filesystem cannot hand its inode number back.
+    let old = b.join("cache.old");
+    fs::rename(&d, &old).unwrap();
     dir(&d);
     age(&d.join("file"), 3600);
     age(&d, 3600);
@@ -351,6 +403,7 @@ fn fingerprint_tracks_inode_mtime_and_size() {
         plan::differences(&fp, &fp3).contains(&"inode"),
         "{fp:?} {fp3:?}"
     );
+    fs::remove_dir_all(&old).unwrap();
 
     // A big change in size is a change; a small one is not.
     let mut bigger = f.clone();
@@ -464,13 +517,19 @@ fn plans_expire_after_an_hour() {
         plan::usable(&edited, "host", 1000, t + TTL_SECS + 5),
         Err(Unusable::Expired(_))
     ));
-    // Nor does moving created_at into the future.
+    // Nor does moving created_at into the future, even by a second.
     let mut future = p.clone();
     future.created_at = "2999-01-01T00:00:00Z".into();
     assert!(matches!(
         plan::usable(&future, "host", 1000, t),
         Err(Unusable::Expired(_))
     ));
+    let ahead = plan_at(t + 1);
+    assert!(matches!(
+        plan::usable(&ahead, "host", 1000, t),
+        Err(Unusable::Expired(_))
+    ));
+    assert_eq!(plan::usable(&ahead, "host", 1000, t + 1), Ok(()));
 }
 
 #[test]
