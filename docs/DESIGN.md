@@ -137,7 +137,7 @@ Crates likely needed: `clap`, `ratatui`, `crossterm`, `serde`/`serde_json`, `ray
 | # | Deliverable | Done when |
 |---|---|---|
 | M0 | Workspace, `scan` (parallel, `-x`, hardlinks counted once, unaccounted space), JSON v1 types, `doctor` | `dwhy scan / --json` on pc-ubuntu matches `du`/`df`, and the gap is explained |
-| M1 | Detectors: cargo-target, node-modules, venv, user-cache, git-worktree, stale-tree, tool-versions, trash, Docker (images, build cache, containers, volumes) | It finds the same items the 2026-11-13 manual cleanup found |
+| M1 | Detectors: cargo-target, node-modules, venv, user-cache, git-worktree, stale-tree, tool-versions, trash, Docker (images, build cache, containers, volumes) | It finds the same items the 2026-11-13 manual cleanup found (checklist and what is out of scope: [ACCEPTANCE-M1.md](ACCEPTANCE-M1.md)) |
 | M2 | Guards, `plan`, `apply` with tier policy, audit log | Guard fixture tests pass; an agent can clear the `regenerable` items alone and is refused `review` items |
 | M3 | Snapshots, `diff`, `watch`, `postgres-wal` probe | **WAL demo:** a test Compose file (Postgres with a failing `archive_command` and `archive_timeout=10s`) is flagged by `watch`/`diff`, and `explain` names the dead archive target |
 | M4 | TUI: tree + findings, mark, plan preview, apply with confirmation | Usable over ssh at 80×24; the same plan file works in TUI and CLI |
