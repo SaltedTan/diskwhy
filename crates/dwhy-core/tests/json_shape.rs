@@ -198,6 +198,11 @@ fn sample() -> ScanReport {
             },
             total: 29_345_411_119,
         }),
+        snapshot: Some(SavedSnapshot {
+            id: "20261115T060000Z-1f2e3d4c".into(),
+            path: "/home/u/.local/state/diskwhy/snapshots/20261115T060000Z-1f2e3d4c.json.gz".into(),
+            pruned: 1,
+        }),
     }
 }
 
@@ -472,4 +477,94 @@ fn audit_record_shape() {
         ..start.clone()
     };
     insta::assert_json_snapshot!(vec![start, end]);
+}
+
+#[test]
+fn snapshot_shape() {
+    let totals = Totals {
+        allocated: 79_456_894_976,
+        apparent: 75_000_000_000,
+        files: 2_000_000,
+        dirs: 150_000,
+        symlinks: 20_000,
+        other: 3,
+        hardlinks_deduped: 1_000,
+        hardlink_bytes_deduped: 2_000_000,
+    };
+    let usage_line = |count, active, bytes| UsageLine {
+        count,
+        active,
+        bytes,
+    };
+    insta::assert_json_snapshot!(Snapshot {
+        schema: SCHEMA.into(),
+        tool: Tool {
+            name: "diskwhy".into(),
+            version: "0.0.1".into(),
+        },
+        host: "pc-ubuntu".into(),
+        uid: 1000,
+        created_at: "2026-11-16T06:00:00Z".into(),
+        scan: SnapshotScan {
+            roots: vec!["/home/u".into()],
+            one_filesystem: true,
+            min_dir_bytes: 104_857_600,
+            totals,
+            detectors: vec!["cargo-target".into(), "docker-volume".into()],
+        },
+        dirs: vec![SnapshotDir {
+            path: "/home/u".into(),
+            allocated: 79_456_894_976,
+            apparent: 75_000_000_000,
+            files: 2_000_000,
+        }],
+        fs: vec![SnapshotFs {
+            mount: "/".into(),
+            fstype: "ext4".into(),
+            size: 420_906_795_008,
+            used: 360_777_252_864,
+            avail: 38_712_254_464,
+            scanned: 79_456_894_976,
+        }],
+        docker: Some(SnapshotDocker {
+            usage: DockerUsage {
+                root_dir: "/var/lib/docker".into(),
+                containerd_image_store: true,
+                images: usage_line(2, 1, 1_000_000_000),
+                containers: usage_line(1, 1, 4096),
+                volumes: usage_line(1, 1, 33_041_965_056),
+                build_cache: usage_line(3, 0, 500_000_000),
+                total: 34_541_969_152,
+            },
+            images: vec![SnapshotImage {
+                id: "sha256:6d03d5821c0d".into(),
+                tags: vec!["postgres:16-alpine".into()],
+                bytes: 440_401_920,
+            }],
+            containers: vec![SnapshotContainer {
+                id: "c0ffee".into(),
+                name: "example-postgres-1".into(),
+                image: "postgres:16-alpine".into(),
+                state: "running".into(),
+                bytes: Some(4096),
+            }],
+            volumes: vec![
+                SnapshotVolume {
+                    name: "example_postgres_data".into(),
+                    bytes: Some(33_041_965_056),
+                },
+                SnapshotVolume {
+                    name: "unsized".into(),
+                    bytes: None,
+                },
+            ],
+        }),
+        findings: vec![SnapshotFinding {
+            id: "f_7c1e00000000".into(),
+            detector: "docker-volume".into(),
+            path: "docker://volume/example_postgres_data".into(),
+            bytes: 33_041_965_056,
+            tier: Tier::Review,
+        }],
+    });
 }

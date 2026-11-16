@@ -211,5 +211,10 @@ expression: sample()
       "bytes": 4616635167
     },
     "total": 29345411119
+  },
+  "snapshot": {
+    "id": "20261115T060000Z-1f2e3d4c",
+    "path": "/home/u/.local/state/diskwhy/snapshots/20261115T060000Z-1f2e3d4c.json.gz",
+    "pruned": 1
   }
 }
