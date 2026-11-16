@@ -380,7 +380,7 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
         let preview = apply::report(&plan, &checks, &policy, true, &env);
         let mut err = std::io::stderr().lock();
         human::render_apply(&mut err, &preview, None, true)?;
-        let bytes: u64 = ready.iter().map(|c| c.item.bytes).sum();
+        let bytes = apply::total_bytes(ready.iter().map(|c| &c.item));
         write!(
             err,
             "remove {} item{} ({})? [y/N] ",

@@ -424,6 +424,12 @@ fn run(c: &Check, mounts: &MountTable) -> (ApplyOutcome, String) {
     }
 }
 
+/// The bytes `items` hold together, counting an item inside another item
+/// once (see [`crate::plan::distinct_bytes`]).
+pub fn total_bytes<'a>(items: impl IntoIterator<Item = &'a ApplyItem>) -> u64 {
+    crate::plan::distinct_bytes(items.into_iter().map(|i| (i.path.as_str(), i.bytes)))
+}
+
 /// The report for `checks`.
 pub fn report(
     plan: &Plan,
@@ -433,21 +439,7 @@ pub fn report(
     env: &Env,
 ) -> ApplyReport {
     let items: Vec<ApplyItem> = checks.iter().map(|c| c.item.clone()).collect();
-    let removed: Vec<&ApplyItem> = items
-        .iter()
-        .filter(|i| i.outcome == ApplyOutcome::Removed)
-        .collect();
-    let freed = removed
-        .iter()
-        .filter(|i| {
-            let p = Path::new(&i.path);
-            !p.is_absolute()
-                || !removed
-                    .iter()
-                    .any(|o| o.path != i.path && p.starts_with(Path::new(&o.path)))
-        })
-        .map(|i| i.bytes)
-        .sum();
+    let freed = total_bytes(items.iter().filter(|i| i.outcome == ApplyOutcome::Removed));
     ApplyReport {
         schema: SCHEMA.into(),
         tool: Tool::current(),

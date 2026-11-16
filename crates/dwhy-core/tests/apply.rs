@@ -617,6 +617,57 @@ fn deepest_items_run_first_and_commands_report_failure() {
 }
 
 #[test]
+fn an_item_inside_another_is_counted_once() {
+    let (_t, b) = base();
+    write(&b.join("scratch/app/target/file"), "t");
+    write(&b.join("scratch/notes"), "n");
+    // The nesting rule: the outer finding's bytes already hold the inner's.
+    let mut outer = finding("stale-tree", &b.join("scratch"), Tier::Review);
+    outer.bytes = 10_000;
+    outer.nested_bytes = Some(9_000);
+    let mut inner = finding(
+        "cargo-target",
+        &b.join("scratch/app/target"),
+        Tier::Rebuildable,
+    );
+    inner.bytes = 9_000;
+    let found = vec![outer.clone(), inner];
+    let plan = make_plan(&b, found.clone());
+    assert_eq!(plan.bytes, 10_000);
+    let pol = policy(Tier::Rebuildable, &[&outer.id]);
+    let mut checks = evaluate(&b, &plan, found, &pol);
+    assert!(checks.iter().all(|c| c.ready()), "{:?}", outcomes(&checks));
+
+    let preview = apply::report(&plan, &checks, &pol, true, &env());
+    let would = preview
+        .items
+        .iter()
+        .filter(|i| i.outcome == ApplyOutcome::WouldRemove);
+    assert_eq!(would.clone().count(), 2);
+    assert_eq!(apply::total_bytes(would), 10_000, "not 19 000");
+    assert_eq!(apply::total_bytes(checks.iter().map(|c| &c.item)), 10_000);
+
+    let (_s, state) = base();
+    let mut audit = Audit::open(&state.join("a.jsonl")).unwrap();
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |_| {},
+    );
+    assert!(!b.join("scratch").exists());
+    let r = apply::report(&plan, &checks, &pol, false, &env());
+    assert!(
+        r.items.iter().all(|i| i.outcome == ApplyOutcome::Removed),
+        "{:?}",
+        r.items
+    );
+    assert_eq!(r.freed, 10_000);
+}
+
+#[test]
 fn a_removal_whose_audit_line_cannot_be_written_does_not_run() {
     if !Path::new("/dev/full").exists() {
         return;

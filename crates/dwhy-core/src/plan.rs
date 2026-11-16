@@ -172,18 +172,27 @@ pub fn build(
 
 /// The bytes of the items, leaving out any item inside another item.
 fn items_bytes(items: &[PlanItem]) -> u64 {
-    let paths: Vec<&Path> = items
-        .iter()
-        .map(|i| Path::new(&i.finding.path))
-        .filter(|p| p.is_absolute())
-        .collect();
+    distinct_bytes(
+        items
+            .iter()
+            .map(|i| (i.finding.path.as_str(), i.finding.bytes)),
+    )
+}
+
+/// The sum of `(path, bytes)` pairs, leaving out any pair whose absolute
+/// path lies inside another pair's: an outer finding's bytes already hold
+/// those of findings nested in it. Pseudo-paths (`docker://…`) never nest.
+pub fn distinct_bytes<'a>(items: impl IntoIterator<Item = (&'a str, u64)>) -> u64 {
+    let items: Vec<(&Path, u64)> = items.into_iter().map(|(p, b)| (Path::new(p), b)).collect();
     items
         .iter()
-        .filter(|i| {
-            let p = Path::new(&i.finding.path);
-            !p.is_absolute() || !paths.iter().any(|o| *o != p && p.starts_with(o))
+        .filter(|(p, _)| {
+            !p.is_absolute()
+                || !items
+                    .iter()
+                    .any(|(o, _)| o.is_absolute() && o != p && p.starts_with(o))
         })
-        .map(|i| i.finding.bytes)
+        .map(|(_, b)| b)
         .sum()
 }
 

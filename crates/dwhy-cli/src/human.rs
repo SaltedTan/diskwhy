@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
 
+use dwhy_core::apply::{self, tier_name};
 use dwhy_core::report::{
     ActionKind, ApplyOutcome, ApplyReport, DetectorAvailability, DirEntry, DoctorReport, Finding,
     FsReport, GuardStatus, Plan, ScanReport, SkipReason, Tier,
@@ -245,12 +246,11 @@ pub fn render_apply(
     let plural = |n: usize| if n == 1 { "" } else { "s" };
     if r.dry_run {
         let n = count(ApplyOutcome::WouldRemove);
-        let bytes: u64 = r
-            .items
-            .iter()
-            .filter(|i| i.outcome == ApplyOutcome::WouldRemove)
-            .map(|i| i.bytes)
-            .sum();
+        let bytes = apply::total_bytes(
+            r.items
+                .iter()
+                .filter(|i| i.outcome == ApplyOutcome::WouldRemove),
+        );
         writeln!(
             w,
             "would remove {n} item{} ({}){rest}; nothing removed",
@@ -270,15 +270,6 @@ pub fn render_apply(
         writeln!(w, "audit log: {}", p.display())?;
     }
     Ok(())
-}
-
-fn tier_name(t: Tier) -> &'static str {
-    match t {
-        Tier::Regenerable => "regenerable",
-        Tier::Rebuildable => "rebuildable",
-        Tier::Review => "review",
-        Tier::Blocked => "blocked",
-    }
 }
 
 /// A finding's bytes less those held by findings inside it, which are
