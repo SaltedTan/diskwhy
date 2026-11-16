@@ -1,14 +1,17 @@
-//! Running git the way diskwhy must: `--no-optional-locks`, no prompts, no
-//! stdin, and none of the caller's `GIT_DIR`-style variables.
+//! Running git the way diskwhy must: `--no-optional-locks`, no fsmonitor
+//! (a program the repository's config can name), no prompts, no stdin, and
+//! none of the caller's `GIT_DIR`-style variables.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// Runs `git --no-optional-locks -C <dir> <args>` and returns its stdout.
+/// Runs `git --no-optional-locks -c core.fsmonitor=false -C <dir> <args>`
+/// and returns its stdout.
 /// The error is the first line of stderr.
 pub(crate) fn run(git: &str, dir: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new(git)
         .arg("--no-optional-locks")
+        .args(["-c", "core.fsmonitor=false"])
         .arg("-C")
         .arg(dir)
         .args(args)

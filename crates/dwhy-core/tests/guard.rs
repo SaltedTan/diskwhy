@@ -320,6 +320,121 @@ fn linked_worktrees() {
 }
 
 #[test]
+fn submodule_whose_git_dir_goes_with_the_finding_blocks() {
+    let (_t, b) = base();
+    pushed_repo(&b, "lib");
+    let proj = pushed_repo(&b, "proj");
+    let url = b.join("lib-remote.git");
+    git(
+        &proj,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            url.to_str().unwrap(),
+            "lib",
+        ],
+    );
+    let lib = proj.join("lib");
+    commit(&lib, "one");
+    commit(&lib, "two");
+    // The superproject records the new submodule commit and is pushed, so
+    // only the submodule's own commits are unpublished. Its git directory
+    // is proj/.git/modules/lib, removed with proj.
+    git(&proj, &["add", "lib"]);
+    git(&proj, &["commit", "-q", "-m", "bump lib"]);
+    git(&proj, &["push", "-q"]);
+    let (tier, g) = guards(&b, &proj);
+    assert_eq!(tier, Tier::Blocked, "{g:?}");
+    assert_eq!(get(&g, "git-dirty").status, GuardStatus::Pass, "{g:?}");
+    let u = get(&g, "git-unpublished");
+    assert_eq!(u.status, GuardStatus::Block);
+    assert!(
+        u.detail
+            .contains(&format!("{} (2 commits on no remote)", lib.display())),
+        "{}",
+        u.detail
+    );
+}
+
+#[test]
+fn separate_git_dir_inside_the_finding_blocks() {
+    let (_t, b) = base();
+    let scratch = b.join("scratch/try-1");
+    let work = scratch.join("proj");
+    fs::create_dir_all(&work).unwrap();
+    git(
+        &work,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            scratch.join("proj.git").to_str().unwrap(),
+        ],
+    );
+    commit(&work, "a");
+    let (tier, g) = guards(&b, &scratch);
+    assert_eq!(tier, Tier::Blocked, "{g:?}");
+    let u = get(&g, "git-unpublished");
+    assert_eq!(u.status, GuardStatus::Block);
+    assert!(u.detail.contains("1 commit on no remote"), "{}", u.detail);
+
+    // Only the work tree is in the finding: the repository lives on, and
+    // the commit stays on its branch.
+    let (tier, g) = guards(&b, &work);
+    assert_eq!(tier, Tier::Review, "{g:?}");
+    assert_eq!(get(&g, "git-unpublished").status, GuardStatus::Warn);
+}
+
+#[test]
+fn git_runs_none_of_the_repositorys_programs() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_t, b) = base();
+    let repo = pushed_repo(&b, "app");
+    write(
+        &repo.join(".gitattributes"),
+        "a filter=evil\nb filter=evilproc\n",
+    );
+    write(&repo.join("a"), "aaaa");
+    write(&repo.join("b"), "bbbb");
+    git(&repo, &["add", ".gitattributes", "a", "b"]);
+    git(&repo, &["commit", "-q", "-m", "files"]);
+    git(&repo, &["push", "-q"]);
+    let marker = |name: &str| b.join(format!("ran-{name}"));
+    let fsmonitor = b.join("fsmonitor.sh");
+    write(
+        &fsmonitor,
+        &format!("#!/bin/sh\ntouch '{}'\n", marker("fsmonitor").display()),
+    );
+    fs::set_permissions(&fsmonitor, fs::Permissions::from_mode(0o755)).unwrap();
+    let touch = |name: &str| format!("touch '{}'; cat", marker(name).display());
+    for (k, v) in [
+        ("filter.evil.clean", touch("clean")),
+        ("filter.evil.required", "true".into()),
+        ("filter.evilproc.process", touch("process")),
+        ("core.fsmonitor", fsmonitor.to_string_lossy().into_owned()),
+    ] {
+        git(&repo, &["config", k, &v]);
+    }
+    // Same size, older mtime: git has to read the files again to compare.
+    for f in ["a", "b"] {
+        fs::File::options()
+            .write(true)
+            .open(repo.join(f))
+            .unwrap()
+            .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+            .unwrap();
+    }
+    let (tier, g) = guards(&b, &repo);
+    for name in ["fsmonitor", "clean", "process"] {
+        assert!(!marker(name).exists(), "git ran the repository's {name}");
+    }
+    assert_eq!(tier, Tier::Review, "{g:?}");
+}
+
+#[test]
 fn git_missing_blocks_when_there_is_a_repository() {
     let (_t, b) = base();
     let repo = pushed_repo(&b, "app");

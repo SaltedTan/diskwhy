@@ -10,14 +10,20 @@
 //! - `git-dirty`: a git worktree inside it (or the finding itself) has
 //!   uncommitted changes, untracked files included.
 //! - `git-unpublished`: removing it would lose commits. For a repository
-//!   whose `.git` directory is inside the finding, that is anything
-//!   reachable from a local ref, stash or worktree HEAD that is on no remote
-//!   branch. For a linked worktree or submodule (a `.git` file), the
+//!   whose git directory is inside the finding (a `.git` directory, or a
+//!   `.git` file pointing inside it: a submodule of a superproject in the
+//!   finding, a `--separate-git-dir` clone), that is anything reachable from
+//!   a local ref, stash or worktree HEAD that is on no remote branch. For a
+//!   linked worktree or submodule whose git directory is outside, the
 //!   repository lives on, so only commits reachable from HEAD and from no
 //!   branch or remote are lost (block); unpushed commits on its branch stay
 //!   in the repository (warn).
 //! - `git-linked-worktrees`: a repository inside the finding has linked
 //!   worktrees outside it, which removing the repository would break.
+//!
+//! Git runs none of the repository's own programs: fsmonitor and every
+//! configured filter driver are switched off, and `git status` leaves
+//! submodules alone (each is checked as a repository of its own).
 //!
 //! For a Docker volume, `container-mount`: mounted by a running container
 //! (block) or a stopped one (warn).
@@ -149,13 +155,21 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
         let root = Path::new(&f.path);
         repos.iter().filter(|r| r.starts_with(root)).collect()
     };
-    // Every repository any finding needs, read once and in parallel.
-    let mut needed: Vec<&PathBuf> = findings.iter().flat_map(&inside).collect();
-    needed.sort();
-    needed.dedup();
+    // Every repository any finding needs, with the outermost finding it is
+    // in, read once and in parallel.
+    let mut needed: HashMap<&PathBuf, PathBuf> = HashMap::new();
+    for f in findings.iter() {
+        for r in inside(f) {
+            let root = PathBuf::from(&f.path);
+            let outer = needed.entry(r).or_insert_with(|| root.clone());
+            if outer.starts_with(&root) {
+                *outer = root;
+            }
+        }
+    }
     let states: HashMap<&PathBuf, RepoState> = needed
         .par_iter()
-        .map(|r| (*r, RepoState::read(git.as_deref(), r)))
+        .map(|(r, outer)| (*r, RepoState::read(git.as_deref(), r, outer)))
         .collect();
     for f in findings.iter_mut() {
         let mut results = Vec::new();
@@ -216,16 +230,12 @@ fn repositories(tree: &ScanTree) -> Vec<PathBuf> {
 }
 
 fn named(procs: &[&Proc]) -> String {
-    let mut s = procs
-        .iter()
-        .take(MAX_NAMED)
-        .map(|p| format!("{} (pid {})", p.name, p.pid))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if procs.len() > MAX_NAMED {
-        s.push_str(&format!(" and {} more", procs.len() - MAX_NAMED));
-    }
-    s
+    list(
+        &procs
+            .iter()
+            .map(|p| format!("{} (pid {})", p.name, p.pid))
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn unread_note(procs: &Processes) -> String {
@@ -295,44 +305,55 @@ fn in_use_open(root: &Path, procs: &Processes) -> GuardResult {
 enum RepoState {
     Failed(String),
     Read {
-        /// `.git` is a directory: the repository itself lives here.
-        owns_repo: bool,
+        /// The repository's git directory (shared by all its worktrees):
+        /// when it is inside a finding, the repository goes with it.
+        common: PathBuf,
         dirty: usize,
-        /// Commits lost if the directory goes.
+        /// Commits on no remote branch, from every local ref, stash and
+        /// worktree HEAD; counted when `common` is inside a finding.
+        unpublished: usize,
+        /// Linked worktrees of the repository (their directories); read
+        /// when `common` is inside a finding.
+        linked: Vec<PathBuf>,
+        /// Commits reachable from HEAD and from no branch or remote.
         lost: usize,
         /// Unpushed commits on the worktree's branch (they stay in the repo).
         unpushed_kept: usize,
         branch: Option<String>,
-        /// Linked worktrees of this repository (their directories).
-        linked: Vec<PathBuf>,
     },
 }
 
 impl RepoState {
-    fn read(git: Option<&str>, dir: &Path) -> RepoState {
+    /// Reads the repository at `dir`; `outer` is the outermost finding it
+    /// is in.
+    fn read(git: Option<&str>, dir: &Path, outer: &Path) -> RepoState {
         let Some(git) = git else {
             return RepoState::Failed("git is not installed".into());
         };
-        match Self::try_read(git, dir) {
+        match Self::try_read(git, dir, outer) {
             Ok(s) => s,
             Err(e) => RepoState::Failed(e),
         }
     }
 
-    fn try_read(git: &str, dir: &Path) -> Result<RepoState, String> {
-        let owns_repo = std::fs::symlink_metadata(dir.join(".git")).is_ok_and(|m| m.is_dir());
+    fn try_read(git: &str, dir: &Path, outer: &Path) -> Result<RepoState, String> {
+        let git_dir = dir.join(".git");
+        let gitfile = !std::fs::symlink_metadata(&git_dir).is_ok_and(|m| m.is_dir());
         // One call for the changes, the branch and whether HEAD exists.
-        let status = crate::gitcmd::run(
-            git,
-            dir,
-            &[
+        let mut args = no_filters(git, dir)?;
+        args.extend(
+            [
                 "status",
                 "--porcelain=v2",
                 "--branch",
                 "-z",
                 "--untracked-files=normal",
-            ],
-        )?;
+                "--ignore-submodules=all",
+            ]
+            .map(String::from),
+        );
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let status = crate::gitcmd::run(git, dir, &args)?;
         let mut dirty = 0;
         let mut branch = None;
         let mut has_head = true;
@@ -354,12 +375,27 @@ impl RepoState {
                 .parse()
                 .map_err(|_| format!("unexpected git output: {}", out.trim()))
         };
-        let (lost, unpushed_kept, linked) = if owns_repo {
+        let common = if gitfile {
+            let out = crate::gitcmd::run(
+                git,
+                dir,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )?;
+            PathBuf::from(out.trim_end_matches('\n'))
+        } else {
+            git_dir
+        };
+        let (unpublished, linked) = if common.starts_with(outer) {
             // Everything local (branches, tags, stash, every worktree's
             // HEAD) that no remote branch has.
-            let lost = count(&["rev-list", "--count", "--all", "--not", "--remotes"])?;
-            (lost, 0, linked_worktrees(&dir.join(".git")))
-        } else if has_head {
+            (
+                count(&["rev-list", "--count", "--all", "--not", "--remotes"])?,
+                linked_worktrees(&common),
+            )
+        } else {
+            (0, Vec::new())
+        };
+        let (lost, unpushed_kept) = if gitfile && has_head {
             let lost = count(&[
                 "rev-list",
                 "--count",
@@ -373,19 +409,44 @@ impl RepoState {
             } else {
                 0
             };
-            (lost, unpushed, Vec::new())
+            (lost, unpushed)
         } else {
-            (0, 0, Vec::new())
+            (0, 0)
         };
         Ok(RepoState::Read {
-            owns_repo,
+            common,
             dirty,
+            unpublished,
+            linked,
             lost,
             unpushed_kept,
             branch,
-            linked,
         })
     }
+}
+
+/// `-c` options switching off every filter driver in the repository's
+/// config, so that `git status` runs none of their programs when it hashes
+/// a file.
+fn no_filters(git: &str, dir: &Path) -> Result<Vec<String>, String> {
+    let keys = crate::gitcmd::run(git, dir, &["config", "--list", "--name-only", "-z"])?;
+    let mut drivers: Vec<&str> = keys
+        .split('\0')
+        .filter_map(|k| Some(k.strip_prefix("filter.")?.rsplit_once('.')?.0))
+        .collect();
+    drivers.sort();
+    drivers.dedup();
+    let mut out = Vec::new();
+    for d in drivers {
+        if d.contains('=') {
+            return Err(format!("cannot switch off filter driver {d:?}"));
+        }
+        for kv in ["clean=", "smudge=", "process=", "required=false"] {
+            out.push("-c".to_string());
+            out.push(format!("filter.{d}.{kv}"));
+        }
+    }
+    Ok(out)
 }
 
 /// Directories of the linked worktrees that still exist, from each
@@ -456,33 +517,36 @@ fn git_guards(root: &Path, repos: &[(&PathBuf, &RepoState)]) -> Vec<GuardResult>
         match state {
             RepoState::Failed(e) => failed.push(format!("{d}: {e}")),
             RepoState::Read {
-                owns_repo,
+                common,
                 dirty: n_dirty,
+                unpublished,
+                linked,
                 lost: n_lost,
                 unpushed_kept,
                 branch,
-                linked,
             } => {
                 if *n_dirty > 0 {
                     dirty.push(format!("{d} ({n_dirty} changed or untracked)"));
                 }
-                if *n_lost > 0 {
-                    lost.push(if *owns_repo {
-                        format!("{d} ({} on no remote)", commits(*n_lost))
-                    } else {
-                        format!("{d} ({} on no branch or remote)", commits(*n_lost))
-                    });
-                }
-                if *unpushed_kept > 0 {
-                    kept.push(format!(
-                        "{d} ({} unpushed on {})",
-                        commits(*unpushed_kept),
-                        branch.as_deref().unwrap_or("its branch")
-                    ));
-                }
-                for w in linked {
-                    if !w.starts_with(root) {
-                        linked_out.push(format!("{} (of {d})", w.display()));
+                if common.starts_with(root) {
+                    if *unpublished > 0 {
+                        lost.push(format!("{d} ({} on no remote)", commits(*unpublished)));
+                    }
+                    for w in linked {
+                        if !w.starts_with(root) {
+                            linked_out.push(format!("{} (of {d})", w.display()));
+                        }
+                    }
+                } else {
+                    if *n_lost > 0 {
+                        lost.push(format!("{d} ({} on no branch or remote)", commits(*n_lost)));
+                    }
+                    if *unpushed_kept > 0 {
+                        kept.push(format!(
+                            "{d} ({} unpushed on {})",
+                            commits(*unpushed_kept),
+                            branch.as_deref().unwrap_or("its branch")
+                        ));
                     }
                 }
             }
