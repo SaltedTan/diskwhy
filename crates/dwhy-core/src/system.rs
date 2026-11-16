@@ -23,13 +23,19 @@ pub fn euid() -> u32 {
 }
 
 /// diskwhy's own state: `$XDG_STATE_HOME/diskwhy`, else
-/// `$HOME/.local/state/diskwhy`. A relative `XDG_STATE_HOME` is ignored, as
-/// the XDG spec says.
+/// `$HOME/.local/state/diskwhy`. A relative or empty `XDG_STATE_HOME` is
+/// ignored, as the XDG spec says; a relative or empty `HOME` gives `None`,
+/// so state never lands under the current directory.
 pub fn state_dir() -> Option<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .map(|h| h.join(".local/state"))
+        })?;
     Some(state.join("diskwhy"))
 }
 

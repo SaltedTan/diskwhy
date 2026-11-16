@@ -306,6 +306,29 @@ fn scan_snapshot_writes_only_under_the_state_dir() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("snapshot not saved"));
 }
 
+#[test]
+fn scan_snapshot_refuses_a_relative_home() {
+    let t = fixture();
+    let root = fs::canonicalize(t.path()).unwrap();
+    for home in ["", "relative/home"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_dwhy"))
+            .args(["scan", ".", "-q", "--json", "--snapshot", "--no-detectors"])
+            .current_dir(&root)
+            .env("HOME", home)
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .expect("run dwhy");
+        assert_eq!(out.status.code(), Some(1), "HOME={home:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("cannot place snapshots"),
+            "HOME={home:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!root.join(".local").exists());
+        assert!(!root.join("relative").exists());
+    }
+}
+
 /// (path, size, mtime) of everything under `p`.
 fn listing(p: &Path) -> Vec<(String, u64, i64)> {
     use std::os::unix::fs::MetadataExt;
