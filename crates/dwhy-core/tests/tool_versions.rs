@@ -438,6 +438,35 @@ fn pyenv_python_pins_match_only_their_variant() {
 }
 
 #[test]
+fn pyenv_pypy_prefix_pin_keeps_the_matching_release() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let versions = home.join(".pyenv/versions");
+    for v in ["pypy3.9-7.3.15", "pypy3.10-7.3.15", "3.12.1", "3.13-dev"] {
+        install(&versions.join(v));
+    }
+    // pyenv resolves `pypy3.9` to the newest installed pypy3.9-*.
+    text(&home.join("code/p/.python-version"), "pypy3.9\n3.12\n");
+    assert_eq!(paths(&detect(home)), Vec::<String>::new());
+}
+
+#[test]
+fn uv_key_pin_with_a_platform() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let root = uv_root(home);
+    let k = |v: &str| root.join(format!("cpython-{v}-linux-x86_64-gnu"));
+    for v in ["3.12.1", "3.12.4", "3.13.0"] {
+        install(&k(v));
+    }
+    text(
+        &home.join("code/p/.python-version"),
+        "cpython-3.12-linux-x86_64-gnu\n",
+    );
+    assert_eq!(paths(&detect(home)), [s(&k("3.12.1"))]);
+}
+
+#[test]
 fn uv_python_install_dir_from_env() {
     let home = tempfile::tempdir().unwrap();
     let home = home.path();

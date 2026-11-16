@@ -1018,15 +1018,23 @@ fn resolve_python(installs: &[Install], requests: &[String], default_impl: &str)
             continue;
         };
         // Only builds of the requested variant: none for `3.13`, the
-        // free-threaded ones for `3.13t`.
-        let (uv_variant, pyenv_suffix) = match &rest[digits.len()..] {
+        // free-threaded ones for `3.13t`. A uv key may name the platform
+        // after the variant; a PyPy release follows the pyenv group.
+        let tail = &rest[digits.len()..];
+        let (variant, platform) = tail.split_once('-').unwrap_or((tail, ""));
+        let (uv_variant, pyenv_suffix) = match variant {
             "t" | "+freethreaded" => ("freethreaded", "t"),
-            tail => (tail.trim_start_matches('+'), tail),
+            v => (v.trim_start_matches('+'), tail),
         };
-        let uv_group = format!("{imp}+{uv_variant}-");
+        let uv_group = format!("{imp}+{uv_variant}-{platform}");
         let pyenv_group = format!("{imp}#{pyenv_suffix}");
         out.extend(newest_matching(installs, &req, |g| {
-            g.starts_with(&uv_group) || g == pyenv_group
+            g.starts_with(&uv_group)
+                || g == pyenv_group
+                || (pyenv_suffix.is_empty()
+                    && g.strip_prefix(&pyenv_group)
+                        .and_then(|r| r.strip_prefix('-'))
+                        .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit())))
         }));
     }
     out
