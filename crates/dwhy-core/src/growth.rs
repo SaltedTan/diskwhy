@@ -30,19 +30,34 @@ fn delta(before: Option<u64>, after: Option<u64>) -> i64 {
     r.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
+fn depth(path: &str) -> usize {
+    Path::new(path).components().count()
+}
+
+fn within(path: &Path, roots: &[String]) -> bool {
+    roots.iter().any(|r| path.starts_with(r))
+}
+
+/// The mount point the scan skipped that kept its walk from `path`, a
+/// path under its roots: one between the deepest root above it and it.
+fn blocked_by<'a>(path: &Path, scan: &'a SnapshotScan) -> Option<&'a str> {
+    let root = scan
+        .roots
+        .iter()
+        .filter(|r| path.starts_with(r))
+        .map(|r| depth(r))
+        .max()?;
+    scan.skipped_mounts
+        .iter()
+        .filter(|m| path.starts_with(m) && depth(m) > root)
+        .max_by_key(|m| depth(m))
+        .map(String::as_str)
+}
+
 /// Whether the scan walked `path`: it is under a root, and no mount point
 /// the walk skipped lies between that root and it.
 fn walked(path: &Path, scan: &SnapshotScan) -> bool {
-    let deepest = |v: &[String]| {
-        v.iter()
-            .filter(|a| path.starts_with(a))
-            .map(|a| Path::new(a).components().count())
-            .max()
-    };
-    match (deepest(&scan.roots), deepest(&scan.skipped_mounts)) {
-        (Some(root), Some(mount)) => root >= mount,
-        (root, _) => root.is_some(),
-    }
+    within(path, &scan.roots) && blocked_by(path, scan).is_none()
 }
 
 /// Mount points `side` skipped where `other` walked something it would
@@ -68,9 +83,10 @@ fn left_out<'a>(side: &'a SnapshotScan, other: &'a SnapshotScan) -> impl Iterato
 /// the current allocated size of a directory `new` does not record (one
 /// that shrank below its threshold), `None` when it no longer exists.
 /// Only paths both scans walked are compared: inside the roots of both,
-/// and not at or below a mount point either skipped. Directories above a
-/// mount point one side skipped and the other walked are left out too:
-/// their totals cover different ground.
+/// and not at or below a mount point either skipped. When the two differ
+/// in `one_filesystem`, directories above a mount point one side skipped
+/// and the other walked are left out too: their totals cover different
+/// ground.
 pub fn diff(
     old: &Snapshot,
     old_id: Option<String>,
@@ -83,21 +99,48 @@ pub fn diff(
         (Some(n), Some(o)) => n - o,
         _ => 0,
     };
-    let mut mounts: Vec<&str> = left_out(&old.scan, &new.scan)
-        .chain(left_out(&new.scan, &old.scan))
+    let above: Vec<&str> = if old.scan.one_filesystem != new.scan.one_filesystem {
+        left_out(&old.scan, &new.scan)
+            .chain(left_out(&new.scan, &old.scan))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // The mount points that keep a path inside the roots of both out.
+    let blockers = |path: &str| {
+        let p = Path::new(path);
+        let mut v: Vec<&str> = [blocked_by(p, &old.scan), blocked_by(p, &new.scan)]
+            .into_iter()
+            .flatten()
+            .collect();
+        v.extend(above.iter().filter(|m| Path::new(m).starts_with(p)));
+        v
+    };
+    let in_roots = |path: &str| {
+        let p = Path::new(path);
+        within(p, &old.scan.roots) && within(p, &new.scan.roots)
+    };
+    let both = |path: &str| in_roots(path) && blockers(path).is_empty();
+    let mut notes = Vec::new();
+    let mut mounts: Vec<&str> = old
+        .dirs
+        .iter()
+        .chain(&new.dirs)
+        .map(|d| d.path.as_str())
+        .chain(
+            old.findings
+                .iter()
+                .chain(&new.findings)
+                .map(|f| f.path.as_str()),
+        )
+        .filter(|p| p.starts_with('/') && in_roots(p))
+        .flat_map(&blockers)
         .collect();
     mounts.sort_unstable();
     mounts.dedup();
-    let both = |path: &str| {
-        let p = Path::new(path);
-        walked(p, &old.scan)
-            && walked(p, &new.scan)
-            && !mounts.iter().any(|m| Path::new(m).starts_with(p))
-    };
-    let mut notes = Vec::new();
     if !mounts.is_empty() {
         notes.push(format!(
-            "not compared: paths at, below or above mount points one side did not enter: {}",
+            "not compared, because one side did not enter these mount points: {}",
             mounts.join(", ")
         ));
     }

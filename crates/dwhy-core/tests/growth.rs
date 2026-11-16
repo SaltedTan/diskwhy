@@ -366,8 +366,7 @@ fn only_paths_inside_both_scans_are_compared() {
     assert_eq!(d.roots, ["/h/a", "/srv"]);
 }
 
-const HOME_NOTE: &str =
-    "not compared: paths at, below or above mount points one side did not enter: /home";
+const HOME_NOTE: &str = "not compared, because one side did not enter these mount points: /home";
 
 /// The notes about mount points (Docker notes left out).
 fn mount_notes(d: &dwhy_core::report::DiffReport) -> Vec<&str> {
@@ -435,6 +434,7 @@ fn a_mount_entered_on_one_side_only_leaves_out_the_dirs_above_it() {
         snap("2026-11-16T00:00:00Z", &["/"], &["cargo-target"]),
         &["/proc"],
     );
+    new.scan.one_filesystem = false;
     new.dirs = dirs(&[("/", 82 * G), ("/usr", 12 * G), ("/home", 30 * G)]);
     new.findings = vec![
         sfinding("f_u", "cargo-target", "/usr/src/x/target", 2 * G),
@@ -454,6 +454,8 @@ fn a_mount_entered_on_one_side_only_leaves_out_the_dirs_above_it() {
 
     // With the same mounts skipped on both sides, / is compared.
     let mut new = skipping(new, &["/home", "/proc"]);
+    new.scan.one_filesystem = true;
+    new.findings.pop();
     new.dirs = dirs(&[("/", 54 * G), ("/usr", 12 * G)]);
     let d = growth::diff(&old, None, "f".into(), &new, &no_tree, 10 * M);
     assert_eq!(
@@ -461,6 +463,31 @@ fn a_mount_entered_on_one_side_only_leaves_out_the_dirs_above_it() {
         [
             ("/", Some(50 * G), Some(54 * G), 4 * G as i64, false),
             ("/usr", Some(10 * G), Some(12 * G), 2 * G as i64, false)
+        ]
+    );
+    assert_eq!(mount_notes(&d), [] as [&str; 0]);
+}
+
+#[test]
+fn with_the_same_x_a_mount_skipped_on_one_side_leaves_the_dirs_above_it_compared() {
+    // Both -x on /. A snap refresh mounted /snap/x/1 between the scans, and
+    // the snapshot was saved before skipped mounts were recorded: neither
+    // side's totals include what any of those mounts hold.
+    let mut old = snap("2026-11-15T00:00:00Z", &["/"], &["cargo-target"]);
+    old.dirs = dirs(&[("/", 50 * G), ("/snap", 4 * G), ("/usr", 10 * G)]);
+    let mut new = skipping(
+        snap("2026-11-16T00:00:00Z", &["/"], &["cargo-target"]),
+        &["/home", "/proc", "/snap/x/1"],
+    );
+    new.dirs = dirs(&[("/", 56 * G), ("/snap", 7 * G), ("/usr", 13 * G)]);
+
+    let d = growth::diff(&old, None, "f".into(), &new, &no_tree, 10 * M);
+    assert_eq!(
+        rows(&d.dirs),
+        [
+            ("/", Some(50 * G), Some(56 * G), 6 * G as i64, false),
+            ("/snap", Some(4 * G), Some(7 * G), 3 * G as i64, false),
+            ("/usr", Some(10 * G), Some(13 * G), 3 * G as i64, false)
         ]
     );
     assert_eq!(mount_notes(&d), [] as [&str; 0]);
