@@ -276,7 +276,12 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
             })
             .and_then(|dir| snapshot::save(&dir, &snap, now_secs()))
         {
-            Ok(saved) => report.snapshot = Some(saved),
+            Ok(saved) => {
+                if let Some(e) = saved.prune_error {
+                    eprintln!("dwhy: warning: old snapshots not pruned: {e}");
+                }
+                report.snapshot = Some(saved.snapshot);
+            }
             Err(e) => save_error = Some(e),
         }
     }

@@ -159,13 +159,17 @@ fn docker_part(s: &docker::Snapshot) -> SnapshotDocker {
     }
 }
 
-/// 8 hex digits identifying the host, uid, roots and `one_filesystem`.
+/// 8 hex digits identifying the host, uid, roots (in any order) and
+/// `one_filesystem`.
 pub fn scope(host: &str, uid: u32, roots: &[String], one_filesystem: bool) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let uid = uid.to_string();
+    let mut sorted: Vec<&str> = roots.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
     let parts = [host, uid.as_str(), if one_filesystem { "x" } else { "c" }]
         .into_iter()
-        .chain(roots.iter().map(String::as_str));
+        .chain(sorted);
     for part in parts {
         for b in part.bytes().chain(std::iter::once(0u8)) {
             h ^= b as u64;
@@ -341,9 +345,18 @@ pub fn prune(dir: &Path, now: i64, keep: &str) -> Result<u64, String> {
     Ok(n)
 }
 
+/// A saved snapshot, and why pruning failed when it did (the snapshot is
+/// saved either way).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Saved {
+    pub snapshot: SavedSnapshot,
+    pub prune_error: Option<String>,
+}
+
 /// Writes `snap` to `dir` (created 0700 when missing) as a new 0600 file,
-/// never replacing one, then prunes old snapshots.
-pub fn save(dir: &Path, snap: &Snapshot, now: i64) -> Result<SavedSnapshot, String> {
+/// never replacing one, then prunes old snapshots. An `Err` means nothing
+/// was saved.
+pub fn save(dir: &Path, snap: &Snapshot, now: i64) -> Result<Saved, String> {
     let created = parse_time(&snap.created_at)
         .ok_or_else(|| format!("bad created_at {:?}", snap.created_at))?;
     fs::DirBuilder::new()
@@ -394,11 +407,17 @@ pub fn save(dir: &Path, snap: &Snapshot, now: i64) -> Result<SavedSnapshot, Stri
     }
     let _ = fs::remove_file(&tmp);
     let (id, path) = linked.ok_or_else(|| format!("too many snapshots named {base}"))?;
-    let pruned = prune(dir, now, &id)?;
-    Ok(SavedSnapshot {
-        id,
-        path: path.to_string_lossy().into_owned(),
-        pruned,
+    let (pruned, prune_error) = match prune(dir, now, &id) {
+        Ok(n) => (n, None),
+        Err(e) => (0, Some(e)),
+    };
+    Ok(Saved {
+        snapshot: SavedSnapshot {
+            id,
+            path: path.to_string_lossy().into_owned(),
+            pruned,
+        },
+        prune_error,
     })
 }
 
@@ -456,5 +475,10 @@ mod tests {
         assert_ne!(a, scope("h", 1001, &r(&["/home/u"]), true));
         assert_ne!(a, scope("h", 1000, &r(&["/home/u"]), false));
         assert_ne!(a, scope("h", 1000, &r(&["/home/u", "/srv"]), true));
+        // Root order does not matter.
+        assert_eq!(
+            scope("h", 1000, &r(&["/srv", "/opt"]), true),
+            scope("h", 1000, &r(&["/opt", "/srv"]), true)
+        );
     }
 }

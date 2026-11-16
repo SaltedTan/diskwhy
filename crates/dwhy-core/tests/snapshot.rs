@@ -201,7 +201,9 @@ fn save_writes_a_private_compressed_file_and_never_replaces_one() {
     let snap = sample("2026-11-16T06:00:00Z", &["/home/u"]);
     let now = snapshot::parse_time("2026-11-16T06:00:01Z").unwrap();
 
-    let a = snapshot::save(&dir, &snap, now).unwrap();
+    let saved = snapshot::save(&dir, &snap, now).unwrap();
+    assert_eq!(saved.prune_error, None);
+    let a = saved.snapshot;
     assert_eq!(mode(&dir), 0o700);
     assert_eq!(mode(Path::new(&a.path)), 0o600);
     assert_eq!(a.pruned, 0);
@@ -217,7 +219,7 @@ fn save_writes_a_private_compressed_file_and_never_replaces_one() {
 
     // Same second, same scope: a new name, the first file untouched.
     let ino = fs::metadata(&a.path).unwrap().ino();
-    let b = snapshot::save(&dir, &snap, now).unwrap();
+    let b = snapshot::save(&dir, &snap, now).unwrap().snapshot;
     assert_eq!(b.id, format!("{}-1", a.id));
     assert_eq!(fs::metadata(&a.path).unwrap().ino(), ino);
 
@@ -245,7 +247,7 @@ fn load_rejects_what_is_not_a_snapshot() {
     let dir = t.path().join("s");
     let mut snap = sample("2026-11-16T06:00:00Z", &["/"]);
     snap.schema = "diskwhy/v9".into();
-    let saved = snapshot::save(&dir, &snap, 0).unwrap();
+    let saved = snapshot::save(&dir, &snap, 0).unwrap().snapshot;
     let err = snapshot::load(Path::new(&saved.path)).unwrap_err();
     assert!(err.contains("unsupported schema"), "{err}");
 }
@@ -308,8 +310,8 @@ fn saving_prunes_only_snapshot_files() {
     let new = sample("2026-11-16T06:00:00Z", &["/home/u"]);
     let other = sample("2026-11-10T06:00:00Z", &["/srv"]);
     let early = snapshot::parse_time("2026-01-01T00:00:01Z").unwrap();
-    let old_saved = snapshot::save(&dir, &old, early).unwrap();
-    let other_saved = snapshot::save(&dir, &other, early).unwrap();
+    let old_saved = snapshot::save(&dir, &old, early).unwrap().snapshot;
+    let other_saved = snapshot::save(&dir, &other, early).unwrap().snapshot;
 
     // Lookalikes that must survive: a symlink with a snapshot name pointing
     // at a file outside, an unrelated file, and a directory.
@@ -321,7 +323,7 @@ fn saving_prunes_only_snapshot_files() {
     fs::create_dir(dir.join("20250101T000000Z-0000abce.json.gz")).unwrap();
 
     let now = snapshot::parse_time("2026-11-16T06:00:01Z").unwrap();
-    let saved = snapshot::save(&dir, &new, now).unwrap();
+    let saved = snapshot::save(&dir, &new, now).unwrap().snapshot;
     assert_eq!(saved.pruned, 1);
     assert!(!Path::new(&old_saved.path).exists());
     assert!(Path::new(&other_saved.path).exists());
@@ -338,6 +340,36 @@ fn a_snapshot_older_than_the_policy_still_saves() {
     let t = tempfile::tempdir().unwrap();
     let snap = sample("2020-01-01T00:00:00Z", &["/"]);
     let now = snapshot::parse_time("2026-11-16T00:00:00Z").unwrap();
-    let saved = snapshot::save(t.path(), &snap, now).unwrap();
+    let saved = snapshot::save(t.path(), &snap, now).unwrap().snapshot;
     assert!(Path::new(&saved.path).exists());
+}
+
+/// Restores a directory's mode when dropped, so the temp dir can be removed.
+struct RestoreMode(PathBuf, u32);
+
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+    }
+}
+
+#[test]
+fn a_pruning_failure_does_not_unsave_the_snapshot() {
+    if rustix::process::geteuid().is_root() {
+        return; // root reads any directory
+    }
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("snapshots");
+    fs::create_dir(&dir).unwrap();
+    // Writable and searchable but not listable: linking works, listing fails.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+    let _restore = RestoreMode(dir.clone(), 0o700);
+    let snap = sample("2026-11-16T06:00:00Z", &["/"]);
+    let saved = snapshot::save(&dir, &snap, 0).unwrap();
+    assert!(saved.prune_error.is_some());
+    assert_eq!(saved.snapshot.pruned, 0);
+    assert_eq!(
+        snapshot::load(Path::new(&saved.snapshot.path)).unwrap(),
+        snap
+    );
 }
