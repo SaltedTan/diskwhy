@@ -130,12 +130,13 @@ impl Docker for Live {
             docker,
             &self.api.socket.to_string_lossy(),
             container_id,
-            user,
-            db,
             sql,
         );
         let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..]).current_dir("/");
+        cmd.args(&argv[1..])
+            .env("PGUSER", user)
+            .env("PGDATABASE", db)
+            .current_dir("/");
         for name in UNSET_PG_ENV {
             cmd.env_remove(name);
         }
@@ -157,15 +158,7 @@ impl Docker for Live {
 /// `PGCONNECT_TIMEOUT` (5 s) for connecting and `statement_timeout` (10 s)
 /// per statement. The query only reads and runs inside `BEGIN READ ONLY`.
 /// Run as argv, never through a shell.
-pub fn psql_argv(
-    docker: &str,
-    socket: &str,
-    container_id: &str,
-    user: &str,
-    db: &str,
-    sql: &str,
-) -> Vec<String> {
-    let db = format!("dbname='{}'", db.replace('\\', "\\\\").replace('\'', "\\'"));
+pub fn psql_argv(docker: &str, socket: &str, container_id: &str, sql: &str) -> Vec<String> {
     [
         docker,
         "-H",
@@ -184,6 +177,10 @@ pub fn psql_argv(
         UNSET_PG_ENV[1],
         "-e",
         UNSET_PG_ENV[2],
+        "-e",
+        "PGUSER",
+        "-e",
+        "PGDATABASE",
         container_id,
         "psql",
         "-X",
@@ -195,10 +192,6 @@ pub fn psql_argv(
         "ON_ERROR_STOP=1",
         "-F",
         &FIELD_SEP.to_string(),
-        "-U",
-        user,
-        "-d",
-        &db,
         "-c",
         "BEGIN READ ONLY",
         "-c",
@@ -1446,19 +1439,24 @@ mod tests {
 
     #[test]
     fn psql_is_read_only_and_never_prompts() {
-        let a = psql_argv("docker", "/run/d.sock", "abc", "app", "appdb", QUERY);
+        let a = psql_argv("docker", "/run/d.sock", "abc", QUERY);
         let s: Vec<&str> = a.iter().map(String::as_str).collect();
         assert_eq!(&s[..4], ["docker", "-H", "unix:///run/d.sock", "exec"]);
         assert!(
             s.contains(&"PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=10s -c search_path=pg_catalog")
         );
-        for setting in ["PGHOST=", "PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE"] {
+        for setting in [
+            "PGHOST=",
+            "PGHOSTADDR",
+            "PGSERVICE",
+            "PGSERVICEFILE",
+            "PGCONNECT_TIMEOUT=5",
+            "PGUSER",
+            "PGDATABASE",
+        ] {
             assert!(s.windows(2).any(|w| w == ["-e", setting]), "{setting}");
         }
-        assert_eq!(
-            s[s.iter().position(|x| *x == "-d").unwrap() + 1],
-            "dbname='appdb'"
-        );
+        assert!(!s.contains(&"-U") && !s.contains(&"-d"));
         // No terminal and no stdin for docker exec (psql's own -t comes after "psql").
         let psql = s.iter().position(|x| *x == "psql").unwrap();
         assert!(
@@ -1470,27 +1468,6 @@ mod tests {
         let q = s.iter().position(|x| *x == QUERY).unwrap();
         assert!(begin < q);
         assert!(s.contains(&"-X") && s.contains(&"-w"));
-        assert_eq!(s[s.iter().position(|x| *x == "-U").unwrap() + 1], "app");
-    }
-
-    #[test]
-    fn psql_database_is_a_literal_libpq_name() {
-        for (db, expected) in [
-            ("appdb", "dbname='appdb'"),
-            ("x host=10.0.0.5", "dbname='x host=10.0.0.5'"),
-            (
-                r"x\' host=10.0.0.5 options='-c default_transaction_read_only=off'",
-                r"dbname='x\\\' host=10.0.0.5 options=\'-c default_transaction_read_only=off\''",
-            ),
-            (
-                "postgresql://10.0.0.5/app",
-                "dbname='postgresql://10.0.0.5/app'",
-            ),
-        ] {
-            let a = psql_argv("docker", "/run/d.sock", "abc", "app", db, QUERY);
-            let d = a.iter().position(|x| x == "-d").unwrap();
-            assert_eq!(a[d + 1], expected);
-        }
     }
 
     #[test]

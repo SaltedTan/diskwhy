@@ -107,7 +107,7 @@ impl Docker for Fake {
     fn psql(&self, id: &str, user: &str, db: &str, _sql: &str) -> Result<String, PsqlError> {
         self.asked
             .borrow_mut()
-            .push(format!("psql {id} -U {user} -d {db}"));
+            .push(format!("psql {id} user={user} db={db}"));
         self.psql.clone()
     }
 }
@@ -213,7 +213,7 @@ fn failing_archiver_with_an_exited_target() {
     assert_eq!(f.guards, volume_finding(VOLUME).guards);
     // Ran as the database user from the container's environment, and never
     // read the logs: psql answered.
-    assert!(fake.asked_for(&format!("psql {PG} -U app -d appdb")));
+    assert!(fake.asked_for(&format!("psql {PG} user=app db=appdb")));
     assert!(!fake.asked_for(&format!("GET /containers/{PG}/logs")));
 }
 
@@ -372,6 +372,50 @@ fn fallback_notes_export_only_psql_failure_categories() {
             assert!(!output.contains("tenant_a"));
         }
     }
+}
+
+#[test]
+fn docker_exec_passes_role_and_literal_database_only_by_environment() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let docker = dir.path().join("docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\nprintf '%s\\n' \"$PGUSER\" \"$PGDATABASE\" \"${PGHOSTADDR+x}${PGSERVICE+x}${PGSERVICEFILE+x}\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
+    let runner = Live {
+        api: Api {
+            socket: dir.path().join("unused.sock"),
+            timeout: postgres_wal::API_TIMEOUT,
+        },
+        docker: Some(docker.to_string_lossy().into_owned()),
+        exec_timeout: postgres_wal::EXEC_TIMEOUT,
+    };
+
+    let user = "operator@example.test";
+    let database = "archive host=10.0.0.5";
+    let observed = runner.psql(PG, user, database, "SELECT 1").unwrap();
+    let mut lines = observed.lines();
+    assert_eq!(lines.next(), Some(user));
+    assert_eq!(lines.next(), Some(database));
+    assert_eq!(lines.next(), Some(""));
+    let args: Vec<_> = lines.collect();
+    for setting in ["PGHOST=", "PGUSER", "PGDATABASE"] {
+        assert!(args.windows(2).any(|pair| pair == ["-e", setting]));
+    }
+    assert!(!args.iter().any(|arg| {
+        arg.contains(user)
+            || arg.contains(database)
+            || arg.contains("10.0.0.5")
+            || matches!(
+                *arg,
+                "-U" | "-d" | "-h" | "--host" | "--username" | "--dbname"
+            )
+    }));
 }
 
 #[test]
@@ -611,7 +655,7 @@ fn default_user_is_postgres() {
         env.retain(|e| !e.as_str().unwrap().starts_with("POSTGRES_"));
     });
     probe(&fake);
-    assert!(fake.asked_for(&format!("psql {PG} -U postgres -d postgres")));
+    assert!(fake.asked_for(&format!("psql {PG} user=postgres db=postgres")));
 }
 
 #[test]
