@@ -776,14 +776,15 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
         };
         dwhy_core::guard::check(one, tree, &ctx, &processes);
         drop(status);
-        if let Some(dir) = &dir
-            && let Some(base) = explain::growth_base(dir, &host, uid, &one[0].id, &generated_at)
-        {
-            match explain::growth_across_replacement(&base, &one[0].path, daemon.as_deref()) {
-                Some(note) => notes.push(note),
-                None => growth::fill_growth(one, &base, &generated_at),
-            }
-        }
+        let base = dir
+            .as_deref()
+            .and_then(|dir| explain::growth_base(dir, &host, uid, &f.id, &generated_at));
+        notes.extend(explain::fill_growth(
+            f,
+            base.as_ref(),
+            &generated_at,
+            daemon.as_deref(),
+        ));
     }
     let report = ExplainReport {
         schema: dwhy_core::SCHEMA.into(),

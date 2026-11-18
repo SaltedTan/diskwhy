@@ -313,7 +313,9 @@ pub fn saved_object(snap: &Snapshot, path: &str) -> Option<SavedObject> {
             .volumes
             .iter()
             .find(|v| v.name == name)
-            .and_then(|v| v.created_at.clone()),
+            .and_then(|v| v.created_at.as_ref())
+            .filter(|time| !time.is_empty())
+            .cloned(),
     }?;
     Some(SavedObject {
         kind,
@@ -382,12 +384,18 @@ pub fn identity(saved: &SavedObject, now: &docker::Snapshot) -> Identity {
                 return Identity::Unknown;
             };
             match volumes.iter().find(|v| v.name == saved.name) {
-                Some(v) if v.created_at == saved.id => Identity::Present {
+                Some(v)
+                    if !saved.id.is_empty()
+                        && !v.created_at.is_empty()
+                        && v.created_at != saved.id =>
+                {
+                    Identity::Replaced {
+                        replacement_id: v.created_at.clone(),
+                    }
+                }
+                Some(v) => Identity::Present {
                     path: at(v.name.clone()),
                     measured: v.usage_data.as_ref().is_some_and(|u| u.size >= 0),
-                },
-                Some(v) => Identity::Replaced {
-                    replacement_id: v.created_at.clone(),
                 },
                 None => Identity::Gone,
             }
@@ -395,24 +403,39 @@ pub fn identity(saved: &SavedObject, now: &docker::Snapshot) -> Identity {
     }
 }
 
-/// A note when growth for the finding at `path` would compare two
-/// different Docker objects: the one `base` recorded there and the one
-/// listed there now. `None` when they are the same, or either is unknown.
-pub fn growth_across_replacement(
-    base: &Snapshot,
-    path: &str,
-    now: Option<&docker::Snapshot>,
+/// Fills growth for a selected finding, or returns a note when Docker
+/// identity prevents the comparison.
+pub fn fill_growth(
+    finding: &mut Finding,
+    base: Option<&Snapshot>,
+    now: &str,
+    daemon: Option<&docker::Snapshot>,
 ) -> Option<String> {
-    let saved = saved_object(base, path)?;
-    match identity(&saved, now?) {
-        Identity::Replaced { .. } => Some(format!(
+    if let Some((DockerKind::Volume, name)) = docker_kind(&finding.path)
+        && daemon.is_some_and(|d| {
+            d.volumes()
+                .iter()
+                .any(|v| v.name == name && v.created_at.is_empty())
+        })
+    {
+        return Some(
+            "growth omitted: the daemon did not report this volume's creation time, so its identity can't be confirmed"
+                .into(),
+        );
+    }
+    let base = base?;
+    if let Some(saved) = saved_object(base, &finding.path)
+        && daemon.is_some_and(|d| matches!(identity(&saved, d), Identity::Replaced { .. }))
+    {
+        return Some(format!(
             "growth not computed: {} {} was a different object in the snapshot of {}",
             saved.kind.word(),
             saved.name,
             base.created_at
-        )),
-        _ => None,
+        ));
     }
+    crate::growth::fill_growth(std::slice::from_mut(finding), base, now);
+    None
 }
 
 /// The outcome of explaining a saved id whose path is a Docker pseudo-path.

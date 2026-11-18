@@ -131,13 +131,15 @@ fn a_snapshot_records_each_object_by_its_immutable_id() {
         None
     );
     let mut old = base.clone();
-    for v in &mut old.docker.as_mut().unwrap().volumes {
-        v.created_at = None;
+    for time in [None, Some(String::new())] {
+        for v in &mut old.docker.as_mut().unwrap().volumes {
+            v.created_at = time.clone();
+        }
+        assert_eq!(
+            explain::saved_object(&old, "docker://volume/orphan_pg"),
+            None
+        );
     }
-    assert_eq!(
-        explain::saved_object(&old, "docker://volume/orphan_pg"),
-        None
-    );
 }
 
 #[test]
@@ -178,7 +180,7 @@ fn a_container_recreated_under_its_name_leaves_the_saved_finding_gone() {
     assert!(out.finding.is_none());
     assert!(out.inside.is_empty());
     let (current, _) = explain::pick(findings(&now), path, None);
-    let f = current.expect("a direct path lookup finds the new container");
+    let mut f = current.expect("a direct path lookup finds the new container");
     assert_eq!(f.action.argv.as_ref().unwrap().last().unwrap(), new_id);
     assert_eq!(
         out.notes,
@@ -188,20 +190,16 @@ fn a_container_recreated_under_its_name_leaves_the_saved_finding_gone() {
         ]
     );
 
-    // Growth from a snapshot of the old container is refused for a path
-    // query too; the same container is fine.
-    let base = saved_snapshot(Some(&daemon()));
+    // Growth from a snapshot of the old container is refused for a path query too.
+    let mut base = saved_snapshot(Some(&daemon()));
+    base.findings.push(saved_finding("docker-container", path));
     assert_eq!(
-        explain::growth_across_replacement(&base, path, Some(&now)).as_deref(),
+        explain::fill_growth(&mut f, Some(&base), "2026-11-15T00:00:00Z", Some(&now)).as_deref(),
         Some(
             "growth not computed: container old-job was a different object in the snapshot of 2026-11-14T00:00:00Z"
         )
     );
-    assert_eq!(
-        explain::growth_across_replacement(&base, path, Some(&daemon())),
-        None
-    );
-    assert_eq!(explain::growth_across_replacement(&base, path, None), None);
+    assert!(f.growth.is_none());
 }
 
 #[test]
@@ -247,6 +245,48 @@ fn a_volume_recreated_with_a_new_creation_time_is_replaced() {
     assert!(!out.gone);
     assert_eq!(out.finding.unwrap().path, path);
     assert!(out.notes.is_empty(), "{:?}", out.notes);
+}
+
+#[test]
+fn a_listed_volume_without_a_live_creation_time_has_no_growth() {
+    let path = "docker://volume/orphan_pg";
+    let sampled_at = "2026-11-15T00:00:00Z";
+    let mut now = daemon();
+    now.df
+        .volumes
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|v| v.name == "orphan_pg")
+        .unwrap()
+        .created_at
+        .clear();
+    let out = explain_now("docker-volume", path, &now);
+    assert!(!out.gone);
+    assert!(out.notes.is_empty());
+    let mut finding = out.finding.expect("the listed volume is still detected");
+    assert_eq!(finding.path, path);
+
+    let before = daemon();
+    let mut base = saved_snapshot(Some(&before));
+    base.findings.push(saved_finding("docker-volume", path));
+    for baseline in [Some(&base), None] {
+        assert_eq!(
+            explain::fill_growth(&mut finding, baseline, sampled_at, Some(&now)).as_deref(),
+            Some(
+                "growth omitted: the daemon did not report this volume's creation time, so its identity can't be confirmed"
+            )
+        );
+        assert!(finding.growth.is_none());
+    }
+
+    let out = explain_now("docker-volume", path, &before);
+    let mut finding = out.finding.unwrap();
+    assert_eq!(
+        explain::fill_growth(&mut finding, Some(&base), sampled_at, Some(&before)),
+        None
+    );
+    assert_eq!(finding.growth.unwrap().bytes_per_day, 313_524_224);
 }
 
 #[test]
