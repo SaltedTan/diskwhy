@@ -8,7 +8,7 @@ Each item that M1 covers is reproduced in a temp home by `crates/dwhy-core/tests
 
 | # | What the cleanup removed | How | Size then | Detector | Tier dwhy gives |
 |---|---|---|---|---|---|
-| 1 | Postgres WAL backlog of `bmc-prod-test` (archiving to a stopped fake-S3 container had failed for 6 days) | restarted `bmc-s3test`, so the backlog archived | ~29G | not M1: the `postgres-wal` probe (M3) | — |
+| 1 | Postgres WAL backlog of `bmc-prod-test` (archiving to a stopped fake-S3 container had failed for 6 days) | restarted `bmc-s3test`, so the backlog archived | ~29G | not M1: the `postgres-wal` probe, reproduced by the M3 WAL demo ([ACCEPTANCE-M3.md](ACCEPTANCE-M3.md)) | — |
 | 2 | Go build cache, npm cache, uv cache, pip cache | `go clean -cache`, `npm cache clean --force`, `uv cache clean`, `rm -rf ~/.cache/pip` | ~24G with rows 3, 5, 6 | `user-cache` | `regenerable`; `blocked` (recent-write) when written in the last 24 hours |
 | 3 | `~/.cache/fr-pg-tools` test clusters, logs and bench dirs | `rm` | 8.6G | not M1 (see below) | — |
 | 4 | Rust `target/` in `~/projects/lspcheck` and two lspcheck worktrees | `cargo clean` | | `cargo-target` | `rebuildable` |
@@ -25,7 +25,7 @@ Differences in thresholds: the cleanup removed worktrees with no commit for a we
 
 ## Not covered by M1
 
-- **Postgres WAL (row 1).** The space came from a stuck archiver. See the M3 `postgres-wal` probe in [Decisions taken](DESIGN.md#decisions-taken).
+- **Postgres WAL (row 1).** The space came from a stuck archiver. The M3 `postgres-wal` probe (see [Decisions taken](DESIGN.md#decisions-taken)) covers it, and [ACCEPTANCE-M3.md](ACCEPTANCE-M3.md) reproduces it with a Compose demo.
 - **Your own directories (rows 3, 11, 12).** `~/.cache/fr-pg-tools` test clusters, `~/opt/ninfer-all` builds and `~/models` have no tool behind them that says what is safe to remove. A `.dwhy-scratch` file in such a directory makes `stale-tree` report its old contents. A detector for model folders can come after M1.
 
 ## Manual check on pc-ubuntu
