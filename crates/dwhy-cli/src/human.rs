@@ -8,8 +8,8 @@ use dwhy_core::apply::{self, tier_name};
 use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{
     ActionKind, ApplyOutcome, ApplyReport, Change, ChangeKind, DetectorAvailability, DiffReport,
-    DirEntry, DoctorReport, Finding, FsReport, GuardStatus, Plan, Rate, ScanReport, SkipReason,
-    Tier, WatchReport,
+    DirEntry, DoctorReport, ExplainReport, Finding, FsReport, GuardStatus, Plan, Rate, ScanReport,
+    SkipReason, Tier, WatchReport,
 };
 use dwhy_core::units::{age, human, signed, thousands};
 
@@ -288,6 +288,135 @@ pub fn render_watch(w: &mut impl Write, r: &WatchReport, top: usize) -> io::Resu
         writeln!(w)?;
     }
     for n in &r.notes {
+        writeln!(w, "note: {n}")?;
+    }
+    Ok(())
+}
+
+/// One finding in full: what it is, the probe's evidence, every guard,
+/// growth, the action and the cost of recovery. Without a finding, what is
+/// at the path and the findings inside it.
+pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
+    writeln!(w, "dwhy explain · {} · {}", r.host, r.path)?;
+    if let Some(s) = &r.resolved.snapshot {
+        writeln!(
+            w,
+            "  {} resolved through snapshot {} ({})",
+            r.query, s.id, s.created_at
+        )?;
+    }
+    let Some(f) = &r.finding else {
+        writeln!(w)?;
+        if r.gone {
+            writeln!(
+                w,
+                "finding {} is gone: no detector reports it at {} now",
+                r.query, r.path
+            )?;
+        } else {
+            writeln!(w, "no detector claims this path")?;
+        }
+        if let Some(s) = &r.size {
+            writeln!(
+                w,
+                "size: {} allocated ({} apparent)",
+                human(s.allocated),
+                human(s.apparent)
+            )?;
+        }
+        if !r.inside.is_empty() {
+            writeln!(w)?;
+            writeln!(w, "findings inside it:")?;
+            for i in &r.inside {
+                writeln!(
+                    w,
+                    "  {:>8}  {:<13} {:<12} {}  {}",
+                    human(i.bytes),
+                    i.detector,
+                    tier_name(i.tier),
+                    i.path,
+                    i.id
+                )?;
+            }
+        }
+        return render_notes(w, &r.notes);
+    };
+
+    writeln!(w)?;
+    writeln!(
+        w,
+        "finding {} · {} · {}",
+        f.id,
+        f.detector,
+        tier_name(f.tier)
+    )?;
+    writeln!(w, "  {:>8}  {}", human(f.bytes), f.path)?;
+    if let Some(t) = &f.last_modified {
+        writeln!(w, "  last written {t}")?;
+    }
+    writeln!(w, "  {}", f.reason)?;
+
+    if let Some(ev) = f.evidence.as_ref().and_then(|e| e.postgres_wal.as_ref()) {
+        writeln!(w)?;
+        writeln!(w, "evidence ({}):", postgres_wal::NAME)?;
+        writeln!(w, "  {}", postgres_wal::summary(ev))?;
+        for n in &ev.notes {
+            writeln!(w, "  note: {n}")?;
+        }
+    }
+
+    writeln!(w)?;
+    if f.guards.is_empty() {
+        writeln!(w, "guards: none apply")?;
+    } else {
+        writeln!(w, "guards:")?;
+        for g in &f.guards {
+            let status = match g.status {
+                GuardStatus::Pass => "pass",
+                GuardStatus::Warn => "warn",
+                GuardStatus::Block => "BLOCK",
+            };
+            writeln!(w, "  {status:<5}  {:<20} {}", g.name, g.detail)?;
+        }
+    }
+
+    writeln!(w)?;
+    match &f.growth {
+        Some(g) => writeln!(
+            w,
+            "growth: {}/day since {}",
+            signed(g.bytes_per_day),
+            g.since
+        )?,
+        None => writeln!(
+            w,
+            "growth: unknown (no snapshot an hour or more old lists this finding)"
+        )?,
+    }
+
+    writeln!(w)?;
+    let kind = match f.action.kind {
+        ActionKind::Advice => "advice, nothing to run",
+        ActionKind::Command => "command",
+        ActionKind::RemovePath => "path removal",
+    };
+    writeln!(w, "action ({kind}):")?;
+    writeln!(w, "  {}", f.action.text)?;
+
+    writeln!(w)?;
+    writeln!(w, "recovery:")?;
+    writeln!(w, "  cost: {}", f.recovery.cost)?;
+    if let Some(how) = &f.recovery.how {
+        writeln!(w, "  how:  {how}")?;
+    }
+    render_notes(w, &r.notes)
+}
+
+fn render_notes(w: &mut impl Write, notes: &[String]) -> io::Result<()> {
+    if !notes.is_empty() {
+        writeln!(w)?;
+    }
+    for n in notes {
         writeln!(w, "note: {n}")?;
     }
     Ok(())

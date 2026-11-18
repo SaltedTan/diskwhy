@@ -1,0 +1,116 @@
+---
+source: crates/dwhy-core/tests/json_shape.rs
+expression: reports
+---
+[
+  {
+    "schema": "diskwhy/v1",
+    "tool": {
+      "name": "diskwhy",
+      "version": "0.0.1"
+    },
+    "host": "pc-ubuntu",
+    "uid": 1000,
+    "generated_at": "2026-11-13T06:00:00Z",
+    "query": "f_7c1e00000000",
+    "resolved": {
+      "via": "id",
+      "snapshot": {
+        "id": "20261112T060000Z-0123abcd",
+        "path": "/home/me/.local/state/diskwhy/snapshots/20261112T060000Z-0123abcd.json.gz",
+        "created_at": "2026-11-12T06:00:00Z"
+      }
+    },
+    "path": "docker://volume/example_postgres_data",
+    "finding": {
+      "id": "f_7c1e00000000",
+      "detector": "docker-volume",
+      "probe": "postgres-wal",
+      "path": "docker://volume/example_postgres_data",
+      "bytes": 33041965056,
+      "nested_bytes": null,
+      "last_modified": "2026-11-13T02:10:00Z",
+      "growth": {
+        "bytes_per_day": 4831838208,
+        "since": "2026-11-12T06:00:00Z"
+      },
+      "tier": "review",
+      "reason": "pg_wal holds 29G vs 53M data; archiving is failing, with 151 failures in total (last failure 2026-11-13T02:10:00Z, last success 2026-11-07T07:25:00Z) (target s3test exited); volume example_postgres_data holds 30.8G and is mounted by example-postgres-1 (running)",
+      "guards": [
+        {
+          "name": "container-mount",
+          "status": "warn",
+          "detail": "mounted by example-postgres-1 (running)"
+        }
+      ],
+      "action": {
+        "kind": "advice",
+        "text": "restore the archive target s3test; WAL is freed at the next checkpoint"
+      },
+      "recovery": {
+        "cost": "n/a: nothing is removed; Postgres recycles WAL itself",
+        "how": null
+      },
+      "evidence": {
+        "postgres_wal": {
+          "container": "example-postgres-1",
+          "wal_bytes": 31138512896,
+          "data_bytes": 55574528,
+          "failed_count": 151,
+          "last_archived_at": "2026-11-07T07:25:00Z",
+          "last_failed_at": "2026-11-13T02:10:00Z",
+          "last_failed_wal": "000000010000000000000097",
+          "archive_mode": "on",
+          "archive_program": "aws",
+          "archive_timeout": "10s",
+          "targets": [
+            {
+              "host": "s3test",
+              "container": "example-s3test-1",
+              "state": "exited"
+            }
+          ],
+          "unmatched_hosts": 2,
+          "source": "psql",
+          "notes": []
+        }
+      }
+    },
+    "gone": false,
+    "inside": [],
+    "notes": []
+  },
+  {
+    "schema": "diskwhy/v1",
+    "tool": {
+      "name": "diskwhy",
+      "version": "0.0.1"
+    },
+    "host": "pc-ubuntu",
+    "uid": 1000,
+    "generated_at": "2026-11-13T06:00:00Z",
+    "query": "app",
+    "resolved": {
+      "via": "path"
+    },
+    "path": "/home/me/app",
+    "finding": null,
+    "gone": false,
+    "size": {
+      "allocated": 9700000000,
+      "apparent": 9500000000
+    },
+    "inside": [
+      {
+        "id": "f_c2b7afdaa165",
+        "path": "/home/me/app/target",
+        "detector": "cargo-target",
+        "bytes": 9663676416,
+        "tier": "rebuildable"
+      }
+    ],
+    "notes": [
+      "not run: git-worktree (see `dwhy doctor`)"
+    ]
+  }
+]

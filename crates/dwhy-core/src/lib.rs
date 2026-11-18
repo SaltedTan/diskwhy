@@ -7,7 +7,8 @@
 //! removal, plans ([`plan`]) select findings for it, and [`apply`] carries a
 //! plan out with [`remove`] or the tools' own commands. M3: [`snapshot`]s
 //! record scans so later runs can tell what grew ([`growth`]), and
-//! [`probes`] explain why a finding is big.
+//! [`probes`] explain why a finding is big; [`explain`] picks what `dwhy
+//! explain` reports.
 
 pub mod account;
 pub mod apply;
@@ -15,6 +16,7 @@ pub mod detect;
 pub mod detectors;
 pub mod docker;
 pub mod doctor;
+pub mod explain;
 mod gitcmd;
 pub mod growth;
 pub mod guard;

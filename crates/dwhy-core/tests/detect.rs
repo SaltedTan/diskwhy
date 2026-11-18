@@ -216,6 +216,40 @@ fn ignores_lookalikes() {
 }
 
 #[test]
+fn finds_a_target_dir_that_is_the_scan_root() {
+    let t = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    let target = cargo_crate(&root.join("app"), "target", 2, Some(CARGO_TAG));
+    let f = cargo_findings(&target, Some("cargo"));
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert_eq!(f[0].path, target.to_str().unwrap());
+    assert_eq!(f[0].id, detect::finding_id("cargo-target", &f[0].path));
+    // The same finding as when the crate is scanned.
+    assert_eq!(cargo_findings(&root, Some("cargo")), f);
+}
+
+#[test]
+fn a_root_target_dir_needs_a_real_manifest_next_to_it() {
+    let t = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    // No Cargo.toml next to it.
+    let lone = root.join("lone/target");
+    write(&lone.join("big"), 2 << 20);
+    fs::write(lone.join("CACHEDIR.TAG"), CARGO_TAG).unwrap();
+    assert!(cargo_findings(&lone, Some("cargo")).is_empty());
+    // Cargo.toml is a symlink: not followed.
+    fs::write(root.join("real.toml"), "[package]\n").unwrap();
+    symlink(root.join("real.toml"), root.join("lone/Cargo.toml")).unwrap();
+    assert!(cargo_findings(&lone, Some("cargo")).is_empty());
+    // Cargo.toml is a directory.
+    let dir_manifest = root.join("d/target");
+    write(&dir_manifest.join("big"), 2 << 20);
+    fs::write(dir_manifest.join("CACHEDIR.TAG"), CARGO_TAG).unwrap();
+    fs::create_dir(root.join("d/Cargo.toml")).unwrap();
+    assert!(cargo_findings(&dir_manifest, Some("cargo")).is_empty());
+}
+
+#[test]
 fn nested_target_dirs_yield_only_the_outermost() {
     let t = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(t.path()).unwrap();

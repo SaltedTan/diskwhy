@@ -4,7 +4,8 @@
 //! written by cargo (cargo tags every target dir it creates, renamed ones
 //! too), or when it is named `target` and holds cargo's `.rustc_info.json`
 //! (a target dir whose tag was removed). Some other `target/`, such as a
-//! downloaded prebuilt binary, matches neither.
+//! downloaded prebuilt binary, matches neither. When the target dir is
+//! itself a scan root, the `Cargo.toml` next to it is looked for on disk.
 
 use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
 use crate::report::{Action, ActionKind, Finding, Recovery, Tier};
@@ -35,21 +36,24 @@ impl Detector for CargoTarget {
             if !n.is_dir || !(tagged || rustc_info) {
                 continue;
             }
-            let Some(parent) = tree.parent(id) else {
-                continue;
-            };
-            if !tree.node(parent).markers.contains(Markers::CARGO_TOML) {
-                continue;
-            }
             let bytes = n.freeable();
             if bytes < MIN_BYTES {
                 continue;
             }
             let path = tree.path(id);
+            let crate_dir = match tree.parent(id) {
+                Some(p) if tree.node(p).markers.contains(Markers::CARGO_TOML) => tree.path(p),
+                Some(_) => continue,
+                // A scan root (`dwhy explain …/target`): its parent was not
+                // scanned, so look for the manifest on disk.
+                None => match path.parent() {
+                    Some(d) if is_file(&d.join("Cargo.toml")) => d.to_path_buf(),
+                    _ => continue,
+                },
+            };
             if !(rustc_info || written_by_cargo(&path.join("CACHEDIR.TAG"))) {
                 continue;
             }
-            let crate_dir = tree.path(parent);
             let manifest = crate_dir.join("Cargo.toml");
             let path_s = path.to_string_lossy().into_owned();
             let action = match ctx.tool_command("cargo") {
@@ -115,6 +119,11 @@ impl Detector for CargoTarget {
         }
         Ok(out)
     }
+}
+
+/// A regular file, not following a symlink (as the `CARGO_TOML` marker).
+fn is_file(p: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|md| md.is_file())
 }
 
 fn written_by_cargo(tag: &std::path::Path) -> bool {

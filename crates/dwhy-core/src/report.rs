@@ -936,6 +936,89 @@ pub struct Rate {
     pub bytes_per_minute: i64,
 }
 
+// ---------------------------------------------------------------------------
+// Explain (M3): `dwhy explain`
+// ---------------------------------------------------------------------------
+
+/// Output of `dwhy explain --json`: one finding with its probe evidence,
+/// guards and growth, or what is at a path no detector claims.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplainReport {
+    pub schema: String,
+    pub tool: Tool,
+    pub host: String,
+    pub uid: u32,
+    /// When the rescan finished, RFC 3339 (UTC).
+    pub generated_at: String,
+    /// The argument as given: a finding id, a path or a `docker://` pseudo-path.
+    pub query: String,
+    pub resolved: ExplainResolved,
+    /// The path examined: absolute for a filesystem path, else the
+    /// pseudo-path.
+    pub path: String,
+    /// The finding at `path` (with the id asked for, when `query` is an id),
+    /// with guards, growth and probe evidence filled in. `None` when no
+    /// detector claims the path, or when the finding is `gone`.
+    #[serde(default)]
+    pub finding: Option<Finding>,
+    /// True when `query` named a finding id a snapshot lists, and the
+    /// rescan no longer reports it.
+    #[serde(default)]
+    pub gone: bool,
+    /// What is at a filesystem `path` now; absent for pseudo-paths and for a
+    /// path that no longer exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<ExplainSize>,
+    /// Findings at or below `path`, when `finding` is `None`; largest first.
+    #[serde(default)]
+    pub inside: Vec<FindingRef>,
+    /// Detectors that did not run or failed, and other caveats.
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+/// How `dwhy explain` found the path it examined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainResolved {
+    pub via: ExplainVia,
+    /// The snapshot that turned the id into a path (`via = id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<ExplainSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplainVia {
+    /// A finding id, looked up in the newest snapshot that lists it.
+    Id,
+    /// A filesystem path or a `docker://` pseudo-path.
+    Path,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainSnapshot {
+    pub id: String,
+    pub path: String,
+    pub created_at: String,
+}
+
+/// Size of a path, each hardlinked file counted once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainSize {
+    pub allocated: u64,
+    pub apparent: u64,
+}
+
+/// A finding named by id, for lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingRef {
+    pub id: String,
+    pub path: String,
+    pub detector: String,
+    pub bytes: u64,
+    pub tier: Tier,
+}
+
 /// Output of `dwhy doctor --json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DoctorReport {

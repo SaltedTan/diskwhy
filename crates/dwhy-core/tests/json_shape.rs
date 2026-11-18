@@ -832,3 +832,76 @@ fn findings_without_evidence_have_no_evidence_key() {
     let back: Finding = serde_json::from_value(v).unwrap();
     assert_eq!(back.evidence, None);
 }
+
+#[test]
+fn explain_report_shape() {
+    let tool = Tool {
+        name: "diskwhy".into(),
+        version: "0.0.1".into(),
+    };
+    // An id resolved through a snapshot to a probed Docker volume.
+    let mut probed = probed_finding();
+    probed.growth = Some(Growth {
+        bytes_per_day: 4_831_838_208,
+        since: "2026-11-12T06:00:00Z".into(),
+    });
+    let by_id = ExplainReport {
+        schema: SCHEMA.into(),
+        tool: tool.clone(),
+        host: "pc-ubuntu".into(),
+        uid: 1000,
+        generated_at: "2026-11-13T06:00:00Z".into(),
+        query: "f_7c1e00000000".into(),
+        resolved: ExplainResolved {
+            via: ExplainVia::Id,
+            snapshot: Some(ExplainSnapshot {
+                id: "20261112T060000Z-0123abcd".into(),
+                path: "/home/me/.local/state/diskwhy/snapshots/20261112T060000Z-0123abcd.json.gz"
+                    .into(),
+                created_at: "2026-11-12T06:00:00Z".into(),
+            }),
+        },
+        path: "docker://volume/example_postgres_data".into(),
+        finding: Some(probed),
+        gone: false,
+        size: None,
+        inside: vec![],
+        notes: vec![],
+    };
+    // A path no detector claims, with a finding inside it.
+    let by_path = ExplainReport {
+        query: "app".into(),
+        resolved: ExplainResolved {
+            via: ExplainVia::Path,
+            snapshot: None,
+        },
+        path: "/home/me/app".into(),
+        finding: None,
+        size: Some(ExplainSize {
+            allocated: 9_700_000_000,
+            apparent: 9_500_000_000,
+        }),
+        inside: vec![FindingRef {
+            id: "f_c2b7afdaa165".into(),
+            path: "/home/me/app/target".into(),
+            detector: "cargo-target".into(),
+            bytes: 9_663_676_416,
+            tier: Tier::Rebuildable,
+        }],
+        notes: vec!["not run: git-worktree (see `dwhy doctor`)".into()],
+        ..by_id.clone()
+    };
+    let reports = vec![by_id, by_path];
+    insta::assert_json_snapshot!(reports);
+    for r in &reports {
+        let back: ExplainReport = serde_json::from_str(&serde_json::to_string(r).unwrap()).unwrap();
+        assert_eq!(&back, r);
+    }
+    // Optional parts may be missing when read back.
+    let mut v = serde_json::to_value(&reports[0]).unwrap();
+    for k in ["finding", "gone", "inside", "notes"] {
+        v.as_object_mut().unwrap().remove(k);
+    }
+    let back: ExplainReport = serde_json::from_value(v).unwrap();
+    assert!(back.finding.is_none() && !back.gone && back.inside.is_empty());
+}
