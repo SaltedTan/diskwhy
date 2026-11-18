@@ -357,10 +357,8 @@ pub struct Evidence {
     pub postgres_wal: Option<PostgresWal>,
 }
 
-/// The `postgres-wal` probe: why a Postgres data volume is big. Read with
-/// read-only queries through `docker exec … psql` (`source: psql`), or,
-/// when that is not possible, from the container's inspect data and the
-/// tail of its log only (`source: api-only`, `notes` says why).
+/// WAL and archiving evidence from the `postgres-wal` probe. See [`EvidenceSource`]
+/// for how it was collected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostgresWal {
     /// The running Postgres container that mounts the volume.
@@ -385,6 +383,7 @@ pub struct PostgresWal {
     /// format (WAL segment, partial segment, timeline history or backup history).
     #[serde(default)]
     pub last_failed_wal: Option<String>,
+    /// Lowercase `on`, `off` or `always` when recognized, otherwise null.
     #[serde(default)]
     pub archive_mode: Option<String>,
     /// The program word extracted from `archive_command`. Reported words
@@ -392,6 +391,7 @@ pub struct PostgresWal {
     /// extraction fails. The raw command and its arguments are omitted.
     #[serde(default)]
     pub archive_program: Option<String>,
+    /// Duration as reported by the source, or null if missing or unrecognized.
     #[serde(default)]
     pub archive_timeout: Option<String>,
     /// Inferred archive hosts that match Docker container identifiers.
@@ -426,7 +426,8 @@ pub struct ArchiveTarget {
 pub enum EvidenceSource {
     /// Read-only queries through `docker exec … psql`.
     Psql,
-    /// Engine API GETs only: inspect and the log tail.
+    /// Engine API GETs only. WAL bytes, data bytes and the latest archive
+    /// success time are null. `notes` describes why the probe fell back.
     ApiOnly,
 }
 
@@ -949,7 +950,8 @@ pub struct DoctorReport {
     pub docker_socket: DockerSocket,
     pub tools: Vec<ToolStatus>,
     pub detectors: Vec<DetectorStatus>,
-    /// Probes (`postgres-wal`, …), which add evidence to findings.
+    /// Probe availability. Reports written before this field was added read
+    /// back with an empty list.
     #[serde(default)]
     pub probes: Vec<DetectorStatus>,
     pub notes: Vec<String>,
