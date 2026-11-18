@@ -5,8 +5,7 @@
 # writer inserting ~2 MB a second keep WAL segments switching; the volume
 # grows by a few hundred MB a minute.
 #
-# Run it only under a project name of its own (`docker compose -p <name>`)
-# and remove it with `docker compose -p <name> down -v --remove-orphans`.
+# Use a dedicated project name. See docs/ACCEPTANCE-M3.md for cleanup.
 services:
   s3test:
     image: postgres:16-alpine
@@ -42,7 +41,17 @@ services:
       PGPASSWORD: demo
     tmpfs:
       - /var/lib/postgresql/data
-    entrypoint: ["timeout", "-s", "KILL", "600", "sh", "-c"]
+    entrypoint:
+      - sh
+      - -c
+      - |
+        timeout -s KILL 600 sh -c "$$1"
+        status=$$?
+        case "$$status" in
+          137) exit 0 ;;
+          *) exit "$$status" ;;
+        esac
+      - writer
     command:
       - |
         psql -h postgres -U postgres -d demo -q -c 'create table if not exists w(x text)' || exit 1

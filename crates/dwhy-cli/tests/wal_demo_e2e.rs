@@ -74,10 +74,10 @@ impl<'a> Project<'a> {
         };
         let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
         eprintln!(
-            "To clean up after an interrupt, run: env -u DOCKER_CONTEXT DOCKER_HOST={} docker compose -f {} -p {} down -v --remove-orphans",
-            quote(docker_host),
-            quote(COMPOSE),
-            p.name
+            "To clean up after an interrupt, run: env -u DOCKER_CONTEXT DOCKER_HOST={host} COMPOSE_PROJECT_NAME={name} docker compose -p {name} -f {file} down -v --remove-orphans",
+            host = quote(docker_host),
+            name = p.name,
+            file = quote(COMPOSE),
         );
         // From here on, Drop tears down whatever `up` managed to create.
         run(p.compose().args(["up", "-d", "--pull", "never"]));
@@ -86,7 +86,8 @@ impl<'a> Project<'a> {
 
     fn compose(&self) -> Command {
         let mut c = docker_command("docker", self.docker_host);
-        c.args(["compose", "-f", COMPOSE, "-p", &self.name]);
+        c.env("COMPOSE_PROJECT_NAME", &self.name)
+            .args(["compose", "-p", &self.name, "-f", COMPOSE]);
         c
     }
 

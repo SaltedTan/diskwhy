@@ -8,7 +8,7 @@ DESIGN.md says M3 is done when a test Compose file, Postgres with a failing `arc
 
 - `s3test` exits at once (`entrypoint: ["true"]`). It plays the dead fake S3.
 - `postgres` runs with `archive_mode=on`, `archive_command=wget -Y off -q -O /dev/null http://s3test:9000/wal/%f` and `archive_timeout=10s`. The archive command bypasses proxies and fails because `s3test` has exited, so WAL segments awaiting archival cannot be recycled.
-- `writer` inserts 2000 rows of 1 KB about once a second to keep segments filling and switching. It stops after ten minutes.
+- `writer` inserts 2000 rows of 1 KB about once a second to keep segments filling and switching. It exits successfully after ten minutes.
 
 [`crates/dwhy-cli/tests/wal_demo_e2e.rs`](../crates/dwhy-cli/tests/wal_demo_e2e.rs) drives the built `dwhy` binary against it:
 
@@ -18,7 +18,11 @@ DESIGN.md says M3 is done when a test Compose file, Postgres with a failing `arc
 4. Poll the apparent file sizes with `find` and `stat` inside the project's own Postgres container until they total 1.1 GiB. The test uses the sizes it read even if files disappear during a walk. The `docker-volume` detector reports an in-use volume from 1 GiB. The poll gives up after 10 minutes.
 5. `dwhy diff --detectors docker-build-cache`. The test checks that the volume grew by more than 512 MiB since the snapshot.
 6. `dwhy explain docker://volume/<project>_pgdata`. The test checks for a `docker-volume` finding whose `postgres_wal` evidence has `archive_mode` `on`, archive failures, and the target `s3test` in state `exited`, and whose advice starts with `restore the archive target s3test`.
-7. A Drop guard runs `docker compose -p <project> down -v --remove-orphans` when the test finishes or unwinds from a panic. On success the test also checks that `docker ps -a`, `docker volume ls` and `docker network ls`, filtered by `label=com.docker.compose.project=<project>`, are empty. Ctrl-C skips the guard. After an interrupt, run the cleanup command printed at startup, which includes the socket and Compose file.
+7. A Drop guard takes down the demo project when the test finishes or unwinds from a panic. Every Compose call sets `COMPOSE_PROJECT_NAME` and `-p` to the generated project name. On success the test also checks that `docker ps -a`, `docker volume ls` and `docker network ls`, filtered by `label=com.docker.compose.project=<project>`, are empty. Ctrl-C skips the guard. After an interrupt, run the cleanup command printed at startup.
+
+   ```text
+   env -u DOCKER_CONTEXT DOCKER_HOST=<socket URL> COMPOSE_PROJECT_NAME=<project> docker compose -p <project> -f <absolute Compose path> down -v --remove-orphans
+   ```
 
 ### What it never does
 
