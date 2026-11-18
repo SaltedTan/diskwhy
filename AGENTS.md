@@ -15,7 +15,9 @@ Working rules for coding agents in this repo. Humans: start at [README.md](READM
 crates/dwhy-core   engine: scan (walker), tree (the ScanTree detectors read: per-dir totals,
                    markers, newest mtime), mounts (mountinfo, statvfs), account (unaccounted + hints),
                    detect (Detector trait, CATALOG shared with doctor, finding IDs, nesting rule),
-                   detectors/ (one file per detector), docker (read-only Engine API client:
+                   detectors/ (one file per detector), probes/ (one file per probe; run by scan
+                   after the detectors: postgres-wal reads the Engine API and runs read-only psql
+                   through docker exec), docker (read-only Engine API client:
                    GET /system/df and /info over the unix socket), guard (pre-removal checks:
                    processes, git, container mounts; run at plan and apply, never in scan),
                    plan (selection, fingerprints, expiry), apply (re-detect, tier policy, run
