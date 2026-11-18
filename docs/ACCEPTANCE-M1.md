@@ -8,7 +8,7 @@ Each item that M1 covers is reproduced in a temp home by `crates/dwhy-core/tests
 
 | # | What the cleanup removed | How | Size then | Detector | Tier dwhy gives |
 |---|---|---|---|---|---|
-| 1 | Postgres WAL backlog of `bmc-prod-test` (archiving to a stopped fake-S3 container had failed for 6 days) | restarted `bmc-s3test`, so the backlog archived | ~29G | not M1: the `postgres-wal` probe (M3) | — |
+| 1 | Postgres WAL backlog of `bmc-prod-test` (archiving to a stopped fake-S3 container had failed for 6 days) | restarted `bmc-s3test`, so the backlog archived | ~29G | not M1: the `postgres-wal` probe, reproduced by the M3 WAL demo ([ACCEPTANCE-M3.md](ACCEPTANCE-M3.md)) | — |
 | 2 | Go build cache, npm cache, uv cache, pip cache | `go clean -cache`, `npm cache clean --force`, `uv cache clean`, `rm -rf ~/.cache/pip` | ~24G with rows 3, 5, 6 | `user-cache` | `regenerable`; `blocked` (recent-write) when written in the last 24 hours |
 | 3 | `~/.cache/fr-pg-tools` test clusters, logs and bench dirs | `rm` | 8.6G | not M1 (see below) | — |
 | 4 | Rust `target/` in `~/projects/lspcheck` and two lspcheck worktrees | `cargo clean` | | `cargo-target` | `rebuildable` |

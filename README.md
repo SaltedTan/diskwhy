@@ -4,7 +4,7 @@
 
 `diskwhy` (binary `dwhy`) is a Rust tool for Linux dev boxes and servers, used over ssh. It finds what is big *and what is growing*, explains each item, checks whether it is safe to delete, and removes it the way the owning tool would. It has a TUI for people and a JSON CLI (scan → plan → apply) that agents can drive within limits you set.
 
-Status: pre-MVP, private. See [docs/DESIGN.md](docs/DESIGN.md) for scope and milestones. M0 (scanner, `diskwhy/v1` JSON types, `doctor`) and M1 (detectors) are in place. M2 (guards, `plan`, `apply`) is built: an agent can clear `regenerable` items on its own and is refused `review` ones. M3 (growth) has started: `scan --snapshot` keeps a history of scans, `diff` shows what grew since one, `watch` measures what is growing right now, and the `postgres-wal` probe explains a Postgres volume full of WAL.
+Status: pre-MVP, private. See [docs/DESIGN.md](docs/DESIGN.md) for scope and milestones. M0 (scanner, `diskwhy/v1` JSON types, `doctor`) and M1 (detectors) are in place. M2 (guards, `plan`, `apply`) is built: an agent can clear `regenerable` items on its own and is refused `review` ones. M3 (growth) is in place. `scan --snapshot` keeps a history of scans, `diff` shows what grew since one, `watch` measures what is growing right now, and the `postgres-wal` probe explains a Postgres volume full of WAL.
 
 ## Usage
 

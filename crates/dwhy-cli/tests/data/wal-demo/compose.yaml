@@ -1,0 +1,68 @@
+# diskwhy M3 WAL demo (docs/ACCEPTANCE-M3.md), used by tests/wal_demo_e2e.rs.
+#
+# Postgres archives WAL to a fake S3 (`s3test`) that exits at once, so every
+# archive_command fails and pg_wal keeps growing. archive_timeout=10s and a
+# writer inserting ~2 MB a second keep WAL segments switching; the volume
+# grows by a few hundred MB a minute.
+#
+# Use a dedicated project name. See docs/ACCEPTANCE-M3.md for cleanup.
+services:
+  s3test:
+    image: postgres:16-alpine
+    entrypoint: ["true"]
+    restart: "no"
+    tmpfs:
+      - /var/lib/postgresql/data
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: demo
+    command:
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=wget -Y off -q -O /dev/null http://s3test:9000/wal/%f
+      - -c
+      - archive_timeout=10s
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "127.0.0.1"]
+      interval: 2s
+      retries: 30
+  writer:
+    image: postgres:16-alpine
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: demo
+    tmpfs:
+      - /var/lib/postgresql/data
+    entrypoint:
+      - sh
+      - -c
+      - |
+        timeout -s KILL 600 sh -c "$$1"
+        status=$$?
+        case "$$status" in
+          137) exit 0 ;;
+          *) exit "$$status" ;;
+        esac
+      - writer
+    command:
+      - |
+        psql -h postgres -U postgres -d demo -q -c 'create table if not exists w(x text)' || exit 1
+        while true; do
+          psql -h postgres -U postgres -d demo -q -c "insert into w select repeat('x', 1000) from generate_series(1, 2000)"
+          sleep 1
+        done
+networks:
+  default:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+volumes:
+  pgdata:
