@@ -9,7 +9,7 @@
 //! and the prune command is limited to those records.
 
 use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
-use crate::docker::{Container, Snapshot};
+use crate::docker::{Container, Image, Snapshot};
 use crate::report::{Action, ActionKind, Finding, GuardResult, GuardStatus, Recovery, Tier};
 use crate::tree::ScanTree;
 use crate::units::human;
@@ -78,15 +78,91 @@ fn finding(
     }
 }
 
-fn container_name(c: &Container) -> String {
+/// A container's name, as its findings' pseudo-paths use it.
+pub(crate) fn container_name(c: &Container) -> String {
     c.names
         .first()
         .map(|n| n.trim_start_matches('/').to_string())
         .unwrap_or_else(|| c.id.chars().take(12).collect())
 }
 
-fn short_id(id: &str) -> String {
+pub(crate) fn short_id(id: &str) -> String {
     id.trim_start_matches("sha256:").chars().take(12).collect()
+}
+
+fn image_tags(img: &Image) -> impl Iterator<Item = &str> {
+    img.repo_tags
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .filter(|t| *t != "<none>:<none>")
+}
+
+/// An image's label, as its findings' pseudo-paths use it: its first tag,
+/// else its short id.
+pub(crate) fn image_label(img: &Image) -> String {
+    image_tags(img)
+        .next()
+        .map_or_else(|| short_id(&img.id), str::to_string)
+}
+
+/// Whether `label` names `img`: one of its tags, or its short id when it
+/// has none.
+pub(crate) fn image_named(img: &Image, label: &str) -> bool {
+    match image_tags(img).next() {
+        Some(_) => image_tags(img).any(|t| t == label),
+        None => short_id(&img.id) == label,
+    }
+}
+
+pub enum DockerPresence {
+    Missing,
+    Present,
+    Unmeasured,
+}
+
+pub fn docker_presence(snap: &Snapshot, path: &str) -> Option<DockerPresence> {
+    let measured = if let Some(label) = path.strip_prefix("docker://image/") {
+        snap.df
+            .images
+            .as_ref()?
+            .iter()
+            .find(|img| {
+                img.repo_tags
+                    .iter()
+                    .flatten()
+                    .any(|t| t == label && t != "<none>:<none>")
+                    || short_id(&img.id) == label
+            })
+            .map(|img| img.size >= 0)
+    } else if let Some(name) = path.strip_prefix("docker://container/") {
+        snap.df
+            .containers
+            .as_ref()?
+            .iter()
+            .find(|c| {
+                c.names.iter().any(|n| n.trim_start_matches('/') == name)
+                    || c.id.chars().take(12).eq(name.chars())
+            })
+            .map(|c| c.size_rw.is_some_and(|size| size >= 0))
+    } else if let Some(name) = path.strip_prefix("docker://volume/") {
+        snap.df
+            .volumes
+            .as_ref()?
+            .iter()
+            .find(|v| v.name == name)
+            .map(|v| v.usage_data.as_ref().is_some_and(|u| u.size >= 0))
+    } else if path == "docker://build-cache" {
+        let cache = snap.df.build_cache.as_ref()?;
+        (!cache.is_empty()).then(|| cache.iter().all(|r| r.size >= 0))
+    } else {
+        return None;
+    };
+    Some(match measured {
+        None => DockerPresence::Missing,
+        Some(true) => DockerPresence::Present,
+        Some(false) => DockerPresence::Unmeasured,
+    })
 }
 
 /// The Docker object behind a finding's pseudo-path, for its fingerprint:

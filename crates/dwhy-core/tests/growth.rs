@@ -114,6 +114,7 @@ fn docker(
             .map(|&(name, bytes)| SnapshotVolume {
                 name: name.into(),
                 bytes,
+                created_at: None,
             })
             .collect(),
     }

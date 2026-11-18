@@ -1166,3 +1166,702 @@ fn watch_reports_a_dir_written_during_the_window() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("at least 1s"));
 }
+
+/// Everything under the state dir: what explain must leave alone.
+fn state_listing(state: &Path) -> Vec<(String, u64, i64)> {
+    if state.join("diskwhy").exists() {
+        listing(state)
+    } else {
+        Vec::new()
+    }
+}
+
+#[test]
+fn explain_a_finding_by_path() {
+    let (_t, root) = cargo_fixture();
+    let target = format!("{root}/app/target");
+    let state = tempfile::tempdir().unwrap();
+    let st = state.path();
+    let before = listing(Path::new(&root));
+    let out = dwhy_in(
+        st,
+        &[
+            "explain",
+            &target,
+            "--json",
+            "-q",
+            "--detectors",
+            "cargo-target",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["schema"], "diskwhy/v1");
+    assert_eq!(v["query"], target.as_str());
+    assert_eq!(v["resolved"], serde_json::json!({"via": "path"}));
+    assert_eq!(v["path"], target.as_str());
+    assert_eq!(v["gone"], false);
+    assert_eq!(v["inside"], serde_json::json!([]));
+    assert!(v["size"]["allocated"].as_u64().unwrap() >= 3 << 20, "{v}");
+    assert!(v["size"]["apparent"].as_u64().unwrap() >= 3 << 20, "{v}");
+    let f = &v["finding"];
+    assert_eq!(f["detector"], "cargo-target");
+    assert_eq!(f["path"], target.as_str());
+    assert_eq!(
+        f["id"],
+        dwhy_core::detect::finding_id("cargo-target", &target).as_str()
+    );
+    assert_eq!(f["tier"], "rebuildable");
+    assert_eq!(f["growth"], Value::Null);
+    assert!(f["last_modified"].is_string());
+    assert!(f["recovery"]["cost"].is_string());
+    let guards: Vec<&str> = f["guards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        guards.contains(&"in-use-cwd") && guards.contains(&"in-use-open"),
+        "{guards:?}"
+    );
+
+    // Text: the header, the finding, every guard, growth, action and recovery.
+    let out = dwhy_in(
+        st,
+        &["explain", &target, "-q", "--detectors", "cargo-target"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("dwhy explain · "), "{text}");
+    assert!(text.lines().next().unwrap().ends_with(&target), "{text}");
+    for want in [
+        "· cargo-target · rebuildable",
+        "guards:",
+        "in-use-cwd",
+        "no eligible snapshot (one filesystem, at least an hour old) lists this finding",
+        "action (",
+        "recovery:",
+        "how:  cargo build",
+    ] {
+        assert!(text.contains(want), "{want:?} in {text}");
+    }
+
+    // Relative paths work too.
+    let out = Command::new(env!("CARGO_BIN_EXE_dwhy"))
+        .args([
+            "explain",
+            "target",
+            "--json",
+            "-q",
+            "--detectors",
+            "cargo-target",
+        ])
+        .current_dir(format!("{root}/app"))
+        .env("XDG_STATE_HOME", st)
+        .output()
+        .unwrap();
+    assert_eq!(json_of(&out)["path"], target.as_str());
+
+    assert_eq!(listing(Path::new(&root)), before, "explain writes nothing");
+    assert!(state_listing(st).is_empty(), "explain writes no state");
+}
+
+#[test]
+fn explain_a_node_modules_dir_through_its_parent() {
+    // node-modules recognises node_modules from the project holding it, so
+    // explain finds it only by walking the parent.
+    let t = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    let web = root.join("web");
+    fs::create_dir_all(web.join("node_modules/left-pad")).unwrap();
+    fs::write(web.join("package.json"), r#"{"name":"web"}"#).unwrap();
+    fs::write(web.join("package-lock.json"), "{}").unwrap();
+    fs::write(
+        web.join("node_modules/left-pad/index.js"),
+        vec![1u8; 2 << 20],
+    )
+    .unwrap();
+    // A sibling outside the queried path is not listed.
+    fs::write(web.join("big.bin"), vec![1u8; 4 << 20]).unwrap();
+    let nm = web.join("node_modules").to_str().unwrap().to_string();
+    let state = tempfile::tempdir().unwrap();
+    let before = listing(&root);
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "explain",
+            &nm,
+            "--json",
+            "-q",
+            "--detectors",
+            "node-modules",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["path"], nm.as_str());
+    assert_eq!(v["notes"], serde_json::json!([]), "{v}");
+    let f = &v["finding"];
+    assert_eq!(f["detector"], "node-modules", "{v}");
+    assert_eq!(f["path"], nm.as_str());
+    assert_eq!(
+        f["id"],
+        dwhy_core::detect::finding_id("node-modules", &nm).as_str()
+    );
+    assert!(!f["guards"].as_array().unwrap().is_empty(), "{v}");
+    // The size is the node_modules dir's own, not its parent's.
+    let allocated = v["size"]["allocated"].as_u64().unwrap();
+    assert!((2 << 20..4 << 20).contains(&allocated), "{v}");
+    let apparent = v["size"]["apparent"].as_u64().unwrap();
+    assert!((2 << 20..3 << 20).contains(&apparent), "{v}");
+    assert_eq!(listing(&root), before, "explain writes nothing");
+    assert!(state_listing(state.path()).is_empty());
+}
+
+#[test]
+fn explain_a_path_no_detector_claims_lists_the_findings_inside() {
+    let (_t, root) = cargo_fixture();
+    let app = format!("{root}/app");
+    let target = format!("{app}/target");
+    let state = tempfile::tempdir().unwrap();
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "explain",
+            &app,
+            "--json",
+            "-q",
+            "--detectors",
+            "cargo-target",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["finding"], Value::Null);
+    assert_eq!(v["gone"], false);
+    assert!(v["size"]["allocated"].as_u64().unwrap() >= 3 << 20);
+    let inside = v["inside"].as_array().unwrap();
+    assert_eq!(inside.len(), 1, "{v}");
+    assert_eq!(inside[0]["path"], target.as_str());
+    assert_eq!(inside[0]["detector"], "cargo-target");
+    assert_eq!(inside[0]["tier"], "rebuildable");
+    assert_eq!(
+        inside[0]["id"],
+        dwhy_core::detect::finding_id("cargo-target", &target).as_str()
+    );
+    assert!(inside[0]["bytes"].as_u64().unwrap() >= 3 << 20);
+
+    let out = dwhy_in(
+        state.path(),
+        &["explain", &app, "-q", "--detectors", "cargo-target"],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("no detector claims this path"), "{text}");
+    assert!(text.contains("size: "), "{text}");
+    assert!(text.contains(&target), "{text}");
+
+    // A path that does not exist is an error.
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "explain",
+            &format!("{root}/nope"),
+            "-q",
+            "--detectors",
+            "cargo-target",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn explain_an_unknown_id_suggests_the_path() {
+    let (_t, root) = cargo_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let st = state.path();
+    let out = Command::new(env!("CARGO_BIN_EXE_dwhy"))
+        .args([
+            "explain",
+            "f_000000000000",
+            "-q",
+            "--detectors",
+            "cargo-target",
+        ])
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("cannot find snapshots") && err.contains("dwhy explain <path>"),
+        "{err}"
+    );
+
+    // No snapshots at all, then one that does not list the id.
+    for _ in 0..2 {
+        let out = dwhy_in(
+            st,
+            &[
+                "explain",
+                "f_000000000000",
+                "-q",
+                "--detectors",
+                "cargo-target",
+            ],
+        );
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(out.stdout.is_empty());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("no snapshot lists finding f_000000000000")
+                && err.contains("dwhy explain <path>")
+                && err.contains("dwhy scan --snapshot"),
+            "{err}"
+        );
+        let out = dwhy_in(
+            st,
+            &[
+                "scan",
+                &root,
+                "-q",
+                "--snapshot",
+                "--detectors",
+                "cargo-target",
+            ],
+        );
+        assert_eq!(out.status.code(), Some(0));
+    }
+}
+
+#[test]
+fn explain_an_id_through_a_snapshot_then_when_it_is_gone() {
+    let (_t, root) = cargo_fixture();
+    let target = format!("{root}/app/target");
+    let id = dwhy_core::detect::finding_id("cargo-target", &target);
+    let state = tempfile::tempdir().unwrap();
+    let st = state.path();
+    let out = dwhy_in(
+        st,
+        &[
+            "scan",
+            &root,
+            "-q",
+            "--json",
+            "--snapshot",
+            "--detectors",
+            "cargo-target",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let saved = json_of(&out)["snapshot"].clone();
+    assert_eq!(json_of(&out)["findings"][0]["id"], id.as_str());
+
+    let explain = |extra: &[&str]| {
+        dwhy_in(
+            st,
+            &[
+                &["explain", &id, "-q", "--detectors", "cargo-target"][..],
+                extra,
+            ]
+            .concat(),
+        )
+    };
+    let mut state_before = state_listing(st);
+    let out = explain(&["--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["query"], id.as_str());
+    assert_eq!(v["resolved"]["via"], "id");
+    assert_eq!(v["resolved"]["snapshot"]["id"], saved["id"]);
+    assert_eq!(v["resolved"]["snapshot"]["path"], saved["path"]);
+    assert!(v["resolved"]["snapshot"]["created_at"].is_string());
+    assert_eq!(v["path"], target.as_str());
+    assert_eq!(v["gone"], false);
+    assert_eq!(v["finding"]["id"], id.as_str());
+    assert!(!v["finding"]["guards"].as_array().unwrap().is_empty());
+    // The snapshot is seconds old: no rate.
+    assert_eq!(v["finding"]["growth"], Value::Null);
+    let text = String::from_utf8_lossy(&explain(&[]).stdout).into_owned();
+    assert!(text.contains("resolved through snapshot"), "{text}");
+    assert_eq!(state_listing(st), state_before, "explain writes no state");
+
+    let out = dwhy_in(
+        st,
+        &["explain", &id, "-q", "--json", "--detectors", "stale-tree"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["gone"], false);
+    assert_eq!(v["finding"], Value::Null);
+    assert_eq!(
+        v["notes"],
+        serde_json::json!([
+            format!("still present at {target}, but not detected now"),
+            "detector cargo-target not selected by --detectors"
+        ])
+    );
+    let out = dwhy_in(st, &["explain", &id, "-q", "--detectors", "stale-tree"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!("still present at {target}, but not detected now")),
+        "{text}"
+    );
+
+    if dwhy_core::system::euid() != 0 {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Restore<'a>(&'a Path, fs::Permissions);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(self.0, self.1.clone());
+            }
+        }
+
+        let path = Path::new(&target);
+        let debug = path.join("debug");
+        for (locked, mode, present) in [
+            (debug.as_path(), 0o000, true),
+            (path, 0o000, true),
+            (path.parent().unwrap(), 0o311, true),
+            (path.parent().unwrap(), 0o000, false),
+        ] {
+            let _restore = Restore(locked, fs::metadata(locked).unwrap().permissions());
+            fs::set_permissions(locked, fs::Permissions::from_mode(mode)).unwrap();
+            let out = explain(&["--json"]);
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            let report = json_of(&out);
+            assert_eq!(report["gone"], false);
+            assert_eq!(report["finding"], Value::Null);
+            assert!(
+                report["notes"].as_array().unwrap().iter().any(|n| {
+                    n.as_str().is_some_and(|s| {
+                        s.contains(locked.to_str().unwrap())
+                            && if present {
+                                s.contains("could not be read") || s.contains("cannot open")
+                            } else {
+                                s.starts_with("could not check: ")
+                            }
+                    })
+                }),
+                "{report}"
+            );
+            assert_eq!(
+                report["notes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n == &format!("still present at {target}, but not detected now")),
+                present
+            );
+        }
+    }
+
+    // Make the snapshot two hours old, from when the finding was 1 MiB smaller.
+    let path = saved["path"].as_str().unwrap();
+    let mut snap = dwhy_core::snapshot::load(Path::new(path)).unwrap();
+    let then = dwhy_core::snapshot::parse_time(&snap.created_at).unwrap() - 7200;
+    snap.created_at = time::OffsetDateTime::from_unix_timestamp(then)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    snap.findings.iter_mut().find(|f| f.id == id).unwrap().bytes -= 1 << 20;
+    fs::remove_file(path).unwrap();
+    dwhy_core::snapshot::save(Path::new(path).parent().unwrap(), &snap, then + 7200).unwrap();
+    state_before = state_listing(st);
+
+    let v = json_of(&explain(&["--json"]));
+    let g = &v["finding"]["growth"];
+    assert_eq!(g["since"], snap.created_at.as_str());
+    let rate = g["bytes_per_day"].as_i64().unwrap();
+    assert!((11 << 20..=12 << 20).contains(&rate), "{rate}");
+    let text = String::from_utf8_lossy(&explain(&[]).stdout).into_owned();
+    assert!(
+        text.contains(&format!("/day since {}", snap.created_at)),
+        "{text}"
+    );
+
+    // Gone: the target dir was removed since the snapshot.
+    fs::remove_dir_all(&target).unwrap();
+    let out = explain(&["--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["gone"], true);
+    assert_eq!(v["finding"], Value::Null);
+    assert_eq!(v["path"], target.as_str());
+    assert!(v.get("size").is_none());
+    let notes = v["notes"].as_array().unwrap();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("no longer exists")),
+        "{v}"
+    );
+    let out = explain(&[]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(&format!("finding {id} is gone")), "{text}");
+
+    // The directory is back without any build artifacts.
+    fs::create_dir(&target).unwrap();
+    fs::write(format!("{target}/leftover"), b"x").unwrap();
+    let v = json_of(&explain(&["--json"]));
+    assert_eq!(v["gone"], false);
+    assert_eq!(v["finding"], Value::Null);
+    assert_eq!(
+        v["notes"],
+        serde_json::json!([
+            format!("still present at {target}, but not detected now"),
+            "it may be below the detector's size or age threshold, covered by a finding above it, or need context above the walked directory"
+        ])
+    );
+    assert!(v["size"]["apparent"].as_u64().unwrap() >= 1, "{v}");
+    assert_eq!(v["inside"], serde_json::json!([]));
+
+    let parent = Path::new(&target).parent().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+    fs::write(parent, b"now a file").unwrap();
+    let out = explain(&["--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["gone"], true);
+    assert_eq!(v["finding"], Value::Null);
+
+    // explain writes nothing in the state dir.
+    assert_eq!(state_listing(st), state_before);
+}
+
+#[test]
+fn explain_finds_a_nested_scratch_directory_by_path_and_id() {
+    let data = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let parent = fs::canonicalize(data.path()).unwrap().join("scratch");
+    let child = parent.join("child");
+    fs::create_dir_all(&child).unwrap();
+    fs::write(parent.join(".dwhy-scratch"), b"").unwrap();
+    fs::write(child.join(".dwhy-scratch"), b"").unwrap();
+    fs::write(child.join("data"), vec![1; 2 << 20]).unwrap();
+    age_tree(&child, 8 * 86_400);
+
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "scan",
+            parent.to_str().unwrap(),
+            "-q",
+            "--json",
+            "--snapshot",
+            "--detectors",
+            "stale-tree",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let scan = json_of(&out);
+    let saved = &scan["findings"][0];
+    assert_eq!(saved["path"], child.to_str().unwrap());
+    let id = saved["id"].as_str().unwrap();
+    age_tree(&parent, 8 * 86_400);
+
+    for arg in [child.to_str().unwrap(), id] {
+        let out = dwhy_in(
+            state.path(),
+            &["explain", arg, "-q", "--json", "--detectors", "stale-tree"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let report = json_of(&out);
+        assert_eq!(report["finding"]["id"], id, "{report}");
+        assert_eq!(report["gone"], false);
+    }
+}
+
+#[test]
+fn explain_uses_full_snapshot_times_and_matching_growth_coverage() {
+    let (_data, root) = cargo_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let target = format!("{root}/app/target");
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "scan",
+            &root,
+            "-q",
+            "--json",
+            "--snapshot",
+            "--detectors",
+            "cargo-target",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let scan = json_of(&out);
+    let id = scan["findings"][0]["id"].as_str().unwrap();
+    let path = Path::new(scan["snapshot"]["path"].as_str().unwrap());
+    let mut snap = dwhy_core::snapshot::load(path).unwrap();
+    fs::remove_file(path).unwrap();
+
+    let now = time::OffsetDateTime::now_utc();
+    let t = now.replace_nanosecond(0).unwrap() - time::Duration::hours(2);
+    let timestamp = |t: time::OffsetDateTime| {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    snap.created_at = timestamp(t + time::Duration::milliseconds(900));
+    let newest_one_fs =
+        dwhy_core::snapshot::save(path.parent().unwrap(), &snap, now.unix_timestamp()).unwrap();
+    let growth_since = snap.created_at.clone();
+    snap.created_at = timestamp(t + time::Duration::milliseconds(100));
+    dwhy_core::snapshot::save(path.parent().unwrap(), &snap, now.unix_timestamp()).unwrap();
+
+    let explain = |arg: &str| {
+        let out = dwhy_in(
+            state.path(),
+            &[
+                "explain",
+                arg,
+                "-q",
+                "--json",
+                "--detectors",
+                "cargo-target",
+            ],
+        );
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        json_of(&out)
+    };
+    let report = explain(id);
+    assert_eq!(
+        report["resolved"]["snapshot"]["id"],
+        newest_one_fs.snapshot.id
+    );
+    assert_eq!(report["finding"]["growth"]["since"], growth_since);
+
+    snap.scan.one_filesystem = false;
+    snap.created_at = timestamp(t + time::Duration::minutes(1));
+    let cross_fs =
+        dwhy_core::snapshot::save(path.parent().unwrap(), &snap, now.unix_timestamp()).unwrap();
+    let report = explain(id);
+    assert_eq!(report["resolved"]["snapshot"]["id"], cross_fs.snapshot.id);
+    assert_eq!(report["finding"]["growth"]["since"], growth_since);
+    assert_eq!(explain(&target)["finding"]["growth"]["since"], growth_since);
+}
+
+#[test]
+fn explain_rejects_non_utf8_paths() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let data = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let path = data.path().join(OsStr::from_bytes(b"dir\xff"));
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("file"), b"x").unwrap();
+    symlink(&path, data.path().join("link")).unwrap();
+    for (arg, cwd) in [
+        (path.as_path(), data.path()),
+        (Path::new("file"), path.as_path()),
+        (Path::new("link/file"), data.path()),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_dwhy"))
+            .arg("explain")
+            .arg(arg)
+            .args(["-q", "--json", "--detectors", "cargo-target"])
+            .current_dir(cwd)
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(out.stdout.is_empty());
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            text.contains("explain needs a UTF-8 path (diskwhy/v1 reports paths as UTF-8)"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn explain_does_not_alias_a_lossy_finding_to_a_utf8_path() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (_data, root) = cargo_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let app = Path::new(&root).join("app");
+    fs::rename(
+        app.join("target"),
+        app.join(OsStr::from_bytes(b"target\xff")),
+    )
+    .unwrap();
+    let other = app.join("target�");
+    fs::create_dir(&other).unwrap();
+
+    for path in [other, app] {
+        let out = dwhy_in(
+            state.path(),
+            &[
+                "explain",
+                path.to_str().unwrap(),
+                "-q",
+                "--json",
+                "--detectors",
+                "cargo-target",
+            ],
+        );
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let report = json_of(&out);
+        assert_eq!(report["finding"], Value::Null);
+        assert_eq!(report["inside"], serde_json::json!([]));
+    }
+}
+
+#[test]
+fn explain_refuses_an_id_whose_saved_path_was_lossy() {
+    let (_data, root) = cargo_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "scan",
+            &root,
+            "-q",
+            "--json",
+            "--snapshot",
+            "--detectors",
+            "cargo-target",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let scan = json_of(&out);
+    let path = Path::new(scan["snapshot"]["path"].as_str().unwrap());
+    // What v1 saves for a target dir named `target\xff`.
+    let mut snap = dwhy_core::snapshot::load(path).unwrap();
+    let lossy = format!("{root}/app/target\u{FFFD}");
+    let id = dwhy_core::detect::finding_id("cargo-target", &lossy);
+    snap.findings[0].path = lossy;
+    snap.findings[0].id = id.clone();
+    fs::remove_file(path).unwrap();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    dwhy_core::snapshot::save(path.parent().unwrap(), &snap, now).unwrap();
+
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "explain",
+            &id,
+            "-q",
+            "--json",
+            "--detectors",
+            "cargo-target",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!(
+            "the saved path for {id} was not valid UTF-8 and can't be checked reliably; \
+             run `dwhy explain <path>` with the real path"
+        )),
+        "{err}"
+    );
+}

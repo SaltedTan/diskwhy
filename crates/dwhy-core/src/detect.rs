@@ -289,6 +289,16 @@ pub fn run_with(
     built: &[Box<dyn Detector>],
     only: Option<&[String]>,
 ) -> (Vec<Finding>, Vec<DetectorRun>) {
+    let (findings, runs) = run_candidates(tree, ctx, built, only);
+    (outermost(findings), runs)
+}
+
+pub fn run_candidates(
+    tree: &ScanTree,
+    ctx: &DetectContext,
+    built: &[Box<dyn Detector>],
+    only: Option<&[String]>,
+) -> (Vec<Finding>, Vec<DetectorRun>) {
     let mut all = Vec::new();
     let mut runs = Vec::new();
     for info in CATALOG {
@@ -329,7 +339,7 @@ pub fn run_with(
         }
         runs.push(run);
     }
-    (outermost(all), runs)
+    (all, runs)
 }
 
 /// RFC 3339 (UTC) for seconds since the epoch.

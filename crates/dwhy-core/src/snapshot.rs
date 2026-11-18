@@ -161,6 +161,7 @@ pub fn docker_part(s: &docker::Snapshot) -> SnapshotDocker {
                     .as_ref()
                     .filter(|u| u.size >= 0)
                     .map(|u| u.size as u64),
+                created_at: Some(v.created_at.clone()).filter(|t| !t.is_empty()),
             })
             .collect(),
     }
