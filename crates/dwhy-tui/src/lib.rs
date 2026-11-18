@@ -14,6 +14,7 @@ pub mod ui;
 use std::io::{self, IsTerminal};
 use std::panic;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -23,6 +24,8 @@ use crossterm::{cursor, execute};
 use dwhy_core::scan::Progress;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use signal_hook::SigId;
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
 pub use app::App;
 pub use job::{Options, Scanned, Stage};
@@ -39,43 +42,55 @@ enum Msg {
 
 /// Opens the TUI: checks there is a terminal, scans `opts` in a background
 /// thread, and browses the result until the person quits.
-pub fn run(opts: Options) -> Result<(), Error> {
+pub fn run(opts: Options) -> Result<u8, Error> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(
             "the TUI needs a terminal (stdin and stdout); use `dwhy scan` (or `dwhy scan --json`) instead"
                 .into(),
         );
     }
-    // Bad roots and detector names fail before the screen changes.
-    let roots = opts.roots()?;
-
-    let progress = Arc::new(Progress::default());
-    let (tx, rx) = mpsc::channel();
-    {
-        let (progress, roots) = (progress.clone(), roots.clone());
-        // Not joined: quitting mid-scan leaves it to end with the process.
-        std::thread::Builder::new()
-            .name("dwhy-tui-scan".into())
-            .spawn(move || {
-                let stage_tx = tx.clone();
-                let res = job::scan(&opts, &roots, &progress, &mut |s| {
-                    let _ = stage_tx.send(Msg::Stage(s));
-                });
-                let _ = tx.send(Msg::Done(res.map(Box::new)));
-            })?;
+    let signal = Termination::register()?;
+    let result = run_terminal(opts, &signal);
+    match signal.exit_code() {
+        Some(code) => Ok(code),
+        None => result.map(|()| 0),
     }
-    let labels = roots
-        .iter()
-        .map(|r| app::sanitize(&r.to_string_lossy()))
-        .collect();
-    let mut app = App::new(labels, progress);
+}
+
+fn run_terminal(opts: Options, signal: &Termination) -> Result<(), Error> {
+    let labels = if opts.paths.is_empty() {
+        vec![".".into()]
+    } else {
+        opts.paths
+            .iter()
+            .map(|r| app::sanitize(&r.to_string_lossy()))
+            .collect()
+    };
+    let progress = Arc::new(Progress::default());
+    let mut app = App::new(labels, progress.clone());
 
     let _guard = TerminalGuard::enter()?;
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     term.clear()?;
-    loop {
+
+    let (tx, rx) = mpsc::channel();
+    // Not joined: quitting mid-scan leaves it to end with the process.
+    std::thread::Builder::new()
+        .name("dwhy-tui-scan".into())
+        .spawn(move || {
+            let res = job::scan(&opts, &progress, &mut |s| {
+                let _ = tx.send(Msg::Stage(s));
+            });
+            let _ = tx.send(Msg::Done(res.map(Box::new)));
+        })?;
+
+    while signal.exit_code().is_none() {
         term.draw(|f| ui::draw(f, &mut app))?;
-        if event::poll(TICK)?
+        let ready = event::poll(TICK)?;
+        if signal.exit_code().is_some() {
+            return Ok(());
+        }
+        if ready
             && let Event::Key(key) = event::read()?
             && app.on_key(key)
         {
@@ -94,6 +109,42 @@ pub fn run(opts: Options) -> Result<(), Error> {
                     break;
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct Termination {
+    flag: Arc<AtomicUsize>,
+    registrations: Vec<SigId>,
+}
+
+impl Termination {
+    fn register() -> io::Result<Self> {
+        let mut signal = Self::default();
+        for num in [SIGHUP, SIGINT, SIGTERM] {
+            signal.registrations.push(signal_hook::flag::register_usize(
+                num,
+                signal.flag.clone(),
+                num as usize,
+            )?);
+        }
+        Ok(signal)
+    }
+
+    fn exit_code(&self) -> Option<u8> {
+        match self.flag.load(Ordering::Relaxed) {
+            0 => None,
+            num => Some(128 + num as u8),
+        }
+    }
+}
+
+impl Drop for Termination {
+    fn drop(&mut self) {
+        for id in self.registrations.drain(..) {
+            signal_hook::low_level::unregister(id);
         }
     }
 }
@@ -138,4 +189,19 @@ impl Drop for TerminalGuard {
 fn restore() {
     let _ = terminal::disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen, cursor::Show);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn termination_flag_requests_quit_with_signal_status() {
+        let signal = Termination::default();
+        assert_eq!(signal.exit_code(), None);
+        for (num, status) in [(SIGHUP, 129), (SIGINT, 130), (SIGTERM, 143)] {
+            signal.flag.store(num as usize, Ordering::Relaxed);
+            assert_eq!(signal.exit_code(), Some(status));
+        }
+    }
 }

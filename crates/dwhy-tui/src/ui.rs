@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Browser, SizeMode, State};
+use crate::app::{App, Browser, SizeMode, State, sanitize};
 use crate::job::{Mark, Stage};
 
 /// Filesystem lines shown before "… N more".
@@ -24,14 +24,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let fs_lines = match &app.state {
         State::Scanning { .. } => 1,
-        State::Browsing(b) => {
-            let n = b.data.report.fs.len();
-            if n > MAX_FS_LINES {
-                MAX_FS_LINES
-            } else {
-                n.max(1)
-            }
-        }
+        State::Browsing(b) if b.fs_offset.is_some() => 0,
+        State::Browsing(b) => b.data.report.fs.len().clamp(1, MAX_FS_LINES),
     };
     let [title, fs, list, status, keys] = Layout::vertical([
         Constraint::Length(1),
@@ -75,14 +69,42 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(Span::styled(" q quit", dim)), keys);
         }
         State::Browsing(b) => {
+            let reports = &b.data.report.fs;
+            if let Some(offset) = &mut b.fs_offset {
+                let height = list.height as usize;
+                *offset = (*offset).min(reports.len().saturating_sub(height.max(1)));
+                let end = (*offset + height).min(reports.len());
+                f.render_widget(title_line("filesystems", "", width), title);
+                f.render_widget(Paragraph::new(fs_text(&reports[*offset..end], width)), list);
+                let msg = if end > *offset {
+                    format!(" {}–{end} of {} filesystems", *offset + 1, reports.len())
+                } else {
+                    format!(" {} filesystems", reports.len())
+                };
+                f.render_widget(Paragraph::new(msg), status);
+                let help = " ↑↓ PgUp PgDn scroll · f back to tree · q quit";
+                f.render_widget(Paragraph::new(Span::styled(help, dim)), keys);
+                return;
+            }
             let path = b.path();
             let place = if path.is_empty() {
                 "scan roots".to_string()
             } else {
-                path
+                sanitize(&path)
             };
             f.render_widget(title_line(&place, app.mode.label(), width), title);
-            let fsl = fs_text(&b.data.report.fs, width);
+            let shown = if reports.len() > MAX_FS_LINES {
+                MAX_FS_LINES - 1
+            } else {
+                reports.len()
+            };
+            let mut fsl = fs_text(&reports[..shown], width);
+            if shown < reports.len() {
+                fsl.push(Line::raw(format!(
+                    " … {} more filesystems · f to view all",
+                    reports.len() - shown
+                )));
+            }
             f.render_widget(Paragraph::new(fsl), fs);
             draw_list(f, b, app.mode, list);
             f.render_widget(Paragraph::new(status_text(b, app.mode)), status);
@@ -90,8 +112,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 SizeMode::Allocated => "apparent",
                 SizeMode::Apparent => "allocated",
             };
-            let help =
-                format!(" ↑↓ PgUp PgDn move · Enter open · Backspace up · a {other} · q quit");
+            let help = format!(
+                " ↑↓ PgUp PgDn · Enter open · Backspace up · a {other} · f filesystems · q quit"
+            );
             f.render_widget(Paragraph::new(Span::styled(help, dim)), keys);
         }
     }
@@ -123,13 +146,7 @@ fn fs_text(fs: &[FsReport], width: usize) -> Vec<Line<'static>> {
     if fs.is_empty() {
         return vec![Line::raw(" no filesystem figures")];
     }
-    let shown = if fs.len() > MAX_FS_LINES {
-        MAX_FS_LINES - 1
-    } else {
-        fs.len()
-    };
-    let mut out: Vec<Line> = fs[..shown]
-        .iter()
+    fs.iter()
         .map(|f| {
             let figures = format!("  used {} of {}", human(f.used), human(f.size));
             let gap = match f.unaccounted {
@@ -141,27 +158,26 @@ fn fs_text(fs: &[FsReport], width: usize) -> Vec<Line<'static>> {
                 // Only a scan of the mount point can measure the gap.
                 None => format!("  scanned {} (subtree only)", human(f.scanned)),
             };
-            let tail = format!(" {}", f.fstype);
-            let room = width.saturating_sub(1 + tail.len() + figures.len() + gap.width());
-            let mount = middle(&f.mount, room.max(12));
+            let room = width.saturating_sub(figures.width() + gap.width() + 2);
+            let mount = sanitize(&f.mount);
+            let fstype = sanitize(&f.fstype);
+            let location = if mount.width() + fstype.width() < room {
+                format!("{mount} {fstype}")
+            } else {
+                middle(&mount, room)
+            };
             let gap_style = if f.unaccounted_large {
                 Style::new().add_modifier(Modifier::BOLD)
             } else {
                 Style::new()
             };
             Line::from(vec![
-                Span::raw(format!(" {mount}{tail}{figures}")),
+                Span::raw(figures),
                 Span::styled(gap, gap_style),
+                Span::raw(format!("  {location}")),
             ])
         })
-        .collect();
-    if shown < fs.len() {
-        out.push(Line::raw(format!(
-            " … {} more filesystems",
-            fs.len() - shown
-        )));
-    }
-    out
+        .collect()
 }
 
 fn draw_list(f: &mut Frame, b: &mut Browser, mode: SizeMode, area: Rect) {
@@ -221,6 +237,14 @@ fn status_text(b: &Browser, mode: SizeMode) -> Line<'static> {
     let mut parts = vec![format!(" {} {} here", human(b.total(mode)), mode.label())];
     if !b.rows.is_empty() {
         parts.push(format!("{}/{}", b.selected + 1, b.rows.len()));
+    }
+    let errors = r.scan.error_count;
+    if errors > 0 {
+        parts.push(format!(
+            "{} scan error{}",
+            thousands(errors),
+            if errors == 1 { "" } else { "s" }
+        ));
     }
     if let Some(m) = b.mark() {
         parts.push(format!("this directory: {}", mark_text(m)));

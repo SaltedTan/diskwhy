@@ -40,7 +40,7 @@ pub struct Row {
 pub enum RowKind {
     /// A directory (or a non-directory root) in the tree.
     Node(NodeId),
-    /// The files directly in this directory, and the directory itself.
+    /// The non-directory entries directly in this directory.
     Files,
 }
 
@@ -60,6 +60,7 @@ pub struct Browser {
     pub selected: usize,
     /// First row on screen.
     pub offset: usize,
+    pub(crate) fs_offset: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -113,6 +114,7 @@ impl App {
             rows: Vec::new(),
             selected: 0,
             offset: 0,
+            fs_offset: None,
         };
         b.rows = rows(&b.data, place, self.mode);
         self.state = State::Browsing(Box::new(b));
@@ -141,6 +143,23 @@ impl App {
         let State::Browsing(b) = &mut self.state else {
             return false;
         };
+        if key.code == KeyCode::Char('f') {
+            b.fs_offset = if b.fs_offset.is_some() { None } else { Some(0) };
+            return false;
+        }
+        if let Some(offset) = &mut b.fs_offset {
+            let last = b.data.report.fs.len().saturating_sub(page);
+            *offset = match key.code {
+                KeyCode::Up => offset.saturating_sub(1),
+                KeyCode::Down => (*offset + 1).min(last),
+                KeyCode::PageUp => offset.saturating_sub(page),
+                KeyCode::PageDown => (*offset + page).min(last),
+                KeyCode::Home => 0,
+                KeyCode::End => last,
+                _ => *offset,
+            };
+            return false;
+        }
         let last = b.rows.len().saturating_sub(1);
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => b.selected = b.selected.saturating_sub(1),
@@ -264,8 +283,7 @@ fn size(t: &dwhy_core::report::Totals, mode: SizeMode) -> u64 {
     }
 }
 
-/// The rows for `place`, largest first (ties by name). A directory's own
-/// files are one `[files]` row, shown when they take any space.
+/// The rows for `place`, largest first (ties by name).
 fn rows(data: &Scanned, place: Place, mode: SizeMode) -> Vec<Row> {
     let t = &data.tree;
     let node_row = |id: NodeId| Row {
@@ -277,11 +295,14 @@ fn rows(data: &Scanned, place: Place, mode: SizeMode) -> Vec<Row> {
         Place::Roots => t.roots().iter().map(|&id| node_row(id)).collect(),
         Place::Dir(id) => {
             let mut v: Vec<Row> = t.children(id).iter().map(|&c| node_row(c)).collect();
-            let own = size(&t.node(id).own, mode);
-            if own > 0 {
+            let node = t.node(id);
+            if node.has_direct_files {
                 v.push(Row {
                     kind: RowKind::Files,
-                    size: own,
+                    size: match mode {
+                        SizeMode::Allocated => node.own.allocated - node.directory_allocated,
+                        SizeMode::Apparent => node.own.apparent,
+                    },
                     mark: None,
                 });
             }

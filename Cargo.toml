@@ -13,6 +13,7 @@ dwhy-core = { path = "crates/dwhy-core" }
 dwhy-tui = { path = "crates/dwhy-tui" }
 clap = { version = "4.6", features = ["derive"] }
 crossterm = "0.29"
+signal-hook = { version = "0.4", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
 unicode-width = "0.2"
 rayon = "1.12"

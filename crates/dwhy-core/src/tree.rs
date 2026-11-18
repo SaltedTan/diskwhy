@@ -113,6 +113,8 @@ pub struct TreeNode {
     /// The directory inode and its non-directory entries (hardlinked inodes
     /// included where they are attributed to this directory).
     pub own: Totals,
+    pub directory_allocated: u64,
+    pub has_direct_files: bool,
     /// `own` plus all descendants.
     pub total: Totals,
     pub markers: Markers,
@@ -296,6 +298,8 @@ mod tests {
                 allocated: own,
                 ..Totals::default()
             },
+            directory_allocated: own,
+            has_direct_files: false,
             total: Totals::default(),
             markers: Markers::empty(),
             newest_mtime: 0,

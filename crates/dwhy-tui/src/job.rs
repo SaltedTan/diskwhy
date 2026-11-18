@@ -28,7 +28,7 @@ impl Options {
     /// The roots to scan, made absolute (symlinks in the last component are
     /// not followed). Fails like `dwhy scan` does on a missing root or an
     /// unknown detector name.
-    pub fn roots(&self) -> Result<Vec<PathBuf>, String> {
+    fn roots(&self) -> Result<Vec<PathBuf>, String> {
         if let Some(names) = &self.detectors {
             detect::validate_selection(names)?;
         }
@@ -56,7 +56,6 @@ pub enum Mark {
     Unreadable,
     /// It was listed, but this many entries could not be `lstat`ed.
     EntriesDenied(u64),
-    /// Listing it failed for another reason (see the scan's errors).
     Error,
 }
 
@@ -71,14 +70,13 @@ pub struct Scanned {
 }
 
 /// Runs the whole scan on this thread, reporting each stage to `stage`.
-/// `roots` come from [`Options::roots`].
 pub fn scan(
     opts: &Options,
-    roots: &[PathBuf],
     progress: &Progress,
     stage: &mut dyn FnMut(Stage),
 ) -> Result<Scanned, String> {
     stage(Stage::Walking);
+    let roots = opts.roots()?;
     let mounts = MountTable::read().unwrap_or_default();
     let one_fs = !opts.cross_filesystems;
     let scan_opts = ScanOptions {
@@ -88,7 +86,7 @@ pub fn scan(
         threads: opts.threads,
         ..ScanOptions::default()
     };
-    let result = scan::scan(roots, &scan_opts, &mounts, progress).map_err(|e| e.to_string())?;
+    let result = scan::scan(&roots, &scan_opts, &mounts, progress).map_err(|e| e.to_string())?;
 
     stage(Stage::Accounting);
     let mut report = account::system_scan_report(&result, &mounts);
@@ -108,7 +106,11 @@ pub fn scan(
         }
     }
     for (path, _) in &result.errors {
-        if let Some(id) = tree.find(path) {
+        if let Some(id) = path
+            .ancestors()
+            .filter_map(|p| tree.find(p))
+            .find(|&id| tree.node(id).is_dir)
+        {
             marks.entry(id).or_insert(Mark::Error);
         }
     }

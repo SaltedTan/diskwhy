@@ -228,10 +228,21 @@ fn tui_needs_a_terminal() {
         assert!(out.stdout.is_empty(), "no escape codes on a pipe");
     }
     // Paths go after `dwhy tui`, not bare `dwhy`.
-    assert_eq!(dwhy(&["."]).status.code(), Some(1));
-    assert_eq!(
-        dwhy(&["tui", "-x", "--cross-filesystems"]).status.code(),
-        Some(1)
+    let out = dwhy(&["."]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("unexpected argument '.'") || err.contains("unrecognized subcommand '.'"),
+        "{err}"
+    );
+    let out = dwhy(&["tui", "-x", "--cross-filesystems"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("cannot be used with")
+            && err.contains("--cross-filesystems")
+            && (err.contains("--one-file-system") || err.contains("'-x'")),
+        "{err}"
     );
 }
 

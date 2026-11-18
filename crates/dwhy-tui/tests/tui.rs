@@ -2,7 +2,7 @@
 //! TestBackend. No terminal and no pty.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dwhy_core::report::FsReport;
 use dwhy_core::scan::Progress;
-use dwhy_tui::app::{App, RowKind, SizeMode};
+use dwhy_tui::app::{App, SizeMode};
 use dwhy_tui::job::{self, Mark, Options, Scanned};
 use dwhy_tui::ui;
 use ratatui::Terminal;
@@ -87,8 +87,7 @@ fn opts(paths: Vec<PathBuf>) -> Options {
 
 fn scan(paths: &[&Path]) -> Scanned {
     let o = opts(paths.iter().map(|p| p.to_path_buf()).collect());
-    let roots = o.roots().unwrap();
-    job::scan(&o, &roots, &Progress::default(), &mut |_| {}).unwrap()
+    job::scan(&o, &Progress::default(), &mut |_| {}).unwrap()
 }
 
 /// Replaces the machine's `df` figures with fixed ones: a whole-filesystem
@@ -191,6 +190,40 @@ fn tree_root_80x24() {
     let mut app = app_with(data);
     assert_eq!(labels(&app), ["big/", "mid/", "[files]"]);
     insta::assert_snapshot!(render(&mut app, 80, 24, Some(&root)));
+}
+
+#[test]
+fn filesystem_overflow_80x24() {
+    let fixture = fixture(false);
+    let root = fixture.root();
+    let mut data = scan(&[&root]);
+    pin_fs(&mut data, true);
+    data.report.fs[1].fstype = "fuse.mergerfs".into();
+    data.report.fs[1].mount = format!("/data/{}/pool", "nested/".repeat(8));
+    data.report.fs[1].scanned = 117 << 30;
+    for n in 2..24 {
+        let mut fs = data.report.fs[0].clone();
+        fs.mount = format!("/mnt/volume{n}");
+        fs.unaccounted = Some((n as u64) << 30);
+        data.report.fs.push(fs);
+    }
+    let mut app = app_with(data);
+    let screen = render(&mut app, 80, 24, Some(&root));
+    assert!(screen.contains("scanned 117.0G (subtree only)"), "{screen}");
+    assert!(screen.contains("… 22 more filesystems · f to view all"));
+
+    press(&mut app, &[KeyCode::Char('f')]);
+    let screen = render(&mut app, 80, 24, None);
+    insta::assert_snapshot!(screen);
+    assert!(screen.contains("unaccounted 3.0G  /mnt/volume3"));
+    assert!(!screen.contains("/mnt/volume23"));
+    press(&mut app, &[KeyCode::PageDown]);
+    let screen = render(&mut app, 80, 24, None);
+    assert!(screen.contains("unaccounted 23.0G  /mnt/volume23"));
+    press(&mut app, &[KeyCode::PageUp]);
+    assert!(render(&mut app, 80, 24, None).contains("1–21 of 24 filesystems"));
+    press(&mut app, &[KeyCode::Char('f')]);
+    assert!(!render(&mut app, 80, 24, None).contains("/mnt/volume3"));
 }
 
 #[test]
@@ -332,12 +365,53 @@ fn unreadable_directories_are_listed_and_marked() {
         press(&mut app, &[KeyCode::Up]);
     }
     press(&mut app, &[KeyCode::Enter]);
-    let screen = render(&mut app, 80, 24, None);
-    assert!(
-        screen.contains("unreadable: its contents are not counted"),
-        "{screen}"
-    );
-    assert!(screen.contains("this directory: unreadable"), "{screen}");
+    for mode in [SizeMode::Allocated, SizeMode::Apparent] {
+        assert_eq!(app.mode, mode);
+        assert!(labels(&app).is_empty());
+        let screen = render(&mut app, 80, 24, None);
+        assert!(
+            screen.contains("unreadable: its contents are not counted"),
+            "{screen}"
+        );
+        assert!(screen.contains("this directory: unreadable"), "{screen}");
+        press(&mut app, &[KeyCode::Char('a')]);
+    }
+}
+
+#[test]
+fn files_row_counts_measured_entries_and_excludes_directory_blocks() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let a = root.join("a");
+    let b = root.join("b");
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    let mut app = app_with(scan(&[&b]));
+    assert!(labels(&app).is_empty());
+    assert!(render(&mut app, 80, 24, None).contains("(empty)"));
+
+    let file = a.join("file");
+    fs::write(&file, b"diskwhy").unwrap();
+    fs::hard_link(&file, b.join("file")).unwrap();
+    fs::File::create(root.join("empty")).unwrap();
+    let allocated = fs::metadata(&file).unwrap().blocks() * 512;
+    let data = scan(&[root]);
+    for (label, expected) in [("a/", [allocated, 7]), ("b/", [0, 0])] {
+        let mut app = app_with(data.clone());
+        for _ in 0..labels(&app).iter().position(|s| s == label).unwrap() {
+            press(&mut app, &[KeyCode::Down]);
+        }
+        press(&mut app, &[KeyCode::Enter]);
+        for bytes in expected {
+            assert_eq!(labels(&app), ["[files]"]);
+            assert_eq!(app.browser().unwrap().rows[0].size, bytes);
+            press(&mut app, &[KeyCode::Char('a')]);
+        }
+    }
+    let mut app = app_with(data);
+    press(&mut app, &[KeyCode::Char('a'), KeyCode::End]);
+    assert_eq!(selected(&app), "[files]");
+    assert_eq!(app.browser().unwrap().selected_row().unwrap().size, 0);
 }
 
 #[test]
@@ -351,18 +425,11 @@ fn several_roots_are_listed_together() {
     assert_eq!(names.len(), 2);
     assert_eq!(names[0], format!("{}/", ra.display()), "largest first");
     assert_eq!(app.browser().unwrap().path(), "");
-    press(&mut app, &[KeyCode::Enter]);
-    assert_eq!(app.browser().unwrap().path(), ra.to_str().unwrap());
+    press(&mut app, &[KeyCode::Down, KeyCode::Enter]);
+    assert_eq!(app.browser().unwrap().path(), rb.to_str().unwrap());
     press(&mut app, &[KeyCode::Backspace]);
     assert_eq!(app.browser().unwrap().path(), "");
-    assert_eq!(
-        app.browser().unwrap().selected_row().unwrap().kind,
-        app.browser().unwrap().rows[0].kind
-    );
-    assert!(matches!(
-        app.browser().unwrap().rows[0].kind,
-        RowKind::Node(_)
-    ));
+    assert_eq!(selected(&app), format!("{}/", rb.display()));
 }
 
 #[test]
@@ -387,18 +454,19 @@ fn scanning_writes_nothing() {
     };
     let before = list(&root);
     let o = opts(vec![root.clone()]);
-    let roots = o.roots().unwrap();
-    job::scan(&o, &roots, &Progress::default(), &mut |_| {}).unwrap();
+    job::scan(&o, &Progress::default(), &mut |_| {}).unwrap();
     assert_eq!(list(&root), before);
 }
 
 #[test]
 fn bad_roots_and_detectors_fail_before_scanning() {
     let o = opts(vec!["/nonexistent/dwhy-tui-test".into()]);
-    assert!(o.roots().is_err());
+    let result = job::scan(&o, &Progress::default(), &mut |_| {});
+    assert!(result.unwrap_err().contains("/nonexistent/dwhy-tui-test"));
     let mut o = opts(Vec::new());
     o.detectors = Some(vec!["nope".into()]);
-    assert!(o.roots().unwrap_err().contains("unknown detector"));
+    let result = job::scan(&o, &Progress::default(), &mut |_| {});
+    assert!(result.unwrap_err().contains("unknown detector"));
 }
 
 #[test]

@@ -92,6 +92,9 @@ dwhy tui [PATH…] [-x|--cross-filesystems] [--plan FILE]  # the TUI on these ro
 
 Exit codes: `0` ok · `1` error · `2` some items were skipped because of a guard or changed fingerprint · `3` refused by policy.
 
+The TUI restores the terminal on SIGHUP, SIGINT and SIGTERM, then exits with `128 + signal number`.
+Press `f` to open the scrollable filesystem list. The tree's `[files]` row measures direct non-directory entries. The current directory's own blocks are included in its allocated total only, so its rows can add up to less than 100% in allocated mode.
+
 ### JSON contract
 
 The [`diskwhy/v1` serde types](../crates/dwhy-core/src/report.rs) define the JSON contract. The pinned shapes include a [WAL finding](../crates/dwhy-core/tests/snapshots/json_shape__postgres_wal_evidence_shape.snap), [API-only WAL evidence](../crates/dwhy-core/tests/snapshots/json_shape__api_only_evidence_shape.snap) and [explain reports](../crates/dwhy-core/tests/snapshots/json_shape__explain_report_shape.snap).

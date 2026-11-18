@@ -343,8 +343,18 @@ fn run_tui(args: TuiArgs) -> Result<u8> {
         cross_filesystems: args.cross_filesystems,
         detectors: None,
         threads: 0,
-    })?;
-    Ok(EXIT_OK)
+    })
+    .map_err(|e| {
+        let mut message = String::new();
+        for c in e.to_string().chars() {
+            if c.is_control() {
+                message.extend(c.escape_default());
+            } else {
+                message.push(c);
+            }
+        }
+        message.into()
+    })
 }
 
 fn run_scan(args: ScanArgs) -> Result<u8> {
