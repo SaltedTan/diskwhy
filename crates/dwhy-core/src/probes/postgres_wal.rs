@@ -671,10 +671,36 @@ pub fn parse_psql(out: &str) -> Result<PsqlRow, String> {
         last_archived_at: time(fields[3])?,
         last_failed_at: time(fields[4])?,
         last_failed_wal: archive_file_name(fields[5]),
-        archive_mode: text(fields[6]),
+        archive_mode: archive_mode_value(fields[6]),
         archive_command: text(fields[7]),
-        archive_timeout: text(fields[8]),
+        archive_timeout: archive_timeout_value(fields[8]),
     })
+}
+
+fn archive_mode_value(value: &str) -> Option<String> {
+    let mode = value.to_ascii_lowercase();
+    matches!(mode.as_str(), "on" | "off" | "always").then_some(mode)
+}
+
+fn archive_timeout_value(value: &str) -> Option<String> {
+    let integer = value.trim_start_matches(|c: char| c.is_ascii_digit());
+    if integer.len() == value.len() {
+        return None;
+    }
+    let unit = if let Some(fraction) = integer.strip_prefix('.') {
+        let rest = fraction.trim_start_matches(|c: char| c.is_ascii_digit());
+        if rest.len() == fraction.len() {
+            return None;
+        }
+        rest
+    } else {
+        integer
+    };
+    matches!(
+        unit.trim_start(),
+        "" | "us" | "ms" | "s" | "min" | "h" | "d"
+    )
+    .then(|| value.to_string())
 }
 
 fn archive_file_name(name: &str) -> Option<String> {
@@ -716,12 +742,16 @@ pub fn command_settings(args: &[String]) -> HashMap<String, String> {
     let mut put = |kv: &str| {
         if let Some((k, v)) = kv.split_once('=') {
             let key = k.trim().to_ascii_lowercase().replace('-', "_");
-            let value = if key == "archive_mode" {
-                v.to_ascii_lowercase()
-            } else {
-                v.to_string()
+            let value = match key.as_str() {
+                "archive_mode" => archive_mode_value(v),
+                "archive_timeout" => archive_timeout_value(v),
+                _ => Some(v.to_string()),
             };
-            out.insert(key, value);
+            if let Some(value) = value {
+                out.insert(key, value);
+            } else {
+                out.remove(&key);
+            }
         }
     };
     let mut it = args.iter();
@@ -782,7 +812,7 @@ pub fn scan_log(text: &str) -> LogScan {
             command_detail = true;
         }
         previous_failure = false;
-        if !matches!(level, "LOG" | "WARNING") {
+        if !matches!(level, "LOG" | "WARNING" | "FATAL") {
             continue;
         }
         if body.starts_with("archive command failed")
@@ -813,7 +843,17 @@ fn postgres_log_record(mut message: &str) -> Option<(&str, &str)> {
             | "DETAIL" | "HINT" | "CONTEXT" | "STATEMENT"),
         ) = prefix.split_ascii_whitespace().next_back()
         {
-            return Some((level, body.trim_start()));
+            let body = body.trim_start();
+            let body = body
+                .split_once(": ")
+                .filter(|(code, _)| {
+                    code.len() == 5
+                        && code
+                            .bytes()
+                            .all(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
+                })
+                .map_or(body, |(_, message)| message.trim_start());
+            return Some((level, body));
         }
         message = body;
     }

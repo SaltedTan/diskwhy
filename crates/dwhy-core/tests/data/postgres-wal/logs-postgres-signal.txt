@@ -1,0 +1,2 @@
+2026-11-13T02:12:00Z 2026-11-13 02:12:00 UTC [61] FATAL:  38000: archive command was terminated by signal 15: Terminated
+2026-11-13T02:12:00Z 2026-11-13 02:12:00 UTC [61] DETAIL:  The failed archive command was: curl -T pg_wal/000000010000000000000097 http://s3test:9000/wal/000000010000000000000097

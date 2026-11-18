@@ -435,6 +435,98 @@ fn api_only_takes_the_command_from_the_log_when_the_command_line_has_none() {
 }
 
 #[test]
+fn archive_settings_only_export_modes_and_durations() {
+    let sep = postgres_wal::FIELD_SEP;
+    for (mode, timeout, expected_mode, expected_timeout) in [
+        ("On", "10s", Some("on"), Some("10s")),
+        ("ALWAYS", "1.5 min", Some("always"), Some("1.5 min")),
+        ("OFF", "0", Some("off"), Some("0")),
+        ("on; SECRET=mode", "10s; SECRET=timeout", None, None),
+        ("", "-10s", None, None),
+        ("off", "10. ms", Some("off"), None),
+    ] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        let mut row: Vec<_> = fake.psql.as_ref().unwrap().split(sep).collect();
+        row[6] = mode;
+        row[8] = timeout;
+        fake.psql = Ok(row.join(&sep.to_string()));
+        let sql = probe(&fake);
+        assert_eq!(evidence(&sql).source, EvidenceSource::Psql);
+
+        fake.psql = Err(PsqlError::Failed);
+        fake.edit(&format!("/containers/{PG}/json"), |v| {
+            v["Args"] = serde_json::json!([
+                "postgres",
+                "-c",
+                format!("archive_mode={mode}"),
+                format!("--archive-timeout={timeout}")
+            ]);
+        });
+        let fallback = probe(&fake);
+        assert_eq!(evidence(&fallback).source, EvidenceSource::ApiOnly);
+        for f in [&sql, &fallback] {
+            let ev = evidence(f);
+            assert_eq!(ev.archive_mode.as_deref(), expected_mode);
+            assert_eq!(ev.archive_timeout.as_deref(), expected_timeout);
+            assert!(!serde_json::to_string(f).unwrap().contains("SECRET"));
+            assert!(!postgres_wal::summary(ev).contains("SECRET"));
+        }
+    }
+}
+
+#[test]
+fn shell_entrypoint_timeout_does_not_export_script() {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    fake.psql = Err(PsqlError::Failed);
+    fake.edit(&format!("/containers/{PG}/json"), |v| {
+        v["Path"] = "sh".into();
+        v["Args"] = serde_json::json!(["-c", "archive_timeout=10s; SECRET=private; exec postgres"]);
+    });
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert_eq!(ev.source, EvidenceSource::ApiOnly);
+    assert_eq!(ev.archive_timeout, None);
+    assert!(!serde_json::to_string(&f).unwrap().contains("SECRET"));
+    assert!(!postgres_wal::summary(ev).contains("SECRET"));
+}
+
+#[test]
+fn fallback_counts_verbose_and_fatal_archiver_records_only() {
+    for (fixture, expected_time, expected_wal) in [
+        (
+            "logs-postgres-verbose.txt",
+            "2026-11-13T02:10:00Z",
+            Some("000000010000000000000097"),
+        ),
+        ("logs-postgres-fatal.txt", "2026-11-13T02:11:00Z", None),
+        ("logs-postgres-signal.txt", "2026-11-13T02:12:00Z", None),
+    ] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        fake.psql = Err(PsqlError::Failed);
+        fake.edit(&format!("/containers/{PG}/json"), |v| {
+            v["Args"] = serde_json::json!(["postgres"]);
+            v["Config"]["Tty"] = true.into();
+        });
+        fake.gets.insert(
+            format!("/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}"),
+            Ok(data(fixture)),
+        );
+        let f = probe(&fake);
+        let ev = evidence(&f);
+        assert_eq!(ev.source, EvidenceSource::ApiOnly, "{fixture}");
+        assert_eq!(ev.failed_count, Some(1), "{fixture}");
+        assert_eq!(
+            ev.last_failed_at.as_deref(),
+            Some(expected_time),
+            "{fixture}"
+        );
+        assert_eq!(ev.last_failed_wal.as_deref(), expected_wal, "{fixture}");
+        assert_eq!(ev.archive_program.as_deref(), Some("curl"), "{fixture}");
+        assert_eq!(ev.targets[0].host, "s3test", "{fixture}");
+    }
+}
+
+#[test]
 fn api_only_with_an_unreadable_log_says_so() {
     let mut fake = Fake::recorded("psql-failing.txt");
     fake.psql = Err(PsqlError::Exec);
