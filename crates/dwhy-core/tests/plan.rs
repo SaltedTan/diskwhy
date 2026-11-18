@@ -68,6 +68,7 @@ fn finding(detector: &str, path: &Path, bytes: u64, tier: Tier) -> Finding {
         id: finding_id(detector, &path),
         detector: detector.into(),
         probe: None,
+        evidence: None,
         path,
         bytes,
         nested_bytes: None,

@@ -344,6 +344,77 @@ pub struct Finding {
     pub guards: Vec<GuardResult>,
     pub action: Action,
     pub recovery: Recovery,
+    /// What the probe named in `probe` found; absent when no probe ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Evidence>,
+}
+
+/// Evidence probes gathered about a finding, one member per probe.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Evidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres_wal: Option<PostgresWal>,
+}
+
+/// The `postgres-wal` probe: why a Postgres data volume is big. Read with
+/// read-only queries through `docker exec … psql` (`source: psql`), or,
+/// when that is not possible, from the container's inspect data and the
+/// tail of its log only (`source: api-only`, `notes` says why).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostgresWal {
+    /// The running Postgres container that mounts the volume.
+    pub container: String,
+    /// Bytes in `pg_wal` (`pg_ls_waldir()`).
+    #[serde(default)]
+    pub wal_bytes: Option<u64>,
+    /// Sum of `pg_database_size` over all databases.
+    #[serde(default)]
+    pub data_bytes: Option<u64>,
+    /// `pg_stat_archiver.failed_count`; with `api-only`, failures in the
+    /// log tail (a lower bound).
+    #[serde(default)]
+    pub failed_count: Option<u64>,
+    /// RFC 3339 (UTC).
+    #[serde(default)]
+    pub last_archived_at: Option<String>,
+    /// RFC 3339 (UTC).
+    #[serde(default)]
+    pub last_failed_at: Option<String>,
+    #[serde(default)]
+    pub last_failed_wal: Option<String>,
+    #[serde(default)]
+    pub archive_mode: Option<String>,
+    #[serde(default)]
+    pub archive_command: Option<String>,
+    #[serde(default)]
+    pub archive_timeout: Option<String>,
+    /// Hosts `archive_command` sends WAL to, matched with containers.
+    #[serde(default)]
+    pub targets: Vec<ArchiveTarget>,
+    pub source: EvidenceSource,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveTarget {
+    /// As written in `archive_command`.
+    pub host: String,
+    /// The container it names (by name, Compose service or network alias).
+    pub container: Option<String>,
+    /// The container's state (`running`, `exited`, …); `missing` when the
+    /// name matches no container; `unresolved` when it is not a container
+    /// name (a domain name or an address of none), so it was not checked.
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvidenceSource {
+    /// Read-only queries through `docker exec … psql`.
+    Psql,
+    /// Engine API GETs only: inspect and the log tail.
+    ApiOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -865,6 +936,9 @@ pub struct DoctorReport {
     pub docker_socket: DockerSocket,
     pub tools: Vec<ToolStatus>,
     pub detectors: Vec<DetectorStatus>,
+    /// Probes (`postgres-wal`, …), which add evidence to findings.
+    #[serde(default)]
+    pub probes: Vec<DetectorStatus>,
     pub notes: Vec<String>,
 }
 

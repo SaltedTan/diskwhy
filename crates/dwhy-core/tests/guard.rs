@@ -68,6 +68,7 @@ fn finding(path: &str, tier: Tier) -> Finding {
         id: "f_test".into(),
         detector: "stale-tree".into(),
         probe: None,
+        evidence: None,
         path: path.into(),
         bytes: 1,
         nested_bytes: None,

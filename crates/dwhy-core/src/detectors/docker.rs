@@ -64,6 +64,7 @@ fn finding(
         id: finding_id(detector, &path),
         detector: detector.into(),
         probe: None,
+        evidence: None,
         path,
         bytes,
         nested_bytes: None,

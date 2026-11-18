@@ -24,6 +24,7 @@ pub const TOOLS: &[(&str, &[&str])] = &[
             "docker-build-cache",
             "docker-container",
             "docker-volume",
+            "probe:postgres-wal (psql through `docker exec`)",
         ],
     ),
     ("cargo", &["cargo-target (removal via `cargo clean`)"]),
@@ -235,9 +236,10 @@ pub fn doctor() -> DoctorReport {
         euid,
         root,
         docker_group,
-        docker_socket: ctx.docker_socket,
-        tools: ctx.tools,
+        docker_socket: ctx.docker_socket.clone(),
+        tools: ctx.tools.clone(),
         detectors,
+        probes: crate::probes::statuses(&ctx),
         notes,
     }
 }

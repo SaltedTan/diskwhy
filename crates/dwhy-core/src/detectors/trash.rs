@@ -186,6 +186,7 @@ impl Detector for Trash {
                 id: finding_id(self.name(), &path_s),
                 detector: self.name().into(),
                 probe: None,
+                evidence: None,
                 bytes,
                 nested_bytes: None,
                 last_modified: Some(rfc3339(newest.copied().unwrap_or(n.newest_mtime))),

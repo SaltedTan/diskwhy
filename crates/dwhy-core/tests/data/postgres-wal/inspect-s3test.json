@@ -1,0 +1,50 @@
+{
+ "Id": "bb22000000000000000000000000000000000000000000000000000000000002",
+ "Created": "2026-11-07T07:00:00.000000000Z",
+ "Path": "docker-entrypoint.sh",
+ "Args": [
+  "server",
+  "/data"
+ ],
+ "State": {
+  "Status": "exited",
+  "Running": false,
+  "ExitCode": 137,
+  "StartedAt": "2026-11-07T07:00:01Z",
+  "FinishedAt": "0001-01-01T00:00:00Z"
+ },
+ "Name": "/pgwal-s3test-1",
+ "Mounts": [],
+ "Config": {
+  "Hostname": "bb2200000000",
+  "Env": [
+   "MINIO_ROOT_USER=x"
+  ],
+  "Cmd": [
+   "server",
+   "/data"
+  ],
+  "Image": "x",
+  "Tty": false,
+  "Labels": {
+   "com.docker.compose.project": "pgwal",
+   "com.docker.compose.service": "s3test"
+  }
+ },
+ "NetworkSettings": {
+  "Networks": {
+   "pgwal_default": {
+    "Aliases": [
+     "pgwal-s3test-1",
+     "s3test"
+    ],
+    "DNSNames": [
+     "pgwal-s3test-1",
+     "s3test",
+     "bb2200000000"
+    ],
+    "IPAddress": ""
+   }
+  }
+ }
+}

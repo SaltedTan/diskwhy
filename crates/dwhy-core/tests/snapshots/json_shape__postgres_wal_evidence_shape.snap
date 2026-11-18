@@ -1,0 +1,64 @@
+---
+source: crates/dwhy-core/tests/json_shape.rs
+expression: f
+---
+{
+  "id": "f_7c1e00000000",
+  "detector": "docker-volume",
+  "probe": "postgres-wal",
+  "path": "docker://volume/example_postgres_data",
+  "bytes": 33041965056,
+  "nested_bytes": null,
+  "last_modified": "2026-11-13T02:10:00Z",
+  "growth": null,
+  "tier": "review",
+  "reason": "pg_wal holds 29G vs 53M data; archive_command failing 151x since 2026-11-07 (target s3test exited); volume example_postgres_data holds 30.8G and is mounted by example-postgres-1 (running)",
+  "guards": [
+    {
+      "name": "container-mount",
+      "status": "warn",
+      "detail": "mounted by example-postgres-1 (running)"
+    }
+  ],
+  "action": {
+    "kind": "advice",
+    "text": "restore the archive target s3test; WAL is freed at the next checkpoint"
+  },
+  "recovery": {
+    "cost": "n/a: nothing is removed; Postgres recycles WAL itself",
+    "how": null
+  },
+  "evidence": {
+    "postgres_wal": {
+      "container": "example-postgres-1",
+      "wal_bytes": 31138512896,
+      "data_bytes": 55574528,
+      "failed_count": 151,
+      "last_archived_at": "2026-11-07T07:25:00Z",
+      "last_failed_at": "2026-11-13T02:10:00Z",
+      "last_failed_wal": "000000010000000000000097",
+      "archive_mode": "on",
+      "archive_command": "aws --endpoint-url http://s3test:9000 s3 cp %p s3://wal/%f",
+      "archive_timeout": "10s",
+      "targets": [
+        {
+          "host": "s3test",
+          "container": "example-s3test-1",
+          "state": "exited"
+        },
+        {
+          "host": "backup",
+          "container": null,
+          "state": "missing"
+        },
+        {
+          "host": "s3.example.com",
+          "container": null,
+          "state": "unresolved"
+        }
+      ],
+      "source": "psql",
+      "notes": []
+    }
+  }
+}

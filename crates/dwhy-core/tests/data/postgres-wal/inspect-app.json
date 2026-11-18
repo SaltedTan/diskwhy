@@ -1,0 +1,56 @@
+{
+ "Id": "cc33000000000000000000000000000000000000000000000000000000000003",
+ "Created": "2026-11-07T07:00:00.000000000Z",
+ "Path": "docker-entrypoint.sh",
+ "Args": [
+  "serve"
+ ],
+ "State": {
+  "Status": "running",
+  "Running": true,
+  "ExitCode": 0,
+  "StartedAt": "2026-11-07T07:00:01Z",
+  "FinishedAt": "0001-01-01T00:00:00Z"
+ },
+ "Name": "/other-app-1",
+ "Mounts": [
+  {
+   "Type": "volume",
+   "Name": "pgwal_pg_data",
+   "Destination": "/backup",
+   "Driver": "local",
+   "RW": false
+  }
+ ],
+ "Config": {
+  "Hostname": "cc3300000000",
+  "Env": [
+   "PATH=/bin"
+  ],
+  "Cmd": [
+   "serve"
+  ],
+  "Image": "x",
+  "Tty": false,
+  "Labels": {
+   "com.docker.compose.project": "other",
+   "com.docker.compose.service": "app"
+  }
+ },
+ "NetworkSettings": {
+  "Networks": {
+   "pgwal_default": {
+    "Aliases": [
+     "other-app-1",
+     "app"
+    ],
+    "DNSNames": [
+     "other-app-1",
+     "app",
+     "cc3300000000"
+    ],
+    "IPAddress": "172.20.0.2"
+   }
+  }
+ }
+}

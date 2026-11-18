@@ -22,7 +22,7 @@ use dwhy_core::plan::{self, Selection};
 use dwhy_core::report::{ActionKind, Plan, PlanScan, SavedSnapshot, ScanReport, Tier};
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::tree::ScanTree;
-use dwhy_core::{docker, doctor, growth, snapshot, system, units};
+use dwhy_core::{docker, doctor, growth, probes, snapshot, system, units};
 
 pub const EXIT_OK: u8 = 0;
 pub const EXIT_ERROR: u8 = 1;
@@ -319,7 +319,7 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
     let docker_snap = if args.no_detectors {
         None
     } else {
-        detect_into(&mut report, &result.tree, args.detectors.as_deref())
+        detect_into(&mut report, &result.tree, args.detectors.as_deref(), true)
     };
 
     // Growth on findings, from a snapshot of the same roots old enough for
@@ -387,15 +387,21 @@ fn scan_report(result: &scan::ScanResult, mounts: &MountTable) -> ScanReport {
     account::build_scan_report(result, mounts, &env, &|p| mounts::statvfs(p).ok())
 }
 
-/// Runs the detectors (all, or `only`) and puts their findings and Docker's
-/// totals in `report`. Returns the Docker state when it was fetched.
+/// Runs the detectors (all, or `only`), then the probes when `probe`, and
+/// puts their findings and Docker's totals in `report`. Returns the Docker
+/// state when it was fetched.
 fn detect_into(
     report: &mut ScanReport,
     tree: &ScanTree,
     only: Option<&[String]>,
+    probe: bool,
 ) -> Option<Arc<docker::Snapshot>> {
     let ctx = DetectContext::from_system();
-    let (findings, runs) = detect::run_with(tree, &ctx, &dwhy_core::detectors::registry(), only);
+    let (mut findings, runs) =
+        detect::run_with(tree, &ctx, &dwhy_core::detectors::registry(), only);
+    if probe {
+        probes::run(&mut findings, &ctx);
+    }
     report.findings = findings;
     report.detectors = runs;
     let snap = ctx.docker.fetched()?;
@@ -466,7 +472,7 @@ fn run_diff(args: DiffArgs) -> Result<u8> {
     let docker_snap = if args.no_detectors {
         None
     } else {
-        detect_into(&mut report, &result.tree, args.detectors.as_deref())
+        detect_into(&mut report, &result.tree, args.detectors.as_deref(), false)
     };
     let fresh = snapshot::build(
         &report,

@@ -370,6 +370,7 @@ impl Venv {
             id: finding_id(self.name(), &path_s),
             detector: self.name().into(),
             probe: None,
+            evidence: None,
             bytes,
             nested_bytes: None,
             last_modified: Some(rfc3339(n.newest_mtime)),
