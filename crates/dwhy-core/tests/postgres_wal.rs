@@ -324,12 +324,8 @@ fn psql_failure_falls_back_to_the_api_and_the_log_tail() {
     assert_eq!(ev.archive_timeout.as_deref(), Some("10s"));
     assert_eq!(ev.archive_program.as_deref(), Some("aws"));
     assert_eq!(ev.targets[0].state, "exited");
-    assert!(
-        ev.notes[0].starts_with("psql not used: docker exec psql failed")
-            && ev.notes[0].contains("role \"app\" does not exist"),
-        "{:?}",
-        ev.notes
-    );
+    assert!(ev.notes[0].starts_with("psql not used: psql failed;"));
+    assert!(!ev.notes[0].contains("role"));
     assert!(
         f.reason.starts_with(&format!(
             "observed 3 archive failures in the last {LOG_TAIL} log lines (last failure 2026-11-13T02:10:00.3Z); current archiver health unknown (target s3test (pgwal-s3test-1) exited)"
@@ -345,6 +341,68 @@ fn psql_failure_falls_back_to_the_api_and_the_log_tail() {
     assert!(fake.asked_for(&format!(
         "GET /containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}"
     )));
+}
+
+#[test]
+fn fallback_notes_export_only_psql_failure_categories() {
+    for (error, category) in [
+        (
+            r#"ERROR: permission denied for database "tenant_a""#,
+            "psql: permission denied",
+        ),
+        (
+            r#"FATAL: password authentication failed for user "tenant_a""#,
+            "psql: authentication failed",
+        ),
+        (
+            "could not connect to tenant_a: Connection refused",
+            "psql: connection failed",
+        ),
+        (
+            "connection to tenant_a failed: No such file or directory",
+            "psql: connection failed",
+        ),
+        (
+            "canceling statement due to statement timeout for tenant_a",
+            "psql: timed out",
+        ),
+        (
+            "docker exec psql gave no answer within 10s",
+            "psql: timed out",
+        ),
+        (
+            "Error response from daemon: container tenant_a has stopped",
+            "docker exec failed",
+        ),
+        (
+            "cannot run docker: /tenant_a/docker: No such file or directory",
+            "docker exec failed",
+        ),
+        (
+            "unexpected psql output: invalid tenant_a row",
+            "psql failed",
+        ),
+    ] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        fake.psql = Err(error.into());
+        fake.gets.retain(|k, _| !k.contains("/logs"));
+        let f = probe(&fake);
+        let ev = evidence(&f);
+        assert_eq!(ev.source, EvidenceSource::ApiOnly);
+        assert_eq!(
+            ev.notes[0],
+            format!(
+                "psql not used: {category}; fallback reads command-line settings and up to {LOG_TAIL} log lines"
+            )
+        );
+        for output in [
+            serde_json::to_string(&f).unwrap(),
+            postgres_wal::summary(ev),
+        ] {
+            assert!(output.contains(category));
+            assert!(!output.contains("tenant_a"));
+        }
+    }
 }
 
 #[test]
@@ -885,9 +943,29 @@ fn every_archive_command_source_exports_only_program_and_hosts() {
             "s3test",
         ),
         (
-            "curl --user user:$(printf %s SECRET) https://s3test:9000/wal",
+            "PGPASSWORD=$(printf '%s' 'https://SECRET') /usr/local/bin/archive-wal %p",
+            "***",
+            "",
+        ),
+        (
+            "curl --user $(printf '%s' 'https://SECRET') https://minio/wal/%f",
             "curl",
-            "s3test",
+            "",
+        ),
+        (
+            "curl --user `printf '%s' 'https://SECRET'` https://minio/wal/%f",
+            "curl",
+            "",
+        ),
+        (
+            "PGPASSWORD=SECRET curl --user ${VAR} https://minio/wal/%f",
+            "***",
+            "",
+        ),
+        (
+            "curl --user ${VAR} https://SECRET https://minio/wal/%f",
+            "curl",
+            "",
         ),
         (
             "azcopy copy %p 'https://account.blob.core.windows.net/archive/%f?sp=w&sig=SECRET'",
@@ -978,6 +1056,17 @@ fn every_archive_command_source_exports_only_program_and_hosts() {
             );
             if host == "s3test" {
                 assert!(f.reason.contains("target s3test"), "{}", f.reason);
+            } else if host.is_empty() {
+                assert!(!f.reason.contains("(target"), "{}", f.reason);
+                if source == "sql" {
+                    assert!(
+                        f.action.text.starts_with("fix archive_command"),
+                        "{}",
+                        f.action.text
+                    );
+                } else {
+                    assert_eq!(f.action, volume_finding(VOLUME).action);
+                }
             }
         }
     }

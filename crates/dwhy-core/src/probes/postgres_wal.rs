@@ -540,20 +540,49 @@ fn gather(
         }
         Err(e) => {
             ev.source = EvidenceSource::ApiOnly;
+            let category = psql_failure_category(&e);
             ev.notes.push(format!(
-                "psql not used: {e}; fallback reads command-line settings and up to {LOG_TAIL} log lines"
+                "psql not used: {category}; fallback reads command-line settings and up to {LOG_TAIL} log lines"
             ));
             api_only(insp, docker, &mut ev)
         }
     };
     if let Some(raw) = raw_command {
-        ev.targets = analyze_archive_command(&raw)
+        let (program, hosts) = analyze_archive_command(&raw);
+        ev.targets = hosts
             .iter()
             .map(|host| resolve_target(host, insp, listed, docker, cache))
             .collect();
-        ev.archive_program = Some(archive_program(&raw));
+        ev.archive_program = Some(program);
     }
     ev
+}
+
+fn psql_failure_category(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("error response from daemon")
+        || error.starts_with("cannot run docker:")
+        || error.starts_with("`docker` is not installed")
+        || error.starts_with("docker exec psql:")
+    {
+        "docker exec failed"
+    } else if error.contains("gave no answer within")
+        || error.contains("timed out")
+        || error.contains("timeout")
+    {
+        "psql: timed out"
+    } else if error.contains("authentication failed") {
+        "psql: authentication failed"
+    } else if error.contains("permission denied") {
+        "psql: permission denied"
+    } else if error.contains("could not connect")
+        || error.contains("connection refused")
+        || error.contains("no such file")
+    {
+        "psql: connection failed"
+    } else {
+        "psql failed"
+    }
 }
 
 /// Settings from the command line, failures from the log tail.
@@ -812,14 +841,14 @@ fn assignment_name(word: &str) -> Option<&str> {
     .then_some(name)
 }
 
-fn archive_program(mut input: &str) -> String {
+fn archive_program(mut input: &str, expanded: bool) -> String {
     loop {
         input = input.trim_start_matches(char::is_whitespace);
         let (len, word, closed) = command_word(input);
         if !closed || len == 0 {
             return "***".into();
         }
-        if assignment_name(&input[..len]).is_some() {
+        if !expanded && assignment_name(&input[..len]).is_some() {
             input = &input[len..];
         } else if !word.is_empty()
             && word
@@ -833,8 +862,13 @@ fn archive_program(mut input: &str) -> String {
     }
 }
 
-fn analyze_archive_command(mut input: &str) -> Vec<String> {
+fn analyze_archive_command(mut input: &str) -> (String, Vec<String>) {
+    let expanded = input.contains("$(") || input.contains('`') || input.contains("${");
+    let program = archive_program(input, expanded);
     let mut hosts: Vec<String> = Vec::new();
+    if expanded {
+        return (program, hosts);
+    }
     let mut seen_program = false;
     let mut endpoint_next = false;
     let mut auth_next = false;
@@ -906,7 +940,7 @@ fn analyze_archive_command(mut input: &str) -> Vec<String> {
             hosts.push(host);
         }
     }
-    hosts
+    (program, hosts)
 }
 
 fn endpoint_host(authority: &str, port_required: bool) -> Option<String> {
@@ -1257,7 +1291,7 @@ mod tests {
                 &["store"],
             ),
         ] {
-            assert_eq!(analyze_archive_command(command), expected, "{command}");
+            assert_eq!(analyze_archive_command(command).1, expected, "{command}");
         }
     }
 

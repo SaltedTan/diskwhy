@@ -810,7 +810,7 @@ fn api_only_evidence_shape() {
     ev.data_bytes = None;
     ev.last_archived_at = None;
     ev.source = EvidenceSource::ApiOnly;
-    ev.notes = vec!["psql not used: docker exec psql failed".into()];
+    ev.notes = vec!["psql not used: psql failed".into()];
     insta::assert_json_snapshot!(ev);
 }
 
