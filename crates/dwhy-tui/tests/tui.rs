@@ -10,8 +10,8 @@ use std::sync::atomic::Ordering;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dwhy_core::report::FsReport;
 use dwhy_core::scan::Progress;
-use dwhy_tui::app::{App, SizeMode};
-use dwhy_tui::job::{self, Mark, Options, Scanned};
+use dwhy_tui::app::{App, RowKind, SizeMode, State};
+use dwhy_tui::job::{self, Options, PermissionMark, Scanned};
 use dwhy_tui::ui;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -22,9 +22,7 @@ const MIB: usize = 1 << 20;
 const ROOT_PLACEHOLDER: &str = "/tmp/dwhyXXXXXX";
 
 /// A fixture under /tmp with a fixed-length name (`/tmp/dwhy` and six random
-/// characters), so screens differ only in those characters. Sizes are
-/// chosen so the rounded figures do not depend on the filesystem's
-/// directory block sizes.
+/// characters), so screens differ only in those characters.
 struct Fixture {
     // Dropped first: restores permissions so the temp dir can be removed.
     _locked: Option<Unlock>,
@@ -188,6 +186,21 @@ fn tree_root_80x24() {
     let mut data = scan(&[&root]);
     pin_fs(&mut data, true);
     let mut app = app_with(data);
+    let State::Browsing(b) = &mut app.state else {
+        unreachable!();
+    };
+    let big = b.data.tree.find(&root.join("big")).unwrap();
+    let mid = b.data.tree.find(&root.join("mid")).unwrap();
+    for row in &mut b.rows {
+        row.size = match row.kind {
+            RowKind::Node(id) if id == big => 5 * MIB as u64,
+            RowKind::Node(id) if id == mid => 2 * MIB as u64 + (700 << 10),
+            RowKind::Files => 3 * MIB as u64 / 2,
+            _ => panic!("unexpected row: {row:?}"),
+        };
+    }
+    b.rows.sort_by_key(|row| std::cmp::Reverse(row.size));
+    b.total = b.rows.iter().map(|row| row.size).sum::<u64>() + 4096;
     assert_eq!(labels(&app), ["big/", "mid/", "[files]"]);
     insta::assert_snapshot!(render(&mut app, 80, 24, Some(&root)));
 }
@@ -239,7 +252,7 @@ fn inside_a_directory_apparent_120x40() {
     render(&mut app, 120, 40, Some(&root));
     press(
         &mut app,
-        &[KeyCode::Down, KeyCode::Enter, KeyCode::Char('a')],
+        &[KeyCode::Char('a'), KeyCode::Down, KeyCode::Enter],
     );
     assert_eq!(app.mode, SizeMode::Apparent);
     assert_eq!(
@@ -250,7 +263,10 @@ fn inside_a_directory_apparent_120x40() {
     // but still listed, marked unreadable.
     assert_eq!(labels(&app), ["[files]", "sub/", "locked/"]);
     let b = app.browser().unwrap();
-    assert_eq!(b.rows[2].mark, Some(Mark::Unreadable));
+    assert_eq!(
+        b.rows[2].mark.unwrap().permission,
+        Some(PermissionMark::Unreadable)
+    );
     assert_eq!(b.rows[2].size, 0);
     insta::assert_snapshot!(render(&mut app, 120, 40, Some(&root)));
 }
@@ -260,6 +276,7 @@ fn navigation() {
     let f = fixture(false);
     let root = f.root();
     let mut app = app_with(scan(&[&root]));
+    press(&mut app, &[KeyCode::Char('a')]);
     assert_eq!(selected(&app), "big/");
     // Up at the top and Backspace at the only root stay put.
     press(&mut app, &[KeyCode::Up, KeyCode::Backspace]);
@@ -303,6 +320,7 @@ fn pages_move_by_the_rows_on_screen() {
         fs::write(d.join("f"), vec![0u8; (i + 1) * 8192]).unwrap();
     }
     let mut app = app_with(scan(&[t.path()]));
+    press(&mut app, &[KeyCode::Char('a')]);
     // 80×24 with one filesystem line leaves 20 list rows.
     let screen = render(&mut app, 80, 24, None);
     assert_eq!(app.viewport, 20);
@@ -350,14 +368,20 @@ fn unreadable_directories_are_listed_and_marked() {
     let f = fixture(true);
     let root = f.root();
     let mut app = app_with(scan(&[&root]));
-    press(&mut app, &[KeyCode::Down, KeyCode::Enter]);
+    press(
+        &mut app,
+        &[KeyCode::Char('a'), KeyCode::Down, KeyCode::Enter],
+    );
     let b = app.browser().unwrap();
     let locked = b
         .rows
         .iter()
         .find(|r| b.label(r) == "locked/")
         .expect("listed, not dropped");
-    assert_eq!(locked.mark, Some(Mark::Unreadable));
+    assert_eq!(
+        locked.mark.unwrap().permission,
+        Some(PermissionMark::Unreadable)
+    );
     assert!(render(&mut app, 80, 24, None).contains("locked/  [unreadable]"));
     // Inside it: nothing to list, and the screen says why.
     press(&mut app, &[KeyCode::End]);
@@ -365,7 +389,7 @@ fn unreadable_directories_are_listed_and_marked() {
         press(&mut app, &[KeyCode::Up]);
     }
     press(&mut app, &[KeyCode::Enter]);
-    for mode in [SizeMode::Allocated, SizeMode::Apparent] {
+    for mode in [SizeMode::Apparent, SizeMode::Allocated] {
         assert_eq!(app.mode, mode);
         assert!(labels(&app).is_empty());
         let screen = render(&mut app, 80, 24, None);
@@ -421,6 +445,7 @@ fn several_roots_are_listed_together() {
     fs::write(b.path().join("x"), vec![1u8; 8192]).unwrap();
     let (ra, rb) = (a.root(), fs::canonicalize(b.path()).unwrap());
     let mut app = app_with(scan(&[&rb, &ra]));
+    press(&mut app, &[KeyCode::Char('a')]);
     let names = labels(&app);
     assert_eq!(names.len(), 2);
     assert_eq!(names[0], format!("{}/", ra.display()), "largest first");

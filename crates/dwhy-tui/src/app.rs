@@ -57,6 +57,7 @@ pub struct Browser {
     pub data: Scanned,
     pub place: Place,
     pub rows: Vec<Row>,
+    pub total: u64,
     pub selected: usize,
     /// First row on screen.
     pub offset: usize,
@@ -112,11 +113,12 @@ impl App {
             data,
             place,
             rows: Vec::new(),
+            total: 0,
             selected: 0,
             offset: 0,
             fs_offset: None,
         };
-        b.rows = rows(&b.data, place, self.mode);
+        b.refresh_rows(self.mode);
         self.state = State::Browsing(Box::new(b));
     }
 
@@ -192,14 +194,6 @@ impl Browser {
         }
     }
 
-    /// The size of what is shown, in `mode`.
-    pub fn total(&self, mode: SizeMode) -> u64 {
-        match self.place {
-            Place::Roots => self.rows.iter().map(|r| r.size).sum(),
-            Place::Dir(id) => size(&self.data.tree.node(id).total, mode),
-        }
-    }
-
     /// The mark on the directory shown, if any.
     pub fn mark(&self) -> Option<Mark> {
         match self.place {
@@ -242,7 +236,7 @@ impl Browser {
             return;
         }
         self.place = Place::Dir(id);
-        self.rows = rows(&self.data, self.place, mode);
+        self.refresh_rows(mode);
         self.selected = 0;
         self.offset = 0;
     }
@@ -257,7 +251,7 @@ impl Browser {
             None => return,
         };
         self.place = up;
-        self.rows = rows(&self.data, up, mode);
+        self.refresh_rows(mode);
         self.selected = self
             .rows
             .iter()
@@ -269,10 +263,18 @@ impl Browser {
     /// Re-sorts for a new size mode, keeping the same row selected.
     fn resort(&mut self, mode: SizeMode) {
         let keep = self.selected_row().map(|r| r.kind);
-        self.rows = rows(&self.data, self.place, mode);
+        self.refresh_rows(mode);
         self.selected = keep
             .and_then(|k| self.rows.iter().position(|r| r.kind == k))
             .unwrap_or(0);
+    }
+
+    fn refresh_rows(&mut self, mode: SizeMode) {
+        self.rows = rows(&self.data, self.place, mode);
+        self.total = match self.place {
+            Place::Roots => self.rows.iter().map(|r| r.size).sum(),
+            Place::Dir(id) => size(&self.data.tree.node(id).total, mode),
+        };
     }
 }
 

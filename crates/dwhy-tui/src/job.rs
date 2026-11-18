@@ -8,7 +8,7 @@ use dwhy_core::account;
 use dwhy_core::detect;
 use dwhy_core::mounts::MountTable;
 use dwhy_core::report::{ScanReport, UnreadableReason};
-use dwhy_core::scan::{self, Progress, ScanOptions};
+use dwhy_core::scan::{self, Progress, ScanOptions, ScanResult};
 use dwhy_core::tree::{NodeId, ScanTree};
 
 /// What to scan.
@@ -51,12 +51,18 @@ pub enum Stage {
 
 /// Why a directory's contents are not (fully) counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mark {
+pub enum PermissionMark {
     /// It could not be listed.
     Unreadable,
     /// It was listed, but this many entries could not be `lstat`ed.
     EntriesDenied(u64),
-    Error,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Mark {
+    pub permission: Option<PermissionMark>,
+    pub read_error: bool,
+    pub skipped_mounts: usize,
 }
 
 /// A finished scan: the report `dwhy scan --json` would print (without its
@@ -94,15 +100,24 @@ pub fn scan(
     stage(Stage::Detecting);
     detect::detect_into(&mut report, &result.tree, opts.detectors.as_deref(), true);
 
-    let tree = result.tree;
-    let mut marks = HashMap::new();
+    let marks = coverage_marks(&result);
+    Ok(Scanned {
+        report,
+        tree: result.tree,
+        marks,
+    })
+}
+
+fn coverage_marks(result: &ScanResult) -> HashMap<NodeId, Mark> {
+    let tree = &result.tree;
+    let mut marks = HashMap::<NodeId, Mark>::new();
     for u in &result.unreadable {
         if let Some(id) = tree.find(&u.path) {
             let mark = match u.reason {
-                UnreadableReason::PermissionDenied => Mark::Unreadable,
-                UnreadableReason::EntriesDenied => Mark::EntriesDenied(u.entries_unknown),
+                UnreadableReason::PermissionDenied => PermissionMark::Unreadable,
+                UnreadableReason::EntriesDenied => PermissionMark::EntriesDenied(u.entries_unknown),
             };
-            marks.insert(id, mark);
+            marks.entry(id).or_default().permission = Some(mark);
         }
     }
     for (path, _) in &result.errors {
@@ -111,12 +126,113 @@ pub fn scan(
             .filter_map(|p| tree.find(p))
             .find(|&id| tree.node(id).is_dir)
         {
-            marks.entry(id).or_insert(Mark::Error);
+            marks.entry(id).or_default().read_error = true;
         }
     }
-    Ok(Scanned {
-        report,
-        tree,
-        marks,
-    })
+    for skip in &result.skipped_mounts {
+        if let Some(id) = skip.path.parent().and_then(|parent| tree.find(parent)) {
+            marks.entry(id).or_default().skipped_mounts += 1;
+        }
+    }
+    marks
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::Arc;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use dwhy_core::report::SkipReason;
+    use dwhy_core::scan::{SkippedRecord, UnreadableRecord};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+    use crate::{App, ui};
+
+    #[test]
+    fn browser_shows_directory_diagnostics_and_skipped_mounts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mixed = root.join("mixed");
+        let omitted = root.join("omitted");
+        fs::create_dir(&mixed).unwrap();
+        fs::create_dir(&omitted).unwrap();
+        fs::write(mixed.join("measured"), b"data").unwrap();
+        let mounts = MountTable::default();
+        let opts = ScanOptions {
+            threads: 2,
+            ..ScanOptions::default()
+        };
+        let mut result = scan::scan(&[root], &opts, &mounts, &Progress::default()).unwrap();
+        let dev = result.roots[0].dev;
+        result.unreadable.push(UnreadableRecord {
+            path: mixed.clone(),
+            dev,
+            reason: UnreadableReason::EntriesDenied,
+            entries_unknown: 1,
+            known_bytes: 0,
+            owner_uid: dwhy_core::system::euid(),
+        });
+        result
+            .errors
+            .push((mixed.join("failed-stat"), "I/O error".into()));
+        result.error_count = 1;
+        result.skipped_mounts.extend([
+            SkippedRecord {
+                path: omitted.join("volume"),
+                parent_dev: dev,
+                fstype: Some("ext4".into()),
+                reason: SkipReason::OtherFilesystem,
+            },
+            SkippedRecord {
+                path: omitted.join("bind-file"),
+                parent_dev: dev,
+                fstype: Some("ext4".into()),
+                reason: SkipReason::BindMount,
+            },
+        ]);
+        let mut app = App::new(Vec::new(), Arc::new(Progress::default()));
+        app.finish(Scanned {
+            report: account::system_scan_report(&result, &mounts),
+            marks: coverage_marks(&result),
+            tree: result.tree,
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut screen = |app: &mut App| {
+            term.draw(|f| ui::draw(f, app)).unwrap();
+            term.backend().to_string()
+        };
+        let press = |app: &mut App, code| {
+            assert!(!app.on_key(KeyEvent::new(code, KeyModifiers::NONE)));
+        };
+        press(&mut app, KeyCode::Char('a'));
+        let tree = screen(&mut app);
+        assert!(
+            tree.contains("mixed/  [1 entry unreadable, read error]"),
+            "{tree}"
+        );
+        assert!(tree.contains("omitted/  [2 mounts skipped]"), "{tree}");
+        assert!(tree.contains("2 mounts skipped in scan"), "{tree}");
+
+        press(&mut app, KeyCode::Enter);
+        let inside = screen(&mut app);
+        assert!(inside.contains("[files]"), "{inside}");
+        assert!(
+            inside.contains("this directory: 1 entry unreadable, read error"),
+            "{inside}"
+        );
+
+        for key in [KeyCode::Backspace, KeyCode::Down, KeyCode::Enter] {
+            press(&mut app, key);
+        }
+        let inside = screen(&mut app);
+        assert!(
+            inside.contains("this directory: 2 mounts skipped"),
+            "{inside}"
+        );
+        assert!(inside.contains("2 mounts skipped in scan"), "{inside}");
+        assert!(!inside.contains("(empty)"), "{inside}");
+    }
 }

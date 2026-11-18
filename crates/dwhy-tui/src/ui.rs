@@ -13,7 +13,7 @@ use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Browser, SizeMode, State, sanitize};
-use crate::job::{Mark, Stage};
+use crate::job::{Mark, PermissionMark, Stage};
 
 /// Filesystem lines shown before "… N more".
 const MAX_FS_LINES: usize = 3;
@@ -27,11 +27,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         State::Browsing(b) if b.fs_offset.is_some() => 0,
         State::Browsing(b) => b.data.report.fs.len().clamp(1, MAX_FS_LINES),
     };
+    let status_lines = match &app.state {
+        State::Browsing(b) if b.fs_offset.is_none() && b.mark().is_some() => 2,
+        _ => 1,
+    };
     let [title, fs, list, status, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(fs_lines as u16),
         Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Length(status_lines),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -106,7 +110,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 )));
             }
             f.render_widget(Paragraph::new(fsl), fs);
-            draw_list(f, b, app.mode, list);
+            draw_list(f, b, list);
             f.render_widget(Paragraph::new(status_text(b, app.mode)), status);
             let other = match app.mode {
                 SizeMode::Allocated => "apparent",
@@ -180,7 +184,7 @@ fn fs_text(fs: &[FsReport], width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn draw_list(f: &mut Frame, b: &mut Browser, mode: SizeMode, area: Rect) {
+fn draw_list(f: &mut Frame, b: &mut Browser, area: Rect) {
     let height = area.height as usize;
     let width = area.width as usize;
     let mut lines: Vec<Line> = Vec::new();
@@ -200,11 +204,10 @@ fn draw_list(f: &mut Frame, b: &mut Browser, mode: SizeMode, area: Rect) {
         b.offset = b.selected + 1 - height;
     }
     b.offset = b.offset.min(b.rows.len().saturating_sub(height.max(1)));
-    let total = b.total(mode);
     // "> " size bar pct "  "
     let fixed = 2 + 7 + 1 + BAR + 1 + 4 + 2;
     for (i, row) in b.rows.iter().enumerate().skip(b.offset).take(height) {
-        let pct = percent(row.size, total);
+        let pct = percent(row.size, b.total);
         let mark = row.mark.map(|m| format!("  [{}]", mark_text(m)));
         let mark_w = mark.as_deref().map_or(0, str::width);
         let name = middle(&b.label(row), width.saturating_sub(fixed + mark_w));
@@ -232,11 +235,15 @@ fn draw_list(f: &mut Frame, b: &mut Browser, mode: SizeMode, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn status_text(b: &Browser, mode: SizeMode) -> Line<'static> {
+fn status_text(b: &Browser, mode: SizeMode) -> Vec<Line<'static>> {
     let r = &b.data.report;
-    let mut parts = vec![format!(" {} {} here", human(b.total(mode)), mode.label())];
+    let mut parts = vec![format!(" {} {} here", human(b.total), mode.label())];
     if !b.rows.is_empty() {
         parts.push(format!("{}/{}", b.selected + 1, b.rows.len()));
+    }
+    let skipped = r.scan.skipped_mounts.len();
+    if skipped > 0 {
+        parts.push(format!("{} in scan", skipped_mounts_text(skipped)));
     }
     let errors = r.scan.error_count;
     if errors > 0 {
@@ -245,9 +252,6 @@ fn status_text(b: &Browser, mode: SizeMode) -> Line<'static> {
             thousands(errors),
             if errors == 1 { "" } else { "s" }
         ));
-    }
-    if let Some(m) = b.mark() {
-        parts.push(format!("this directory: {}", mark_text(m)));
     }
     let unread = r.scan.unreadable.count;
     if unread > 0 {
@@ -259,19 +263,40 @@ fn status_text(b: &Browser, mode: SizeMode) -> Line<'static> {
     }
     let n = r.findings.len();
     parts.push(format!("{n} finding{}", if n == 1 { "" } else { "s" }));
-    Line::raw(parts.join(" · "))
+    let mut lines = vec![Line::raw(parts.join(" · "))];
+    if let Some(m) = b.mark() {
+        lines.push(Line::raw(format!(" this directory: {}", mark_text(m))));
+    }
+    lines
 }
 
 fn mark_text(m: Mark) -> String {
-    match m {
-        Mark::Unreadable => "unreadable".into(),
-        Mark::EntriesDenied(n) => format!(
-            "{} entr{} unreadable",
-            thousands(n),
-            if n == 1 { "y" } else { "ies" }
-        ),
-        Mark::Error => "read error".into(),
+    let mut parts = Vec::new();
+    if let Some(permission) = m.permission {
+        parts.push(match permission {
+            PermissionMark::Unreadable => "unreadable".into(),
+            PermissionMark::EntriesDenied(n) => format!(
+                "{} entr{} unreadable",
+                thousands(n),
+                if n == 1 { "y" } else { "ies" }
+            ),
+        });
     }
+    if m.read_error {
+        parts.push("read error".into());
+    }
+    if m.skipped_mounts > 0 {
+        parts.push(skipped_mounts_text(m.skipped_mounts));
+    }
+    parts.join(", ")
+}
+
+fn skipped_mounts_text(n: usize) -> String {
+    format!(
+        "{} mount{} skipped",
+        thousands(n as u64),
+        if n == 1 { "" } else { "s" }
+    )
 }
 
 /// `part` as a whole percentage of `total`, rounded.

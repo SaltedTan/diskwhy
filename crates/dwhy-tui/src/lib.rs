@@ -23,7 +23,7 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use dwhy_core::scan::Progress;
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
@@ -84,14 +84,28 @@ fn run_terminal(opts: Options, signal: &Termination) -> Result<(), Error> {
             let _ = tx.send(Msg::Done(res.map(Box::new)));
         })?;
 
+    event_loop(&mut term, &mut app, &rx, signal, event::poll, event::read)
+}
+
+fn event_loop<B: Backend>(
+    term: &mut Terminal<B>,
+    app: &mut App,
+    rx: &mpsc::Receiver<Msg>,
+    signal: &Termination,
+    mut poll: impl FnMut(Duration) -> io::Result<bool>,
+    mut read: impl FnMut() -> io::Result<Event>,
+) -> Result<(), Error>
+where
+    B::Error: 'static,
+{
     while signal.exit_code().is_none() {
-        term.draw(|f| ui::draw(f, &mut app))?;
-        let ready = event::poll(TICK)?;
+        term.draw(|f| ui::draw(f, app))?;
+        let ready = poll(TICK)?;
         if signal.exit_code().is_some() {
             return Ok(());
         }
         if ready
-            && let Event::Key(key) = event::read()?
+            && let Event::Key(key) = read()?
             && app.on_key(key)
         {
             return Ok(());
@@ -194,6 +208,7 @@ fn restore() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn termination_flag_requests_quit_with_signal_status() {
@@ -202,6 +217,54 @@ mod tests {
         for (num, status) in [(SIGHUP, 129), (SIGINT, 130), (SIGTERM, 143)] {
             signal.flag.store(num as usize, Ordering::Relaxed);
             assert_eq!(signal.exit_code(), Some(status));
+        }
+    }
+
+    #[test]
+    fn pending_signal_quits_before_drawing_or_polling() {
+        let signal = Termination::default();
+        signal.flag.store(SIGTERM as usize, Ordering::Relaxed);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let blank = term.backend().to_string();
+        let mut app = App::new(vec![".".into()], Arc::new(Progress::default()));
+        let (_tx, rx) = mpsc::channel();
+        event_loop(
+            &mut term,
+            &mut app,
+            &rx,
+            &signal,
+            |_| panic!("polled after termination"),
+            || panic!("read after termination"),
+        )
+        .unwrap();
+        assert_eq!(term.backend().to_string(), blank);
+    }
+
+    #[test]
+    fn signal_during_poll_quits_before_reading_events_or_scan_messages() {
+        for ready in [false, true] {
+            let signal = Termination::default();
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut app = App::new(vec![".".into()], Arc::new(Progress::default()));
+            let (tx, rx) = mpsc::channel();
+            tx.send(Msg::Done(Err(
+                "processed scan result after termination".into()
+            )))
+            .unwrap();
+            event_loop(
+                &mut term,
+                &mut app,
+                &rx,
+                &signal,
+                |_| {
+                    signal.flag.store(SIGINT as usize, Ordering::Relaxed);
+                    Ok(ready)
+                },
+                || panic!("read after termination"),
+            )
+            .unwrap();
+            assert!(term.backend().to_string().contains("Scanning"));
+            assert!(matches!(rx.try_recv(), Ok(Msg::Done(Err(_)))));
         }
     }
 }
