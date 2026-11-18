@@ -1,0 +1,28 @@
+---
+source: crates/dwhy-tui/tests/tui.rs
+expression: screen
+---
+" dwhy  /home/me/projects/diskwhy/target                             rebuildable "
+"finding f_d23405096642 · cargo-target · rebuildable                             "
+"      3.2G  /home/me/projects/diskwhy/target                                    "
+"  last written 2026-11-12T08:30:00Z                                             "
+"  Cargo build output of /home/me/projects/diskwhy (3.2G); last written 7d 2h ago"
+"                                                                                "
+"guards: none from the scan (the full checks run when a plan is made)            "
+"                                                                                "
+"growth: +120.0M/day since 2026-11-17T09:00:00Z                                  "
+"                                                                                "
+"action (command):                                                               "
+"  /usr/bin/cargo clean --manifest-path /home/me/projects/diskwhy/Cargo.toml     "
+"    --target-dir /home/me/projects/diskwhy/target                               "
+"                                                                                "
+"recovery:                                                                       "
+"  cost: the next build recompiles the crate and all its dependencies            "
+"  how:  cargo build                                                             "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+" lines 1–16 of 16                                                               "
+" ↑↓ PgUp PgDn scroll · Esc back to findings · Tab tree · q quit                 "

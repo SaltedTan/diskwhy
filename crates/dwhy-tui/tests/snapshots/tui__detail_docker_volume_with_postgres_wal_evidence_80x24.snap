@@ -1,0 +1,28 @@
+---
+source: crates/dwhy-tui/tests/tui.rs
+expression: screen
+---
+" dwhy  docker://volume/pgdata                                            review "
+"finding f_61b778c65c47 · docker-volume · review                                 "
+"     29.4G  docker://volume/pgdata                                              "
+"  pg_wal holds 29.0G vs 53.0M data; archiving is failing, with 151 failures in  "
+"    total (last failure 2026-11-13T02:10:00Z, last success 2026-11-07T07:25:00Z)"
+"    (target s3test exited); volume pgdata holds 29.4G and is mounted by pg-1    "
+"    (running) (a running container uses it)                                     "
+"                                                                                "
+"evidence (postgres-wal):                                                        "
+"  psql in pg-1, archive_mode on, archive_timeout 10s, last archived             "
+"    2026-11-07T07:25:00Z, last failed 2026-11-13T02:10:00Z, failed WAL          "
+"    00000001000000000000001D, archive target s3test exited                      "
+"  note: archive target s3test is a stopped container                            "
+"                                                                                "
+"guards:                                                                         "
+"  warn   container-mount      mounted by pg-1 (running)                         "
+"                                                                                "
+"growth: +1.2G/day since 2026-11-17T09:00:00Z                                    "
+"                                                                                "
+"action (advice, nothing to run):                                                "
+"  restore the archive target s3test; WAL is freed at the next checkpoint once it"
+"    is archived (do not remove the volume: it holds the database)               "
+" lines 1–21 of 24                                                               "
+" ↑↓ PgUp PgDn scroll · Esc back to findings · Tab tree · q quit                 "

@@ -505,3 +505,69 @@ fn find_picks_the_newest_matching_snapshot() {
     let err = find(&dir.join("none"), &Since::Last, "testhost", 1000, None, now).unwrap_err();
     assert!(err.contains("dwhy scan --snapshot"), "{err}");
 }
+
+#[test]
+fn scan_growth_comes_from_the_newest_snapshot_of_the_same_roots_an_hour_old() {
+    let t = fixture();
+    let (res, mounts) = scan_of(t.path());
+    let mut report = report_of(&res, &mounts);
+    let root = report.scan.roots[0].path.clone();
+    let path = format!("{root}/big");
+    report.findings = vec![
+        finding(&path, 400 << 20),
+        finding(&format!("{root}/new"), 1 << 20),
+    ];
+    let state = tempfile::tempdir().unwrap();
+    let dir = state.path().join("snapshots");
+    let now = snapshot::parse_time(&report.generated_at).unwrap();
+
+    // Nothing to read yet: no growth, and no error.
+    assert_eq!(
+        dwhy_core::growth::fill_scan_growth(&mut report, &dir, now),
+        None
+    );
+    assert!(report.findings.iter().all(|f| f.growth.is_none()));
+
+    let listing = |created_at: &str, roots: &[&str], bytes: u64| {
+        let mut s = sample(created_at, roots);
+        s.findings = vec![dwhy_core::report::SnapshotFinding {
+            id: dwhy_core::detect::finding_id("cargo-target", &path),
+            detector: "cargo-target".into(),
+            path: path.clone(),
+            bytes,
+            tier: Tier::Rebuildable,
+        }];
+        s
+    };
+    // 06:00 now: 04:00 is used. 05:30 is too recent, 03:00 older, and
+    // 05:00 of other roots or (cross filesystems) do not count.
+    let mut crossing = listing("2026-11-16T05:00:00Z", &[&root], 0);
+    crossing.scan.one_filesystem = false;
+    for s in [
+        listing("2026-11-16T03:00:00Z", &[&root], 0),
+        listing("2026-11-16T04:00:00Z", &[&root], 300 << 20),
+        listing("2026-11-16T05:00:00Z", &["/elsewhere"], 0),
+        crossing,
+        listing("2026-11-16T05:30:00Z", &[&root], 0),
+    ] {
+        snapshot::save(&dir, &s, now).unwrap();
+    }
+    let saved = snapshot::list(&dir).unwrap().len();
+
+    let base = dwhy_core::growth::fill_scan_growth(&mut report, &dir, now);
+    assert_eq!(base.as_deref(), Some("2026-11-16T04:00:00Z"));
+    let g = report.findings[0].growth.as_ref().unwrap();
+    // 100M in two hours.
+    assert_eq!(g.bytes_per_day, 1200 << 20);
+    assert_eq!(g.since, "2026-11-16T04:00:00Z");
+    assert_eq!(report.findings[1].growth, None, "not in the snapshot");
+    // It only reads.
+    assert_eq!(snapshot::list(&dir).unwrap().len(), saved);
+
+    // A report without findings reads nothing.
+    report.findings.clear();
+    assert_eq!(
+        dwhy_core::growth::fill_scan_growth(&mut report, &dir, now),
+        None
+    );
+}

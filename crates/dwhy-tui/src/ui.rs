@@ -1,10 +1,14 @@
 //! Drawing the app. Laid out to stay legible at 80×24: one title line, a
-//! line per filesystem (at most three), the list, a status line, key help.
+//! line per filesystem (at most three, tree view only), the list, a status
+//! line, key help.
 
 use std::sync::atomic::Ordering;
 
-use dwhy_core::report::FsReport;
-use dwhy_core::units::{human, thousands};
+use dwhy_core::apply::{action_kind_name, guard_status_name, tier_name};
+use dwhy_core::growth::MIN_AGE_SECS;
+use dwhy_core::probes::postgres_wal;
+use dwhy_core::report::{Finding, FsReport};
+use dwhy_core::units::{human, signed, thousands};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -12,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Browser, SizeMode, State, sanitize};
+use crate::app::{App, Browser, SizeMode, State, View, sanitize};
 use crate::job::{Mark, PermissionMark, Stage};
 
 /// Filesystem lines shown before "… N more".
@@ -24,11 +28,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let fs_lines = match &app.state {
         State::Scanning { .. } => 1,
-        State::Browsing(b) if b.fs_offset.is_some() => 0,
+        State::Browsing(b) if b.view != View::Tree || b.fs_offset.is_some() => 0,
         State::Browsing(b) => b.data.report.fs.len().clamp(1, MAX_FS_LINES),
     };
     let status_lines = match &app.state {
-        State::Browsing(b) if b.fs_offset.is_none() && b.mark().is_some() => 2,
+        State::Browsing(b)
+            if b.view == View::Tree && b.fs_offset.is_none() && b.mark().is_some() =>
+        {
+            2
+        }
         _ => 1,
     };
     let [title, fs, list, status, keys] = Layout::vertical([
@@ -72,6 +80,42 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(Span::styled(msg, bold)), status);
             f.render_widget(Paragraph::new(Span::styled(" q quit", dim)), keys);
         }
+        State::Browsing(b) if b.view == View::Findings => {
+            let filter = b.findings.filter.map_or("all tiers", tier_name);
+            let count = format!(
+                "{filter} · {}/{}",
+                b.findings.shown.len(),
+                b.data.report.findings.len()
+            );
+            f.render_widget(title_line("findings", &count, width), title);
+            draw_findings(f, b, list);
+            f.render_widget(Paragraph::new(findings_status(b)), status);
+            let help = " ↑↓ PgUp PgDn · Enter details · t tier filter · Tab tree · q quit";
+            f.render_widget(Paragraph::new(Span::styled(help, dim)), keys);
+        }
+        State::Browsing(b) if b.view == View::Detail => {
+            let Some(finding) = b.selected_finding() else {
+                return;
+            };
+            f.render_widget(
+                title_line(&sanitize(&finding.path), tier_name(finding.tier), width),
+                title,
+            );
+            let lines = detail_lines(finding, b.data.growth_base.as_deref(), width);
+            let height = list.height as usize;
+            let scroll = b
+                .findings
+                .scroll
+                .min(lines.len().saturating_sub(height.max(1)));
+            b.findings.scroll = scroll;
+            let end = (scroll + height).min(lines.len());
+            let msg = format!(" lines {}–{end} of {}", scroll + 1, lines.len());
+            let shown: Vec<Line> = lines.into_iter().skip(scroll).take(height).collect();
+            f.render_widget(Paragraph::new(shown), list);
+            f.render_widget(Paragraph::new(msg), status);
+            let help = " ↑↓ PgUp PgDn scroll · Esc back to findings · Tab tree · q quit";
+            f.render_widget(Paragraph::new(Span::styled(help, dim)), keys);
+        }
         State::Browsing(b) => {
             let reports = &b.data.report.fs;
             if let Some(offset) = &mut b.fs_offset {
@@ -86,7 +130,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                     format!(" {} filesystems", reports.len())
                 };
                 f.render_widget(Paragraph::new(msg), status);
-                let help = " ↑↓ PgUp PgDn scroll · f back to tree · q quit";
+                let help = " ↑↓ PgUp PgDn scroll · f back to tree · Tab findings · q quit";
                 f.render_widget(Paragraph::new(Span::styled(help, dim)), keys);
                 return;
             }
@@ -117,7 +161,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 SizeMode::Apparent => "allocated",
             };
             let help = format!(
-                " ↑↓ PgUp PgDn · Enter open · Backspace up · a {other} · f filesystems · q quit"
+                " ↑↓ · Enter open · Bksp up · a {other} · f filesystems · Tab findings · q quit"
             );
             f.render_widget(Paragraph::new(Span::styled(help, dim)), keys);
         }
@@ -233,6 +277,233 @@ fn draw_list(f: &mut Frame, b: &mut Browser, area: Rect) {
         lines.push(line);
     }
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Width of the growth column: `+999.9M/d`.
+const GROWTH_W: usize = 9;
+/// Width of the tier column: `rebuildable`.
+const TIER_W: usize = 11;
+
+/// One row per finding shown: tier, size, growth, detector, path. The path
+/// is shortened to fit; the figures never are.
+fn draw_findings(f: &mut Frame, b: &mut Browser, area: Rect) {
+    let width = area.width as usize;
+    let all = &b.data.report.findings;
+    let l = &mut b.findings;
+    if l.shown.is_empty() {
+        let mut lines = Vec::new();
+        if let Some(t) = l.filter.filter(|_| !all.is_empty()) {
+            lines.push(Line::raw(format!("  no {} findings", tier_name(t))));
+        } else {
+            let failed: Vec<_> = b
+                .data
+                .report
+                .detectors
+                .iter()
+                .filter_map(|d| d.error.as_ref().map(|e| (&d.name, e)))
+                .collect();
+            if failed.is_empty() {
+                lines.push(Line::raw("  no findings"));
+            } else {
+                lines.push(Line::raw("  no findings; detectors failed:"));
+                for (name, e) in failed {
+                    lines.push(Line::raw(format!(
+                        "    {}: {}",
+                        sanitize(name),
+                        sanitize(e)
+                    )));
+                }
+            }
+        }
+        f.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+    let det_w = l
+        .shown
+        .iter()
+        .map(|&i| all[i].detector.width())
+        .max()
+        .unwrap_or(0)
+        .max("detector".len());
+    let header = format!(
+        "  {:<TIER_W$}  {:>7}  {:>GROWTH_W$}  {:<det_w$}  path",
+        "tier", "size", "growth", "detector"
+    );
+    let mut lines = vec![Line::styled(
+        header,
+        Style::new().add_modifier(Modifier::DIM),
+    )];
+    let height = (area.height as usize).saturating_sub(1);
+    if l.selected < l.offset {
+        l.offset = l.selected;
+    } else if height > 0 && l.selected >= l.offset + height {
+        l.offset = l.selected + 1 - height;
+    }
+    l.offset = l.offset.min(l.shown.len().saturating_sub(height.max(1)));
+    let fixed = 2 + TIER_W + 2 + 7 + 2 + GROWTH_W + 2 + det_w + 2;
+    for (row, &i) in l.shown.iter().enumerate().skip(l.offset).take(height) {
+        let finding = &all[i];
+        let sel = row == l.selected;
+        let growth = match &finding.growth {
+            Some(g) => format!("{}/d", signed(g.bytes_per_day)),
+            None => "–".into(),
+        };
+        let mut line = Line::from(vec![
+            Span::raw(if sel { "> " } else { "  " }),
+            Span::raw(format!("{:<TIER_W$}  ", tier_name(finding.tier))),
+            Span::raw(format!("{:>7}  ", human(finding.bytes))),
+            Span::raw(format!("{growth:>GROWTH_W$}  ")),
+            Span::raw(format!("{:<det_w$}  ", sanitize(&finding.detector))),
+            Span::styled(
+                middle(&sanitize(&finding.path), width.saturating_sub(fixed)),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        if sel {
+            line = line.style(Style::new().add_modifier(Modifier::REVERSED));
+        }
+        lines.push(line);
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn findings_status(b: &Browser) -> Line<'static> {
+    let l = &b.findings;
+    let mut parts = Vec::new();
+    if !l.shown.is_empty() {
+        parts.push(format!("{}/{}", l.selected + 1, l.shown.len()));
+    }
+    parts.push(match &b.data.growth_base {
+        Some(at) => format!("growth since {at}"),
+        None => no_growth_data(),
+    });
+    let failed = b
+        .data
+        .report
+        .detectors
+        .iter()
+        .filter(|d| d.error.is_some())
+        .count();
+    if failed > 0 && !b.data.report.findings.is_empty() {
+        parts.push(format!(
+            "{failed} detector{} failed",
+            if failed == 1 { "" } else { "s" }
+        ));
+    }
+    Line::raw(format!(" {}", parts.join(" · ")))
+}
+
+fn no_growth_data() -> String {
+    format!(
+        "no growth data (no snapshot of these roots ≥ {}h old)",
+        MIN_AGE_SECS / 3600
+    )
+}
+
+/// What `dwhy explain` shows for a finding, in the same order, wrapped to
+/// `width`. Guards are the ones the scan recorded; growth comes from the
+/// scan's base snapshot (`base`, its `created_at`).
+fn detail_lines(f: &Finding, base: Option<&str>, width: usize) -> Vec<Line<'static>> {
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut text = |s: String| {
+        for l in wrap(&sanitize(&s), width) {
+            out.push(Line::raw(l));
+        }
+    };
+    text(format!(
+        "finding {} · {} · {}",
+        f.id,
+        f.detector,
+        tier_name(f.tier)
+    ));
+    text(format!("  {:>8}  {}", human(f.bytes), f.path));
+    if let Some(t) = &f.last_modified {
+        text(format!("  last written {t}"));
+    }
+    text(format!("  {}", f.reason));
+
+    if let Some(ev) = f.evidence.as_ref().and_then(|e| e.postgres_wal.as_ref()) {
+        text(String::new());
+        text(format!("evidence ({}):", postgres_wal::NAME));
+        text(format!("  {}", postgres_wal::summary(ev)));
+        for n in &ev.notes {
+            text(format!("  note: {n}"));
+        }
+    }
+
+    text(String::new());
+    if f.guards.is_empty() {
+        text("guards: none from the scan (the full checks run when a plan is made)".into());
+    } else {
+        text("guards:".into());
+        for g in &f.guards {
+            text(format!(
+                "  {:<5}  {:<20} {}",
+                guard_status_name(g.status),
+                g.name,
+                g.detail
+            ));
+        }
+    }
+
+    text(String::new());
+    text(match (&f.growth, base) {
+        (Some(g), _) => format!("growth: {}/day since {}", signed(g.bytes_per_day), g.since),
+        (None, Some(at)) => format!("growth: unknown (not in the snapshot of {at})"),
+        (None, None) => format!("growth: {}", no_growth_data()),
+    });
+
+    text(String::new());
+    text(format!("action ({}):", action_kind_name(f.action.kind)));
+    text(format!("  {}", f.action.text));
+
+    text(String::new());
+    text("recovery:".into());
+    text(format!("  cost: {}", f.recovery.cost));
+    if let Some(how) = &f.recovery.how {
+        text(format!("  how:  {how}"));
+    }
+    if let Some(first) = out.first_mut() {
+        *first = std::mem::take(first).style(bold);
+    }
+    out
+}
+
+/// Breaks `s` into lines of at most `width` columns, at spaces where it can
+/// and anywhere in a word too long for a line. Continuation lines keep the
+/// first line's indent, plus two columns.
+fn wrap(s: &str, width: usize) -> Vec<String> {
+    if s.width() <= width || width == 0 {
+        return vec![s.to_string()];
+    }
+    let indent = s.len() - s.trim_start_matches(' ').len();
+    let cont = " ".repeat((indent + 2).min(width / 2));
+    let mut out = Vec::new();
+    let mut line = String::new();
+    let mut line_w = 0;
+    for word in s.split_inclusive(' ') {
+        let word_w = word.trim_end_matches(' ').width();
+        if line_w + word_w > width && !line.trim().is_empty() {
+            out.push(line.trim_end().to_string());
+            line = cont.clone();
+            line_w = cont.len();
+        }
+        for c in word.chars() {
+            let cw = c.width().unwrap_or(0);
+            if line_w + cw > width && c != ' ' {
+                out.push(line.trim_end().to_string());
+                line = cont.clone();
+                line_w = cont.len();
+            }
+            line.push(c);
+            line_w += cw;
+        }
+    }
+    if !line.trim().is_empty() {
+        out.push(line.trim_end().to_string());
+    }
+    out
 }
 
 fn status_text(b: &Browser, mode: SizeMode) -> Vec<Line<'static>> {

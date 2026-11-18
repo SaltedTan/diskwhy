@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use dwhy_core::report::{Finding, Tier};
 use dwhy_core::scan::Progress;
 use dwhy_core::tree::NodeId;
 
@@ -52,9 +53,45 @@ pub enum Place {
     Dir(NodeId),
 }
 
+/// Which full-screen view is shown once the scan is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    /// The directory tree.
+    Tree,
+    /// The findings list.
+    Findings,
+    /// One finding, what `dwhy explain` shows for it.
+    Detail,
+}
+
+/// The tier filter cycle: all, then each tier, then all again.
+const FILTERS: [Option<Tier>; 5] = [
+    None,
+    Some(Tier::Regenerable),
+    Some(Tier::Rebuildable),
+    Some(Tier::Review),
+    Some(Tier::Blocked),
+];
+
+/// The findings list and the detail view's scroll position.
+#[derive(Debug, Default)]
+pub struct FindingList {
+    /// Only findings of this tier; `None`: all.
+    pub filter: Option<Tier>,
+    /// Indices into the report's findings that the filter lets through,
+    /// largest first.
+    pub shown: Vec<usize>,
+    pub selected: usize,
+    /// First row on screen.
+    pub offset: usize,
+    /// First line of the detail view on screen.
+    pub scroll: usize,
+}
+
 #[derive(Debug)]
 pub struct Browser {
     pub data: Scanned,
+    pub view: View,
     pub place: Place,
     pub rows: Vec<Row>,
     pub total: u64,
@@ -62,6 +99,7 @@ pub struct Browser {
     /// First row on screen.
     pub offset: usize,
     pub(crate) fs_offset: Option<usize>,
+    pub findings: FindingList,
 }
 
 #[derive(Debug)]
@@ -111,14 +149,17 @@ impl App {
         };
         let mut b = Browser {
             data,
+            view: View::Tree,
             place,
             rows: Vec::new(),
             total: 0,
             selected: 0,
             offset: 0,
             fs_offset: None,
+            findings: FindingList::default(),
         };
         b.refresh_rows(self.mode);
+        b.refilter(None);
         self.state = State::Browsing(Box::new(b));
     }
 
@@ -145,6 +186,24 @@ impl App {
         let State::Browsing(b) = &mut self.state else {
             return false;
         };
+        if key.code == KeyCode::Tab {
+            b.view = match b.view {
+                View::Tree => View::Findings,
+                View::Findings | View::Detail => View::Tree,
+            };
+            return false;
+        }
+        match b.view {
+            View::Tree => {}
+            View::Findings => {
+                b.on_findings_key(key.code, page);
+                return false;
+            }
+            View::Detail => {
+                b.on_detail_key(key.code, page);
+                return false;
+            }
+        }
         if key.code == KeyCode::Char('f') {
             b.fs_offset = if b.fs_offset.is_some() { None } else { Some(0) };
             return false;
@@ -221,6 +280,73 @@ impl Browser {
 
     pub fn selected_row(&self) -> Option<&Row> {
         self.rows.get(self.selected)
+    }
+
+    /// The finding selected in the findings list (and shown in the detail view).
+    pub fn selected_finding(&self) -> Option<&Finding> {
+        let &i = self.findings.shown.get(self.findings.selected)?;
+        self.data.report.findings.get(i)
+    }
+
+    fn on_findings_key(&mut self, code: KeyCode, page: usize) {
+        let l = &mut self.findings;
+        let last = l.shown.len().saturating_sub(1);
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => l.selected = l.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => l.selected = (l.selected + 1).min(last),
+            KeyCode::PageUp => l.selected = l.selected.saturating_sub(page),
+            KeyCode::PageDown => l.selected = (l.selected + page).min(last),
+            KeyCode::Home | KeyCode::Char('g') => l.selected = 0,
+            KeyCode::End | KeyCode::Char('G') => l.selected = last,
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if !l.shown.is_empty() => {
+                l.scroll = 0;
+                self.view = View::Detail;
+            }
+            KeyCode::Char('t') => {
+                let at = FILTERS.iter().position(|&f| f == l.filter).unwrap_or(0);
+                self.refilter(FILTERS[(at + 1) % FILTERS.len()]);
+            }
+            _ => {}
+        }
+    }
+
+    fn on_detail_key(&mut self, code: KeyCode, page: usize) {
+        // Scrolling past the end is clamped when drawn, once the height is known.
+        let s = &mut self.findings.scroll;
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => *s = s.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => *s = s.saturating_add(1),
+            KeyCode::PageUp => *s = s.saturating_sub(page),
+            KeyCode::PageDown => *s = s.saturating_add(page),
+            KeyCode::Home | KeyCode::Char('g') => *s = 0,
+            KeyCode::End | KeyCode::Char('G') => *s = usize::MAX,
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                self.view = View::Findings;
+            }
+            _ => {}
+        }
+    }
+
+    /// Applies a tier filter, keeping the selected finding when it is still shown.
+    fn refilter(&mut self, filter: Option<Tier>) {
+        let keep = self.findings.shown.get(self.findings.selected).copied();
+        let all = &self.data.report.findings;
+        let mut shown: Vec<usize> = (0..all.len())
+            .filter(|&i| filter.is_none_or(|t| all[i].tier == t))
+            .collect();
+        shown.sort_by(|&a, &b| {
+            all[b]
+                .bytes
+                .cmp(&all[a].bytes)
+                .then_with(|| all[a].path.cmp(&all[b].path))
+        });
+        let l = &mut self.findings;
+        l.selected = keep
+            .and_then(|k| shown.iter().position(|&i| i == k))
+            .unwrap_or(0);
+        l.offset = 0;
+        l.shown = shown;
+        l.filter = filter;
     }
 
     fn descend(&mut self, mode: SizeMode) {

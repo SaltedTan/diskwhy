@@ -98,6 +98,8 @@ The scan runs in the background and shows progress through the walk, filesystem 
 
 The header shows used space and capacity, along with the unaccounted figure where available. For a subtree it shows the scanned bytes. If more than three filesystems are reported, the header shows the first two and an overflow count. Press `f` to toggle the scrollable list of all filesystem figures. The tree status includes the total in the current view, scan diagnostics and the findings count.
 
+Tab switches between the tree and the findings list, both full screen. The list shows each finding's tier, size, growth, detector and path, largest first. `t` cycles the tier filter (all, regenerable, rebuildable, review, blocked), and the header shows the filter and how many findings it shows of the total. Enter opens a finding's detail view: what `dwhy explain` shows, scrollable, with Esc or Backspace back to the list at the same selection. Growth comes from the same base snapshot as `dwhy scan` (the newest of the same roots at least an hour old), read-only; without one, the list shows `–` and the detail view says there is no growth data. The detail view shows the guards the scan recorded; the full guard checks run when a plan is made.
+
 Page Up and Page Down move by one screen, and Home and End go to either end of the list. In the tree, `k` and `j` move up and down, Right and `l` open a directory, Left and `h` go up to the parent, and `g` and `G` go to the first and last rows. Ctrl-C also quits.
 
 The TUI restores the terminal on exit, including after a panic. On SIGHUP, SIGINT or SIGTERM it exits with `128 + signal number`.
@@ -131,7 +133,7 @@ The versioned CLI output is the contract for agents and the planned MCP server.
 crates/
   dwhy-core     scan engine, snapshot/diff/watch (growth), detectors, probes, guards, plan/apply, JSON types
   dwhy-cli      clap front end, JSON output, exit codes (binary: dwhy)
-  dwhy-tui      ratatui + crossterm tree browser (M4a)
+  dwhy-tui      ratatui + crossterm tree browser and findings (M4a–M4b)
   dwhy-mcp      (later) rmcp server exposing scan/explain/plan/apply with the same policy
 ```
 

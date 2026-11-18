@@ -8,9 +8,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use dwhy_core::report::FsReport;
+use dwhy_core::probes::postgres_wal;
+use dwhy_core::report::{
+    Action, ActionKind, ArchiveTarget, EvidenceSource, Finding, FsReport, Growth, GuardResult,
+    GuardStatus, PostgresWal, Recovery, Tier,
+};
 use dwhy_core::scan::Progress;
-use dwhy_tui::app::{App, RowKind, SizeMode, State};
+use dwhy_core::{growth, snapshot, system};
+use dwhy_tui::app::{App, RowKind, SizeMode, State, View};
 use dwhy_tui::job::{self, Options, PermissionMark, Scanned};
 use dwhy_tui::ui;
 use ratatui::Terminal;
@@ -80,6 +85,8 @@ fn opts(paths: Vec<PathBuf>) -> Options {
         // Never reach the machine's Docker daemon or caches.
         detectors: Some(vec!["cargo-target".into()]),
         threads: 2,
+        // Never read the machine's snapshots.
+        snapshot_dir: None,
     }
 }
 
@@ -527,4 +534,526 @@ fn percent_and_bar() {
     assert_eq!(ui::bar(100), "██████████");
     assert_eq!(ui::bar(55), "█████▌");
     assert_eq!(ui::bar(0), "");
+}
+
+// Findings pane and detail view (M4b). Findings are built by hand, so
+// nothing depends on Docker, the machine's caches or the clock.
+
+const GIB: u64 = 1 << 30;
+const BASE: &str = "2026-11-17T09:00:00Z";
+
+fn hand_finding(detector: &str, path: &str, bytes: u64, tier: Tier) -> Finding {
+    Finding {
+        id: dwhy_core::detect::finding_id(detector, path),
+        detector: detector.into(),
+        probe: None,
+        evidence: None,
+        path: path.into(),
+        bytes,
+        nested_bytes: None,
+        last_modified: Some("2026-11-12T08:30:00Z".into()),
+        growth: None,
+        tier,
+        reason: format!("{detector} output"),
+        guards: Vec::new(),
+        action: Action {
+            kind: ActionKind::RemovePath,
+            text: format!("rm -rf {path}"),
+            argv: None,
+        },
+        recovery: Recovery {
+            cost: "rebuilt on next use".into(),
+            how: None,
+        },
+    }
+}
+
+fn grows(mut f: Finding, per_day: i64) -> Finding {
+    f.growth = Some(Growth {
+        bytes_per_day: per_day,
+        since: BASE.into(),
+    });
+    f
+}
+
+/// A cargo target dir with growth, as a scan with a base snapshot gives it.
+fn cargo_finding() -> Finding {
+    let path = "/home/me/projects/diskwhy/target";
+    let mut f = grows(
+        hand_finding("cargo-target", path, 3_435_973_837, Tier::Rebuildable),
+        125_829_120,
+    );
+    f.reason =
+        "Cargo build output of /home/me/projects/diskwhy (3.2G); last written 7d 2h ago".into();
+    f.action = Action {
+        kind: ActionKind::Command,
+        text: "/usr/bin/cargo clean --manifest-path /home/me/projects/diskwhy/Cargo.toml \
+               --target-dir /home/me/projects/diskwhy/target"
+            .into(),
+        argv: None,
+    };
+    f.recovery = Recovery {
+        cost: "the next build recompiles the crate and all its dependencies".into(),
+        how: Some("cargo build".into()),
+    };
+    f
+}
+
+/// An in-use Postgres volume whose WAL the `postgres-wal` probe diagnosed.
+fn pg_volume_finding() -> Finding {
+    let mut f = grows(
+        hand_finding(
+            "docker-volume",
+            "docker://volume/pgdata",
+            31_568_000_000,
+            Tier::Review,
+        ),
+        1_288_490_189,
+    );
+    f.last_modified = None;
+    f.reason = "volume pgdata holds 29.4G and is mounted by pg-1 (running) \
+                (a running container uses it)"
+        .into();
+    f.action = Action {
+        kind: ActionKind::Advice,
+        text:
+            "in use: if the data is no longer needed, remove the containers first, then the volume"
+                .into(),
+        argv: None,
+    };
+    f.recovery = Recovery {
+        cost: "n/a while in use".into(),
+        how: None,
+    };
+    f.guards.push(GuardResult {
+        name: "container-mount".into(),
+        status: GuardStatus::Warn,
+        detail: "mounted by pg-1 (running)".into(),
+    });
+    postgres_wal::annotate(
+        &mut f,
+        PostgresWal {
+            container: "pg-1".into(),
+            wal_bytes: Some(29 << 30),
+            data_bytes: Some(53 << 20),
+            failed_count: Some(151),
+            last_archived_at: Some("2026-11-07T07:25:00Z".into()),
+            last_failed_at: Some("2026-11-13T02:10:00Z".into()),
+            last_failed_wal: Some("00000001000000000000001D".into()),
+            archive_mode: Some("on".into()),
+            archive_program: Some("curl".into()),
+            archive_timeout: Some("10s".into()),
+            targets: vec![ArchiveTarget {
+                host: "s3test".into(),
+                container: Some("s3test".into()),
+                state: "exited".into(),
+            }],
+            unmatched_hosts: 0,
+            source: EvidenceSource::Psql,
+            notes: vec!["archive target s3test is a stopped container".into()],
+        },
+    );
+    f
+}
+
+/// One finding per tier but review twice, out of size order.
+fn mixed_findings() -> Vec<Finding> {
+    let mut blocked = hand_finding(
+        "git-worktree",
+        "/home/me/projects/old-feature",
+        640 << 20,
+        Tier::Blocked,
+    );
+    blocked.guards.push(GuardResult {
+        name: "git-unpublished".into(),
+        status: GuardStatus::Block,
+        detail: "2 commits not on any remote".into(),
+    });
+    vec![
+        grows(
+            hand_finding(
+                "trash",
+                "/home/me/.local/share/Trash",
+                90 << 20,
+                Tier::Regenerable,
+            ),
+            -12 << 20,
+        ),
+        cargo_finding(),
+        hand_finding(
+            "node-modules",
+            "/home/me/projects/web-dashboard-with-a-rather-long-name/packages/frontend/node_modules",
+            812 << 20,
+            Tier::Rebuildable,
+        ),
+        pg_volume_finding(),
+        grows(
+            hand_finding(
+                "user-cache",
+                "/home/me/.cache/pip",
+                3 * GIB / 2,
+                Tier::Regenerable,
+            ),
+            0,
+        ),
+        blocked,
+        hand_finding(
+            "stale-tree",
+            "/home/me/scratch/2024-experiments",
+            2 * GIB,
+            Tier::Review,
+        ),
+    ]
+}
+
+/// The app on a scanned temp fixture whose findings are replaced by `findings`.
+fn findings_app(findings: Vec<Finding>, base: Option<&str>) -> (Fixture, App) {
+    let f = fixture(false);
+    let root = f.root();
+    let mut data = scan(&[&root]);
+    pin_fs(&mut data, false);
+    data.report.findings = findings;
+    data.growth_base = base.map(str::to_string);
+    (f, app_with(data))
+}
+
+fn view(app: &App) -> View {
+    app.browser().unwrap().view
+}
+
+fn selected_path(app: &App) -> String {
+    app.browser()
+        .unwrap()
+        .selected_finding()
+        .unwrap()
+        .path
+        .clone()
+}
+
+fn shown_paths(app: &App) -> Vec<String> {
+    let b = app.browser().unwrap();
+    b.findings
+        .shown
+        .iter()
+        .map(|&i| b.data.report.findings[i].path.clone())
+        .collect()
+}
+
+#[test]
+fn tab_switches_between_the_tree_and_the_findings() {
+    let (f, mut app) = findings_app(mixed_findings(), Some(BASE));
+    let root = f.root();
+    assert_eq!(view(&app), View::Tree);
+    press(&mut app, &[KeyCode::Down]);
+    assert_eq!(selected(&app), "mid/");
+    press(&mut app, &[KeyCode::Tab]);
+    assert_eq!(view(&app), View::Findings);
+    assert_eq!(
+        selected_path(&app),
+        "docker://volume/pgdata",
+        "largest first"
+    );
+    // Tree keys do nothing here; list keys move the finding selection.
+    press(
+        &mut app,
+        &[KeyCode::Char('a'), KeyCode::Char('f'), KeyCode::Down],
+    );
+    assert_eq!(app.mode, SizeMode::Allocated);
+    assert_eq!(selected_path(&app), "/home/me/projects/diskwhy/target");
+    press(&mut app, &[KeyCode::Tab]);
+    assert_eq!(view(&app), View::Tree);
+    let tree = render(&mut app, 80, 24, Some(&root));
+    assert!(
+        tree.contains("used 120.0G of 400.0G"),
+        "f did not open the filesystems: {tree}"
+    );
+    // The tree is where it was, and its keys still work.
+    assert_eq!(selected(&app), "mid/");
+    press(&mut app, &[KeyCode::Enter]);
+    assert_eq!(
+        app.browser().unwrap().path(),
+        root.join("mid").to_str().unwrap()
+    );
+    let screen = render(&mut app, 80, 24, Some(&root));
+    assert!(screen.contains("Tab findings"), "{screen}");
+    // Back to the findings at the same selection; Tab from the detail
+    // view goes to the tree too.
+    press(&mut app, &[KeyCode::Tab, KeyCode::Enter]);
+    assert_eq!(view(&app), View::Detail);
+    press(&mut app, &[KeyCode::Tab]);
+    assert_eq!(view(&app), View::Tree);
+    press(&mut app, &[KeyCode::Tab]);
+    assert_eq!(view(&app), View::Findings);
+    assert_eq!(selected_path(&app), "/home/me/projects/diskwhy/target");
+    assert!(
+        app.on_key(key(KeyCode::Char('q'))),
+        "q quits from the findings"
+    );
+}
+
+#[test]
+fn tier_filter_cycles_and_keeps_the_selection_when_it_can() {
+    let (_f, mut app) = findings_app(mixed_findings(), Some(BASE));
+    press(&mut app, &[KeyCode::Tab]);
+    assert_eq!(
+        shown_paths(&app),
+        [
+            "docker://volume/pgdata",
+            "/home/me/projects/diskwhy/target",
+            "/home/me/scratch/2024-experiments",
+            "/home/me/.cache/pip",
+            "/home/me/projects/web-dashboard-with-a-rather-long-name/packages/frontend/node_modules",
+            "/home/me/projects/old-feature",
+            "/home/me/.local/share/Trash",
+        ]
+    );
+    // Select the cargo target dir, then cycle through every tier.
+    press(&mut app, &[KeyCode::Down]);
+    let expect = [
+        (Some(Tier::Regenerable), 2, "regenerable · 2/7"),
+        (Some(Tier::Rebuildable), 2, "rebuildable · 2/7"),
+        (Some(Tier::Review), 2, "review · 2/7"),
+        (Some(Tier::Blocked), 1, "blocked · 1/7"),
+        (None, 7, "all tiers · 7/7"),
+    ];
+    for (filter, n, header) in expect {
+        press(&mut app, &[KeyCode::Char('t')]);
+        let b = app.browser().unwrap();
+        assert_eq!(b.findings.filter, filter);
+        assert_eq!(b.findings.shown.len(), n);
+        assert!(
+            b.findings
+                .shown
+                .iter()
+                .all(|&i| filter.is_none_or(|t| b.data.report.findings[i].tier == t))
+        );
+        let screen = render(&mut app, 80, 24, None);
+        assert!(screen.lines().next().unwrap().contains(header), "{screen}");
+    }
+    // A filter that hides the selection selects its largest finding; the
+    // blocked one stayed selected back in all tiers.
+    assert_eq!(selected_path(&app), "/home/me/projects/old-feature");
+    // A selection the filter shows stays selected.
+    press(&mut app, &[KeyCode::Up, KeyCode::Up]);
+    assert_eq!(selected_path(&app), "/home/me/.cache/pip");
+    press(&mut app, &[KeyCode::Char('t')]);
+    assert_eq!(
+        app.browser().unwrap().findings.filter,
+        Some(Tier::Regenerable)
+    );
+    assert_eq!(selected_path(&app), "/home/me/.cache/pip");
+}
+
+#[test]
+fn a_filter_that_empties_the_list_says_so() {
+    let only_rebuildable = vec![cargo_finding()];
+    let (_f, mut app) = findings_app(only_rebuildable, None);
+    press(&mut app, &[KeyCode::Tab, KeyCode::Char('t')]);
+    let b = app.browser().unwrap();
+    assert_eq!(b.findings.filter, Some(Tier::Regenerable));
+    assert!(b.findings.shown.is_empty());
+    assert!(b.selected_finding().is_none());
+    let screen = render(&mut app, 80, 24, None);
+    assert!(screen.contains("no regenerable findings"), "{screen}");
+    assert!(screen.contains("regenerable · 0/1"), "{screen}");
+    // Nothing to open, and moving does nothing.
+    press(&mut app, &[KeyCode::Down, KeyCode::End, KeyCode::Enter]);
+    assert_eq!(view(&app), View::Findings);
+    press(&mut app, &[KeyCode::Char('t')]);
+    assert_eq!(selected_path(&app), "/home/me/projects/diskwhy/target");
+    press(&mut app, &[KeyCode::Char('t')]);
+    assert!(render(&mut app, 80, 24, None).contains("no review findings"));
+}
+
+#[test]
+fn no_findings_and_failed_detectors_are_explicit() {
+    let (_f, mut app) = findings_app(Vec::new(), None);
+    press(&mut app, &[KeyCode::Tab]);
+    let screen = render(&mut app, 80, 24, None);
+    assert!(screen.contains("  no findings "), "{screen}");
+    assert!(screen.contains("all tiers · 0/0"), "{screen}");
+    // A filter on an empty report still says there are none at all.
+    press(&mut app, &[KeyCode::Char('t')]);
+    assert!(render(&mut app, 80, 24, None).contains("  no findings "));
+
+    let f = fixture(false);
+    let mut data = scan(&[&f.root()]);
+    data.report.findings.clear();
+    let run = data
+        .report
+        .detectors
+        .iter_mut()
+        .find(|d| d.name == "cargo-target")
+        .unwrap();
+    run.error = Some("cannot read Cargo.toml".into());
+    let mut with_finding = data.clone();
+    let mut app = app_with(data);
+    press(&mut app, &[KeyCode::Tab]);
+    let screen = render(&mut app, 80, 24, None);
+    assert!(
+        screen.contains("no findings; detectors failed:"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("    cargo-target: cannot read Cargo.toml"),
+        "{screen}"
+    );
+    // With findings, the failure is counted in the status line.
+    with_finding.report.findings = vec![cargo_finding()];
+    let mut app = app_with(with_finding);
+    press(&mut app, &[KeyCode::Tab]);
+    let screen = render(&mut app, 80, 24, None);
+    assert!(screen.contains("1 detector failed"), "{screen}");
+}
+
+#[test]
+fn enter_opens_the_detail_and_esc_returns_to_the_same_selection() {
+    let (_f, mut app) = findings_app(mixed_findings(), Some(BASE));
+    press(&mut app, &[KeyCode::Tab, KeyCode::Down, KeyCode::Down]);
+    assert_eq!(selected_path(&app), "/home/me/scratch/2024-experiments");
+    for back in [KeyCode::Esc, KeyCode::Backspace] {
+        press(&mut app, &[KeyCode::Enter]);
+        assert_eq!(view(&app), View::Detail);
+        let screen = render(&mut app, 80, 24, None);
+        assert!(screen.contains("finding f_"), "{screen}");
+        assert!(screen.contains("stale-tree output"), "{screen}");
+        // List keys scroll the detail instead of moving the selection.
+        press(&mut app, &[KeyCode::Down, KeyCode::Char('t')]);
+        assert_eq!(app.browser().unwrap().findings.filter, None);
+        press(&mut app, &[back]);
+        assert_eq!(view(&app), View::Findings);
+        assert_eq!(selected_path(&app), "/home/me/scratch/2024-experiments");
+    }
+    // The detail view opens at its top again.
+    press(&mut app, &[KeyCode::Enter]);
+    assert_eq!(app.browser().unwrap().findings.scroll, 0);
+}
+
+#[test]
+fn findings_list_80x24() {
+    let (_f, mut app) = findings_app(mixed_findings(), Some(BASE));
+    press(&mut app, &[KeyCode::Tab, KeyCode::Down]);
+    let screen = render(&mut app, 80, 24, None);
+    // Figures are never cut; the long path is shortened in the middle.
+    assert!(
+        screen.contains("rebuildable   812.0M          –  node-modules"),
+        "{screen}"
+    );
+    assert!(screen.contains("…"), "{screen}");
+    assert!(screen.contains("-12.0M/d"), "{screen}");
+    insta::assert_snapshot!(screen);
+}
+
+#[test]
+fn findings_list_120x40() {
+    let mut findings = mixed_findings();
+    for f in &mut findings {
+        f.growth = None;
+    }
+    let (_f, mut app) = findings_app(findings, None);
+    press(&mut app, &[KeyCode::Tab]);
+    let screen = render(&mut app, 120, 40, None);
+    assert!(screen.contains("no growth data (no snapshot of these roots ≥ 1h old)"));
+    insta::assert_snapshot!(screen);
+}
+
+#[test]
+fn detail_filesystem_finding_80x24() {
+    let (_f, mut app) = findings_app(vec![cargo_finding()], Some(BASE));
+    press(&mut app, &[KeyCode::Tab, KeyCode::Enter]);
+    let screen = render(&mut app, 80, 24, None);
+    assert!(
+        screen.contains("growth: +120.0M/day since 2026-11-17T09:00:00Z"),
+        "{screen}"
+    );
+    insta::assert_snapshot!(screen);
+}
+
+#[test]
+fn detail_docker_volume_with_postgres_wal_evidence_80x24() {
+    let (_f, mut app) = findings_app(vec![pg_volume_finding()], Some(BASE));
+    press(&mut app, &[KeyCode::Tab, KeyCode::Enter]);
+    let screen = render(&mut app, 80, 24, None);
+    assert!(screen.contains("evidence (postgres-wal):"), "{screen}");
+    insta::assert_snapshot!(screen);
+    // It does not fit: End scrolls to the last line, and no further.
+    press(&mut app, &[KeyCode::End]);
+    let end = render(&mut app, 80, 24, None);
+    assert!(end.contains("  cost: n/a: nothing is removed"), "{end}");
+    assert!(!end.contains("finding f_"), "{end}");
+    assert!(end.contains("lines 4–24 of 24"), "{end}");
+    let scroll = app.browser().unwrap().findings.scroll;
+    assert!(scroll > 0);
+    press(&mut app, &[KeyCode::Down, KeyCode::PageDown]);
+    render(&mut app, 80, 24, None);
+    assert_eq!(app.browser().unwrap().findings.scroll, scroll);
+    press(&mut app, &[KeyCode::Home]);
+    assert!(render(&mut app, 80, 24, None).contains("finding f_"));
+}
+
+#[test]
+fn detail_says_when_there_is_no_growth_to_show() {
+    let mut f = cargo_finding();
+    f.growth = None;
+    let (_x, mut app) = findings_app(vec![f.clone()], None);
+    press(&mut app, &[KeyCode::Tab]);
+    let list = render(&mut app, 80, 24, None);
+    assert!(list.contains("          –  cargo-target"), "{list}");
+    press(&mut app, &[KeyCode::Enter]);
+    let screen = render(&mut app, 80, 24, None);
+    assert!(
+        screen.contains("growth: no growth data (no snapshot of these roots ≥ 1h old)"),
+        "{screen}"
+    );
+    // A base snapshot that does not list the finding.
+    let (_x, mut app) = findings_app(vec![f], Some(BASE));
+    press(&mut app, &[KeyCode::Tab, KeyCode::Enter]);
+    let screen = render(&mut app, 80, 24, None);
+    assert!(
+        screen.contains("growth: unknown (not in the snapshot of 2026-11-17T09:00:00Z)"),
+        "{screen}"
+    );
+}
+
+/// The scan reads growth from the snapshot directory it is given, and from
+/// nowhere when it is given none.
+#[test]
+fn scan_takes_growth_from_the_snapshot_dir_it_is_given() {
+    const TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+                       # This file is a cache directory tag created by cargo.\n";
+    let f = fixture(false);
+    let root = f.root();
+    fs::create_dir_all(root.join("app/target")).unwrap();
+    fs::write(root.join("app/Cargo.toml"), b"[package]\n").unwrap();
+    fs::write(root.join("app/target/CACHEDIR.TAG"), TAG).unwrap();
+    fs::write(root.join("app/target/out"), vec![5u8; 2 * MIB]).unwrap();
+    let plain = scan(&[&root]);
+    assert_eq!(plain.report.findings.len(), 1);
+    assert!(plain.growth_base.is_none());
+    assert!(plain.report.findings[0].growth.is_none());
+
+    // A snapshot of these roots old enough, listing the finding smaller.
+    let state = tempfile::tempdir().unwrap();
+    let dir = state.path().join("snapshots");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut old = plain.report.clone();
+    old.generated_at = dwhy_core::detect::rfc3339(now - 2 * growth::MIN_AGE_SECS);
+    old.findings[0].bytes /= 2;
+    assert_eq!(old.host, system::hostname());
+    let snap = snapshot::build(&old, &plain.tree, None, 0);
+    snapshot::save(&dir, &snap, now).unwrap();
+    let listed = fs::read_dir(&dir).unwrap().count();
+
+    let mut o = opts(vec![root.clone()]);
+    o.snapshot_dir = Some(dir.clone());
+    let data = job::scan(&o, &Progress::default(), &mut |_| {}).unwrap();
+    assert_eq!(data.growth_base.as_deref(), Some(old.generated_at.as_str()));
+    let g = data.report.findings[0].growth.as_ref().unwrap();
+    assert!(g.bytes_per_day > 0, "{g:?}");
+    assert_eq!(g.since, old.generated_at);
+    // Read only: nothing saved or pruned.
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), listed);
 }

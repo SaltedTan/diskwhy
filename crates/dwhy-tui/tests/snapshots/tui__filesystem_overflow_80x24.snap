@@ -25,4 +25,4 @@ expression: screen
 "  used 120.0G of 400.0G  unaccounted 19.0G  /mnt/volume19 ext4                  "
 "  used 120.0G of 400.0G  unaccounted 20.0G  /mnt/volume20 ext4                  "
 " 1–21 of 24 filesystems                                                         "
-" ↑↓ PgUp PgDn scroll · f back to tree · q quit                                  "
+" ↑↓ PgUp PgDn scroll · f back to tree · Tab findings · q quit                   "

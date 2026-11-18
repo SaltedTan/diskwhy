@@ -11,10 +11,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::report::{
-    Change, ChangeKind, DiffBase, DiffReport, Finding, Growth, Rate, SCHEMA, Snapshot,
+    Change, ChangeKind, DiffBase, DiffReport, Finding, Growth, Rate, SCHEMA, ScanReport, Snapshot,
     SnapshotDocker, SnapshotScan, Tool, WatchReport,
 };
-use crate::snapshot::parse_time;
+use crate::snapshot::{self, parse_time};
 
 /// `scan` puts growth on findings from the newest snapshot at least this
 /// old: a rate from a shorter window, scaled to a day, is mostly noise.
@@ -655,6 +655,30 @@ pub fn fill_growth(findings: &mut [Finding], old: &Snapshot, now: &str) {
             });
         }
     }
+}
+
+/// Puts growth on a scan report's findings, as `dwhy scan` and the TUI do:
+/// from the newest snapshot in `dir` of the same roots (and the same
+/// one-filesystem setting) that is at least [`MIN_AGE_SECS`] old at `now`
+/// (seconds since the epoch). Best effort and read-only: without such a
+/// snapshot, findings have no growth. Returns the `created_at` of the
+/// snapshot used.
+pub fn fill_scan_growth(report: &mut ScanReport, dir: &Path, now: i64) -> Option<String> {
+    if report.findings.is_empty() {
+        return None;
+    }
+    let roots: Vec<String> = report.scan.roots.iter().map(|r| r.path.clone()).collect();
+    let found = snapshot::find(
+        dir,
+        &snapshot::Since::Age(MIN_AGE_SECS),
+        &report.host,
+        report.uid,
+        Some((&roots, report.scan.one_filesystem)),
+        now,
+    )
+    .ok()?;
+    fill_growth(&mut report.findings, &found.snapshot, &report.generated_at);
+    Some(found.snapshot.created_at)
 }
 
 #[cfg(test)]
