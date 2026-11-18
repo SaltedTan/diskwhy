@@ -65,8 +65,8 @@ pub struct Mark {
     pub skipped_mounts: usize,
 }
 
-/// A finished scan: the report `dwhy scan --json` would print (without its
-/// directory list) and the directory tree.
+/// A finished scan. The report supplies filesystem figures and scan diagnostics.
+/// The full tree supplies directory rows independently of the report's size cutoff.
 #[derive(Debug, Clone)]
 pub struct Scanned {
     pub report: ScanReport,
