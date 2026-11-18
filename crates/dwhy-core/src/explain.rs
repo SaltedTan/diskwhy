@@ -4,6 +4,7 @@
 //! CLI rescans, runs the detectors, the probes and the guards; nothing here
 //! writes.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,9 @@ use crate::report::{
     SnapshotFinding,
 };
 use crate::snapshot::{self, Entry};
+use crate::tree::ScanTree;
+
+pub const PATH_HINT: &str = "run `dwhy explain <path>` with its path";
 
 /// What `dwhy explain` was asked about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,7 +80,6 @@ pub enum Walk {
     /// The path itself, with a note when that is because the parent could
     /// not be used.
     Itself(Option<String>),
-    ParentUnreadable(String),
 }
 
 /// Decides what to walk for `abs`, an absolute path whose parent is
@@ -111,9 +114,11 @@ pub fn walk_for(abs: &Path, mounts: &MountTable) -> Walk {
     }
     match parent_md.and_then(|_| std::fs::read_dir(parent)) {
         Ok(_) => Walk::Parent(parent.to_path_buf()),
-        Err(e) => {
-            Walk::ParentUnreadable(format!("cannot open its parent {}: {e}", parent.display()))
-        }
+        Err(e) => Walk::Itself(Some(format!(
+            "cannot open its parent {}: {e}; scanned {} alone",
+            parent.display(),
+            abs.display()
+        ))),
     }
 }
 
@@ -190,7 +195,7 @@ pub fn resolve_id(
     uid: u32,
     id: &str,
 ) -> Result<(ExplainSnapshot, SnapshotFinding), String> {
-    match newest_listing(dir, host, uid, id, None)? {
+    match newest_listing(dir, host, uid, id, None).map_err(|e| format!("{e}; {PATH_HINT}"))? {
         (Some(found), _) => Ok((
             ExplainSnapshot {
                 id: found.entry.id,
@@ -201,7 +206,7 @@ pub fn resolve_id(
         )),
         (None, err) => {
             let mut msg = format!(
-                "no snapshot lists finding {id}; run `dwhy explain <path>` with its path, \
+                "no snapshot lists finding {id}; {PATH_HINT}, \
                  or save snapshots with `dwhy scan --snapshot`"
             );
             if let Some(e) = err {
@@ -233,6 +238,21 @@ pub fn docker_selection(only: Option<&[String]>) -> Vec<String> {
         .collect()
 }
 
+pub fn exclude_lossy_paths(findings: &mut Vec<Finding>, tree: &ScanTree) {
+    if !findings
+        .iter()
+        .any(|f| f.path.contains(char::REPLACEMENT_CHARACTER))
+    {
+        return;
+    }
+    let lossy: HashSet<PathBuf> = tree
+        .ids()
+        .filter(|&id| tree.name(id).to_str().is_none())
+        .map(|id| PathBuf::from(tree.path(id).to_string_lossy().into_owned()))
+        .collect();
+    findings.retain(|f| !Path::new(&f.path).ancestors().any(|p| lossy.contains(p)));
+}
+
 /// Picks the finding explained from a rescan's `findings`: the one with
 /// `id` when given, else the cheapest tier at `path`. When there is none,
 /// also lists the findings at or below `path`, largest first.
@@ -242,7 +262,7 @@ pub fn pick(
     id: Option<&str>,
 ) -> (Option<Finding>, Vec<FindingRef>) {
     let at = match id {
-        Some(id) => findings.iter().position(|f| f.id == id),
+        Some(id) => findings.iter().position(|f| f.id == id && f.path == path),
         None => findings
             .iter()
             .enumerate()
@@ -257,9 +277,9 @@ pub fn pick(
     if let Some(i) = at {
         return (Some(findings.swap_remove(i)), Vec::new());
     }
+    findings.retain(|f| within(&f.path, path));
     let inside = detect::outermost(findings)
         .iter()
-        .filter(|f| within(&f.path, path))
         .map(finding_ref)
         .collect();
     (None, inside)
@@ -455,7 +475,7 @@ mod tests {
         // Searchable, not readable: the path can be statted, its parent not listed.
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311)).unwrap();
         let _restore = Restore(parent.clone());
-        let Walk::ParentUnreadable(note) =
+        let Walk::Itself(Some(note)) =
             walk_for(&parent.join("app"), &MountTable::read().unwrap_or_default())
         else {
             panic!("the parent cannot be opened");
@@ -501,6 +521,16 @@ mod tests {
         let nested = vec![
             f("stale-tree", "/p/app/scratch", 100),
             f("stale-tree", "/p/app/scratch/child", 50),
+        ];
+        let (got, inside) = pick(nested, "/p/app", None);
+        assert!(got.is_none());
+        assert_eq!(inside.len(), 1);
+        assert_eq!(inside[0].path, "/p/app/scratch");
+
+        let nested = vec![
+            f("stale-tree", "/p", 100),
+            f("stale-tree", "/p/app/scratch", 50),
+            f("stale-tree", "/p/app/scratch/child", 10),
         ];
         let (got, inside) = pick(nested, "/p/app", None);
         assert!(got.is_none());

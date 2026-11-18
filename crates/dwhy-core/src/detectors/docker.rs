@@ -89,6 +89,56 @@ fn short_id(id: &str) -> String {
     id.trim_start_matches("sha256:").chars().take(12).collect()
 }
 
+pub enum DockerPresence {
+    Missing,
+    Present,
+    Unmeasured,
+}
+
+pub fn docker_presence(snap: &Snapshot, path: &str) -> Option<DockerPresence> {
+    let measured = if let Some(label) = path.strip_prefix("docker://image/") {
+        snap.df
+            .images
+            .as_ref()?
+            .iter()
+            .find(|img| {
+                img.repo_tags
+                    .iter()
+                    .flatten()
+                    .any(|t| t == label && t != "<none>:<none>")
+                    || short_id(&img.id) == label
+            })
+            .map(|img| img.size >= 0)
+    } else if let Some(name) = path.strip_prefix("docker://container/") {
+        snap.df
+            .containers
+            .as_ref()?
+            .iter()
+            .find(|c| {
+                c.names.iter().any(|n| n.trim_start_matches('/') == name)
+                    || c.id.chars().take(12).eq(name.chars())
+            })
+            .map(|c| c.size_rw.is_some_and(|size| size >= 0))
+    } else if let Some(name) = path.strip_prefix("docker://volume/") {
+        snap.df
+            .volumes
+            .as_ref()?
+            .iter()
+            .find(|v| v.name == name)
+            .map(|v| v.usage_data.as_ref().is_some_and(|u| u.size >= 0))
+    } else if path == "docker://build-cache" {
+        let cache = snap.df.build_cache.as_ref()?;
+        (!cache.is_empty()).then(|| cache.iter().all(|r| r.size >= 0))
+    } else {
+        return None;
+    };
+    Some(match measured {
+        None => DockerPresence::Missing,
+        Some(true) => DockerPresence::Present,
+        Some(false) => DockerPresence::Unmeasured,
+    })
+}
+
 /// The Docker object behind a finding's pseudo-path, for its fingerprint:
 /// the image or container id, or a volume's name and creation time (a
 /// volume has no id, and a volume recreated under the same name is another

@@ -961,8 +961,8 @@ pub struct ExplainReport {
     /// finding matched.
     #[serde(default)]
     pub finding: Option<Finding>,
-    /// True when `query` named a saved finding id and the rescan verified
-    /// that its detector no longer reports it.
+    /// True when `query` named a saved finding id and its filesystem path
+    /// or Docker object was confirmed absent.
     #[serde(default)]
     pub gone: bool,
     /// What is at a filesystem `path` now; absent for pseudo-paths and for a

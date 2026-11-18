@@ -19,10 +19,26 @@ use crate::report::{DockerUsage, UsageLine};
 #[serde(rename_all = "PascalCase", default)]
 pub struct SystemDf {
     pub layers_size: i64,
+    #[serde(deserialize_with = "reported_list")]
     pub images: Option<Vec<Image>>,
+    #[serde(deserialize_with = "reported_list")]
     pub containers: Option<Vec<Container>>,
+    #[serde(deserialize_with = "reported_list")]
     pub volumes: Option<Vec<Volume>>,
+    #[serde(deserialize_with = "reported_list")]
     pub build_cache: Option<Vec<BuildCacheRecord>>,
+}
+
+fn reported_list<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(|list| Some(list.unwrap_or_default()))
+}
+
+fn unmeasured_size() -> i64 {
+    -1
 }
 
 /// Parses a `GET /system/df` body. A body with none of the `Images`,
@@ -50,6 +66,7 @@ pub struct Image {
     pub repo_digests: Option<Vec<String>>,
     /// Seconds since the epoch.
     pub created: i64,
+    #[serde(default = "unmeasured_size")]
     pub size: i64,
     /// -1 when the daemon did not compute it.
     pub shared_size: i64,
@@ -91,6 +108,7 @@ pub struct Volume {
 #[serde(rename_all = "PascalCase", default)]
 pub struct VolumeUsage {
     /// -1 when not computed.
+    #[serde(default = "unmeasured_size")]
     pub size: i64,
     /// Containers referencing the volume; -1 when not computed.
     pub ref_count: i64,
@@ -106,6 +124,7 @@ pub struct BuildCacheRecord {
     pub description: String,
     pub in_use: bool,
     pub shared: bool,
+    #[serde(default = "unmeasured_size")]
     pub size: i64,
     pub last_used_at: Option<String>,
 }
@@ -494,7 +513,9 @@ mod tests {
         )
         .unwrap();
         assert!(empty.images.unwrap().is_empty());
-        assert!(empty.containers.is_none());
+        assert!(empty.containers.unwrap().is_empty());
+        let partial = parse_system_df(br#"{"Images":[]}"#).unwrap();
+        assert!(partial.containers.is_none());
     }
 
     #[test]

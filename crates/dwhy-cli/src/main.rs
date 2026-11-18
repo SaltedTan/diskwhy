@@ -5,8 +5,9 @@
 
 mod human;
 
+use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +17,7 @@ use clap::{Args, Parser, Subcommand};
 use dwhy_core::account::{self, ReportEnv};
 use dwhy_core::apply::{self, Audit, Check, Policy};
 use dwhy_core::detect::{self, DetectContext};
+use dwhy_core::detectors::{DockerPresence, docker_presence};
 use dwhy_core::explain::{self, Place, Query, Walk};
 use dwhy_core::guard::Processes;
 use dwhy_core::mounts::{self, MountTable};
@@ -185,7 +187,7 @@ struct WatchArgs {
 struct ExplainArgs {
     /// A finding id (f_…, looked up in the snapshots), a path, or a pseudo-path
     /// such as docker://volume/NAME.
-    target: PathBuf,
+    target: OsString,
     /// Print diskwhy/v1 JSON instead of text.
     #[arg(long)]
     json: bool,
@@ -649,6 +651,8 @@ fn docker_now() -> std::result::Result<Arc<docker::Snapshot>, String> {
 }
 
 fn run_explain(args: ExplainArgs) -> Result<u8> {
+    const UTF8_PATH: &str = "explain needs a UTF-8 path (diskwhy/v1 reports paths as UTF-8)";
+    let query = args.target.to_str().ok_or(UTF8_PATH)?;
     if let Some(names) = &args.detectors {
         detect::validate_selection(names)?;
     }
@@ -658,11 +662,12 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
     let mut notes = Vec::new();
 
     // A finding id becomes the path it had in the newest snapshot listing it.
-    let (place, saved, snap) = match explain::classify(&args.target) {
+    let (place, saved, snap) = match explain::classify(query) {
         Query::Id(id) => {
-            let dir = dir.as_deref().ok_or(
-                "cannot find snapshots: neither XDG_STATE_HOME nor HOME is an absolute path",
-            )?;
+            let dir = dir.as_deref().ok_or_else(|| format!(
+                "cannot find snapshots: neither XDG_STATE_HOME nor HOME is an absolute path; {}",
+                explain::PATH_HINT
+            ))?;
             let (snap, found) = explain::resolve_id(dir, &host, uid, &id)?;
             (explain::place(&found.path), Some(found), Some(snap))
         }
@@ -672,60 +677,57 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
     let generated_at = system::now_rfc3339();
     let ctx = DetectContext::from_system();
     let mut size = None;
-    let mut gap = None;
-    let (path, tree, only) = match place {
+    let is_docker = matches!(&place, Place::Docker(_));
+    let (path, tree, only, scan_issue) = match place {
         // Docker objects are not on the walked filesystem: an empty tree.
         Place::Docker(p) => {
             let only = explain::docker_selection(args.detectors.as_deref());
             if only.is_empty() {
                 notes.push("no Docker detector selected (--detectors)".into());
             }
-            (p, ScanTree::default(), Some(only))
+            (p, Some(ScanTree::default()), Some(only), None)
         }
-        Place::Path(p) => match explain_path(&p, &args, &mut notes) {
-            Ok((abs, totals, tree, scan_gap)) => {
-                size = Some(ExplainSize {
-                    allocated: totals.allocated,
-                    apparent: totals.apparent,
-                });
-                gap = scan_gap;
-                (
-                    abs.to_string_lossy().into_owned(),
-                    tree,
-                    args.detectors.clone(),
-                )
-            }
-            Err(e) => {
-                let Some(saved) = &saved else {
-                    return Err(e.into());
-                };
-                use std::io::ErrorKind::{NotADirectory, NotFound};
-                if matches!(&e, scan::ScanError::Root { source, .. }
-                    if matches!(source.kind(), NotFound | NotADirectory))
-                {
-                    notes.push(format!("{} no longer exists", p.display()));
-                } else {
-                    gap = Some(e.to_string());
+        Place::Path(p) => {
+            let abs = std::path::absolute(&p)?;
+            let input = abs.to_str().ok_or(UTF8_PATH)?;
+            let (path, walked) = match scan::absolute_nofollow(&abs) {
+                Ok(resolved) => (
+                    resolved.to_str().ok_or(UTF8_PATH)?.to_owned(),
+                    explain_path(&resolved, &args, &mut notes),
+                ),
+                Err(source) => (
+                    input.to_owned(),
+                    Err(scan::ScanError::Root { path: p, source }),
+                ),
+            };
+            match walked {
+                Ok((totals, tree, issue)) => {
+                    size = Some(ExplainSize {
+                        allocated: totals.allocated,
+                        apparent: totals.apparent,
+                    });
+                    (path, Some(tree), args.detectors.clone(), issue)
                 }
-                let only = [saved.detector.clone()]
-                    .into_iter()
-                    .filter(|name| args.detectors.as_ref().is_none_or(|o| o.contains(name)))
-                    .collect();
-                (
-                    p.to_string_lossy().into_owned(),
-                    ScanTree::default(),
-                    Some(only),
-                )
+                Err(e) if saved.is_some() => {
+                    (path, None, args.detectors.clone(), Some(e.to_string()))
+                }
+                Err(e) => return Err(e.into()),
             }
-        },
+        }
     };
 
-    let (findings, runs) = detect::run_candidates(
-        &tree,
-        &ctx,
-        &dwhy_core::detectors::registry(),
-        only.as_deref(),
-    );
+    let (findings, runs) = tree.as_ref().map_or_else(Default::default, |tree| {
+        let (mut candidates, runs) = detect::run_candidates(
+            tree,
+            &ctx,
+            &dwhy_core::detectors::registry(),
+            only.as_deref(),
+        );
+        if !is_docker {
+            explain::exclude_lossy_paths(&mut candidates, tree);
+        }
+        (candidates, runs)
+    });
     notes.extend(explain::detector_notes(&runs, only.as_deref()));
     let (mut finding, inside) =
         explain::pick(findings, &path, saved.as_ref().map(|f| f.id.as_str()));
@@ -733,19 +735,28 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
     if let Some(saved) = &saved
         && finding.is_none()
     {
-        if let Some(reason) =
-            gap.or_else(|| explain::detector_gap(&runs, only.as_deref(), &saved.detector))
-        {
-            notes.push(format!("could not check: {reason}"));
-        } else {
-            gone = true;
-        }
+        let detector_issue = tree
+            .as_ref()
+            .and_then(|_| explain::detector_gap(&runs, only.as_deref(), &saved.detector));
+        gone = explain_missing(
+            &saved.path,
+            is_docker,
+            &ctx,
+            detector_issue,
+            scan_issue,
+            &mut notes,
+        );
     }
-    if let Some(f) = &mut finding {
+    if let (Some(f), Some(tree)) = (&mut finding, &tree) {
         let one = std::slice::from_mut(f);
         probes::run(one, &ctx);
         let status = status_line(args.quiet, "checking guards…");
-        dwhy_core::guard::check(one, &tree, &ctx, &Processes::read());
+        let processes = if is_docker {
+            Processes::default()
+        } else {
+            Processes::read()
+        };
+        dwhy_core::guard::check(one, tree, &ctx, &processes);
         drop(status);
         if let Some(dir) = &dir
             && let Some(base) = explain::growth_base(dir, &host, uid, &one[0].id, &generated_at)
@@ -759,7 +770,7 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
         host,
         uid,
         generated_at,
-        query: args.target.to_string_lossy().into_owned(),
+        query: query.to_owned(),
         resolved: ExplainResolved {
             via: if saved.is_some() {
                 ExplainVia::Id
@@ -785,18 +796,75 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
     Ok(EXIT_OK)
 }
 
+fn explain_missing(
+    path: &str,
+    is_docker: bool,
+    ctx: &DetectContext,
+    detector_issue: Option<String>,
+    scan_issue: Option<String>,
+    notes: &mut Vec<String>,
+) -> bool {
+    let mut size_issue = None;
+    let exists = if is_docker {
+        match ctx.docker.fetched() {
+            Some(snapshot) => match docker_presence(&snapshot, path) {
+                Some(DockerPresence::Missing) => Ok(false),
+                Some(DockerPresence::Present) => Ok(true),
+                Some(DockerPresence::Unmeasured) => {
+                    size_issue = Some("the Docker daemon did not report a size".to_string());
+                    Ok(true)
+                }
+                None => Err("the Docker daemon did not report the relevant list".to_string()),
+            },
+            None => Err(detector_issue
+                .clone()
+                .unwrap_or_else(|| "no answer from the Docker daemon".into())),
+        }
+    } else {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(format!("{path}: {e}")),
+        }
+    };
+    match exists {
+        Ok(false) => {
+            notes.push(format!("{path} no longer exists"));
+            true
+        }
+        Ok(true) => {
+            notes.push(format!("still present at {path}, but not detected now"));
+            if detector_issue.is_none() && scan_issue.is_none() && size_issue.is_none() {
+                notes.push("it may be below the detector's size or age threshold, covered by a finding above it, or need context above the walked directory".into());
+            }
+            notes.extend(detector_issue);
+            notes.extend(scan_issue);
+            notes.extend(size_issue);
+            false
+        }
+        Err(reason) => {
+            notes.push(format!("could not check: {reason}"));
+            false
+        }
+    }
+}
+
 fn explain_path(
-    path: &PathBuf,
+    abs: &Path,
     args: &ExplainArgs,
     notes: &mut Vec<String>,
-) -> std::result::Result<(PathBuf, Totals, ScanTree, Option<String>), scan::ScanError> {
+) -> std::result::Result<(Totals, ScanTree, Option<String>), scan::ScanError> {
     let mounts = MountTable::read().unwrap_or_default();
-    let abs = scan::prepare_roots(std::slice::from_ref(path), true)?
-        .pop()
-        .expect("one path gives one scan root");
-    let scan = |root: &PathBuf| {
+    let scan = |root: &Path| {
         measure(
-            std::slice::from_ref(root),
+            &[root.to_path_buf()],
             true,
             u64::MAX,
             args.threads,
@@ -804,46 +872,41 @@ fn explain_path(
             &mounts,
         )
     };
-    let coverage_gap = |result: &scan::ScanResult| {
+    let read_issue = |result: &scan::ScanResult| {
         result
             .unreadable
             .iter()
             .map(|u| u.path.as_path())
             .chain(result.errors.iter().map(|(p, _)| p.as_path()))
-            .find(|p| abs.starts_with(p))
+            .find(|p| abs.starts_with(p) || p.starts_with(abs))
             .map(|p| format!("{} could not be read", p.display()))
             .or_else(|| {
                 (result.error_count > result.errors.len() as u64)
                     .then(|| "the scan has unrecorded errors".to_string())
             })
     };
-    let parent_gap = match explain::walk_for(&abs, &mounts) {
+    match explain::walk_for(abs, &mounts) {
         Walk::Parent(parent) => {
             let result = scan(&parent)?;
-            let gap = coverage_gap(&result);
-            if let Some(node) = result.tree.find(&abs) {
+            let issue = read_issue(&result);
+            if let Some(node) = result.tree.find(abs) {
                 let totals = result.tree.node(node).total;
-                return Ok((abs, totals, result.tree, gap));
+                return Ok((totals, result.tree, issue));
             }
             notes.push(format!(
                 "{} was not in the scan of its parent {}: scanned it alone",
                 abs.display(),
                 parent.display()
             ));
-            gap
+            notes.extend(issue);
         }
         Walk::Itself(note) => {
             notes.extend(note);
-            None
         }
-        Walk::ParentUnreadable(why) => {
-            notes.push(format!("{why}; scanned {} alone", abs.display()));
-            Some(why)
-        }
-    };
-    let result = scan(&abs)?;
-    let gap = parent_gap.or_else(|| coverage_gap(&result));
-    Ok((abs, result.totals(), result.tree, gap))
+    }
+    let result = scan(abs)?;
+    let issue = read_issue(&result);
+    Ok((result.totals(), result.tree, issue))
 }
 
 fn run_plan(args: PlanArgs) -> Result<u8> {

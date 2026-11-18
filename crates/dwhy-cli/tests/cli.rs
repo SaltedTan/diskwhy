@@ -1239,7 +1239,7 @@ fn explain_a_finding_by_path() {
         "· cargo-target · rebuildable",
         "guards:",
         "in-use-cwd",
-        "growth: unknown",
+        "no eligible snapshot (one filesystem, at least an hour old) lists this finding",
         "action (",
         "recovery:",
         "how:  cargo build",
@@ -1381,6 +1381,25 @@ fn explain_an_unknown_id_suggests_the_path() {
     let (_t, root) = cargo_fixture();
     let state = tempfile::tempdir().unwrap();
     let st = state.path();
+    let out = Command::new(env!("CARGO_BIN_EXE_dwhy"))
+        .args([
+            "explain",
+            "f_000000000000",
+            "-q",
+            "--detectors",
+            "cargo-target",
+        ])
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("cannot find snapshots") && err.contains("dwhy explain <path>"),
+        "{err}"
+    );
+
     // No snapshots at all, then one that does not list the id.
     for _ in 0..2 {
         let out = dwhy_in(
@@ -1479,12 +1498,15 @@ fn explain_an_id_through_a_snapshot_then_when_it_is_gone() {
     assert_eq!(v["finding"], Value::Null);
     assert_eq!(
         v["notes"],
-        serde_json::json!(["could not check: detector cargo-target not selected by --detectors"])
+        serde_json::json!([
+            format!("still present at {target}, but not detected now"),
+            "detector cargo-target not selected by --detectors"
+        ])
     );
     let out = dwhy_in(st, &["explain", &id, "-q", "--detectors", "stale-tree"]);
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
-        text.contains(&format!("could not verify whether finding {id} is gone")),
+        text.contains(&format!("still present at {target}, but not detected now")),
         "{text}"
     );
 
@@ -1499,10 +1521,12 @@ fn explain_an_id_through_a_snapshot_then_when_it_is_gone() {
         }
 
         let path = Path::new(&target);
-        for (locked, mode) in [
-            (path, 0o000),
-            (path.parent().unwrap(), 0o311),
-            (path.parent().unwrap(), 0o000),
+        let debug = path.join("debug");
+        for (locked, mode, present) in [
+            (debug.as_path(), 0o000, true),
+            (path, 0o000, true),
+            (path.parent().unwrap(), 0o311, true),
+            (path.parent().unwrap(), 0o000, false),
         ] {
             let _restore = Restore(locked, fs::metadata(locked).unwrap().permissions());
             fs::set_permissions(locked, fs::Permissions::from_mode(mode)).unwrap();
@@ -1514,10 +1538,23 @@ fn explain_an_id_through_a_snapshot_then_when_it_is_gone() {
             assert!(
                 report["notes"].as_array().unwrap().iter().any(|n| {
                     n.as_str().is_some_and(|s| {
-                        s.starts_with("could not check: ") && s.contains(locked.to_str().unwrap())
+                        s.contains(locked.to_str().unwrap())
+                            && if present {
+                                s.contains("could not be read") || s.contains("cannot open")
+                            } else {
+                                s.starts_with("could not check: ")
+                            }
                     })
                 }),
                 "{report}"
+            );
+            assert_eq!(
+                report["notes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n == &format!("still present at {target}, but not detected now")),
+                present
             );
         }
     }
@@ -1567,11 +1604,19 @@ fn explain_an_id_through_a_snapshot_then_when_it_is_gone() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains(&format!("finding {id} is gone")), "{text}");
 
-    // Gone with the directory still there: what is at the path now.
+    // The directory is back without any build artifacts.
     fs::create_dir(&target).unwrap();
     fs::write(format!("{target}/leftover"), b"x").unwrap();
     let v = json_of(&explain(&["--json"]));
-    assert_eq!(v["gone"], true);
+    assert_eq!(v["gone"], false);
+    assert_eq!(v["finding"], Value::Null);
+    assert_eq!(
+        v["notes"],
+        serde_json::json!([
+            format!("still present at {target}, but not detected now"),
+            "it may be below the detector's size or age threshold, covered by a finding above it, or need context above the walked directory"
+        ])
+    );
     assert!(v["size"]["apparent"].as_u64().unwrap() >= 1, "{v}");
     assert_eq!(v["inside"], serde_json::json!([]));
 
@@ -1701,23 +1746,70 @@ fn explain_uses_full_snapshot_times_and_matching_growth_coverage() {
 }
 
 #[test]
-fn explain_reads_a_path_with_non_utf8_bytes() {
+fn explain_rejects_non_utf8_paths() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
     let data = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
-    let path = data.path().join(OsStr::from_bytes(b"file\xff"));
-    fs::write(&path, b"seven!!").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_dwhy"))
-        .arg("explain")
-        .arg(&path)
-        .args(["-q", "--json", "--detectors", "cargo-target"])
-        .env("XDG_STATE_HOME", state.path())
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(0), "{out:?}");
-    let report = json_of(&out);
-    assert_eq!(report["resolved"]["via"], "path");
-    assert_eq!(report["size"]["apparent"], 7);
+    let path = data.path().join(OsStr::from_bytes(b"dir\xff"));
+    fs::create_dir(&path).unwrap();
+    fs::write(path.join("file"), b"x").unwrap();
+    symlink(&path, data.path().join("link")).unwrap();
+    for (arg, cwd) in [
+        (path.as_path(), data.path()),
+        (Path::new("file"), path.as_path()),
+        (Path::new("link/file"), data.path()),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_dwhy"))
+            .arg("explain")
+            .arg(arg)
+            .args(["-q", "--json", "--detectors", "cargo-target"])
+            .current_dir(cwd)
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(out.stdout.is_empty());
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            text.contains("explain needs a UTF-8 path (diskwhy/v1 reports paths as UTF-8)"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn explain_does_not_alias_a_lossy_finding_to_a_utf8_path() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (_data, root) = cargo_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let app = Path::new(&root).join("app");
+    fs::rename(
+        app.join("target"),
+        app.join(OsStr::from_bytes(b"target\xff")),
+    )
+    .unwrap();
+    let other = app.join("target�");
+    fs::create_dir(&other).unwrap();
+
+    for path in [other, app] {
+        let out = dwhy_in(
+            state.path(),
+            &[
+                "explain",
+                path.to_str().unwrap(),
+                "-q",
+                "--json",
+                "--detectors",
+                "cargo-target",
+            ],
+        );
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let report = json_of(&out);
+        assert_eq!(report["finding"], Value::Null);
+        assert_eq!(report["inside"], serde_json::json!([]));
+    }
 }

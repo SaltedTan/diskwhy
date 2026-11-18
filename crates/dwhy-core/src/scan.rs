@@ -175,7 +175,7 @@ pub fn prepare_roots(paths: &[PathBuf], one_filesystem: bool) -> Result<Vec<Path
     Ok(kept.into_iter().map(|(p, _)| p).collect())
 }
 
-pub(crate) fn absolute_nofollow(p: &Path) -> io::Result<PathBuf> {
+pub fn absolute_nofollow(p: &Path) -> io::Result<PathBuf> {
     let abs = std::path::absolute(p)?;
     match (abs.parent(), abs.file_name()) {
         (Some(parent), Some(name)) => Ok(fs::canonicalize(parent)?.join(name)),

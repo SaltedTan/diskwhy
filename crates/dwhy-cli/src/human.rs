@@ -308,14 +308,8 @@ pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
     let Some(f) = &r.finding else {
         writeln!(w)?;
         if r.gone {
-            writeln!(
-                w,
-                "finding {} is gone: no detector reports it at {} now",
-                r.query, r.path
-            )?;
-        } else if r.resolved.via == dwhy_core::report::ExplainVia::Id {
-            writeln!(w, "could not verify whether finding {} is gone", r.query)?;
-        } else {
+            writeln!(w, "finding {} is gone", r.query)?;
+        } else if r.resolved.via == dwhy_core::report::ExplainVia::Path {
             writeln!(w, "no detector claims this path")?;
         }
         if let Some(s) = &r.size {
@@ -392,7 +386,7 @@ pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
         )?,
         None => writeln!(
             w,
-            "growth: unknown (no snapshot an hour or more old lists this finding)"
+            "growth: unknown (no eligible snapshot (one filesystem, at least an hour old) lists this finding)"
         )?,
     }
 
