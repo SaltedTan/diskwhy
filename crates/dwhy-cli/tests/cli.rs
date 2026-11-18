@@ -1469,6 +1469,59 @@ fn explain_an_id_through_a_snapshot_then_when_it_is_gone() {
     assert!(text.contains("resolved through snapshot"), "{text}");
     assert_eq!(state_listing(st), state_before, "explain writes no state");
 
+    let out = dwhy_in(
+        st,
+        &["explain", &id, "-q", "--json", "--detectors", "stale-tree"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["gone"], false);
+    assert_eq!(v["finding"], Value::Null);
+    assert_eq!(
+        v["notes"],
+        serde_json::json!(["could not check: detector cargo-target not selected by --detectors"])
+    );
+    let out = dwhy_in(st, &["explain", &id, "-q", "--detectors", "stale-tree"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!("could not verify whether finding {id} is gone")),
+        "{text}"
+    );
+
+    if dwhy_core::system::euid() != 0 {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Restore<'a>(&'a Path, fs::Permissions);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(self.0, self.1.clone());
+            }
+        }
+
+        let path = Path::new(&target);
+        for (locked, mode) in [
+            (path, 0o000),
+            (path.parent().unwrap(), 0o311),
+            (path.parent().unwrap(), 0o000),
+        ] {
+            let _restore = Restore(locked, fs::metadata(locked).unwrap().permissions());
+            fs::set_permissions(locked, fs::Permissions::from_mode(mode)).unwrap();
+            let out = explain(&["--json"]);
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            let report = json_of(&out);
+            assert_eq!(report["gone"], false);
+            assert_eq!(report["finding"], Value::Null);
+            assert!(
+                report["notes"].as_array().unwrap().iter().any(|n| {
+                    n.as_str().is_some_and(|s| {
+                        s.starts_with("could not check: ") && s.contains(locked.to_str().unwrap())
+                    })
+                }),
+                "{report}"
+            );
+        }
+    }
+
     // Make the snapshot two hours old, from when the finding was 1 MiB smaller.
     let path = saved["path"].as_str().unwrap();
     let mut snap = dwhy_core::snapshot::load(Path::new(path)).unwrap();
@@ -1522,6 +1575,149 @@ fn explain_an_id_through_a_snapshot_then_when_it_is_gone() {
     assert!(v["size"]["apparent"].as_u64().unwrap() >= 1, "{v}");
     assert_eq!(v["inside"], serde_json::json!([]));
 
+    let parent = Path::new(&target).parent().unwrap();
+    fs::remove_dir_all(parent).unwrap();
+    fs::write(parent, b"now a file").unwrap();
+    let out = explain(&["--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["gone"], true);
+    assert_eq!(v["finding"], Value::Null);
+
     // explain writes nothing in the state dir.
     assert_eq!(state_listing(st), state_before);
+}
+
+#[test]
+fn explain_finds_a_nested_scratch_directory_by_path_and_id() {
+    let data = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let parent = fs::canonicalize(data.path()).unwrap().join("scratch");
+    let child = parent.join("child");
+    fs::create_dir_all(&child).unwrap();
+    fs::write(parent.join(".dwhy-scratch"), b"").unwrap();
+    fs::write(child.join(".dwhy-scratch"), b"").unwrap();
+    fs::write(child.join("data"), vec![1; 2 << 20]).unwrap();
+    age_tree(&child, 8 * 86_400);
+
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "scan",
+            parent.to_str().unwrap(),
+            "-q",
+            "--json",
+            "--snapshot",
+            "--detectors",
+            "stale-tree",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let scan = json_of(&out);
+    let saved = &scan["findings"][0];
+    assert_eq!(saved["path"], child.to_str().unwrap());
+    let id = saved["id"].as_str().unwrap();
+    age_tree(&parent, 8 * 86_400);
+
+    for arg in [child.to_str().unwrap(), id] {
+        let out = dwhy_in(
+            state.path(),
+            &["explain", arg, "-q", "--json", "--detectors", "stale-tree"],
+        );
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let report = json_of(&out);
+        assert_eq!(report["finding"]["id"], id, "{report}");
+        assert_eq!(report["gone"], false);
+    }
+}
+
+#[test]
+fn explain_uses_full_snapshot_times_and_matching_growth_coverage() {
+    let (_data, root) = cargo_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let target = format!("{root}/app/target");
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "scan",
+            &root,
+            "-q",
+            "--json",
+            "--snapshot",
+            "--detectors",
+            "cargo-target",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let scan = json_of(&out);
+    let id = scan["findings"][0]["id"].as_str().unwrap();
+    let path = Path::new(scan["snapshot"]["path"].as_str().unwrap());
+    let mut snap = dwhy_core::snapshot::load(path).unwrap();
+    fs::remove_file(path).unwrap();
+
+    let now = time::OffsetDateTime::now_utc();
+    let t = now.replace_nanosecond(0).unwrap() - time::Duration::hours(2);
+    let timestamp = |t: time::OffsetDateTime| {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    snap.created_at = timestamp(t + time::Duration::milliseconds(900));
+    let newest_one_fs =
+        dwhy_core::snapshot::save(path.parent().unwrap(), &snap, now.unix_timestamp()).unwrap();
+    let growth_since = snap.created_at.clone();
+    snap.created_at = timestamp(t + time::Duration::milliseconds(100));
+    dwhy_core::snapshot::save(path.parent().unwrap(), &snap, now.unix_timestamp()).unwrap();
+
+    let explain = |arg: &str| {
+        let out = dwhy_in(
+            state.path(),
+            &[
+                "explain",
+                arg,
+                "-q",
+                "--json",
+                "--detectors",
+                "cargo-target",
+            ],
+        );
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        json_of(&out)
+    };
+    let report = explain(id);
+    assert_eq!(
+        report["resolved"]["snapshot"]["id"],
+        newest_one_fs.snapshot.id
+    );
+    assert_eq!(report["finding"]["growth"]["since"], growth_since);
+
+    snap.scan.one_filesystem = false;
+    snap.created_at = timestamp(t + time::Duration::minutes(1));
+    let cross_fs =
+        dwhy_core::snapshot::save(path.parent().unwrap(), &snap, now.unix_timestamp()).unwrap();
+    let report = explain(id);
+    assert_eq!(report["resolved"]["snapshot"]["id"], cross_fs.snapshot.id);
+    assert_eq!(report["finding"]["growth"]["since"], growth_since);
+    assert_eq!(explain(&target)["finding"]["growth"]["since"], growth_since);
+}
+
+#[test]
+fn explain_reads_a_path_with_non_utf8_bytes() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let data = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let path = data.path().join(OsStr::from_bytes(b"file\xff"));
+    fs::write(&path, b"seven!!").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_dwhy"))
+        .arg("explain")
+        .arg(&path)
+        .args(["-q", "--json", "--detectors", "cargo-target"])
+        .env("XDG_STATE_HOME", state.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let report = json_of(&out);
+    assert_eq!(report["resolved"]["via"], "path");
+    assert_eq!(report["size"]["apparent"], 7);
 }

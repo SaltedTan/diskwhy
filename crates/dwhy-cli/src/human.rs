@@ -313,6 +313,8 @@ pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
                 "finding {} is gone: no detector reports it at {} now",
                 r.query, r.path
             )?;
+        } else if r.resolved.via == dwhy_core::report::ExplainVia::Id {
+            writeln!(w, "could not verify whether finding {} is gone", r.query)?;
         } else {
             writeln!(w, "no detector claims this path")?;
         }

@@ -4,20 +4,19 @@
 //! CLI rescans, runs the detectors, the probes and the guards; nothing here
 //! writes.
 
+use std::ffi::OsStr;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use crate::mounts::MountTable;
-use crate::report::{DetectorAvailability, DetectorRun, Finding, FindingRef};
-use crate::snapshot::{self, Found};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
-/// The detectors a `docker://` pseudo-path can come from.
-pub const DOCKER_DETECTORS: &[&str] = &[
-    "docker-image",
-    "docker-build-cache",
-    "docker-container",
-    "docker-volume",
-];
+use crate::detect::{self, CATALOG, Needs};
+use crate::mounts::MountTable;
+use crate::report::{
+    DetectorAvailability, DetectorRun, ExplainSnapshot, Finding, FindingRef, Snapshot,
+    SnapshotFinding,
+};
+use crate::snapshot::{self, Entry};
 
 /// What `dwhy explain` was asked about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,18 +47,20 @@ pub fn is_finding_id(arg: &str) -> bool {
         })
 }
 
-pub fn classify(arg: &str) -> Query {
-    if is_finding_id(arg) {
-        Query::Id(arg.to_string())
+pub fn classify(arg: impl AsRef<OsStr>) -> Query {
+    let arg = arg.as_ref();
+    if let Some(id) = arg.to_str().filter(|s| is_finding_id(s)) {
+        Query::Id(id.to_owned())
     } else {
         Query::Place(place(arg))
     }
 }
 
 /// A finding's path (as a snapshot records it) or a path argument.
-pub fn place(path: &str) -> Place {
-    if path.starts_with("docker://") {
-        Place::Docker(path.to_string())
+pub fn place(path: impl AsRef<OsStr>) -> Place {
+    let path = path.as_ref();
+    if let Some(pseudo) = path.to_str().filter(|s| s.starts_with("docker://")) {
+        Place::Docker(pseudo.to_owned())
     } else {
         Place::Path(PathBuf::from(path))
     }
@@ -75,6 +76,7 @@ pub enum Walk {
     /// The path itself, with a note when that is because the parent could
     /// not be used.
     Itself(Option<String>),
+    ParentUnreadable(String),
 }
 
 /// Decides what to walk for `abs`, an absolute path whose parent is
@@ -84,82 +86,119 @@ pub enum Walk {
 /// (its parent is on another filesystem, or it is a bind mount, which the
 /// walk would not enter), or its parent cannot be opened.
 pub fn walk_for(abs: &Path, mounts: &MountTable) -> Walk {
+    if mounts.at(abs).is_some() {
+        return Walk::Itself(Some(format!(
+            "{} is a mount point; scanned it alone",
+            abs.display()
+        )));
+    }
     let Ok(md) = std::fs::symlink_metadata(abs) else {
         // The scan of the path reports the error.
         return Walk::Itself(None);
     };
-    let Some(parent) = abs.parent().filter(|_| md.is_dir()) else {
+    let Some(parent) = abs.parent() else {
         return Walk::Itself(None);
     };
-    let alone = |why: String| {
-        Walk::Itself(Some(format!(
-            "{why}: scanned {} alone, so detectors that recognise it from its parent may miss it",
+    let parent_md = std::fs::symlink_metadata(parent);
+    if parent_md.as_ref().is_ok_and(|pmd| pmd.dev() != md.dev()) {
+        return Walk::Itself(Some(format!(
+            "{} is a mount point and its parent is on another filesystem; scanned it alone",
             abs.display()
-        )))
-    };
-    let open = std::fs::symlink_metadata(parent).and_then(|pmd| {
-        std::fs::read_dir(parent)?;
-        Ok(pmd)
-    });
-    match open {
-        Ok(pmd) if pmd.dev() != md.dev() || mounts.at(abs).is_some() => alone(format!(
-            "{} is a mount point and its parent is another filesystem",
-            abs.display()
-        )),
+        )));
+    }
+    if !md.is_dir() {
+        return Walk::Itself(None);
+    }
+    match parent_md.and_then(|_| std::fs::read_dir(parent)) {
         Ok(_) => Walk::Parent(parent.to_path_buf()),
-        Err(e) => alone(format!("cannot open its parent {}: {e}", parent.display())),
+        Err(e) => {
+            Walk::ParentUnreadable(format!("cannot open its parent {}: {e}", parent.display()))
+        }
     }
 }
 
-/// The newest snapshot in `dir` of `host` and `uid`, created at or before
-/// `cutoff` (seconds since the epoch), whose findings include `id`, whatever
-/// its roots. Snapshots that cannot be read are skipped; the first such
-/// error comes back alongside.
+struct Listing {
+    entry: Entry,
+    snapshot: Snapshot,
+    finding: SnapshotFinding,
+}
+
+/// The newest snapshot listing `id` for this host and uid. A growth
+/// cutoff also limits the search to one-filesystem snapshots.
 fn newest_listing(
     dir: &Path,
     host: &str,
     uid: u32,
     id: &str,
-    cutoff: i64,
-) -> Result<(Option<Found>, Option<String>), String> {
+    cutoff: Option<OffsetDateTime>,
+) -> Result<(Option<Listing>, Option<String>), String> {
     let mut first_err = None;
-    for e in snapshot::list(dir)?.iter().rev() {
-        if e.created > cutoff {
+    let mut newest: Option<(OffsetDateTime, Listing)> = None;
+    for entry in snapshot::list(dir)?.into_iter().rev() {
+        if cutoff.is_some_and(|c| entry.created > c.unix_timestamp()) {
             continue;
         }
-        let s = match snapshot::load(&e.path) {
+        if newest
+            .as_ref()
+            .is_some_and(|(t, _)| entry.created < t.unix_timestamp())
+        {
+            break;
+        }
+        let s = match snapshot::load(&entry.path) {
             Ok(s) => s,
             Err(err) => {
                 first_err.get_or_insert(err);
                 continue;
             }
         };
-        if s.host == host && s.uid == uid && s.findings.iter().any(|f| f.id == id) {
-            let found = Found {
-                id: Some(e.id.clone()),
-                path: e.path.clone(),
-                snapshot: s,
-            };
-            return Ok((Some(found), first_err));
+        if s.host != host || s.uid != uid || (cutoff.is_some() && !s.scan.one_filesystem) {
+            continue;
+        }
+        let Some(finding) = s.findings.iter().find(|f| f.id == id).cloned() else {
+            continue;
+        };
+        let Ok(created) = OffsetDateTime::parse(&s.created_at, &Rfc3339) else {
+            first_err.get_or_insert_with(|| {
+                format!(
+                    "{}: bad created_at {:?}",
+                    entry.path.display(),
+                    s.created_at
+                )
+            });
+            continue;
+        };
+        if cutoff.is_none_or(|c| created <= c) && newest.as_ref().is_none_or(|(t, _)| created > *t)
+        {
+            newest = Some((
+                created,
+                Listing {
+                    entry,
+                    snapshot: s,
+                    finding,
+                },
+            ));
         }
     }
-    Ok((None, first_err))
+    Ok((newest.map(|(_, listing)| listing), first_err))
 }
 
 /// Turns a finding id into its path: the newest snapshot of this host and
 /// uid that lists it, and the finding's path there.
-pub fn resolve_id(dir: &Path, host: &str, uid: u32, id: &str) -> Result<(Found, String), String> {
-    match newest_listing(dir, host, uid, id, i64::MAX)? {
-        (Some(found), _) => {
-            let path = found
-                .snapshot
-                .findings
-                .iter()
-                .find(|f| f.id == id)
-                .map(|f| f.path.clone())
-                .unwrap_or_default();
-            Ok((found, path))
-        }
+pub fn resolve_id(
+    dir: &Path,
+    host: &str,
+    uid: u32,
+    id: &str,
+) -> Result<(ExplainSnapshot, SnapshotFinding), String> {
+    match newest_listing(dir, host, uid, id, None)? {
+        (Some(found), _) => Ok((
+            ExplainSnapshot {
+                id: found.entry.id,
+                path: found.entry.path.to_string_lossy().into_owned(),
+                created_at: found.snapshot.created_at,
+            },
+            found.finding,
+        )),
         (None, err) => {
             let mut msg = format!(
                 "no snapshot lists finding {id}; run `dwhy explain <path>` with its path, \
@@ -175,40 +214,50 @@ pub fn resolve_id(dir: &Path, host: &str, uid: u32, id: &str) -> Result<(Found, 
 
 /// The snapshot to measure a finding's growth from: the newest at least
 /// [`crate::growth::MIN_AGE_SECS`] old at `now` that lists `id`, whatever
-/// its roots (a finding's bytes do not depend on the scan root). Best
-/// effort: `None` when there is none or the directory cannot be read.
-pub fn growth_base(dir: &Path, host: &str, uid: u32, id: &str, now: i64) -> Option<Found> {
-    newest_listing(dir, host, uid, id, now - crate::growth::MIN_AGE_SECS)
-        .ok()?
-        .0
+/// its roots, from snapshots that walked one filesystem. Best effort:
+/// `None` when there is none or the directory cannot be read.
+pub fn growth_base(dir: &Path, host: &str, uid: u32, id: &str, now: &str) -> Option<Snapshot> {
+    let cutoff =
+        OffsetDateTime::parse(now, &Rfc3339).ok()? - Duration::seconds(crate::growth::MIN_AGE_SECS);
+    let (found, _) = newest_listing(dir, host, uid, id, Some(cutoff)).ok()?;
+    Some(found?.snapshot)
 }
 
 /// `--detectors` for a `docker://` query: the Docker detectors, limited
 /// to `only` when given.
 pub fn docker_selection(only: Option<&[String]>) -> Vec<String> {
-    DOCKER_DETECTORS
+    CATALOG
         .iter()
-        .filter(|d| only.is_none_or(|o| o.iter().any(|n| n == *d)))
-        .map(|d| d.to_string())
+        .filter(|d| d.needs == Needs::Docker && only.is_none_or(|o| o.iter().any(|n| n == d.name)))
+        .map(|d| d.name.to_string())
         .collect()
 }
 
 /// Picks the finding explained from a rescan's `findings`: the one with
-/// `id` when given, else the first (largest) at `path`. When there is none,
+/// `id` when given, else the cheapest tier at `path`. When there is none,
 /// also lists the findings at or below `path`, largest first.
 pub fn pick(
     mut findings: Vec<Finding>,
     path: &str,
     id: Option<&str>,
 ) -> (Option<Finding>, Vec<FindingRef>) {
-    let at = findings.iter().position(|f| match id {
-        Some(id) => f.id == id,
-        None => f.path == path,
-    });
+    let at = match id {
+        Some(id) => findings.iter().position(|f| f.id == id),
+        None => findings
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.path == path)
+            .min_by(|(_, a), (_, b)| {
+                a.tier
+                    .cmp(&b.tier)
+                    .then_with(|| a.detector.cmp(&b.detector))
+            })
+            .map(|(i, _)| i),
+    };
     if let Some(i) = at {
         return (Some(findings.swap_remove(i)), Vec::new());
     }
-    let inside = findings
+    let inside = detect::outermost(findings)
         .iter()
         .filter(|f| within(&f.path, path))
         .map(finding_ref)
@@ -253,6 +302,20 @@ pub fn detector_notes(runs: &[DetectorRun], only: Option<&[String]>) -> Vec<Stri
         ));
     }
     notes
+}
+
+pub fn detector_gap(runs: &[DetectorRun], only: Option<&[String]>, name: &str) -> Option<String> {
+    if only.is_some_and(|o| !o.iter().any(|n| n == name)) {
+        return Some(format!("detector {name} not selected by --detectors"));
+    }
+    match runs.iter().find(|r| r.name == name) {
+        Some(r) if !r.ran => Some(format!("detector {name} did not run: {}", r.detail)),
+        Some(r) => r
+            .error
+            .as_ref()
+            .map(|e| format!("detector {name} failed: {e}")),
+        None => Some(format!("detector {name} is unknown")),
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +389,15 @@ mod tests {
     }
 
     #[test]
+    fn classifies_non_utf8_as_a_native_path() {
+        use std::os::unix::ffi::OsStrExt;
+        for bytes in [b"f_0123456789a\xff".as_slice(), b"docker://volume/\xff"] {
+            let arg = OsStr::from_bytes(bytes);
+            assert_eq!(classify(arg), Query::Place(Place::Path(arg.into())));
+        }
+    }
+
+    #[test]
     fn walks_the_parent_of_a_directory() {
         let t = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
@@ -337,22 +409,31 @@ mod tests {
         // A file, a missing path and / are walked themselves, with no note.
         assert_eq!(walk_for(&root.join("file"), &mounts), Walk::Itself(None));
         assert_eq!(walk_for(&root.join("nope"), &mounts), Walk::Itself(None));
-        assert_eq!(walk_for(Path::new("/"), &mounts), Walk::Itself(None));
+        assert_eq!(
+            walk_for(Path::new("/"), &MountTable::default()),
+            Walk::Itself(None)
+        );
     }
 
     #[test]
     fn walks_a_mount_point_itself_with_a_note() {
         let mounts = MountTable::read().unwrap_or_default();
-        let Some(m) = mounts.mounts.iter().find(|m| {
-            m.mount_point.starts_with("/dev/")
-                && std::fs::symlink_metadata(&m.mount_point).is_ok_and(|md| md.is_dir())
-        }) else {
-            return;
-        };
-        let Walk::Itself(Some(note)) = walk_for(&m.mount_point, &mounts) else {
-            panic!("{} is a mount point", m.mount_point.display());
-        };
-        assert!(note.contains("is a mount point"), "{note}");
+        for is_dir in [true, false] {
+            let Some(m) = mounts.mounts.iter().find(|m| {
+                m.mount_point.starts_with("/dev/")
+                    && std::fs::symlink_metadata(&m.mount_point)
+                        .is_ok_and(|md| md.is_dir() == is_dir)
+            }) else {
+                continue;
+            };
+            assert_eq!(
+                walk_for(&m.mount_point, &mounts),
+                Walk::Itself(Some(format!(
+                    "{} is a mount point; scanned it alone",
+                    m.mount_point.display()
+                )))
+            );
+        }
     }
 
     #[test]
@@ -374,7 +455,7 @@ mod tests {
         // Searchable, not readable: the path can be statted, its parent not listed.
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311)).unwrap();
         let _restore = Restore(parent.clone());
-        let Walk::Itself(Some(note)) =
+        let Walk::ParentUnreadable(note) =
             walk_for(&parent.join("app"), &MountTable::read().unwrap_or_default())
         else {
             panic!("the parent cannot be opened");
@@ -416,16 +497,31 @@ mod tests {
         assert_eq!(got.unwrap().detector, "docker-volume");
         let (got, inside) = pick(all(), "docker://volume/w", None);
         assert!(got.is_none() && inside.is_empty());
+
+        let nested = vec![
+            f("stale-tree", "/p/app/scratch", 100),
+            f("stale-tree", "/p/app/scratch/child", 50),
+        ];
+        let (got, inside) = pick(nested, "/p/app", None);
+        assert!(got.is_none());
+        assert_eq!(inside.len(), 1);
+        assert_eq!(inside[0].path, "/p/app/scratch");
     }
 
     #[test]
     fn docker_selection_intersects_with_detectors() {
-        assert_eq!(docker_selection(None).len(), 4);
+        assert_eq!(
+            docker_selection(None),
+            [
+                "docker-image",
+                "docker-build-cache",
+                "docker-container",
+                "docker-volume"
+            ]
+        );
         let only = vec!["cargo-target".to_string(), "docker-volume".to_string()];
         assert_eq!(docker_selection(Some(&only)), ["docker-volume"]);
         assert!(docker_selection(Some(&only[..1])).is_empty());
-        let names: Vec<String> = DOCKER_DETECTORS.iter().map(|d| d.to_string()).collect();
-        assert!(crate::detect::validate_selection(&names).is_ok());
     }
 
     #[test]
@@ -469,5 +565,14 @@ mod tests {
         );
         let only = vec!["cargo-target".to_string()];
         assert!(detector_notes(&runs, Some(&only)).is_empty());
+        assert_eq!(detector_gap(&runs, Some(&only), "cargo-target"), None);
+        assert_eq!(
+            detector_gap(&runs, Some(&only), "docker-image").as_deref(),
+            Some("detector docker-image not selected by --detectors")
+        );
+        assert_eq!(
+            detector_gap(&runs, None, "docker-image").as_deref(),
+            Some("detector docker-image failed: no answer")
+        );
     }
 }

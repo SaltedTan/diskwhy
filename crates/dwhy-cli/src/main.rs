@@ -21,8 +21,8 @@ use dwhy_core::guard::Processes;
 use dwhy_core::mounts::{self, MountTable};
 use dwhy_core::plan::{self, Selection};
 use dwhy_core::report::{
-    ActionKind, ExplainReport, ExplainResolved, ExplainSize, ExplainSnapshot, ExplainVia, Plan,
-    PlanScan, SavedSnapshot, ScanReport, Tier,
+    ActionKind, ExplainReport, ExplainResolved, ExplainSize, ExplainVia, Plan, PlanScan,
+    SavedSnapshot, ScanReport, Tier, Totals,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::tree::ScanTree;
@@ -185,7 +185,7 @@ struct WatchArgs {
 struct ExplainArgs {
     /// A finding id (f_…, looked up in the snapshots), a path, or a pseudo-path
     /// such as docker://volume/NAME.
-    target: String,
+    target: PathBuf,
     /// Print diskwhy/v1 JSON instead of text.
     #[arg(long)]
     json: bool,
@@ -658,124 +658,99 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
     let mut notes = Vec::new();
 
     // A finding id becomes the path it had in the newest snapshot listing it.
-    let (place, want, snap) = match explain::classify(&args.target) {
+    let (place, saved, snap) = match explain::classify(&args.target) {
         Query::Id(id) => {
             let dir = dir.as_deref().ok_or(
                 "cannot find snapshots: neither XDG_STATE_HOME nor HOME is an absolute path",
             )?;
-            let (found, path) = explain::resolve_id(dir, &host, uid, &id)?;
-            let snap = ExplainSnapshot {
-                id: found.id.clone().unwrap_or_default(),
-                path: found.path.to_string_lossy().into_owned(),
-                created_at: found.snapshot.created_at.clone(),
-            };
-            (explain::place(&path), Some(id), Some(snap))
+            let (snap, found) = explain::resolve_id(dir, &host, uid, &id)?;
+            (explain::place(&found.path), Some(found), Some(snap))
         }
         Query::Place(p) => (p, None, None),
     };
 
-    // The tree the detectors read and their selection; `None` when the
-    // finding's path no longer exists, so there is nothing to detect.
+    let generated_at = system::now_rfc3339();
     let ctx = DetectContext::from_system();
     let mut size = None;
-    let (path, examine) = match place {
+    let mut gap = None;
+    let (path, tree, only) = match place {
         // Docker objects are not on the walked filesystem: an empty tree.
         Place::Docker(p) => {
             let only = explain::docker_selection(args.detectors.as_deref());
             if only.is_empty() {
                 notes.push("no Docker detector selected (--detectors)".into());
             }
-            (p, Some((ScanTree::default(), Some(only))))
+            (p, ScanTree::default(), Some(only))
         }
-        Place::Path(p)
-            if want.is_some()
-                && matches!(std::fs::symlink_metadata(&p),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            notes.push(format!("{} no longer exists", p.display()));
-            (p.to_string_lossy().into_owned(), None)
-        }
-        // The parent is walked, one level up on one filesystem, so detectors
-        // that recognise the path from its parent see it; the path itself
-        // when that cannot be done (explain::walk_for).
-        Place::Path(p) => {
-            let mounts = MountTable::read().unwrap_or_default();
-            let abs = scan::prepare_roots(std::slice::from_ref(&p), true)?
-                .pop()
-                .ok_or_else(|| format!("{}: nothing to scan", p.display()))?;
-            let scan = |root: &PathBuf| {
-                measure(
-                    std::slice::from_ref(root),
-                    true,
-                    u64::MAX,
-                    args.threads,
-                    args.quiet,
-                    &mounts,
+        Place::Path(p) => match explain_path(&p, &args, &mut notes) {
+            Ok((abs, totals, tree, scan_gap)) => {
+                size = Some(ExplainSize {
+                    allocated: totals.allocated,
+                    apparent: totals.apparent,
+                });
+                gap = scan_gap;
+                (
+                    abs.to_string_lossy().into_owned(),
+                    tree,
+                    args.detectors.clone(),
                 )
-            };
-            let mut walked = None;
-            match explain::walk_for(&abs, &mounts) {
-                Walk::Parent(parent) => {
-                    let result = scan(&parent)?;
-                    match result.tree.find(&abs) {
-                        Some(node) => {
-                            let n = result.tree.node(node);
-                            walked = Some((n.total, result.tree));
-                        }
-                        None => notes.push(format!(
-                            "{} was not in the scan of its parent {}: scanned it alone",
-                            abs.display(),
-                            parent.display()
-                        )),
-                    }
-                }
-                Walk::Itself(note) => notes.extend(note),
             }
-            let (totals, tree) = match walked {
-                Some(w) => w,
-                None => {
-                    let result = scan(&abs)?;
-                    let root = result
-                        .roots
-                        .first()
-                        .ok_or_else(|| format!("{}: nothing scanned", p.display()))?;
-                    (root.totals, result.tree)
+            Err(e) => {
+                let Some(saved) = &saved else {
+                    return Err(e.into());
+                };
+                use std::io::ErrorKind::{NotADirectory, NotFound};
+                if matches!(&e, scan::ScanError::Root { source, .. }
+                    if matches!(source.kind(), NotFound | NotADirectory))
+                {
+                    notes.push(format!("{} no longer exists", p.display()));
+                } else {
+                    gap = Some(e.to_string());
                 }
-            };
-            size = Some(ExplainSize {
-                allocated: totals.allocated,
-                apparent: totals.apparent,
-            });
-            let abs = abs.to_string_lossy().into_owned();
-            (abs, Some((tree, args.detectors.clone())))
-        }
+                let only = [saved.detector.clone()]
+                    .into_iter()
+                    .filter(|name| args.detectors.as_ref().is_none_or(|o| o.contains(name)))
+                    .collect();
+                (
+                    p.to_string_lossy().into_owned(),
+                    ScanTree::default(),
+                    Some(only),
+                )
+            }
+        },
     };
-    let tree = examine.as_ref().map(|(t, _)| t);
 
-    let (mut finding, inside) = match &examine {
-        Some((tree, only)) => {
-            let (findings, runs) = detect::run_with(
-                tree,
-                &ctx,
-                &dwhy_core::detectors::registry(),
-                only.as_deref(),
-            );
-            notes.extend(explain::detector_notes(&runs, only.as_deref()));
-            explain::pick(findings, &path, want.as_deref())
+    let (findings, runs) = detect::run_candidates(
+        &tree,
+        &ctx,
+        &dwhy_core::detectors::registry(),
+        only.as_deref(),
+    );
+    notes.extend(explain::detector_notes(&runs, only.as_deref()));
+    let (mut finding, inside) =
+        explain::pick(findings, &path, saved.as_ref().map(|f| f.id.as_str()));
+    let mut gone = false;
+    if let Some(saved) = &saved
+        && finding.is_none()
+    {
+        if let Some(reason) =
+            gap.or_else(|| explain::detector_gap(&runs, only.as_deref(), &saved.detector))
+        {
+            notes.push(format!("could not check: {reason}"));
+        } else {
+            gone = true;
         }
-        None => (None, Vec::new()),
-    };
-    let generated_at = system::now_rfc3339();
-    if let (Some(f), Some(tree)) = (finding.as_mut(), tree) {
+    }
+    if let Some(f) = &mut finding {
         let one = std::slice::from_mut(f);
         probes::run(one, &ctx);
         let status = status_line(args.quiet, "checking guards…");
-        dwhy_core::guard::check(one, tree, &ctx, &Processes::read());
+        dwhy_core::guard::check(one, &tree, &ctx, &Processes::read());
         drop(status);
         if let Some(dir) = &dir
-            && let Some(base) = explain::growth_base(dir, &host, uid, &one[0].id, now_secs())
+            && let Some(base) = explain::growth_base(dir, &host, uid, &one[0].id, &generated_at)
         {
-            growth::fill_growth(one, &base.snapshot, &generated_at);
+            growth::fill_growth(one, &base, &generated_at);
         }
     }
     let report = ExplainReport {
@@ -784,9 +759,9 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
         host,
         uid,
         generated_at,
-        query: args.target.clone(),
+        query: args.target.to_string_lossy().into_owned(),
         resolved: ExplainResolved {
-            via: if want.is_some() {
+            via: if saved.is_some() {
                 ExplainVia::Id
             } else {
                 ExplainVia::Path
@@ -794,7 +769,7 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
             snapshot: snap,
         },
         path,
-        gone: want.is_some() && finding.is_none(),
+        gone,
         finding,
         size,
         inside,
@@ -808,6 +783,67 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
         human::render_explain(&mut out, &report)?;
     }
     Ok(EXIT_OK)
+}
+
+fn explain_path(
+    path: &PathBuf,
+    args: &ExplainArgs,
+    notes: &mut Vec<String>,
+) -> std::result::Result<(PathBuf, Totals, ScanTree, Option<String>), scan::ScanError> {
+    let mounts = MountTable::read().unwrap_or_default();
+    let abs = scan::prepare_roots(std::slice::from_ref(path), true)?
+        .pop()
+        .expect("one path gives one scan root");
+    let scan = |root: &PathBuf| {
+        measure(
+            std::slice::from_ref(root),
+            true,
+            u64::MAX,
+            args.threads,
+            args.quiet,
+            &mounts,
+        )
+    };
+    let coverage_gap = |result: &scan::ScanResult| {
+        result
+            .unreadable
+            .iter()
+            .map(|u| u.path.as_path())
+            .chain(result.errors.iter().map(|(p, _)| p.as_path()))
+            .find(|p| abs.starts_with(p))
+            .map(|p| format!("{} could not be read", p.display()))
+            .or_else(|| {
+                (result.error_count > result.errors.len() as u64)
+                    .then(|| "the scan has unrecorded errors".to_string())
+            })
+    };
+    let parent_gap = match explain::walk_for(&abs, &mounts) {
+        Walk::Parent(parent) => {
+            let result = scan(&parent)?;
+            let gap = coverage_gap(&result);
+            if let Some(node) = result.tree.find(&abs) {
+                let totals = result.tree.node(node).total;
+                return Ok((abs, totals, result.tree, gap));
+            }
+            notes.push(format!(
+                "{} was not in the scan of its parent {}: scanned it alone",
+                abs.display(),
+                parent.display()
+            ));
+            gap
+        }
+        Walk::Itself(note) => {
+            notes.extend(note);
+            None
+        }
+        Walk::ParentUnreadable(why) => {
+            notes.push(format!("{why}; scanned {} alone", abs.display()));
+            Some(why)
+        }
+    };
+    let result = scan(&abs)?;
+    let gap = parent_gap.or_else(|| coverage_gap(&result));
+    Ok((abs, result.totals(), result.tree, gap))
 }
 
 fn run_plan(args: PlanArgs) -> Result<u8> {
@@ -1050,7 +1086,7 @@ fn measure(
     threads: usize,
     quiet: bool,
     mounts: &MountTable,
-) -> Result<scan::ScanResult> {
+) -> std::result::Result<scan::ScanResult, scan::ScanError> {
     let paths = if paths.is_empty() {
         vec![PathBuf::from(".")]
     } else {
@@ -1098,7 +1134,7 @@ fn measure(
     if let Some(t) = ticker {
         let _ = t.join();
     }
-    Ok(result?)
+    result
 }
 
 fn run_doctor(json: bool) -> Result<u8> {

@@ -948,7 +948,7 @@ pub struct ExplainReport {
     pub tool: Tool,
     pub host: String,
     pub uid: u32,
-    /// When the rescan finished, RFC 3339 (UTC).
+    /// When the rescan began, RFC 3339 (UTC).
     pub generated_at: String,
     /// The argument as given: a finding id, a path or a `docker://` pseudo-path.
     pub query: String,
@@ -958,11 +958,11 @@ pub struct ExplainReport {
     pub path: String,
     /// The finding at `path` (with the id asked for, when `query` is an id),
     /// with guards, growth and probe evidence filled in. `None` when no
-    /// detector claims the path, or when the finding is `gone`.
+    /// finding matched.
     #[serde(default)]
     pub finding: Option<Finding>,
-    /// True when `query` named a finding id a snapshot lists, and the
-    /// rescan no longer reports it.
+    /// True when `query` named a saved finding id and the rescan verified
+    /// that its detector no longer reports it.
     #[serde(default)]
     pub gone: bool,
     /// What is at a filesystem `path` now; absent for pseudo-paths and for a
