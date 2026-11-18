@@ -18,7 +18,7 @@
 //!   and the query inside
 //!   `BEGIN READ ONLY`, under a timeout ([`EXEC_TIMEOUT`]).
 //!
-//! When `docker` is not available or psql fails, the evidence comes from
+//! When exec or psql fails, the evidence comes from
 //! the GETs alone (`source: api-only`): settings from the container's
 //! command line and archive failures from the log tail.
 //!
@@ -49,8 +49,6 @@ pub const LOG_TAIL: u32 = 200;
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long one Engine API GET may take.
 pub const API_TIMEOUT: Duration = Duration::from_secs(10);
-/// Containers inspected at most when looking for a network alias.
-const MAX_ALIAS_INSPECTS: usize = 64;
 /// WAL at least this large and [`WAL_RATIO`] times the data, with archiving
 /// on, is worth advice even when the archiver reports no failure.
 const BIG_WAL: u64 = 1 << 30;
@@ -152,6 +150,7 @@ pub fn psql_argv(
     db: &str,
     sql: &str,
 ) -> Vec<String> {
+    let db = format!("dbname='{}'", db.replace('\\', "\\\\").replace('\'', "\\'"));
     [
         docker,
         "-H",
@@ -164,6 +163,12 @@ pub fn psql_argv(
         // Empty: the local socket, never a server PGHOST names.
         "-e",
         "PGHOST=",
+        "-e",
+        "PGHOSTADDR=",
+        "-e",
+        "PGSERVICE=",
+        "-e",
+        "PGSERVICEFILE=/dev/null",
         container_id,
         "psql",
         "-X",
@@ -178,7 +183,7 @@ pub fn psql_argv(
         "-U",
         user,
         "-d",
-        db,
+        &db,
         "-c",
         "BEGIN READ ONLY",
         "-c",
@@ -251,33 +256,22 @@ pub fn applies_to(f: &Finding) -> bool {
 
 /// For `dwhy doctor`.
 pub fn availability(ctx: &DetectContext) -> (DetectorAvailability, String) {
-    let sock = &ctx.docker_socket;
-    if !sock.exists {
+    let volume = crate::detect::CATALOG
+        .iter()
+        .find(|info| info.name == "docker-volume")
+        .expect("docker-volume is in the detector catalog");
+    let (status, detail) = crate::detect::availability(volume, ctx);
+    if status != DetectorAvailability::Available {
         return (
-            DetectorAvailability::Unavailable,
-            format!("no Docker socket at {}", sock.path),
+            status,
+            format!("docker-volume findings unavailable: {detail}"),
         );
     }
-    if !sock.accessible {
-        return (
-            DetectorAvailability::Unavailable,
-            format!(
-                "cannot use {} (not root and not in the docker group)",
-                sock.path
-            ),
-        );
-    }
-    match ctx.tool_command("docker") {
-        Some(_) => (
-            DetectorAvailability::Available,
-            "reads the Engine API and runs read-only psql queries through `docker exec`".into(),
-        ),
-        None => (
-            DetectorAvailability::Degraded,
-            "`docker` is not installed: evidence comes from the Engine API and logs only (api-only)"
-                .into(),
-        ),
-    }
+    (
+        DetectorAvailability::Available,
+        "uses docker-volume findings, the Engine API and read-only psql through `docker exec`"
+            .into(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -444,19 +438,6 @@ impl Inspects {
     }
 }
 
-/// The evidence for `volume`, when a running container has it at its
-/// Postgres data directory.
-pub fn probe_volume_with(volume: &str, docker: &dyn Docker) -> Result<Option<PostgresWal>, String> {
-    let listed: Vec<Listed> = serde_json::from_slice(&docker.get("/containers/json?all=1")?)
-        .map_err(|e| format!("docker API /containers/json: {e}"))?;
-    Ok(probe_volume(
-        volume,
-        &listed,
-        docker,
-        &mut Inspects::default(),
-    ))
-}
-
 fn probe_volume(
     volume: &str,
     listed: &[Listed],
@@ -476,12 +457,15 @@ fn probe_volume(
             continue;
         }
         let pgdata = insp.env("PGDATA").unwrap_or(DEFAULT_PGDATA);
-        let at_data_dir = insp.mounts.iter().any(|m| {
-            m.kind == "volume"
-                && m.name == volume
-                && m.destination.starts_with('/')
-                && Path::new(pgdata).starts_with(Path::new(&m.destination))
-        });
+        let at_data_dir = insp
+            .mounts
+            .iter()
+            .filter(|m| {
+                m.destination.starts_with('/')
+                    && Path::new(pgdata).starts_with(Path::new(&m.destination))
+            })
+            .max_by_key(|m| Path::new(&m.destination).components().count())
+            .is_some_and(|m| m.kind == "volume" && m.name == volume);
         if at_data_dir {
             return Some(gather(&insp, listed, docker, cache));
         }
@@ -550,7 +534,7 @@ fn gather(
         .unwrap_or_default();
     ev.targets = hosts
         .into_iter()
-        .map(|h| resolve_target(&h, project.as_deref(), &insp.id, listed, docker, cache))
+        .map(|h| resolve_target(&h, project.as_deref(), listed, docker, cache))
         .collect();
     ev
 }
@@ -822,11 +806,10 @@ fn is_ip(h: &str) -> bool {
 }
 
 /// Matches `host` with a container by name, Compose service or network
-/// alias, preferring one of the same Compose project, then a running one.
+/// alias, preferring a running one, then one of the same Compose project.
 fn resolve_target(
     host: &str,
     project: Option<&str>,
-    self_id: &str,
     listed: &[Listed],
     docker: &dyn Docker,
     cache: &mut Inspects,
@@ -836,32 +819,31 @@ fn resolve_target(
         container: None,
         state: "unresolved".into(),
     };
-    if host == "localhost" || is_ip(host) {
-        return unresolved();
-    }
     let rank = |c: &Listed| {
         (
-            project.is_some() && c.label(COMPOSE_PROJECT) == project,
             c.state == "running",
+            project.is_some() && c.label(COMPOSE_PROJECT) == project,
         )
     };
-    let mut matches: Vec<&Listed> = listed
-        .iter()
-        .filter(|c| {
-            c.names.iter().any(|n| n.trim_start_matches('/') == host)
-                || c.label(COMPOSE_SERVICE) == Some(host)
-        })
-        .collect();
-    if matches.is_empty() {
-        for c in listed.iter().take(MAX_ALIAS_INSPECTS) {
-            if c.id != self_id
-                && cache
-                    .get(docker, &c.id)
-                    .is_some_and(|i| i.aliases().any(|a| a == host))
-            {
-                matches.push(c);
+    let mut matches = Vec::new();
+    let mut incomplete = false;
+    for c in listed {
+        let aliases_match = match cache.get(docker, &c.id) {
+            Some(i) => i.aliases().any(|a| a == host),
+            None => {
+                incomplete = true;
+                false
             }
+        };
+        if c.names.iter().any(|n| n.trim_start_matches('/') == host)
+            || c.label(COMPOSE_SERVICE) == Some(host)
+            || aliases_match
+        {
+            matches.push(c);
         }
+    }
+    if incomplete {
+        return unresolved();
     }
     matches.sort_by_key(|c| std::cmp::Reverse(rank(c)));
     match matches.first() {
@@ -870,9 +852,7 @@ fn resolve_target(
             container: Some(name_of(&c.names, &c.id)),
             state: c.state.clone(),
         },
-        // A dotted name is likely DNS outside Docker; a bare one names a
-        // container or service that is not there.
-        None if host.contains('.') => unresolved(),
+        None if host.contains('.') || host == "localhost" || is_ip(host) => unresolved(),
         None => ArchiveTarget {
             host: host.into(),
             container: None,
@@ -931,8 +911,8 @@ fn date(rfc: &str) -> &str {
 }
 
 /// The one-line diagnosis that leads the finding's reason, e.g. "pg_wal
-/// holds 29G vs 53M data; archive_command failing 151x since 2026-11-07
-/// (target s3test exited)".
+/// holds 29G vs 53M data; archive_command has failed 151x (last failure
+/// 2026-11-15, last success 2026-11-07) (target s3test exited)".
 pub fn diagnosis(ev: &PostgresWal) -> String {
     let mut parts = Vec::new();
     match (ev.wal_bytes, ev.data_bytes) {
@@ -940,16 +920,22 @@ pub fn diagnosis(ev: &PostgresWal) -> String {
         (Some(w), None) => parts.push(format!("pg_wal holds {}", human(w))),
         _ => {}
     }
-    if failing(ev) {
+    if ev.source == EvidenceSource::ApiOnly && ev.failed_count.is_none() {
+        parts.push(format!(
+            "archive failures unknown ({})",
+            ev.notes.join("; ")
+        ));
+    } else if failing(ev) {
         let n = ev.failed_count.unwrap_or(0);
-        let mut s = format!("archive_command failing {n}x");
+        let mut s = format!("archive_command has failed {n}x");
         if ev.source == EvidenceSource::ApiOnly {
             s.push_str(&format!(" in the last {LOG_TAIL} log lines"));
         } else {
-            match &ev.last_archived_at {
-                Some(a) => s.push_str(&format!(" since {}", date(a))),
-                None => s.push_str(", nothing archived yet"),
-            }
+            s.push_str(&format!(
+                " (last failure {}, last success {})",
+                ev.last_failed_at.as_deref().map(date).unwrap_or("unknown"),
+                ev.last_archived_at.as_deref().map(date).unwrap_or("none"),
+            ));
         }
         let dead = dead_targets(ev);
         if !dead.is_empty() {
@@ -1040,10 +1026,8 @@ pub fn summary(ev: &PostgresWal) -> String {
         bits.push(format!("archive target {}", t.join(", ")));
     }
     let mut s = bits.join(", ");
-    if ev.source == EvidenceSource::ApiOnly
-        && let Some(n) = ev.notes.first()
-    {
-        s.push_str(&format!(" ({n})"));
+    if ev.source == EvidenceSource::ApiOnly && !ev.notes.is_empty() {
+        s.push_str(&format!(" ({})", ev.notes.join("; ")));
     }
     s
 }
@@ -1147,7 +1131,18 @@ mod tests {
         assert!(
             s.contains(&"PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=10s")
         );
-        assert!(s.contains(&"PGHOST="), "local socket only");
+        for setting in [
+            "PGHOST=",
+            "PGHOSTADDR=",
+            "PGSERVICE=",
+            "PGSERVICEFILE=/dev/null",
+        ] {
+            assert!(s.windows(2).any(|w| w == ["-e", setting]), "{setting}");
+        }
+        assert_eq!(
+            s[s.iter().position(|x| *x == "-d").unwrap() + 1],
+            "dbname='appdb'"
+        );
         // No terminal and no stdin for docker exec (psql's own -t comes after "psql").
         let psql = s.iter().position(|x| *x == "psql").unwrap();
         assert!(
@@ -1160,6 +1155,26 @@ mod tests {
         assert!(begin < q);
         assert!(s.contains(&"-X") && s.contains(&"-w"));
         assert_eq!(s[s.iter().position(|x| *x == "-U").unwrap() + 1], "app");
+    }
+
+    #[test]
+    fn psql_database_is_a_literal_libpq_name() {
+        for (db, expected) in [
+            ("appdb", "dbname='appdb'"),
+            ("x host=10.0.0.5", "dbname='x host=10.0.0.5'"),
+            (
+                r"x\' host=10.0.0.5 options='-c default_transaction_read_only=off'",
+                r"dbname='x\\\' host=10.0.0.5 options=\'-c default_transaction_read_only=off\''",
+            ),
+            (
+                "postgresql://10.0.0.5/app",
+                "dbname='postgresql://10.0.0.5/app'",
+            ),
+        ] {
+            let a = psql_argv("docker", "/run/d.sock", "abc", "app", db, QUERY);
+            let d = a.iter().position(|x| x == "-d").unwrap();
+            assert_eq!(a[d + 1], expected);
+        }
     }
 
     #[test]

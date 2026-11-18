@@ -32,6 +32,6 @@ expression: ev
   ],
   "source": "api-only",
   "notes": [
-    "psql not used: `docker` is not installed"
+    "psql not used: docker exec psql failed"
   ]
 }

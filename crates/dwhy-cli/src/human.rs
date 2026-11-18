@@ -892,7 +892,7 @@ mod tests {
             ActionKind::Advice,
         );
         f.probe = Some("postgres-wal".into());
-        f.reason = "pg_wal holds 29.0G vs 53.0M data; archive_command failing 151x since 2026-11-07 (target s3test exited); volume pg holds 30.0G".into();
+        f.reason = "pg_wal holds 29.0G vs 53.0M data; archive_command has failed 151x (last failure 2026-11-13, last success 2026-11-07) (target s3test exited); volume pg holds 30.0G".into();
         f.action.text =
             "restore the archive target s3test; WAL is freed at the next checkpoint".into();
         f.evidence = Some(Evidence {

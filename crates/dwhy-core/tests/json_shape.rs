@@ -741,7 +741,7 @@ fn probed_finding() -> Finding {
         last_modified: Some("2026-11-13T02:10:00Z".into()),
         growth: None,
         tier: Tier::Review,
-        reason: "pg_wal holds 29G vs 53M data; archive_command failing 151x since 2026-11-07 \
+        reason: "pg_wal holds 29G vs 53M data; archive_command has failed 151x (last failure 2026-11-13, last success 2026-11-07) \
                  (target s3test exited); volume example_postgres_data holds 30.8G and is mounted \
                  by example-postgres-1 (running)"
             .into(),
@@ -812,7 +812,7 @@ fn api_only_evidence_shape() {
     ev.data_bytes = None;
     ev.last_archived_at = None;
     ev.source = EvidenceSource::ApiOnly;
-    ev.notes = vec!["psql not used: `docker` is not installed".into()];
+    ev.notes = vec!["psql not used: docker exec psql failed".into()];
     insta::assert_json_snapshot!(ev);
 }
 

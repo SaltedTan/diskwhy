@@ -196,7 +196,7 @@ fn failing_archiver_with_an_exited_target() {
     assert!(ev.notes.is_empty(), "{:?}", ev.notes);
     assert!(
         f.reason.starts_with(
-            "pg_wal holds 29.0G vs 53.0M data; archive_command failing 151x since 2026-11-07 \
+            "pg_wal holds 29.0G vs 53.0M data; archive_command has failed 151x (last failure 2026-11-15, last success 2026-11-07) \
              (target s3test (pgwal-s3test-1) exited); volume pgwal_pg_data holds"
         ),
         "{}",
@@ -333,7 +333,7 @@ fn psql_failure_falls_back_to_the_api_and_the_log_tail() {
     );
     assert!(
         f.reason.starts_with(&format!(
-            "archive_command failing 3x in the last {LOG_TAIL} log lines (target s3test (pgwal-s3test-1) exited)"
+            "archive_command has failed 3x in the last {LOG_TAIL} log lines (target s3test (pgwal-s3test-1) exited)"
         )),
         "{}",
         f.reason
@@ -351,7 +351,7 @@ fn psql_failure_falls_back_to_the_api_and_the_log_tail() {
 #[test]
 fn api_only_takes_the_command_from_the_log_when_the_command_line_has_none() {
     let mut fake = Fake::recorded("psql-failing.txt");
-    fake.psql = Err("`docker` is not installed".into());
+    fake.psql = Err("docker exec psql failed".into());
     // archive settings in postgresql.conf instead of on the command line
     fake.edit(&format!("/containers/{PG}/json"), |v| {
         v["Args"] = serde_json::json!(["postgres"]);
@@ -374,7 +374,7 @@ fn api_only_takes_the_command_from_the_log_when_the_command_line_has_none() {
 #[test]
 fn api_only_with_an_unreadable_log_says_so() {
     let mut fake = Fake::recorded("psql-failing.txt");
-    fake.psql = Err("`docker` is not installed".into());
+    fake.psql = Err("docker exec psql failed".into());
     fake.gets.retain(|k, _| !k.contains("/logs"));
     let f = probe(&fake);
     let ev = evidence(&f);
@@ -385,7 +385,16 @@ fn api_only_with_an_unreadable_log_says_so() {
         "{:?}",
         ev.notes
     );
-    // Nothing shows a failure, so the detector's advice stays.
+    assert!(
+        f.reason.contains("archive failures unknown"),
+        "{}",
+        f.reason
+    );
+    assert!(f.reason.contains("log tail not read: 404"), "{}", f.reason);
+    assert!(!f.reason.contains("no archive failures"), "{}", f.reason);
+    let summary = postgres_wal::summary(ev);
+    assert!(summary.contains("log tail not read: 404"), "{summary}");
+    assert!(summary.contains("psql not used:"), "{summary}");
     assert_eq!(f.action, volume_finding(VOLUME).action);
 }
 
@@ -507,4 +516,241 @@ fn log_frames_are_demultiplexed() {
     cut.extend_from_slice(b"de");
     assert_eq!(demux_logs(&cut), b"abcde");
     assert_eq!(demux_logs(b""), b"");
+}
+
+#[test]
+fn special_hosts_match_identifiers_before_becoming_unresolved() {
+    for host in ["archive.example.com", "127.0.0.1", "localhost", "::1"] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        let url = if host == "::1" {
+            format!("http://[{host}]:9000")
+        } else {
+            format!("http://{host}:9000")
+        };
+        let output = fake
+            .psql
+            .as_ref()
+            .unwrap()
+            .replace("http://s3test:9000", &url);
+        fake.psql = Ok(output);
+        let f = probe(&fake);
+        assert_eq!(
+            evidence(&f).targets[0],
+            ArchiveTarget {
+                host: host.into(),
+                container: None,
+                state: "unresolved".into(),
+            }
+        );
+        assert!(!f.reason.contains("(target"), "{}", f.reason);
+        assert!(f.action.text.starts_with("fix archive_command"));
+    }
+    for identifier in ["name", "service", "alias", "dns-name"] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        fake.psql = Ok(fake
+            .psql
+            .as_ref()
+            .unwrap()
+            .replace("s3test:9000", "archive.example.com:9000"));
+        match identifier {
+            "name" => fake.edit_listed(S3, |v| {
+                v["Names"] = serde_json::json!(["/archive.example.com"])
+            }),
+            "service" => fake.edit_listed(S3, |v| {
+                v["Labels"]["com.docker.compose.service"] = "archive.example.com".into()
+            }),
+            field => fake.edit(&format!("/containers/{S3}/json"), |v| {
+                let key = if field == "alias" {
+                    "Aliases"
+                } else {
+                    "DNSNames"
+                };
+                v["NetworkSettings"]["Networks"]["pgwal_default"][key] =
+                    serde_json::json!(["archive.example.com"]);
+            }),
+        }
+        let f = probe(&fake);
+        assert_eq!(evidence(&f).targets[0].state, "exited", "{identifier}");
+        assert!(
+            f.reason.contains("(target archive.example.com"),
+            "{}",
+            f.reason
+        );
+    }
+}
+
+#[test]
+fn running_alias_wins_over_an_exited_name_or_service() {
+    for identifier in ["name", "service"] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        fake.edit_listed(S3, |v| {
+            v["Names"] = serde_json::json!(["/old-archive"]);
+            v["Labels"]["com.docker.compose.service"] = "old-archive".into();
+            if identifier == "name" {
+                v["Names"] = serde_json::json!(["/s3test"]);
+            } else {
+                v["Labels"]["com.docker.compose.service"] = "s3test".into();
+            }
+        });
+        fake.edit(&format!("/containers/{APP}/json"), |v| {
+            v["NetworkSettings"]["Networks"] = serde_json::json!({
+                "pgwal_default": { "Aliases": ["s3test"] }
+            });
+        });
+        let f = probe(&fake);
+        assert_eq!(
+            evidence(&f).targets[0].container.as_deref(),
+            Some("other-app-1")
+        );
+        assert_eq!(evidence(&f).targets[0].state, "running");
+        assert!(f.action.text.starts_with("fix archive_command"));
+    }
+}
+
+#[test]
+fn alias_lookup_checks_containers_beyond_the_old_limit() {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    fake.edit_listed(S3, |v| {
+        v["Names"] = serde_json::json!(["/minio-dev"]);
+        v["Labels"] = serde_json::json!({});
+    });
+    for n in 0..65 {
+        let id = format!("unrelated-{n}");
+        fake.edit("/containers/json?all=1", |v| {
+            v.as_array_mut().unwrap().insert(
+                0,
+                serde_json::json!({
+                    "Id": id, "Names": [format!("/{id}")], "State": "running"
+                }),
+            );
+        });
+        fake.set_json(
+            &format!("/containers/{id}/json"),
+            serde_json::json!({"Id": id}),
+        );
+    }
+    let f = probe(&fake);
+    assert_eq!(
+        evidence(&f).targets[0].container.as_deref(),
+        Some("minio-dev")
+    );
+    assert_eq!(evidence(&f).targets[0].state, "exited");
+}
+
+#[test]
+fn incomplete_inspection_never_proves_a_dead_or_missing_target() {
+    for present in [false, true] {
+        for invalid_json in [false, true] {
+            let mut fake = Fake::recorded("psql-failing.txt");
+            if !present {
+                fake.remove_container(S3);
+            }
+            let response = if invalid_json {
+                Ok(b"not json".to_vec())
+            } else {
+                Err("inspection denied".into())
+            };
+            fake.gets
+                .insert(format!("/containers/{APP}/json"), response);
+            let f = probe(&fake);
+            assert_eq!(evidence(&f).targets[0].state, "unresolved");
+            assert_eq!(evidence(&f).targets[0].container, None);
+            assert!(!f.reason.contains("(target"), "{}", f.reason);
+            assert!(f.action.text.starts_with("fix archive_command"));
+        }
+    }
+}
+
+#[test]
+fn only_the_deepest_mount_owns_the_postgres_evidence() {
+    for kind in ["volume", "bind", "tmpfs"] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        let edit = |v: &mut Value| {
+            v["Mounts"][0]["Destination"] = "/var/lib/postgresql".into();
+            v["Mounts"].as_array_mut().unwrap().push(serde_json::json!({
+                "Type": kind, "Name": "inner-data", "Destination": "/var/lib/postgresql/data"
+            }));
+        };
+        fake.edit_listed(PG, edit);
+        fake.edit(&format!("/containers/{PG}/json"), edit);
+        let f = probe(&fake);
+        assert_untouched(&f);
+        assert!(!fake.asked_for("psql"), "{kind}");
+        if kind == "volume" {
+            let mut findings = vec![volume_finding(VOLUME), volume_finding("inner-data")];
+            postgres_wal::probe_all(&mut findings, &fake);
+            assert_untouched(&findings[0]);
+            assert_eq!(evidence(&findings[1]).container, "pgwal-postgres-1");
+        }
+    }
+}
+
+#[test]
+fn an_empty_readable_log_tail_reports_zero_failures() {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    fake.psql = Err("docker exec psql failed".into());
+    fake.gets.insert(
+        format!("/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}"),
+        Ok(Vec::new()),
+    );
+    let f = probe(&fake);
+    assert_eq!(evidence(&f).failed_count, Some(0));
+    assert!(
+        f.reason
+            .starts_with("no archive failures in the last 200 log lines"),
+        "{}",
+        f.reason
+    );
+    assert_eq!(f.action, volume_finding(VOLUME).action);
+}
+
+#[test]
+fn doctor_requires_the_volume_detectors_docker_cli() {
+    use dwhy_core::{detect::DetectContext, probes};
+    let mut ctx = DetectContext {
+        uid: 1000,
+        root: false,
+        home: None,
+        now: 0,
+        tools: Vec::new(),
+        docker_socket: DockerSocket {
+            path: "/fixture/docker.sock".into(),
+            exists: true,
+            accessible: true,
+        },
+        docker: dwhy_core::docker::Source::none(),
+    };
+    let status = probes::statuses(&ctx).pop().unwrap();
+    assert_eq!(status.status, DetectorAvailability::Unavailable);
+    assert!(
+        status.detail.contains("`docker` is not installed"),
+        "{}",
+        status.detail
+    );
+    ctx.tools.push(ToolStatus {
+        name: "docker".into(),
+        path: None,
+        off_path: Some("/fixture/bin/docker".into()),
+        enables: vec![],
+    });
+    assert_eq!(
+        probes::statuses(&ctx)[0].status,
+        DetectorAvailability::Unavailable
+    );
+    ctx.tools[0].path = Some("/fixture/bin/docker".into());
+    assert_eq!(
+        probes::statuses(&ctx)[0].status,
+        DetectorAvailability::Available
+    );
+    ctx.docker_socket.exists = false;
+    assert_eq!(
+        probes::statuses(&ctx)[0].status,
+        DetectorAvailability::Unavailable
+    );
+    ctx.docker_socket.exists = true;
+    ctx.docker_socket.accessible = false;
+    assert_eq!(
+        probes::statuses(&ctx)[0].status,
+        DetectorAvailability::Unavailable
+    );
 }
