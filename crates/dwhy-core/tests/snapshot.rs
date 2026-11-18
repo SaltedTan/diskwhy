@@ -65,6 +65,7 @@ fn finding(path: &str, bytes: u64) -> Finding {
         id: dwhy_core::detect::finding_id("cargo-target", path),
         detector: "cargo-target".into(),
         probe: None,
+        evidence: None,
         path: path.into(),
         bytes,
         nested_bytes: None,

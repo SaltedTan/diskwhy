@@ -1,0 +1,28 @@
+---
+source: crates/dwhy-core/tests/json_shape.rs
+expression: ev
+---
+{
+  "container": "example-postgres-1",
+  "wal_bytes": null,
+  "data_bytes": null,
+  "failed_count": 151,
+  "last_archived_at": null,
+  "last_failed_at": "2026-11-13T02:10:00Z",
+  "last_failed_wal": "000000010000000000000097",
+  "archive_mode": "on",
+  "archive_program": "aws",
+  "archive_timeout": "10s",
+  "targets": [
+    {
+      "host": "s3test",
+      "container": "example-s3test-1",
+      "state": "exited"
+    }
+  ],
+  "unmatched_hosts": 2,
+  "source": "api-only",
+  "notes": [
+    "psql not used: psql failed"
+  ]
+}

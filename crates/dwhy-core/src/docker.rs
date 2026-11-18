@@ -1,8 +1,8 @@
 //! Read-only access to the Docker Engine API over its unix socket.
 //!
-//! Only `GET /system/df` and `GET /info` are used. They give exact byte
-//! counts (the CLI's `docker system df` prints rounded strings). Removal
-//! commands that findings suggest use the docker CLI instead.
+//! The Docker usage snapshot uses `GET /system/df` and `GET /info` for
+//! exact byte counts (the CLI's `docker system df` prints rounded strings).
+//! Docker findings use the CLI for removal commands.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -209,9 +209,23 @@ pub struct Api {
     pub timeout: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub enum GetError {
+    Http(u16, String),
+    Other(String),
+}
+
+impl std::fmt::Display for GetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(_, detail) | Self::Other(detail) => f.write_str(detail),
+        }
+    }
+}
+
 impl Api {
-    pub fn get(&self, path: &str) -> Result<Vec<u8>, String> {
-        let err = |e: std::io::Error| format!("{}: {e}", self.socket.display());
+    pub fn get(&self, path: &str) -> Result<Vec<u8>, GetError> {
+        let err = |e: std::io::Error| GetError::Other(format!("{}: {e}", self.socket.display()));
         let mut s = UnixStream::connect(&self.socket).map_err(err)?;
         s.set_read_timeout(Some(self.timeout)).map_err(err)?;
         s.set_write_timeout(Some(self.timeout)).map_err(err)?;
@@ -226,34 +240,46 @@ impl Api {
                 e.kind(),
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
             ) {
-                format!("docker API {path}: no response within {:?}", self.timeout)
+                GetError::Other(format!(
+                    "docker API {path}: no response within {:?}",
+                    self.timeout
+                ))
             } else {
                 err(e)
             }
         })?;
-        parse_http(&raw).map_err(|e| format!("docker API {path}: {e}"))
+        parse_http(&raw, path)
     }
 }
 
-fn parse_http(raw: &[u8]) -> Result<Vec<u8>, String> {
+fn parse_http(raw: &[u8], path: &str) -> Result<Vec<u8>, GetError> {
+    let other = |detail| GetError::Other(format!("docker API {path}: {detail}"));
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .ok_or("truncated response")?;
+        .ok_or_else(|| other("truncated response".to_string()))?;
     let head = String::from_utf8_lossy(&raw[..split]);
     let body = &raw[split + 4..];
     let status = head.lines().next().unwrap_or("");
-    let code = status.split_whitespace().nth(1).unwrap_or("");
-    if code != "200" {
+    let code = status
+        .strip_prefix("HTTP/")
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .filter(|code| (100..=599).contains(code))
+        .ok_or_else(|| other("invalid HTTP status".to_string()))?;
+    if code != 200 {
         let msg = String::from_utf8_lossy(body);
-        return Err(format!("{status}: {}", msg.trim()));
+        return Err(GetError::Http(
+            code,
+            format!("docker API {path}: {status}: {}", msg.trim()),
+        ));
     }
     let chunked = head.lines().any(|l| {
         let l = l.to_ascii_lowercase();
         l.starts_with("transfer-encoding:") && l.contains("chunked")
     });
     if chunked {
-        dechunk(body)
+        dechunk(body).map_err(other)
     } else {
         Ok(body.to_vec())
     }
@@ -276,6 +302,32 @@ fn dechunk(mut b: &[u8]) -> Result<Vec<u8>, String> {
         out.extend_from_slice(&b[..size]);
         b = b.get(size + 2..).ok_or("truncated chunk")?;
     }
+}
+
+/// The text of a `GET /containers/{id}/logs` body for a container without a
+/// TTY: the daemon multiplexes stdout and stderr in frames, each with an
+/// 8-byte header (stream byte, three zero bytes, big-endian payload
+/// length). The payloads are joined in order.
+pub fn demux_logs(mut raw: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(raw.len());
+    while !raw.is_empty() {
+        let Some((header, rest)) = raw.split_at_checked(8) else {
+            return Err("truncated Docker log header".into());
+        };
+        if !matches!(header[0], 1..=3) || header[1..4] != [0, 0, 0] {
+            return Err("invalid Docker log header".into());
+        }
+        let len = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let Some((payload, remaining)) = rest.split_at_checked(len) else {
+            return Err("truncated Docker log payload".into());
+        };
+        if header[0] == 3 {
+            return Err("Docker log stream error".into());
+        }
+        out.extend_from_slice(payload);
+        raw = remaining;
+    }
+    Ok(out)
 }
 
 /// One Docker snapshot per run, fetched on first use and shared by all
@@ -327,10 +379,11 @@ impl Source {
         self.cell
             .get_or_init(|| {
                 let api = self.api.as_ref().ok_or("no Docker socket configured")?;
-                let df = parse_system_df(&api.get("/system/df")?)
+                let df = parse_system_df(&api.get("/system/df").map_err(|e| e.to_string())?)
                     .map_err(|e| format!("docker API /system/df: {e}"))?;
-                let info: Info = serde_json::from_slice(&api.get("/info")?)
-                    .map_err(|e| format!("docker API /info: {e}"))?;
+                let info: Info =
+                    serde_json::from_slice(&api.get("/info").map_err(|e| e.to_string())?)
+                        .map_err(|e| format!("docker API /info: {e}"))?;
                 Ok(Arc::new(Snapshot { df, info }))
             })
             .clone()
@@ -403,6 +456,8 @@ mod tests {
             timeout: Duration::from_secs(5),
         };
         let e = api.get("/system/df").unwrap_err();
+        assert!(matches!(e, GetError::Http(500, _)));
+        let e = e.to_string();
         assert!(e.contains("500") && e.contains("boom"), "{e}");
 
         let (_d2, slow) = serve(b"");
@@ -410,7 +465,7 @@ mod tests {
             socket: slow,
             timeout: Duration::from_millis(200),
         };
-        let e = api.get("/system/df").unwrap_err();
+        let e = api.get("/system/df").unwrap_err().to_string();
         assert!(e.contains("no response within"), "{e}");
 
         let api = Api {

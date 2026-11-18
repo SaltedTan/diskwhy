@@ -25,7 +25,7 @@ Differences in thresholds: the cleanup removed worktrees with no commit for a we
 
 ## Not covered by M1
 
-- **Postgres WAL (row 1).** The space was not garbage but a symptom: a stuck archiver. Explaining that is the `postgres-wal` probe planned for M3, not a detector.
+- **Postgres WAL (row 1).** The space came from a stuck archiver. See the M3 `postgres-wal` probe in [Decisions taken](DESIGN.md#decisions-taken).
 - **Your own directories (rows 3, 11, 12).** `~/.cache/fr-pg-tools` test clusters, `~/opt/ninfer-all` builds and `~/models` have no tool behind them that says what is safe to remove. A `.dwhy-scratch` file in such a directory makes `stale-tree` report its old contents. A detector for model folders can come after M1.
 
 ## Manual check on pc-ubuntu

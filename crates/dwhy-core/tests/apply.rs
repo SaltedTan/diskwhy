@@ -230,6 +230,7 @@ fn finding(detector: &str, path: &Path, tier: Tier) -> Finding {
         id: finding_id(detector, &path),
         detector: detector.into(),
         probe: None,
+        evidence: None,
         path: path.clone(),
         bytes: 4096,
         nested_bytes: None,

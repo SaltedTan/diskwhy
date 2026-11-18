@@ -1,0 +1,75 @@
+{
+ "Id": "aa11000000000000000000000000000000000000000000000000000000000001",
+ "Created": "2026-11-07T07:00:00.000000000Z",
+ "Path": "docker-entrypoint.sh",
+ "Args": [
+  "postgres",
+  "-c",
+  "archive_mode=on",
+  "-c",
+  "archive_command=aws --endpoint-url http://s3test:9000 s3 cp %p s3://wal/%f",
+  "-c",
+  "archive_timeout=10s"
+ ],
+ "State": {
+  "Status": "running",
+  "Running": true,
+  "ExitCode": 0,
+  "StartedAt": "2026-11-07T07:00:01Z",
+  "FinishedAt": "0001-01-01T00:00:00Z"
+ },
+ "Name": "/pgwal-postgres-1",
+ "Mounts": [
+  {
+   "Type": "volume",
+   "Name": "pgwal_pg_data",
+   "Source": "/var/lib/docker/volumes/pgwal_pg_data/_data",
+   "Destination": "/var/lib/postgresql/data",
+   "Driver": "local",
+   "Mode": "z",
+   "RW": true
+  }
+ ],
+ "Config": {
+  "Hostname": "aa1100000000",
+  "Env": [
+   "POSTGRES_USER=app",
+   "POSTGRES_PASSWORD=secret",
+   "POSTGRES_DB=appdb",
+   "PATH=/usr/local/bin:/usr/bin:/bin",
+   "PG_MAJOR=16",
+   "PGDATA=/var/lib/postgresql/data"
+  ],
+  "Cmd": [
+   "postgres",
+   "-c",
+   "archive_mode=on",
+   "-c",
+   "archive_command=aws --endpoint-url http://s3test:9000 s3 cp %p s3://wal/%f",
+   "-c",
+   "archive_timeout=10s"
+  ],
+  "Image": "x",
+  "Tty": false,
+  "Labels": {
+   "com.docker.compose.project": "pgwal",
+   "com.docker.compose.service": "postgres"
+  }
+ },
+ "NetworkSettings": {
+  "Networks": {
+   "pgwal_default": {
+    "Aliases": [
+     "pgwal-postgres-1",
+     "postgres"
+    ],
+    "DNSNames": [
+     "pgwal-postgres-1",
+     "postgres",
+     "aa1100000000"
+    ],
+    "IPAddress": "172.20.0.2"
+   }
+  }
+ }
+}

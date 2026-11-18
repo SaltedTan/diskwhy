@@ -537,6 +537,7 @@ fn finding(id: &str, bytes: u64) -> Finding {
         id: id.into(),
         detector: "cargo-target".into(),
         probe: None,
+        evidence: None,
         path: format!("/h/{id}"),
         bytes,
         nested_bytes: None,

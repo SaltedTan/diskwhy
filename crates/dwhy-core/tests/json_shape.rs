@@ -119,6 +119,7 @@ fn sample() -> ScanReport {
             id: "f_7c1e".into(),
             detector: "docker-volume".into(),
             probe: Some("postgres-wal".into()),
+            evidence: None,
             path: "docker://volume/example_postgres_data".into(),
             bytes: 33_041_965_056,
             nested_bytes: None,
@@ -245,6 +246,7 @@ fn plan_finding(id: &str, detector: &str, path: &str, tier: Tier, action: Action
         id: id.into(),
         detector: detector.into(),
         probe: None,
+        evidence: None,
         path: path.into(),
         bytes: 9_663_676_416,
         nested_bytes: None,
@@ -726,4 +728,107 @@ fn watch_report_shape() {
         ],
         notes: vec![],
     });
+}
+
+fn probed_finding() -> Finding {
+    Finding {
+        id: "f_7c1e00000000".into(),
+        detector: "docker-volume".into(),
+        probe: Some("postgres-wal".into()),
+        path: "docker://volume/example_postgres_data".into(),
+        bytes: 33_041_965_056,
+        nested_bytes: None,
+        last_modified: Some("2026-11-13T02:10:00Z".into()),
+        growth: None,
+        tier: Tier::Review,
+        reason: "pg_wal holds 29G vs 53M data; archiving is failing, with 151 failures in total (last failure 2026-11-13T02:10:00Z, last success 2026-11-07T07:25:00Z) \
+                 (target s3test exited); volume example_postgres_data holds 30.8G and is mounted \
+                 by example-postgres-1 (running)"
+            .into(),
+        guards: vec![GuardResult {
+            name: "container-mount".into(),
+            status: GuardStatus::Warn,
+            detail: "mounted by example-postgres-1 (running)".into(),
+        }],
+        action: Action {
+            kind: ActionKind::Advice,
+            text: "restore the archive target s3test; WAL is freed at the next checkpoint".into(),
+            argv: None,
+        },
+        recovery: Recovery {
+            cost: "n/a: nothing is removed; Postgres recycles WAL itself".into(),
+            how: None,
+        },
+        evidence: Some(Evidence {
+            postgres_wal: Some(PostgresWal {
+                container: "example-postgres-1".into(),
+                wal_bytes: Some(31_138_512_896),
+                data_bytes: Some(55_574_528),
+                failed_count: Some(151),
+                last_archived_at: Some("2026-11-07T07:25:00Z".into()),
+                last_failed_at: Some("2026-11-13T02:10:00Z".into()),
+                last_failed_wal: Some("000000010000000000000097".into()),
+                archive_mode: Some("on".into()),
+                archive_program: Some("aws".into()),
+                archive_timeout: Some("10s".into()),
+                targets: vec![
+                    ArchiveTarget {
+                        host: "s3test".into(),
+                        container: Some("example-s3test-1".into()),
+                        state: "exited".into(),
+                    },
+                ],
+                unmatched_hosts: 2,
+                source: EvidenceSource::Psql,
+                notes: vec![],
+            }),
+        }),
+    }
+}
+
+#[test]
+fn postgres_wal_evidence_shape() {
+    let f = probed_finding();
+    insta::assert_json_snapshot!(f);
+    let back: Finding = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+    assert_eq!(back, f);
+
+    let mut without_count = serde_json::to_value(&f).unwrap();
+    without_count["evidence"]["postgres_wal"]
+        .as_object_mut()
+        .unwrap()
+        .remove("unmatched_hosts");
+    let back: Finding = serde_json::from_value(without_count.clone()).unwrap();
+    assert_eq!(
+        back.evidence
+            .as_ref()
+            .unwrap()
+            .postgres_wal
+            .as_ref()
+            .unwrap()
+            .unmatched_hosts,
+        0
+    );
+    assert_eq!(serde_json::to_value(&back).unwrap(), without_count);
+}
+
+#[test]
+fn api_only_evidence_shape() {
+    let mut ev = probed_finding().evidence.unwrap().postgres_wal.unwrap();
+    ev.wal_bytes = None;
+    ev.data_bytes = None;
+    ev.last_archived_at = None;
+    ev.source = EvidenceSource::ApiOnly;
+    ev.notes = vec!["psql not used: psql failed".into()];
+    insta::assert_json_snapshot!(ev);
+}
+
+#[test]
+fn findings_without_evidence_have_no_evidence_key() {
+    let mut f = probed_finding();
+    f.evidence = None;
+    let v = serde_json::to_value(&f).unwrap();
+    assert!(v.get("evidence").is_none());
+    let back: Finding = serde_json::from_value(v).unwrap();
+    assert_eq!(back.evidence, None);
 }

@@ -322,6 +322,7 @@ pub struct DeletedOpen {
 pub struct Finding {
     pub id: String,
     pub detector: String,
+    /// The probe that added evidence to this finding, when one did.
     pub probe: Option<String>,
     /// Filesystem path, or a pseudo-path such as `docker://volume/<name>`.
     pub path: String,
@@ -344,6 +345,90 @@ pub struct Finding {
     pub guards: Vec<GuardResult>,
     pub action: Action,
     pub recovery: Recovery,
+    /// Evidence from the probe named in `probe`, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Evidence>,
+}
+
+/// Evidence probes gathered about a finding, one member per probe.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Evidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgres_wal: Option<PostgresWal>,
+}
+
+/// WAL and archiving evidence from the `postgres-wal` probe. See [`EvidenceSource`]
+/// for how it was collected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostgresWal {
+    /// The running Postgres container that mounts the volume.
+    pub container: String,
+    /// Bytes in `pg_wal` (`pg_ls_waldir()`).
+    #[serde(default)]
+    pub wal_bytes: Option<u64>,
+    /// Sum of `pg_database_size` over all databases.
+    #[serde(default)]
+    pub data_bytes: Option<u64>,
+    /// `pg_stat_archiver.failed_count`. With `api-only`, this counts observed
+    /// failures in the log tail and is null if the tail could not be read.
+    #[serde(default)]
+    pub failed_count: Option<u64>,
+    /// RFC 3339 (UTC).
+    #[serde(default)]
+    pub last_archived_at: Option<String>,
+    /// RFC 3339 (UTC).
+    #[serde(default)]
+    pub last_failed_at: Option<String>,
+    /// Failed archive filename, if available and in a recognized Postgres
+    /// format (WAL segment, partial segment, timeline history or backup history).
+    #[serde(default)]
+    pub last_failed_wal: Option<String>,
+    /// Lowercase `on`, `off` or `always` when recognized, otherwise null.
+    #[serde(default)]
+    pub archive_mode: Option<String>,
+    /// The program word extracted from `archive_command`. Reported words
+    /// contain only ASCII letters, digits or `_./+-`, with `***` used when
+    /// extraction fails. The raw command and its arguments are omitted.
+    #[serde(default)]
+    pub archive_program: Option<String>,
+    /// Duration as reported by the source, or null if missing or unrecognized.
+    #[serde(default)]
+    pub archive_timeout: Option<String>,
+    /// Inferred archive hosts that match Docker container identifiers.
+    #[serde(default)]
+    pub targets: Vec<ArchiveTarget>,
+    /// Count of inferred hosts with a completed lookup and no Docker match.
+    /// Host names are omitted, as is the field when the count is zero.
+    /// The count can be partial if inspection fails.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unmatched_hosts: u64,
+    pub source: EvidenceSource,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveTarget {
+    /// The matched name, service, alias or DNS name reported by Docker.
+    pub host: String,
+    /// The name of the matched container.
+    pub container: Option<String>,
+    /// The matched container's state (`running`, `exited`, …).
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvidenceSource {
+    /// Read-only queries through `docker exec … psql`.
+    Psql,
+    /// Engine API GETs only. WAL bytes, data bytes and the latest archive
+    /// success time are null. `notes` describes why the probe fell back.
+    ApiOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -865,6 +950,10 @@ pub struct DoctorReport {
     pub docker_socket: DockerSocket,
     pub tools: Vec<ToolStatus>,
     pub detectors: Vec<DetectorStatus>,
+    /// Probe availability. Reports written before this field was added read
+    /// back with an empty list.
+    #[serde(default)]
+    pub probes: Vec<DetectorStatus>,
     pub notes: Vec<String>,
 }
 

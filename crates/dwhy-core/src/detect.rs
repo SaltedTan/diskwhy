@@ -389,6 +389,7 @@ mod tests {
             id: finding_id(det, path),
             detector: det.into(),
             probe: None,
+            evidence: None,
             path: path.into(),
             bytes,
             nested_bytes: None,

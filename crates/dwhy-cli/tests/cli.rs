@@ -174,7 +174,14 @@ fn scan_json_findings_on_fixture() {
 #[test]
 fn scan_text_output() {
     let t = fixture();
-    let out = dwhy(&["scan", t.path().to_str().unwrap(), "--min-size", "0", "-q"]);
+    let out = dwhy(&[
+        "scan",
+        t.path().to_str().unwrap(),
+        "--min-size",
+        "0",
+        "-q",
+        "--no-detectors",
+    ]);
     assert_eq!(out.status.code(), Some(0));
     let s = String::from_utf8(out.stdout).unwrap();
     assert!(s.contains("largest directories"), "{s}");
@@ -185,7 +192,7 @@ fn scan_text_output() {
 #[test]
 fn exit_codes() {
     // Missing path: error.
-    let out = dwhy(&["scan", "/definitely/not/here"]);
+    let out = dwhy(&["scan", "/definitely/not/here", "--no-detectors"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("error"));
     // Usage errors are 1, not clap's default 2 (2 means "skipped by a guard").
@@ -249,7 +256,7 @@ fn scan_is_read_only() {
     let t = fixture();
     let before = listing(t.path());
     assert_eq!(
-        dwhy(&["scan", t.path().to_str().unwrap(), "-q"])
+        dwhy(&["scan", t.path().to_str().unwrap(), "-q", "--no-detectors"])
             .status
             .code(),
         Some(0)

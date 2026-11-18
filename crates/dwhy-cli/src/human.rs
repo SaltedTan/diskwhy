@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use dwhy_core::apply::{self, tier_name};
+use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{
     ActionKind, ApplyOutcome, ApplyReport, Change, ChangeKind, DetectorAvailability, DiffReport,
     DirEntry, DoctorReport, Finding, FsReport, GuardStatus, Plan, Rate, ScanReport, SkipReason,
@@ -536,6 +537,16 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
             }
             writeln!(w, "  {:>8}  {:<13} {}", "", "", f.reason)?;
             writeln!(w, "  {:>8}  {:<13} → {}", "", "", f.action.text)?;
+            if let Some(ev) = f.evidence.as_ref().and_then(|e| e.postgres_wal.as_ref()) {
+                writeln!(
+                    w,
+                    "  {:>8}  {:<13} {}: {}",
+                    "",
+                    "",
+                    postgres_wal::NAME,
+                    postgres_wal::summary(ev)
+                )?;
+            }
             for g in f.guards.iter().filter(|g| g.status == GuardStatus::Block) {
                 writeln!(
                     w,
@@ -765,18 +776,35 @@ pub fn render_doctor(w: &mut impl Write, d: &DoctorReport) -> io::Result<()> {
     }
     writeln!(w)?;
     writeln!(w, "detectors")?;
+    let mark = |s: DetectorAvailability| match s {
+        DetectorAvailability::Available => "ok  ",
+        DetectorAvailability::Degraded => "part",
+        DetectorAvailability::Unavailable => "off ",
+        DetectorAvailability::NotImplemented => "todo",
+    };
     for det in &d.detectors {
-        let mark = match det.status {
-            DetectorAvailability::Available => "ok  ",
-            DetectorAvailability::Degraded => "part",
-            DetectorAvailability::Unavailable => "off ",
-            DetectorAvailability::NotImplemented => "todo",
-        };
         writeln!(
             w,
-            "  {mark} {:<19} {:<9} {}",
-            det.name, det.milestone, det.detail
+            "  {} {:<19} {:<9} {}",
+            mark(det.status),
+            det.name,
+            det.milestone,
+            det.detail
         )?;
+    }
+    if !d.probes.is_empty() {
+        writeln!(w)?;
+        writeln!(w, "probes")?;
+        for p in &d.probes {
+            writeln!(
+                w,
+                "  {} {:<19} {:<9} {}",
+                mark(p.status),
+                p.name,
+                p.milestone,
+                p.detail
+            )?;
+        }
     }
     if !d.notes.is_empty() {
         writeln!(w)?;
@@ -797,6 +825,7 @@ mod tests {
             id: format!("f_{path}"),
             detector: detector.into(),
             probe: None,
+            evidence: None,
             path: path.into(),
             bytes,
             nested_bytes: None,
@@ -851,6 +880,60 @@ mod tests {
             docker: None,
             snapshot: None,
         }
+    }
+
+    #[test]
+    fn probe_evidence_is_shown_under_its_finding() {
+        let mut f = finding(
+            "docker-volume",
+            "docker://volume/pg",
+            30 << 30,
+            Tier::Review,
+            ActionKind::Advice,
+        );
+        f.probe = Some("postgres-wal".into());
+        f.reason = "pg_wal holds 29.0G vs 53.0M data; archiving is failing, with 151 failures in total (last failure 2026-11-13T02:10:00Z, last success 2026-11-07T07:25:00Z) (target s3test exited); volume pg holds 30.0G".into();
+        f.action.text =
+            "restore the archive target s3test; WAL is freed at the next checkpoint".into();
+        f.evidence = Some(Evidence {
+            postgres_wal: Some(PostgresWal {
+                container: "pg-1".into(),
+                wal_bytes: Some(29 << 30),
+                data_bytes: Some(53 << 20),
+                failed_count: Some(151),
+                last_archived_at: Some("2026-11-07T07:25:00Z".into()),
+                last_failed_at: Some("2026-11-13T02:10:00Z".into()),
+                last_failed_wal: None,
+                archive_mode: Some("on".into()),
+                archive_program: Some("curl".into()),
+                archive_timeout: Some("10s".into()),
+                targets: vec![ArchiveTarget {
+                    host: "s3test".into(),
+                    container: Some("s3test".into()),
+                    state: "exited".into(),
+                }],
+                unmatched_hosts: 0,
+                source: EvidenceSource::Psql,
+                notes: vec![],
+            }),
+        });
+        let mut out = Vec::new();
+        render_findings(&mut out, &report(vec![f]), 10).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        let reason = lines
+            .iter()
+            .position(|l| l.starts_with("pg_wal holds 29.0G vs 53.0M data;"))
+            .expect(&text);
+        assert_eq!(
+            lines[reason + 1],
+            "→ restore the archive target s3test; WAL is freed at the next checkpoint"
+        );
+        assert_eq!(
+            lines[reason + 2],
+            "postgres-wal: psql in pg-1, archive_mode on, archive_timeout 10s, last archived \
+             2026-11-07T07:25:00Z, last failed 2026-11-13T02:10:00Z, archive target s3test exited"
+        );
     }
 
     #[test]

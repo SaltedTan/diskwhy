@@ -1,0 +1,81 @@
+[
+ {
+  "Id": "aa11000000000000000000000000000000000000000000000000000000000001",
+  "Names": [
+   "/pgwal-postgres-1"
+  ],
+  "Image": "postgres:16-alpine",
+  "State": "running",
+  "Status": "Up 6 days",
+  "Labels": {
+   "com.docker.compose.project": "pgwal",
+   "com.docker.compose.service": "postgres"
+  },
+  "Mounts": [
+   {
+    "Type": "volume",
+    "Name": "pgwal_pg_data",
+    "Source": "/var/lib/docker/volumes/pgwal_pg_data/_data",
+    "Destination": "/var/lib/postgresql/data",
+    "Driver": "local",
+    "Mode": "z",
+    "RW": true
+   }
+  ],
+  "NetworkSettings": {
+   "Networks": {
+    "pgwal_default": {
+     "Aliases": null,
+     "IPAddress": "172.20.0.2"
+    }
+   }
+  }
+ },
+ {
+  "Id": "bb22000000000000000000000000000000000000000000000000000000000002",
+  "Names": [
+   "/pgwal-s3test-1"
+  ],
+  "Image": "minio/minio:latest",
+  "State": "exited",
+  "Status": "Exited (137) 6 days ago",
+  "Labels": {
+   "com.docker.compose.project": "pgwal",
+   "com.docker.compose.service": "s3test"
+  },
+  "Mounts": [],
+  "NetworkSettings": {
+   "Networks": {
+    "pgwal_default": {
+     "Aliases": null,
+     "IPAddress": ""
+    }
+   }
+  }
+ },
+ {
+  "Id": "cc33000000000000000000000000000000000000000000000000000000000003",
+  "Names": [
+   "/other-app-1"
+  ],
+  "Image": "app:latest",
+  "State": "running",
+  "Status": "Up 3 hours",
+  "Labels": {
+   "com.docker.compose.project": "other",
+   "com.docker.compose.service": "app"
+  },
+  "Mounts": [
+   {
+    "Type": "volume",
+    "Name": "pgwal_pg_data",
+    "Destination": "/backup",
+    "Driver": "local",
+    "RW": false
+   }
+  ],
+  "NetworkSettings": {
+   "Networks": {}
+  }
+ }
+]
