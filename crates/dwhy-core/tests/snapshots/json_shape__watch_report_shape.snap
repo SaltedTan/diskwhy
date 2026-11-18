@@ -1,0 +1,84 @@
+---
+source: crates/dwhy-core/tests/json_shape.rs
+expression: "WatchReport\n{\n    schema: SCHEMA.into(), tool: Tool\n    { name: \"diskwhy\".into(), version: \"0.0.1\".into(), }, host:\n    \"pc-ubuntu\".into(), uid: 1000, started_at: \"2026-11-18T02:00:00Z\".into(),\n    generated_at: \"2026-11-18T02:01:01Z\".into(), roots:\n    vec![\"/home/u\".into()], one_filesystem: true, for_secs: 60, elapsed_ms:\n    60_000, min_change: 1_048_576, fs:\n    vec![rate(ChangeKind::Fs, \"/\", Some(350_000_000_000),\n    Some(350_100_663_296))], dirs:\n    vec![rate(ChangeKind::Dir, \"/home/u/pg/pg_wal\", Some(838_860_800),\n    Some(939_524_096)),\n    rate(ChangeKind::Dir, \"/home/u/tmp/new\", None, Some(2_097_152)),\n    rate(ChangeKind::Dir, \"/home/u/tmp/gone\", Some(3_145_728), None),],\n    docker_compared: true, docker:\n    vec![rate(ChangeKind::Volume, \"example_pg_wal\", Some(1_073_741_824),\n    Some(1_174_405_120)), container,], notes: vec![],\n}"
+---
+{
+  "schema": "diskwhy/v1",
+  "tool": {
+    "name": "diskwhy",
+    "version": "0.0.1"
+  },
+  "host": "pc-ubuntu",
+  "uid": 1000,
+  "started_at": "2026-11-18T02:00:00Z",
+  "generated_at": "2026-11-18T02:01:01Z",
+  "roots": [
+    "/home/u"
+  ],
+  "one_filesystem": true,
+  "for_secs": 60,
+  "elapsed_ms": 60000,
+  "min_change": 1048576,
+  "fs": [
+    {
+      "kind": "fs",
+      "name": "/",
+      "id": null,
+      "before": 350000000000,
+      "after": 350100663296,
+      "change": 100663296,
+      "bytes_per_minute": 100663296
+    }
+  ],
+  "dirs": [
+    {
+      "kind": "dir",
+      "name": "/home/u/pg/pg_wal",
+      "id": null,
+      "before": 838860800,
+      "after": 939524096,
+      "change": 100663296,
+      "bytes_per_minute": 100663296
+    },
+    {
+      "kind": "dir",
+      "name": "/home/u/tmp/new",
+      "id": null,
+      "before": null,
+      "after": 2097152,
+      "change": 2097152,
+      "bytes_per_minute": 2097152
+    },
+    {
+      "kind": "dir",
+      "name": "/home/u/tmp/gone",
+      "id": null,
+      "before": 3145728,
+      "after": null,
+      "change": -3145728,
+      "bytes_per_minute": -3145728
+    }
+  ],
+  "docker_compared": true,
+  "docker": [
+    {
+      "kind": "volume",
+      "name": "example_pg_wal",
+      "id": null,
+      "before": 1073741824,
+      "after": 1174405120,
+      "change": 100663296,
+      "bytes_per_minute": 100663296
+    },
+    {
+      "kind": "container",
+      "name": "example-db-1",
+      "id": "c1d2e3f4a5b6",
+      "before": 4096,
+      "after": 8192,
+      "change": 4096,
+      "bytes_per_minute": 4096
+    }
+  ],
+  "notes": []
+}

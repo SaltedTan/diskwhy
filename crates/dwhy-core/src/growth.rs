@@ -1,16 +1,18 @@
 //! Growth (M3): what changed between a saved snapshot and a later one
-//! (`dwhy diff`), and growth rates on a scan's findings.
+//! (`dwhy diff`), growth over a short window (`dwhy watch`), and growth
+//! rates on a scan's findings.
 //!
-//! Rates are bytes per day over the time between the two snapshots.
-//! Directory changes are attributed to the deepest directory that holds
-//! most of them ([`deepest`]), the rule `watch` shares.
+//! `diff` rates are bytes per day over the time between the two snapshots,
+//! `watch` rates bytes per minute over its window. Directory changes are
+//! attributed to the deepest directory that holds most of them
+//! ([`deepest`]) in both.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::report::{
-    Change, ChangeKind, DiffBase, DiffReport, Finding, Growth, SCHEMA, Snapshot, SnapshotDocker,
-    SnapshotScan, Tool,
+    Change, ChangeKind, DiffBase, DiffReport, Finding, Growth, Rate, SCHEMA, Snapshot,
+    SnapshotDocker, SnapshotScan, Tool, WatchReport,
 };
 use crate::snapshot::parse_time;
 
@@ -22,6 +24,13 @@ pub const MIN_AGE_SECS: i64 = 3600;
 /// counts as one second.
 pub fn per_day(change: i64, elapsed_secs: i64) -> i64 {
     let r = change as i128 * 86_400 / elapsed_secs.max(1) as i128;
+    r.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+/// `change` bytes over `elapsed_ms` milliseconds, per minute. A
+/// non-positive interval counts as one millisecond.
+pub fn per_minute(change: i64, elapsed_ms: u64) -> i64 {
+    let r = change as i128 * 60_000 / elapsed_ms.max(1) as i128;
     r.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
@@ -40,65 +49,87 @@ fn within(path: &Path, roots: &[String]) -> bool {
 
 /// The mount point the scan skipped that kept its walk from `path`, a
 /// path under its roots: one between the deepest root above it and it.
-fn blocked_by<'a>(path: &Path, scan: &'a SnapshotScan) -> Option<&'a str> {
+fn blocked_by<'a>(
+    path: &Path,
+    scan: &SnapshotScan,
+    skipped: &HashMap<&Path, &'a str>,
+) -> Option<&'a str> {
     let root = scan
         .roots
         .iter()
         .filter(|r| path.starts_with(r))
         .map(|r| depth(r))
         .max()?;
+    path.ancestors()
+        .take(path.components().count().saturating_sub(root))
+        .find_map(|ancestor| skipped.get(ancestor).copied())
+}
+
+fn skipped_mounts(scan: &SnapshotScan) -> HashMap<&Path, &str> {
     scan.skipped_mounts
         .iter()
-        .filter(|m| path.starts_with(m) && depth(m) > root)
-        .max_by_key(|m| depth(m))
-        .map(String::as_str)
+        .map(|mount| (Path::new(mount), mount.as_str()))
+        .collect()
 }
 
 /// Whether the scan walked `path`: it is under a root, and no mount point
 /// the walk skipped lies between that root and it.
-fn walked(path: &Path, scan: &SnapshotScan) -> bool {
-    within(path, &scan.roots) && blocked_by(path, scan).is_none()
+fn walked(path: &Path, scan: &SnapshotScan, skipped: &HashMap<&Path, &str>) -> bool {
+    within(path, &scan.roots) && blocked_by(path, scan, skipped).is_none()
 }
 
 /// Mount points `side` skipped where `other` walked something it would
 /// otherwise compare.
 fn left_out<'a>(side: &'a SnapshotScan, other: &'a SnapshotScan) -> impl Iterator<Item = &'a str> {
-    side.skipped_mounts.iter().map(String::as_str).filter(|m| {
-        let m = Path::new(m);
-        other.roots.iter().any(|r| {
-            let r = Path::new(r);
-            let top = if r.starts_with(m) {
-                r
-            } else if m.starts_with(r) {
-                m
-            } else {
-                return false;
-            };
-            walked(top, other) && !walked(top, side)
+    let skipped = [skipped_mounts(side), skipped_mounts(other)];
+    side.skipped_mounts
+        .iter()
+        .map(String::as_str)
+        .filter(move |m| {
+            let m = Path::new(m);
+            other.roots.iter().any(|r| {
+                let r = Path::new(r);
+                let top = if r.starts_with(m) {
+                    r
+                } else if m.starts_with(r) {
+                    m
+                } else {
+                    return false;
+                };
+                walked(top, other, &skipped[1]) && !walked(top, side, &skipped[0])
+            })
         })
-    })
 }
 
-/// Compares `old` with `new`, a snapshot of a fresh scan. `size_now` gives
-/// the current allocated size of a directory `new` does not record (one
-/// that shrank below its threshold), `None` when it no longer exists.
-/// Only paths both scans walked are compared: inside the roots of both,
-/// and not at or below a mount point either skipped. When the two differ
-/// in `one_filesystem`, directories above a mount point one side skipped
-/// and the other walked are left out too: their totals cover different
-/// ground.
-pub fn diff(
+/// What two snapshots differ by, before rates and ranking.
+struct Compared {
+    fs: Vec<Change>,
+    dirs: Vec<Change>,
+    /// `None` when one side has no Docker figures.
+    docker: Option<Vec<Change>>,
+    findings: Vec<Change>,
+    /// Mount points that kept something out of the comparison.
+    mounts_note: Option<String>,
+    /// Detectors that ran on one side only.
+    findings_note: Option<String>,
+}
+
+/// Compares `old` with `new`, a later snapshot. `size_now` gives the
+/// current allocated size of a directory `new` does not record (one that
+/// shrank below its threshold), `None` when it no longer exists. Only
+/// paths both scans walked are compared: inside the roots of both, and not
+/// at or below a mount point either skipped. When the two differ in
+/// `one_filesystem`, directories above a mount point one side skipped and
+/// the other walked are left out too: their totals cover different ground.
+/// Rates are left at 0.
+fn compare(
     old: &Snapshot,
-    old_id: Option<String>,
-    old_path: String,
     new: &Snapshot,
     size_now: &dyn Fn(&str) -> Option<u64>,
     min_change: u64,
-) -> DiffReport {
-    let elapsed = match (parse_time(&new.created_at), parse_time(&old.created_at)) {
-        (Some(n), Some(o)) => n - o,
-        _ => 0,
-    };
+    excluded: &dyn Fn(&str) -> bool,
+) -> Compared {
+    let skipped = [skipped_mounts(&old.scan), skipped_mounts(&new.scan)];
     let above: Vec<&str> = if old.scan.one_filesystem != new.scan.one_filesystem {
         left_out(&old.scan, &new.scan)
             .chain(left_out(&new.scan, &old.scan))
@@ -109,10 +140,13 @@ pub fn diff(
     // The mount points that keep a path inside the roots of both out.
     let blockers = |path: &str| {
         let p = Path::new(path);
-        let mut v: Vec<&str> = [blocked_by(p, &old.scan), blocked_by(p, &new.scan)]
-            .into_iter()
-            .flatten()
-            .collect();
+        let mut v: Vec<&str> = [
+            blocked_by(p, &old.scan, &skipped[0]),
+            blocked_by(p, &new.scan, &skipped[1]),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         v.extend(above.iter().filter(|m| Path::new(m).starts_with(p)));
         v
     };
@@ -120,8 +154,7 @@ pub fn diff(
         let p = Path::new(path);
         within(p, &old.scan.roots) && within(p, &new.scan.roots)
     };
-    let both = |path: &str| in_roots(path) && blockers(path).is_empty();
-    let mut notes = Vec::new();
+    let both = |path: &str| in_roots(path) && blockers(path).is_empty() && !excluded(path);
     let mut mounts: Vec<&str> = old
         .dirs
         .iter()
@@ -138,30 +171,27 @@ pub fn diff(
         .collect();
     mounts.sort_unstable();
     mounts.dedup();
-    if !mounts.is_empty() {
-        notes.push(format!(
+    let mounts_note = (!mounts.is_empty()).then(|| {
+        format!(
             "not compared, because one side did not enter these mount points: {}",
             mounts.join(", ")
-        ));
-    }
-    let change = |kind: ChangeKind, name: String, before: Option<u64>, after: Option<u64>| {
-        let c = delta(before, after);
-        Change {
-            kind,
-            name,
-            id: None,
-            detector: None,
-            before,
-            after,
-            change: c,
-            at_least: false,
-            bytes_per_day: per_day(c, elapsed),
-        }
+        )
+    });
+    let change = |kind: ChangeKind, name: String, before: Option<u64>, after: Option<u64>| Change {
+        kind,
+        name,
+        id: None,
+        detector: None,
+        before,
+        after,
+        change: delta(before, after),
+        at_least: false,
+        bytes_per_day: 0,
     };
     let big = |c: &Change| c.change != 0 && c.change.unsigned_abs() >= min_change;
 
     // Filesystems in both, changed or not.
-    let mut fs: Vec<Change> = new
+    let fs: Vec<Change> = new
         .fs
         .iter()
         .filter_map(|n| {
@@ -201,29 +231,24 @@ pub fn diff(
             continue;
         }
         // It was below the snapshot's threshold: at least this much growth.
+        // (With no threshold, every directory was recorded: it is new.)
         let mut c = change(ChangeKind::Dir, d.path.clone(), None, Some(d.allocated));
         c.change = delta(Some(floor), Some(d.allocated));
-        c.bytes_per_day = per_day(c.change, elapsed);
-        c.at_least = true;
+        c.at_least = floor > 0;
         dirs.push(c);
     }
     dirs.retain(big);
-    let mut dirs = deepest(dirs);
+    let dirs = deepest(dirs);
 
     // Docker.
-    let mut docker = Vec::new();
-    match (&old.docker, &new.docker) {
-        (Some(o), Some(n)) => docker = docker_changes(o, n, &change),
-        (None, Some(_)) => notes.push("Docker not compared: the snapshot has no Docker figures".into()),
-        (Some(_), None) => notes.push(
-            "Docker not compared: no Docker figures now (daemon unreachable, or Docker detectors not run)"
-                .into(),
-        ),
-        (None, None) => {
-            notes.push("Docker not compared: neither side has Docker figures".into())
+    let docker = match (&old.docker, &new.docker) {
+        (Some(o), Some(n)) => {
+            let mut v = docker_changes(o, n, &change);
+            v.retain(big);
+            Some(v)
         }
-    }
-    docker.retain(big);
+        _ => None,
+    };
 
     // Findings, by id, where the detector ran on both sides.
     let ran_old: HashSet<&str> = old.scan.detectors.iter().map(String::as_str).collect();
@@ -266,14 +291,57 @@ pub fn diff(
     findings.retain(big);
     skipped.sort_unstable();
     skipped.dedup();
-    if !skipped.is_empty() {
-        notes.push(format!(
+    let findings_note = (!skipped.is_empty()).then(|| {
+        format!(
             "findings not compared (detector ran on one side only): {}",
             skipped.join(", ")
-        ));
+        )
+    });
+    Compared {
+        fs,
+        dirs,
+        docker,
+        findings,
+        mounts_note,
+        findings_note,
     }
+}
 
+/// Compares `old` with `new`, a snapshot of a fresh scan (see [`compare`]
+/// for what is compared), with rates in bytes per day.
+pub fn diff(
+    old: &Snapshot,
+    old_id: Option<String>,
+    old_path: String,
+    new: &Snapshot,
+    size_now: &dyn Fn(&str) -> Option<u64>,
+    min_change: u64,
+) -> DiffReport {
+    let elapsed = match (parse_time(&new.created_at), parse_time(&old.created_at)) {
+        (Some(n), Some(o)) => n - o,
+        _ => 0,
+    };
+    let c = compare(old, new, size_now, min_change, &|_| false);
+    let mut notes: Vec<String> = c.mounts_note.into_iter().collect();
+    match (&old.docker, &new.docker) {
+        (Some(_), Some(_)) => {}
+        (None, Some(_)) => notes.push("Docker not compared: the snapshot has no Docker figures".into()),
+        (Some(_), None) => notes.push(
+            "Docker not compared: no Docker figures now (daemon unreachable, or Docker detectors not run)"
+                .into(),
+        ),
+        (None, None) => {
+            notes.push("Docker not compared: neither side has Docker figures".into())
+        }
+    }
+    notes.extend(c.findings_note);
+    let docker_compared = c.docker.is_some();
+    let [mut fs, mut dirs, mut docker, mut findings] =
+        [c.fs, c.dirs, c.docker.unwrap_or_default(), c.findings];
     for list in [&mut fs, &mut dirs, &mut docker, &mut findings] {
+        for x in list.iter_mut() {
+            x.bytes_per_day = per_day(x.change, elapsed);
+        }
         rank(list);
     }
     DiffReport {
@@ -296,11 +364,161 @@ pub fn diff(
         min_change,
         fs,
         dirs,
-        docker_compared: old.docker.is_some() && new.docker.is_some(),
+        docker_compared,
         docker,
         findings,
         notes,
         snapshot: None,
+    }
+}
+
+/// Growth over a `watch` window: `start` and `end` are snapshots of two
+/// walks of the same roots that record every directory (`min_dir_bytes`
+/// 0), taken `elapsed_ms` apart (from the start of one walk to the start
+/// of the next), with rates in bytes per minute. `unreadable` must include
+/// every unreadable or failed entry path from each walk: snapshots alone
+/// do not preserve this coverage information. Coverage exclusions follow
+/// the Watch decision in `docs/DESIGN.md`, in addition to [`diff`]'s rules.
+/// `notes` says nothing about Docker; the caller knows why it is missing.
+pub fn watch(
+    start: &Snapshot,
+    end: &Snapshot,
+    for_secs: u64,
+    elapsed_ms: u64,
+    min_change: u64,
+    unreadable: [&[String]; 2],
+) -> WatchReport {
+    let [old_unreadable, new_unreadable] =
+        unreadable.map(|paths| paths.iter().map(String::as_str).collect::<HashSet<_>>());
+    let changed_coverage: HashSet<&str> = old_unreadable
+        .symmetric_difference(&new_unreadable)
+        .copied()
+        .collect();
+    let [old_mounts, new_mounts] = [start, end].map(|s| {
+        s.scan
+            .skipped_mounts
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>()
+    });
+    let changed_mounts: HashSet<&str> = old_mounts
+        .symmetric_difference(&new_mounts)
+        .copied()
+        .collect();
+    let uncertain_hardlinks = (!changed_coverage.is_empty() || !changed_mounts.is_empty())
+        && [start, end]
+            .iter()
+            .any(|s| s.scan.totals.hardlinks_deduped > 0);
+    let all_unreadable: HashMap<&Path, &str> = old_unreadable
+        .union(&new_unreadable)
+        .map(|&failed| (Path::new(failed), failed))
+        .collect();
+    let above: HashSet<&Path> = changed_coverage
+        .iter()
+        .chain(&changed_mounts)
+        .flat_map(|path| Path::new(path).ancestors().skip(1))
+        .filter(|path| within(path, &start.scan.roots) && within(path, &end.scan.roots))
+        .collect();
+    let c = compare(start, end, &|_| None, min_change, &|path| {
+        let path = Path::new(path);
+        uncertain_hardlinks
+            || above.contains(path)
+            || path
+                .ancestors()
+                .any(|ancestor| all_unreadable.contains_key(ancestor))
+    });
+    let recorded: HashSet<&Path> = start
+        .dirs
+        .iter()
+        .chain(&end.dirs)
+        .filter(|d| {
+            let path = Path::new(&d.path);
+            within(path, &start.scan.roots) && within(path, &end.scan.roots)
+        })
+        .map(|d| Path::new(&d.path))
+        .collect();
+    let mut omitted: Vec<&str> = recorded
+        .iter()
+        .flat_map(|path| path.ancestors())
+        .filter_map(|ancestor| all_unreadable.get(ancestor).copied())
+        .chain(changed_coverage.iter().copied().filter(|failed| {
+            Path::new(failed)
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| recorded.contains(ancestor))
+        }))
+        .collect();
+    omitted.sort_unstable();
+    omitted.dedup();
+    let mut omitted_mounts: Vec<&str> = changed_mounts
+        .iter()
+        .copied()
+        .filter(|mount| {
+            Path::new(mount)
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| recorded.contains(ancestor))
+        })
+        .collect();
+    omitted_mounts.sort_unstable();
+    omitted_mounts.dedup();
+    let mut notes: Vec<String> = c.mounts_note.into_iter().collect();
+    if !omitted.is_empty() {
+        notes.push(format!(
+            "not compared, because a sample could not read these paths: {}",
+            omitted.join(", ")
+        ));
+    }
+    if !omitted_mounts.is_empty() {
+        notes.push(format!(
+            "not compared, because a mount changed during the window: {}",
+            omitted_mounts.join(", ")
+        ));
+    }
+    if uncertain_hardlinks {
+        notes.push(
+            "directories not compared: coverage changed during the window, and files with several hard links may be counted in different places"
+                .into(),
+        );
+    }
+    let rates = |list: Vec<Change>| {
+        let mut v: Vec<Rate> = list
+            .into_iter()
+            .map(|x| Rate {
+                kind: x.kind,
+                name: x.name,
+                id: x.id,
+                before: x.before,
+                after: x.after,
+                change: x.change,
+                bytes_per_minute: per_minute(x.change, elapsed_ms),
+            })
+            .collect();
+        v.sort_by(|a, b| {
+            b.bytes_per_minute
+                .cmp(&a.bytes_per_minute)
+                .then_with(|| b.change.cmp(&a.change))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        v
+    };
+    WatchReport {
+        schema: SCHEMA.into(),
+        tool: Tool::current(),
+        host: end.host.clone(),
+        uid: end.uid,
+        started_at: start.created_at.clone(),
+        generated_at: end.created_at.clone(),
+        roots: end.scan.roots.clone(),
+        one_filesystem: end.scan.one_filesystem,
+        for_secs,
+        elapsed_ms,
+        min_change,
+        fs: rates(c.fs),
+        dirs: rates(c.dirs),
+        docker_compared: c.docker.is_some(),
+        docker: rates(c.docker.unwrap_or_default()),
+        notes,
     }
 }
 
@@ -468,6 +686,11 @@ mod tests {
         assert_eq!(per_day(-500, 43_200), -1000);
         assert_eq!(per_day(5, 0), 432_000);
         assert_eq!(per_day(i64::MAX, 1), i64::MAX);
+        assert_eq!(per_minute(1000, 60_000), 1000);
+        assert_eq!(per_minute(1000, 30_000), 2000);
+        assert_eq!(per_minute(-600, 61_000), -590);
+        assert_eq!(per_minute(5, 0), 300_000);
+        assert_eq!(per_minute(i64::MIN, 1), i64::MIN);
     }
 
     #[test]

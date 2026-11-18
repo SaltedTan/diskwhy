@@ -44,7 +44,7 @@ pub fn default_dir() -> Option<PathBuf> {
 }
 
 /// Builds the snapshot of a finished scan. `docker` is the daemon's state
-/// when the Docker detectors fetched it.
+/// fetched for that scan, either by the Docker detectors or by `watch`.
 pub fn build(
     report: &ScanReport,
     tree: &ScanTree,
@@ -116,7 +116,8 @@ pub fn build(
     }
 }
 
-fn docker_part(s: &docker::Snapshot) -> SnapshotDocker {
+/// The Docker part of a snapshot, from the daemon's figures.
+pub fn docker_part(s: &docker::Snapshot) -> SnapshotDocker {
     let pos = |v: i64| v.max(0) as u64;
     SnapshotDocker {
         usage: docker::usage(s),

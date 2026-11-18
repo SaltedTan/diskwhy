@@ -1,14 +1,16 @@
-//! Growth: comparing two snapshots (`dwhy diff`) and growth on findings.
-//! Snapshots are built by hand; no scan or daemon is involved.
+//! Growth: comparing two snapshots (`dwhy diff`), growth over a window
+//! (`dwhy watch`) and growth on findings. Snapshots are built by hand (Docker
+//! figures from fixed `/system/df` bodies); no scan or daemon is involved.
 
 use std::collections::HashMap;
 
 use dwhy_core::growth::{self, per_day};
 use dwhy_core::report::{
-    Action, ActionKind, Change, ChangeKind, DockerUsage, Finding, Recovery, SCHEMA, Snapshot,
+    Action, ActionKind, Change, ChangeKind, DockerUsage, Finding, Rate, Recovery, SCHEMA, Snapshot,
     SnapshotContainer, SnapshotDir, SnapshotDocker, SnapshotFinding, SnapshotFs, SnapshotImage,
     SnapshotScan, SnapshotVolume, Tier, Tool, UsageLine,
 };
+use dwhy_core::{docker, snapshot};
 
 const M: u64 = 1 << 20;
 const G: u64 = 1 << 30;
@@ -589,4 +591,590 @@ fn findings_get_growth_from_an_older_snapshot_by_id() {
     let mut findings = vec![finding("f_grew", 400 * M)];
     growth::fill_growth(&mut findings, &old, "2026-11-15T12:00:00Z");
     assert_eq!(findings[0].growth, None);
+}
+
+/// A `watch` end: every directory recorded (no threshold).
+fn sample(created_at: &str, list: &[(&str, u64)], used: u64) -> Snapshot {
+    let mut s = snap(created_at, &["/h"], &[]);
+    s.scan.min_dir_bytes = 0;
+    s.dirs = dirs(list);
+    s.fs = fs_used(used);
+    s
+}
+
+/// (kind, name, before, after, change, bytes_per_minute) of one rate.
+type RateRow<'a> = (ChangeKind, &'a str, Option<u64>, Option<u64>, i64, i64);
+
+fn rate_rows(v: &[Rate]) -> Vec<RateRow<'_>> {
+    v.iter()
+        .map(|r| {
+            (
+                r.kind,
+                r.name.as_str(),
+                r.before,
+                r.after,
+                r.change,
+                r.bytes_per_minute,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn watch_rates_growth_per_minute_at_the_deepest_dir() {
+    let start = sample(
+        "2026-11-18T02:00:00Z",
+        &[
+            ("/h", 10 * M),
+            ("/h/a", 4 * M),
+            ("/h/a/logs", M),
+            ("/h/b", 6 * M),
+            ("/h/b/small", M / 2),
+            ("/h/gone", 2 * M),
+        ],
+        50 * G,
+    );
+    let end = sample(
+        "2026-11-18T02:00:31Z",
+        &[
+            ("/h", 23 * M + M / 4),
+            ("/h/a", 16 * M),
+            ("/h/a/logs", 13 * M),
+            ("/h/b", 6 * M + M / 4),
+            ("/h/b/small", M / 2 + M / 4),
+            ("/h/new", 3 * M),
+        ],
+        50 * G + 13 * M,
+    );
+    // 30 s from the start of one walk to the start of the next: rates
+    // per minute are twice the change.
+    let r = growth::watch(&start, &end, 30, 30_000, M, [&[], &[]]);
+    assert_eq!(r.started_at, "2026-11-18T02:00:00Z");
+    assert_eq!(r.generated_at, "2026-11-18T02:00:31Z");
+    assert_eq!((r.for_secs, r.elapsed_ms, r.min_change), (30, 30_000, M));
+    assert_eq!(
+        rate_rows(&r.fs),
+        [(
+            ChangeKind::Fs,
+            "/",
+            Some(50 * G),
+            Some(50 * G + 13 * M),
+            13 * M as i64,
+            26 * M as i64
+        )]
+    );
+    // logs holds most of /h/a's and so of /h's growth: only it is listed.
+    // A new directory is new, not "at least" (every directory was
+    // recorded); changes under 1M (/h/b) are left out.
+    assert_eq!(
+        rate_rows(&r.dirs),
+        [
+            (
+                ChangeKind::Dir,
+                "/h/a/logs",
+                Some(M),
+                Some(13 * M),
+                12 * M as i64,
+                24 * M as i64
+            ),
+            (
+                ChangeKind::Dir,
+                "/h/new",
+                None,
+                Some(3 * M),
+                3 * M as i64,
+                6 * M as i64
+            ),
+            (
+                ChangeKind::Dir,
+                "/h/gone",
+                Some(2 * M),
+                None,
+                -2 * M as i64,
+                -4 * M as i64
+            ),
+        ]
+    );
+    assert!(!r.docker_compared && r.docker.is_empty());
+    // Docker's absence is the caller's to explain.
+    assert!(r.notes.is_empty(), "{:?}", r.notes);
+}
+
+#[test]
+fn watch_omits_directories_when_either_sample_has_unknown_contents() {
+    let start = sample(
+        "2026-11-18T02:00:00Z",
+        &[
+            ("/h", 20 * M),
+            ("/h/data", 8 * M),
+            ("/h/data/logs", 8 * M),
+            ("/h/data/logs/entry", 8 * M),
+            ("/h/data/logs/entry/deep", 6 * M),
+            ("/h/databases", 8 * M),
+            ("/h/quiet", 4 * M),
+        ],
+        50 * G,
+    );
+    let end = sample(
+        "2026-11-18T02:01:00Z",
+        &[
+            ("/h", 17 * M),
+            ("/h/databases", 10 * M),
+            ("/h/quiet", 7 * M),
+        ],
+        50 * G + M,
+    );
+    for failed in ["/h/data", "/h/data/logs", "/h/data/logs/entry"] {
+        let unreadable = vec![failed.to_string(), failed.to_string()];
+        for (before, after, coverage, sign) in [
+            (&start, &end, [&[][..], unreadable.as_slice()], 1),
+            (&end, &start, [unreadable.as_slice(), &[][..]], -1),
+        ] {
+            let r = growth::watch(before, after, 60, 60_000, M, coverage);
+            let changes: HashMap<&str, i64> =
+                r.dirs.iter().map(|d| (d.name.as_str(), d.change)).collect();
+            assert_eq!(
+                changes,
+                HashMap::from([
+                    ("/h/quiet", sign * 3 * M as i64),
+                    ("/h/databases", sign * 2 * M as i64),
+                ]),
+                "{failed}"
+            );
+            assert_eq!(r.fs[0].change, sign * M as i64);
+            assert_eq!(
+                r.notes,
+                [format!(
+                    "not compared, because a sample could not read these paths: {failed}"
+                )]
+            );
+        }
+    }
+}
+
+#[test]
+fn watch_handles_twenty_thousand_unreadable_or_mounted_siblings_quickly() {
+    let paths: Vec<String> = (0..20_000).map(|i| format!("/h/blocked-{i:05}")).collect();
+    let mut start = sample(
+        "2026-11-18T02:00:00Z",
+        &[("/h", 20_001 * M), ("/h/quiet", M)],
+        50 * G,
+    );
+    start.dirs.extend(dirs(
+        &paths
+            .iter()
+            .map(|path| (path.as_str(), M))
+            .collect::<Vec<_>>(),
+    ));
+    let mut end = sample(
+        "2026-11-18T02:01:00Z",
+        &[("/h", 4 * M), ("/h/quiet", 4 * M)],
+        50 * G,
+    );
+    end.dirs.extend(dirs(
+        &paths
+            .iter()
+            .map(|path| (path.as_str(), 0))
+            .collect::<Vec<_>>(),
+    ));
+    let names = paths.join(", ");
+    for mounted in [false, true] {
+        let unreadable = if mounted {
+            end.scan.skipped_mounts = paths.clone();
+            &[][..]
+        } else {
+            paths.as_slice()
+        };
+        let started = std::time::Instant::now();
+        let r = growth::watch(&start, &end, 60, 60_000, M, [&[], unreadable]);
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(
+            rate_rows(&r.dirs),
+            [(
+                ChangeKind::Dir,
+                "/h/quiet",
+                Some(M),
+                Some(4 * M),
+                3 * M as i64,
+                3 * M as i64,
+            )]
+        );
+        let notes = if mounted {
+            vec![
+                format!("not compared, because one side did not enter these mount points: {names}"),
+                format!("not compared, because a mount changed during the window: {names}"),
+            ]
+        } else {
+            vec![format!(
+                "not compared, because a sample could not read these paths: {names}"
+            )]
+        };
+        assert_eq!(r.notes, notes);
+    }
+}
+
+#[test]
+fn watch_compares_ancestors_when_both_samples_failed_at_the_same_path() {
+    let start = sample(
+        "2026-11-18T02:00:00Z",
+        &[
+            ("/h", 10 * M),
+            ("/h/data", 10 * M),
+            ("/h/data/logs", M),
+            ("/h/data/logs/deep", M),
+        ],
+        50 * G,
+    );
+    let end = sample(
+        "2026-11-18T02:01:00Z",
+        &[("/h", 14 * M), ("/h/data", 14 * M), ("/h/data/logs", 0)],
+        50 * G,
+    );
+    let unreadable = vec!["/h/data/logs".to_string()];
+    let r = growth::watch(&start, &end, 60, 60_000, M, [&unreadable, &unreadable]);
+    assert_eq!(
+        rate_rows(&r.dirs),
+        [(
+            ChangeKind::Dir,
+            "/h/data",
+            Some(10 * M),
+            Some(14 * M),
+            4 * M as i64,
+            4 * M as i64,
+        )]
+    );
+    assert_eq!(
+        r.notes,
+        ["not compared, because a sample could not read these paths: /h/data/logs"]
+    );
+}
+
+#[test]
+fn watch_omits_ancestors_of_entries_that_could_not_be_statted() {
+    let start = sample(
+        "2026-11-18T02:00:00Z",
+        &[("/h", 10 * M), ("/h/data", 10 * M)],
+        50 * G,
+    );
+    let end = sample(
+        "2026-11-18T02:01:00Z",
+        &[("/h", 4 * M), ("/h/data", 4 * M)],
+        50 * G,
+    );
+    let unreadable = vec!["/h/data/file".to_string()];
+    for coverage in [
+        [&[][..], unreadable.as_slice()],
+        [unreadable.as_slice(), &[][..]],
+    ] {
+        let r = growth::watch(&start, &end, 60, 60_000, M, coverage);
+        assert!(r.dirs.is_empty(), "{:?}", r.dirs);
+        assert_eq!(
+            r.notes,
+            ["not compared, because a sample could not read these paths: /h/data/file"]
+        );
+    }
+    let r = growth::watch(&start, &end, 60, 60_000, M, [&unreadable, &unreadable]);
+    assert_eq!(r.dirs.len(), 1);
+    assert_eq!(r.dirs[0].name, "/h/data");
+    assert_eq!(r.dirs[0].change, -6 * M as i64);
+    assert!(r.notes.is_empty());
+}
+
+#[test]
+fn watch_omits_directory_rates_when_coverage_can_move_hardlink_attribution() {
+    let mut start = sample(
+        "2026-11-18T02:00:00Z",
+        &[
+            ("/h", 10 * M),
+            ("/h/a", 6 * M),
+            ("/h/b", 0),
+            ("/h/quiet", 4 * M),
+        ],
+        50 * G,
+    );
+    let mut end = sample(
+        "2026-11-18T02:01:00Z",
+        &[
+            ("/h", 14 * M),
+            ("/h/a", 0),
+            ("/h/b", 6 * M),
+            ("/h/quiet", 8 * M),
+        ],
+        50 * G + M,
+    );
+    start.docker = Some(docker(&[], &[], &[], M));
+    end.docker = Some(docker(&[], &[], &[], 3 * M));
+    let unreadable = vec!["/h/a".to_string()];
+
+    for b_existed in [true, false] {
+        let mut start = start.clone();
+        if !b_existed {
+            start.dirs.retain(|d| d.path != "/h/b");
+        }
+        for deduped_at_start in [true, false] {
+            let mut end = end.clone();
+            start.scan.totals.hardlinks_deduped = u64::from(deduped_at_start);
+            end.scan.totals.hardlinks_deduped = u64::from(!deduped_at_start);
+            for skipped_mount in [false, true] {
+                let mut end = end.clone();
+                let (paths, coverage_note) = if skipped_mount {
+                    end.scan.skipped_mounts = unreadable.clone();
+                    (
+                        &[][..],
+                        "not compared, because one side did not enter these mount points: /h/a",
+                    )
+                } else {
+                    (
+                        unreadable.as_slice(),
+                        "not compared, because a sample could not read these paths: /h/a",
+                    )
+                };
+                for (before, after, coverage, sign) in [
+                    (&start, &end, [&[][..], paths], 1),
+                    (&end, &start, [paths, &[][..]], -1),
+                ] {
+                    let r = growth::watch(before, after, 60, 60_000, M, coverage);
+                    assert!(r.dirs.is_empty(), "{:?}", r.dirs);
+                    assert_eq!(r.fs.len(), 1);
+                    assert_eq!(r.fs[0].change, sign * M as i64);
+                    assert!(r.docker_compared);
+                    assert_eq!(r.docker.len(), 1);
+                    assert_eq!(r.docker[0].kind, ChangeKind::BuildCache);
+                    assert_eq!(r.docker[0].change, sign * 2 * M as i64);
+                    let mut notes = vec![coverage_note];
+                    if skipped_mount {
+                        notes.push("not compared, because a mount changed during the window: /h/a");
+                    }
+                    notes.push("directories not compared: coverage changed during the window, and files with several hard links may be counted in different places");
+                    assert_eq!(r.notes, notes);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn watch_omits_mount_ancestors_and_keeps_unaffected_directory_rates() {
+    let start = sample(
+        "2026-11-18T02:00:00Z",
+        &[("/h", 10 * M), ("/h/a", 6 * M), ("/h/b", 4 * M)],
+        50 * G,
+    );
+    let end = skipping(
+        sample(
+            "2026-11-18T02:01:00Z",
+            &[("/h", 8 * M), ("/h/b", 8 * M)],
+            50 * G,
+        ),
+        &["/h/a"],
+    );
+    for (before, after, sign) in [(&start, &end, 1), (&end, &start, -1)] {
+        let r = growth::watch(before, after, 60, 60_000, M, [&[], &[]]);
+        let changes: HashMap<&str, i64> =
+            r.dirs.iter().map(|d| (d.name.as_str(), d.change)).collect();
+        assert_eq!(changes, HashMap::from([("/h/b", sign * 4 * M as i64)]));
+        assert_eq!(
+            r.notes,
+            [
+                "not compared, because one side did not enter these mount points: /h/a",
+                "not compared, because a mount changed during the window: /h/a",
+            ]
+        );
+    }
+}
+
+#[test]
+fn watch_omits_ancestors_of_mounts_appearing_during_the_window() {
+    let start = sample(
+        "2026-11-18T02:00:00Z",
+        &[("/h", 6 * M), ("/h/a", 6 * M)],
+        50 * G,
+    );
+    let end = skipping(
+        sample(
+            "2026-11-18T02:01:00Z",
+            &[("/h", 3 * M), ("/h/new", 3 * M)],
+            50 * G,
+        ),
+        &["/h/a", "/h/new/volume"],
+    );
+    let r = growth::watch(&start, &end, 60, 60_000, M, [&[], &[]]);
+    assert!(r.dirs.is_empty(), "{:?}", r.dirs);
+    assert_eq!(
+        r.notes,
+        [
+            "not compared, because one side did not enter these mount points: /h/a",
+            "not compared, because a mount changed during the window: /h/a, /h/new/volume",
+        ]
+    );
+}
+
+#[test]
+fn watch_omits_ancestors_of_mounts_disappearing_during_the_window() {
+    let start = skipping(
+        sample("2026-11-18T02:00:00Z", &[("/h", 0), ("/h/a", 0)], 50 * G),
+        &["/h/a/volume"],
+    );
+    let end = sample(
+        "2026-11-18T02:01:00Z",
+        &[("/h", 6 * M), ("/h/a", 6 * M), ("/h/a/volume", 6 * M)],
+        50 * G,
+    );
+    let r = growth::watch(&start, &end, 60, 60_000, M, [&[], &[]]);
+    assert!(r.dirs.is_empty(), "{:?}", r.dirs);
+    assert_eq!(
+        r.notes,
+        [
+            "not compared, because one side did not enter these mount points: /h/a/volume",
+            "not compared, because a mount changed during the window: /h/a/volume",
+        ]
+    );
+}
+
+#[test]
+fn watch_does_not_note_mount_changes_outside_compared_ancestors() {
+    let start = skipping(
+        sample(
+            "2026-11-18T02:00:00Z",
+            &[("/h", 4 * M), ("/h/b", 4 * M)],
+            50 * G,
+        ),
+        &["/h/a"],
+    );
+    let mut end = sample("2026-11-18T02:01:00Z", &[("/h/b", 6 * M)], 50 * G);
+    end.scan.roots = vec!["/h/b".into()];
+    let r = growth::watch(&start, &end, 60, 60_000, M, [&[], &[]]);
+    assert_eq!(r.dirs.len(), 1);
+    assert_eq!(r.dirs[0].name, "/h/b");
+    assert_eq!(r.dirs[0].change, 2 * M as i64);
+    assert!(r.notes.is_empty(), "{:?}", r.notes);
+}
+
+#[test]
+fn watch_keeps_directory_rates_with_hardlinks_when_coverage_matches() {
+    let mut start = sample(
+        "2026-11-18T02:00:00Z",
+        &[("/h", 6 * M), ("/h/a", M), ("/h/b", 5 * M)],
+        50 * G,
+    );
+    let mut end = sample(
+        "2026-11-18T02:01:00Z",
+        &[("/h", 9 * M), ("/h/a", M), ("/h/b", 8 * M)],
+        50 * G,
+    );
+    start.scan.totals.hardlinks_deduped = 1;
+    end.scan.totals.hardlinks_deduped = 2;
+    start.scan.skipped_mounts = vec!["/h/skip".into(), "/h/other".into()];
+    end.scan.skipped_mounts = vec!["/h/other".into(), "/h/skip".into(), "/h/skip".into()];
+    let unreadable = ["/h/a".to_string()];
+    for coverage in [[&[][..], &[][..]], [&unreadable[..], &unreadable[..]]] {
+        let r = growth::watch(&start, &end, 60, 60_000, M, coverage);
+        assert_eq!(
+            rate_rows(&r.dirs),
+            [(
+                ChangeKind::Dir,
+                "/h/b",
+                Some(5 * M),
+                Some(8 * M),
+                3 * M as i64,
+                3 * M as i64,
+            )]
+        );
+        assert_eq!(
+            r.notes.len(),
+            usize::from(!coverage[0].is_empty()),
+            "{:?}",
+            r.notes
+        );
+    }
+}
+
+/// Docker's figures parsed from a `GET /system/df` body.
+fn docker_from(body: &serde_json::Value) -> SnapshotDocker {
+    let df = docker::parse_system_df(body.to_string().as_bytes()).unwrap();
+    snapshot::docker_part(&docker::Snapshot {
+        df,
+        info: Default::default(),
+    })
+}
+
+#[test]
+fn watch_compares_docker_from_two_system_df_bodies() {
+    let first: serde_json::Value =
+        serde_json::from_str(include_str!("data/docker-system-df.json")).unwrap();
+    let mut second = first.clone();
+    // A minute later: app-1 wrote 40M into its layer, orphan_pg grew 64M, a
+    // volume appeared, old-job was removed, and build cache grew 20M.
+    let containers = second["Containers"].as_array_mut().unwrap();
+    containers.retain(|c| c["Names"][0] != "/old-job");
+    for c in containers.iter_mut() {
+        if c["Names"][0] == "/app-1" {
+            c["SizeRw"] = (2_900_000 + 40 * M).into();
+        }
+    }
+    let volumes = second["Volumes"].as_array_mut().unwrap();
+    for v in volumes.iter_mut() {
+        if v["Name"] == "orphan_pg" {
+            v["UsageData"]["Size"] = (300 * M + 64 * M).into();
+        }
+    }
+    let mut fresh = volumes[0].clone();
+    fresh["Name"] = "fresh".into();
+    fresh["UsageData"]["Size"] = (8 * M).into();
+    volumes.push(fresh);
+    let cache = second["BuildCache"].as_array_mut().unwrap();
+    let mut layer = cache[0].clone();
+    layer["ID"] = "watch-new-layer".into();
+    layer["Size"] = (20 * M).into();
+    layer["InUse"] = false.into();
+    layer["Shared"] = false.into();
+    cache.push(layer);
+
+    let mut start = sample("2026-11-18T02:00:00Z", &[("/h", M)], 50 * G);
+    let mut end = sample("2026-11-18T02:01:00Z", &[("/h", M)], 50 * G);
+    start.docker = Some(docker_from(&first));
+    end.docker = Some(docker_from(&second));
+    let r = growth::watch(&start, &end, 60, 60_000, M, [&[], &[]]);
+    assert!(r.docker_compared);
+    let rows: Vec<(ChangeKind, &str, i64, i64)> = r
+        .docker
+        .iter()
+        .map(|d| (d.kind, d.name.as_str(), d.change, d.bytes_per_minute))
+        .collect();
+    // Unchanged images, the volume whose size the daemon did not compute,
+    // and changes under 1M are left out.
+    assert_eq!(
+        rows,
+        [
+            (
+                ChangeKind::Volume,
+                "orphan_pg",
+                64 * M as i64,
+                64 * M as i64
+            ),
+            (ChangeKind::Container, "app-1", 40 * M as i64, 40 * M as i64),
+            (
+                ChangeKind::BuildCache,
+                "build cache",
+                20 * M as i64,
+                20 * M as i64
+            ),
+            (ChangeKind::Volume, "fresh", 8 * M as i64, 8 * M as i64),
+            (ChangeKind::Container, "old-job", -500_000_000, -500_000_000),
+        ]
+    );
+    let app = &r.docker[1];
+    assert_eq!(app.id.as_deref(), Some(containers_id(&first, "/app-1")));
+    assert_eq!(r.docker[0].id, None, "volumes are named, not id'd");
+}
+
+fn containers_id<'a>(df: &'a serde_json::Value, name: &str) -> &'a str {
+    df["Containers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["Names"][0] == name)
+        .and_then(|c| c["Id"].as_str())
+        .unwrap()
 }
