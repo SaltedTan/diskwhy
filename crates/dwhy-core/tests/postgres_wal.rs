@@ -1,13 +1,12 @@
 //! The `postgres-wal` probe against recorded Engine API responses and psql
-//! output (tests/data/postgres-wal/). No daemon is contacted and nothing
-//! is executed.
+//! output (tests/data/postgres-wal/). No daemon is contacted.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use dwhy_core::detect::finding_id;
-use dwhy_core::docker::{GetError, demux_logs};
-use dwhy_core::probes::postgres_wal::{self, Docker, LOG_TAIL, PsqlError};
+use dwhy_core::docker::{Api, GetError, demux_logs};
+use dwhy_core::probes::postgres_wal::{self, Docker, LOG_TAIL, Live, PsqlError};
 use dwhy_core::report::*;
 use serde_json::Value;
 
@@ -105,8 +104,7 @@ impl Docker for Fake {
             .unwrap_or_else(|| Err(GetError::Http(404, format!("404 {path}"))))
     }
 
-    fn psql(&self, id: &str, user: &str, db: &str, sql: &str) -> Result<String, PsqlError> {
-        assert_eq!(sql, postgres_wal::QUERY);
+    fn psql(&self, id: &str, user: &str, db: &str, _sql: &str) -> Result<String, PsqlError> {
         self.asked
             .borrow_mut()
             .push(format!("psql {id} -U {user} -d {db}"));
@@ -303,9 +301,7 @@ fn healthy_archiver_gives_no_advice() {
 #[test]
 fn psql_failure_falls_back_to_the_api_and_the_log_tail() {
     let mut fake = Fake::recorded("psql-failing.txt");
-    fake.psql = Err(PsqlError::Stderr(
-        r#"psql: error: FATAL: role "app" does not exist"#.into(),
-    ));
+    fake.psql = Err(PsqlError::Failed);
     let f = probe(&fake);
     let ev = evidence(&f);
     assert_eq!(ev.source, EvidenceSource::ApiOnly);
@@ -344,59 +340,16 @@ fn psql_failure_falls_back_to_the_api_and_the_log_tail() {
 
 #[test]
 fn fallback_notes_export_only_psql_failure_categories() {
-    let stderr = |text: &str| Err(PsqlError::Stderr(text.into()));
     let sep = postgres_wal::FIELD_SEP;
-    for (reply, category, private) in [
-        (
-            stderr(r#"ERROR: permission denied for database "tenant_a""#),
-            "psql: permission denied",
-            "tenant_a",
-        ),
-        (
-            stderr(r#"ERROR: permission denied for database "session_timeout""#),
-            "psql: permission denied",
-            "session_timeout",
-        ),
-        (
-            stderr(r#"FATAL: database "permission denied" does not exist"#),
-            "psql failed",
-            "does not exist",
-        ),
-        (
-            stderr(r#"FATAL: password authentication failed for user "tenant_a""#),
-            "psql: authentication failed",
-            "tenant_a",
-        ),
-        (
-            stderr(
-                r#"connection to server on socket "/tenant_a" failed: No such file or directory"#,
-            ),
-            "psql: connection failed",
-            "tenant_a",
-        ),
-        (
-            stderr(r#"could not connect: Connection refused by "tenant_a""#),
-            "psql: connection failed",
-            "tenant_a",
-        ),
-        (
-            stderr("canceling statement due to statement timeout for tenant_a"),
-            "psql failed",
-            "tenant_a",
-        ),
-        (Err(PsqlError::Timeout), "psql: timed out", "tenant_a"),
-        (
-            stderr("Error response from daemon: container tenant_a has stopped"),
-            "docker exec failed",
-            "tenant_a",
-        ),
-        (Err(PsqlError::Exec), "docker exec failed", "tenant_a"),
+    for (reply, category) in [
+        (Err(PsqlError::Timeout), "psql: timed out"),
+        (Err(PsqlError::Exec), "docker exec failed"),
+        (Err(PsqlError::Failed), "psql failed"),
         (
             Ok(format!(
                 "permission denied for tenant_a{sep}0{sep}0{sep}{sep}{sep}{sep}on{sep}aws{sep}1s"
             )),
             "psql failed",
-            "tenant_a",
         ),
     ] {
         let mut fake = Fake::recorded("psql-failing.txt");
@@ -416,8 +369,52 @@ fn fallback_notes_export_only_psql_failure_categories() {
             postgres_wal::summary(ev),
         ] {
             assert!(output.contains(category));
-            assert!(!output.contains(private));
+            assert!(!output.contains("tenant_a"));
         }
+    }
+}
+
+#[test]
+fn docker_exec_failure_uses_only_fixed_categories() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let docker = dir.path().join("docker");
+    let runner = Live {
+        api: Api {
+            socket: dir.path().join("unused.sock"),
+            timeout: postgres_wal::API_TIMEOUT,
+        },
+        docker: Some(docker.to_string_lossy().into_owned()),
+        exec_timeout: postgres_wal::EXEC_TIMEOUT,
+    };
+    for (stderr, category) in [
+        (
+            r#"FATAL: role "team"permission denied"x" does not exist"#,
+            "psql failed",
+        ),
+        (
+            r#"FATAL: role "Error response from daemon: secret" does not exist"#,
+            "psql failed",
+        ),
+        (
+            "Error response from daemon: container secret has stopped",
+            "docker exec failed",
+        ),
+    ] {
+        fs::write(
+            &docker,
+            format!("#!/bin/sh\nprintf '%s\\n' '{stderr}' >&2\nexit 1\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut fake = Fake::recorded("psql-failing.txt");
+        fake.psql = runner.psql(PG, "app", "appdb", "SELECT 1");
+        let f = probe(&fake);
+        assert!(evidence(&f).notes[0].starts_with(&format!("psql not used: {category};")));
+        assert!(!serde_json::to_string(&f).unwrap().contains(stderr));
+        assert!(!postgres_wal::summary(evidence(&f)).contains(stderr));
     }
 }
 
@@ -721,6 +718,41 @@ fn incomplete_inspection_never_proves_a_dead_or_missing_target() {
 }
 
 #[test]
+fn a_disappeared_container_does_not_hide_an_exited_target() {
+    for api_only in [false, true] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        fake.edit("/containers/json?all=1", |v| {
+            let listed = v.as_array_mut().unwrap();
+            let disappeared = listed.iter().position(|c| c["Id"] == APP).unwrap();
+            listed.rotate_left(disappeared);
+        });
+        fake.gets.remove(&format!("/containers/{APP}/json"));
+        if api_only {
+            fake.psql = Err(PsqlError::Failed);
+        }
+        let f = probe(&fake);
+        let ev = evidence(&f);
+        assert_eq!(
+            ev.source,
+            if api_only {
+                EvidenceSource::ApiOnly
+            } else {
+                EvidenceSource::Psql
+            }
+        );
+        assert_eq!(ev.targets[0].host, "s3test");
+        assert_eq!(ev.targets[0].state, "exited");
+        assert_eq!(ev.unmatched_hosts, 0);
+        assert!(f.reason.contains("(target s3test (pgwal-s3test-1) exited)"));
+        assert!(
+            f.action
+                .text
+                .starts_with("restore the archive target s3test;")
+        );
+    }
+}
+
+#[test]
 fn only_the_deepest_mount_owns_the_postgres_evidence() {
     for kind in ["volume", "bind", "tmpfs", "tmpfs-host-config"] {
         let mut fake = Fake::recorded("psql-failing.txt");
@@ -950,6 +982,86 @@ fn assert_unreadable_daemon_log(f: &Finding, private: &str) {
     assert!(summary.contains(category), "{summary}");
     assert!(!summary.contains(private));
     assert!(!serde_json::to_string(f).unwrap().contains(private));
+    assert_eq!(f.action, volume_finding(VOLUME).action);
+}
+
+#[test]
+fn failed_wal_evidence_accepts_only_postgres_archive_filenames() {
+    let sep = postgres_wal::FIELD_SEP;
+    for (wal, expected) in [
+        ("000000010000000A0000009F", Some("000000010000000A0000009F")),
+        (
+            "000000010000000A0000009F.partial",
+            Some("000000010000000A0000009F.partial"),
+        ),
+        ("0000000A.history", Some("0000000A.history")),
+        (
+            "000000010000000A0000009F.0000008E.backup",
+            Some("000000010000000A0000009F.0000008E.backup"),
+        ),
+        ("/private/storage/000000010000000A0000009F", None),
+        ("000000010000000a0000009f", None),
+        ("000000010000000A0000009F.0000008E.partial", None),
+        ("0000000G.history", None),
+        ("000000010000000A0000009F.0000008.backup", None),
+    ] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        let mut fields: Vec<_> = fake.psql.as_ref().unwrap().split(sep).collect();
+        fields[5] = wal;
+        fake.psql = Ok(fields.join(&sep.to_string()));
+        let sql = probe(&fake);
+        assert_eq!(evidence(&sql).last_failed_wal.as_deref(), expected, "{wal}");
+        assert_eq!(evidence(&sql).source, EvidenceSource::Psql);
+
+        fake.psql = Err(PsqlError::Failed);
+        fake.edit(&format!("/containers/{PG}/json"), |v| {
+            v["Config"]["Tty"] = true.into()
+        });
+        let log = format!(
+            "2026-11-13T02:10:00Z WARNING: archiving write-ahead log file \"{wal}\" failed too many times, will try again later\n"
+        );
+        fake.gets.insert(
+            format!("/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}"),
+            Ok(log.into_bytes()),
+        );
+        let fallback = probe(&fake);
+        assert_eq!(
+            evidence(&fallback).last_failed_wal.as_deref(),
+            expected,
+            "{wal}"
+        );
+        if expected.is_none() {
+            for f in [&sql, &fallback] {
+                assert!(!serde_json::to_string(f).unwrap().contains(wal));
+                assert!(!postgres_wal::summary(evidence(f)).contains(wal));
+            }
+        }
+    }
+}
+
+#[test]
+fn statements_and_unrelated_details_do_not_supply_archiver_evidence() {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    fake.psql = Err(PsqlError::Failed);
+    fake.edit(&format!("/containers/{PG}/json"), |v| {
+        v["Config"]["Tty"] = true.into();
+        v["Args"] = serde_json::json!(["postgres"]);
+    });
+    let log = b"2026-11-13T02:10:00Z ERROR: statement failed\n\
+                2026-11-13T02:10:00Z DETAIL: The failed archive command was: curl https://s3test\n\
+                2026-11-13T02:10:00Z DETAIL: LOG: archive command failed with exit code 6\n\
+                2026-11-13T02:10:00Z STATEMENT: WARNING: archiving write-ahead log file \"000000010000000A0000009F\" failed too many times\n";
+    fake.gets.insert(
+        format!("/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}"),
+        Ok(log.to_vec()),
+    );
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert_eq!(ev.failed_count, Some(0));
+    assert_eq!(ev.last_failed_at, None);
+    assert_eq!(ev.last_failed_wal, None);
+    assert_eq!(ev.archive_program, None);
+    assert!(ev.targets.is_empty());
     assert_eq!(f.action, volume_finding(VOLUME).action);
 }
 

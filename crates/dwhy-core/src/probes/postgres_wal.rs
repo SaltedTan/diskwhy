@@ -95,31 +95,15 @@ pub trait Docker {
 pub enum PsqlError {
     Exec,
     Timeout,
-    Stderr(String),
+    Failed,
 }
 
 impl PsqlError {
     fn category(&self) -> &'static str {
-        let error = match self {
-            Self::Exec => return "docker exec failed",
-            Self::Timeout => return "psql: timed out",
-            Self::Stderr(error) => error,
-        };
-        let text = error.to_ascii_lowercase();
-        let contains = |phrase: &str| text.split('"').step_by(2).any(|part| part.contains(phrase));
-        if contains("error response from daemon") {
-            "docker exec failed"
-        } else if contains("permission denied") {
-            "psql: permission denied"
-        } else if contains("password authentication failed") {
-            "psql: authentication failed"
-        } else if contains("could not connect")
-            || contains("connection refused")
-            || contains("no such file or directory")
-        {
-            "psql: connection failed"
-        } else {
-            "psql failed"
+        match self {
+            Self::Exec => "docker exec failed",
+            Self::Timeout => "psql: timed out",
+            Self::Failed => "psql failed",
         }
     }
 }
@@ -174,13 +158,11 @@ impl Docker for Live {
         }
         let out = run_with_timeout(cmd, self.exec_timeout)?;
         if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let line = err
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .unwrap_or("no error message");
-            return Err(PsqlError::Stderr(line.to_string()));
+            return Err(if out.stderr.starts_with(b"Error response from daemon:") {
+                PsqlError::Exec
+            } else {
+                PsqlError::Failed
+            });
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
@@ -468,19 +450,20 @@ pub fn probe_all(findings: &mut [Finding], docker: &dyn Docker) {
 
 /// Inspect responses, fetched once per container.
 #[derive(Default)]
-struct Inspects(HashMap<String, Option<Inspect>>);
+struct Inspects(HashMap<String, Result<Option<Inspect>, ()>>);
 
 impl Inspects {
-    fn get(&mut self, docker: &dyn Docker, id: &str) -> Option<&Inspect> {
+    fn get(&mut self, docker: &dyn Docker, id: &str) -> Result<Option<&Inspect>, ()> {
         self.0
             .entry(id.to_string())
-            .or_insert_with(|| {
-                docker
-                    .get(&format!("/containers/{id}/json"))
-                    .ok()
-                    .and_then(|b| serde_json::from_slice(&b).ok())
+            .or_insert_with(|| match docker.get(&format!("/containers/{id}/json")) {
+                Ok(body) => serde_json::from_slice(&body).map(Some).map_err(|_| ()),
+                Err(GetError::Http(404, _)) => Ok(None),
+                Err(_) => Err(()),
             })
             .as_ref()
+            .map(Option::as_ref)
+            .map_err(|_| ())
     }
 }
 
@@ -496,9 +479,10 @@ fn probe_volume(
                 .iter()
                 .any(|m| m.kind == "volume" && m.name == volume)
     }) {
-        let Some(insp) = cache.get(docker, &c.id).cloned() else {
+        let Ok(Some(insp)) = cache.get(docker, &c.id) else {
             continue;
         };
+        let insp = insp.clone();
         if insp.state.status != "running" {
             continue;
         }
@@ -561,8 +545,7 @@ fn gather(
         .unwrap_or(user);
     let raw_command = match docker
         .psql(&insp.id, user, db, QUERY)
-        .map_err(|e| e.category())
-        .and_then(|out| parse_psql(&out).map_err(|_| "psql failed"))
+        .and_then(|out| parse_psql(&out).map_err(|_| PsqlError::Failed))
     {
         Ok(row) => {
             ev.wal_bytes = row.wal_bytes;
@@ -575,8 +558,9 @@ fn gather(
             ev.archive_timeout = row.archive_timeout;
             row.archive_command
         }
-        Err(category) => {
+        Err(error) => {
             ev.source = EvidenceSource::ApiOnly;
+            let category = error.category();
             ev.notes.push(format!(
                 "psql not used: {category}; fallback reads command-line settings and up to {LOG_TAIL} log lines"
             ));
@@ -703,11 +687,30 @@ pub fn parse_psql(out: &str) -> Result<PsqlRow, String> {
         failed_count: num(fields[2])?,
         last_archived_at: time(fields[3])?,
         last_failed_at: time(fields[4])?,
-        last_failed_wal: text(fields[5]),
+        last_failed_wal: archive_file_name(fields[5]),
         archive_mode: text(fields[6]),
         archive_command: text(fields[7]),
         archive_timeout: text(fields[8]),
     })
+}
+
+fn archive_file_name(name: &str) -> Option<String> {
+    let hex = |text: &str, width| {
+        text.len() == width
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+    };
+    let valid = if let Some(timeline) = name.strip_suffix(".history") {
+        hex(timeline, 8)
+    } else if let Some(backup) = name.strip_suffix(".backup") {
+        backup
+            .split_once('.')
+            .is_some_and(|(segment, offset)| hex(segment, 24) && hex(offset, 8))
+    } else {
+        hex(name.strip_suffix(".partial").unwrap_or(name), 24)
+    };
+    valid.then(|| name.to_string())
 }
 
 fn epoch_time(s: &str) -> Option<OffsetDateTime> {
@@ -771,29 +774,12 @@ pub struct LogScan {
 pub fn scan_log(text: &str) -> LogScan {
     let mut s = LogScan::default();
     let mut command_detail = false;
+    let mut previous_failure = false;
     for line in text.lines() {
         let message = docker_log_message(line).unwrap_or(line);
-        let when = line_time(line);
-        let starts_record = !message.starts_with([' ', '\t'])
-            && message.split_ascii_whitespace().any(|word| {
-                matches!(
-                    word,
-                    "DEBUG:"
-                        | "INFO:"
-                        | "NOTICE:"
-                        | "WARNING:"
-                        | "ERROR:"
-                        | "LOG:"
-                        | "FATAL:"
-                        | "PANIC:"
-                        | "DETAIL:"
-                        | "HINT:"
-                        | "CONTEXT:"
-                        | "STATEMENT:"
-                )
-            });
+        let record = postgres_log_record(message);
         if command_detail
-            && !starts_record
+            && record.is_none()
             && let Some(command) = &mut s.failed_command
         {
             command.push('\n');
@@ -801,26 +787,54 @@ pub fn scan_log(text: &str) -> LogScan {
             continue;
         }
         command_detail = false;
-        if let Some((_, cmd)) = line.split_once("The failed archive command was: ") {
-            s.failed_command = Some(cmd.trim().to_string());
+        let Some((level, body)) = record else {
+            previous_failure = false;
+            continue;
+        };
+        if previous_failure
+            && level == "DETAIL"
+            && let Some(command) = body.strip_prefix("The failed archive command was: ")
+        {
+            s.failed_command = Some(command.trim().to_string());
             command_detail = true;
+        }
+        previous_failure = false;
+        if !matches!(level, "LOG" | "WARNING") {
             continue;
         }
-        if line.contains("archive command failed")
-            || line.contains("archive command was terminated")
+        if body.starts_with("archive command failed")
+            || body.starts_with("archive command was terminated")
         {
+            previous_failure = true;
             s.failures += 1;
-            if let Some(t) = when {
+            if let Some(t) = line_time(line) {
                 s.last_failure = Some(s.last_failure.map_or(t, |l| l.max(t)));
             }
         }
-        if let Some(rest) = line.split("archiving write-ahead log file \"").nth(1)
+        if let Some(rest) = body.strip_prefix("archiving write-ahead log file \"")
             && let Some((wal, _)) = rest.split_once('"')
         {
-            s.last_failed_wal = Some(wal.to_string());
+            s.last_failed_wal = archive_file_name(wal);
         }
     }
     s
+}
+
+fn postgres_log_record(mut message: &str) -> Option<(&str, &str)> {
+    if message.starts_with([' ', '\t']) {
+        return None;
+    }
+    while let Some((prefix, body)) = message.split_once(": ") {
+        if let Some(
+            level @ ("DEBUG" | "INFO" | "NOTICE" | "WARNING" | "ERROR" | "LOG" | "FATAL" | "PANIC"
+            | "DETAIL" | "HINT" | "CONTEXT" | "STATEMENT"),
+        ) = prefix.split_ascii_whitespace().next_back()
+        {
+            return Some((level, body.trim_start()));
+        }
+        message = body;
+    }
+    None
 }
 
 fn docker_log_message(line: &str) -> Option<&str> {
@@ -1050,7 +1064,9 @@ fn resolve_target(
     let source_networks = source.network_settings.networks.as_ref();
     let mut best = None;
     for c in listed {
-        let inspect = cache.get(docker, &c.id).ok_or(())?;
+        let Some(inspect) = cache.get(docker, &c.id)? else {
+            continue;
+        };
         if inspect.state.status.is_empty() {
             return Err(());
         }
