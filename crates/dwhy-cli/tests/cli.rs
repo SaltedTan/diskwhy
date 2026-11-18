@@ -211,8 +211,28 @@ fn exit_codes() {
     // Help and version are not errors.
     assert_eq!(dwhy(&["--help"]).status.code(), Some(0));
     assert_eq!(dwhy(&["--version"]).status.code(), Some(0));
-    // No TUI yet.
-    assert_eq!(dwhy(&[]).status.code(), Some(1));
+}
+
+#[test]
+fn tui_needs_a_terminal() {
+    // Bare `dwhy` and `dwhy tui` open the TUI; here stdin and stdout are not
+    // terminals, so both refuse and point to `dwhy scan`.
+    for args in [&[][..], &["tui", "."][..]] {
+        let out = dwhy(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("needs a terminal") && err.contains("dwhy scan"),
+            "{err}"
+        );
+        assert!(out.stdout.is_empty(), "no escape codes on a pipe");
+    }
+    // Paths go after `dwhy tui`, not bare `dwhy`.
+    assert_eq!(dwhy(&["."]).status.code(), Some(1));
+    assert_eq!(
+        dwhy(&["tui", "-x", "--cross-filesystems"]).status.code(),
+        Some(1)
+    );
 }
 
 #[test]

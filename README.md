@@ -4,7 +4,7 @@
 
 `diskwhy` (binary `dwhy`) is a Rust tool for Linux dev boxes and servers, used over ssh. It finds what is big *and what is growing*, explains each item, checks whether it is safe to delete, and removes it the way the owning tool would. It has a TUI for people and a JSON CLI (scan → plan → apply) that agents can drive within limits you set.
 
-Status: pre-MVP, private. See [docs/DESIGN.md](docs/DESIGN.md) for scope and milestones. M0 (scanner, `diskwhy/v1` JSON types, `doctor`) and M1 (detectors) are in place. M2 (guards, `plan`, `apply`) is built: an agent can clear `regenerable` items on its own and is refused `review` ones. M3 (growth) is in place. `scan --snapshot` keeps a history of scans, `diff` shows what grew since one, `watch` measures what is growing right now, and the `postgres-wal` probe explains a Postgres volume full of WAL.
+Status: pre-MVP, private. See [docs/DESIGN.md](docs/DESIGN.md) for scope and milestones. M0 (scanner, `diskwhy/v1` JSON types, `doctor`) and M1 (detectors) are in place. M2 (guards, `plan`, `apply`) is built: an agent can clear `regenerable` items on its own and is refused `review` ones. M3 (growth) is in place. `scan --snapshot` keeps a history of scans, `diff` shows what grew since one, `watch` measures what is growing right now, and the `postgres-wal` probe explains a Postgres volume full of WAL. M4 (TUI) has begun: `dwhy` (or `dwhy tui PATH…`) scans and opens a tree browser with sizes, unreadable directories and each filesystem's unaccounted space; it writes and removes nothing. Findings, marking and apply in the TUI come next.
 
 ## Usage
 
@@ -19,6 +19,7 @@ dwhy plan [PATH…] [--tier regenerable|rebuildable|review] [--select ID|PATH,�
           [-x | --cross-filesystems] [--detectors NAME,…]
 dwhy apply PLAN [--max-tier regenerable|rebuildable|review] [--confirm ID,…] [--yes] [--dry-run] [--json]
 dwhy doctor [--json]
+dwhy [tui [PATH…] [-x | --cross-filesystems]]
 ```
 
 - `scan` walks in parallel, never follows symlinks, stays on one filesystem unless `--cross-filesystems` is given, and counts each hardlinked inode once. Sizes are allocated bytes (`st_blocks`), which is what deleting frees; apparent sizes are reported too.
