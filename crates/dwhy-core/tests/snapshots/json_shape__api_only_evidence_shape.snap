@@ -11,7 +11,7 @@ expression: ev
   "last_failed_at": "2026-11-13T02:10:00Z",
   "last_failed_wal": "000000010000000000000097",
   "archive_mode": "on",
-  "archive_command": "aws --endpoint-url http://s3test:9000 s3 cp %p s3://wal/%f",
+  "archive_program": "aws",
   "archive_timeout": "10s",
   "targets": [
     {

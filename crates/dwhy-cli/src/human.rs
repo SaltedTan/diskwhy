@@ -905,7 +905,7 @@ mod tests {
                 last_failed_at: Some("2026-11-13T02:10:00Z".into()),
                 last_failed_wal: None,
                 archive_mode: Some("on".into()),
-                archive_command: Some("curl -T %p http://s3test:9000/wal/%f".into()),
+                archive_program: Some("curl".into()),
                 archive_timeout: Some("10s".into()),
                 targets: vec![ArchiveTarget {
                     host: "s3test".into(),

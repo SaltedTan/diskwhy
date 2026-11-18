@@ -508,7 +508,7 @@ fn gather(
         last_failed_at: None,
         last_failed_wal: None,
         archive_mode: None,
-        archive_command: None,
+        archive_program: None,
         archive_timeout: None,
         targets: Vec::new(),
         source: EvidenceSource::Psql,
@@ -539,20 +539,18 @@ fn gather(
         }
         Err(e) => {
             ev.source = EvidenceSource::ApiOnly;
-            let (detail, _) = analyze_archive_command(&e);
             ev.notes.push(format!(
-                "psql not used: {detail}; fallback reads command-line settings and up to {LOG_TAIL} log lines"
+                "psql not used: {e}; fallback reads command-line settings and up to {LOG_TAIL} log lines"
             ));
             api_only(insp, docker, &mut ev)
         }
     };
     if let Some(raw) = raw_command {
-        let (redacted, hosts) = analyze_archive_command(&raw);
-        ev.targets = hosts
+        ev.targets = analyze_archive_command(&raw)
             .iter()
             .map(|host| resolve_target(host, insp, listed, docker, cache))
             .collect();
-        ev.archive_command = Some(redacted);
+        ev.archive_program = Some(archive_program(&raw));
     }
     ev
 }
@@ -588,8 +586,7 @@ fn api_only(insp: &Inspect, docker: &dyn Docker, ev: &mut PostgresWal) -> Option
             command.or(scan.failed_command)
         }
         Err(e) => {
-            let (detail, _) = analyze_archive_command(&e);
-            ev.notes.push(format!("log tail not read: {detail}"));
+            ev.notes.push(format!("log tail not read: {e}"));
             command
         }
     }
@@ -799,8 +796,37 @@ fn command_word(input: &str) -> (usize, String, bool) {
     (input.len(), value, quote.is_none())
 }
 
-fn analyze_archive_command(mut input: &str) -> (String, Vec<String>) {
-    let mut redacted = String::with_capacity(input.len());
+fn assignment_name(word: &str) -> Option<&str> {
+    let (name, _) = word.split_once('=')?;
+    let mut bytes = name.bytes();
+    let first = bytes.next()?;
+    ((first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+    .then_some(name)
+}
+
+fn archive_program(mut input: &str) -> String {
+    loop {
+        input = input.trim_start_matches(char::is_whitespace);
+        let (len, word, closed) = command_word(input);
+        if !closed || len == 0 {
+            return "***".into();
+        }
+        if assignment_name(&input[..len]).is_some() {
+            input = &input[len..];
+        } else if !word.is_empty()
+            && word
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_./+-".contains(&b))
+        {
+            return word;
+        } else {
+            return "***".into();
+        }
+    }
+}
+
+fn analyze_archive_command(mut input: &str) -> Vec<String> {
     let mut hosts: Vec<String> = Vec::new();
     let mut endpoint_next = false;
     let mut auth_next = false;
@@ -811,60 +837,35 @@ fn analyze_archive_command(mut input: &str) -> (String, Vec<String>) {
             endpoint_next = false;
             auth_next = false;
         }
-        redacted.push_str(separators);
         input = &input[sep..];
         if input.is_empty() {
             break;
         }
         let (len, word, closed) = command_word(input);
-        let raw = &input[..len];
         input = &input[len..];
         let endpoint_value = std::mem::take(&mut endpoint_next);
         if std::mem::take(&mut auth_next) {
-            redacted.push_str("***");
             continue;
         }
         let (key, has_value) = word
             .split_once('=')
             .map_or((word.as_str(), false), |(key, _)| (key, true));
         if AUTH_FLAGS.contains(&key) {
-            if has_value {
-                redacted.push_str(key);
-                redacted.push_str("=***");
-            } else {
-                redacted.push_str(raw);
-                auth_next = true;
-            }
+            auth_next = !has_value;
             continue;
         }
-        if let Some(flag) = ["-u", "-p"].into_iter().find(|flag| word.starts_with(flag)) {
-            redacted.push_str(flag);
-            redacted.push_str("***");
-            continue;
-        }
-        let assignment = has_value
-            && !key.is_empty()
-            && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-        if assignment
-            && ["PASSWORD", "PASSWD", "SECRET", "TOKEN", "KEY", "CREDENTIAL"]
-                .iter()
-                .any(|marker| key.to_ascii_uppercase().contains(marker))
-        {
-            redacted.push_str(key);
-            redacted.push_str("=***");
+        if word.starts_with("-u") || word.starts_with("-p") {
             continue;
         }
         if !closed {
-            redacted.push_str("***");
             break;
         }
         let endpoint_flag = ENDPOINT_FLAGS.contains(&key);
         if endpoint_flag && !has_value {
             endpoint_next = true;
-            redacted.push_str(raw);
             continue;
         }
-        let prefix = if assignment || (key.starts_with("--") && has_value) {
+        let prefix = if assignment_name(&word).is_some() || (key.starts_with("--") && has_value) {
             key.len() + 1
         } else {
             0
@@ -888,40 +889,13 @@ fn analyze_archive_command(mut input: &str) -> (String, Vec<String>) {
         } else {
             None
         };
-        let inner = (raw != word && word.chars().any(char::is_whitespace))
-            .then(|| analyze_archive_command(&word).0)
-            .filter(|inner| inner != &word);
-        let safe = redact_url_userinfo(inner.as_deref().unwrap_or(&word)).or(inner);
-        redacted.push_str(safe.as_deref().unwrap_or(raw));
         if let Some(host) = host
             && !hosts.iter().any(|h| h.eq_ignore_ascii_case(&host))
         {
             hosts.push(host);
         }
     }
-    (redacted, hosts)
-}
-
-fn redact_url_userinfo(word: &str) -> Option<String> {
-    let mut result = String::new();
-    let mut copied = 0;
-    for (scheme_end, _) in word.match_indices("://") {
-        let after = scheme_end + 3;
-        if after < copied {
-            continue;
-        }
-        let rest = &word[after..];
-        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        if let Some((userinfo, _)) = rest[..end].rsplit_once('@') {
-            result.push_str(&word[copied..after]);
-            result.push_str("***");
-            copied = after + userinfo.len();
-        }
-    }
-    (copied != 0).then(|| {
-        result.push_str(&word[copied..]);
-        result
-    })
+    hosts
 }
 
 fn endpoint_host(authority: &str, port_required: bool) -> Option<String> {
@@ -1034,7 +1008,7 @@ fn archiving_on(ev: &PostgresWal) -> bool {
 
 /// Whether SQL evidence shows the latest archive attempt failed.
 pub fn failing(ev: &PostgresWal) -> bool {
-    if ev.source != EvidenceSource::Psql || ev.failed_count.unwrap_or(0) == 0 {
+    if ev.source != EvidenceSource::Psql || !archiving_on(ev) || ev.failed_count.unwrap_or(0) == 0 {
         return false;
     }
     match (&ev.last_failed_at, &ev.last_archived_at) {
@@ -1050,6 +1024,7 @@ pub fn failing(ev: &PostgresWal) -> bool {
 fn needs_archive_repair(ev: &PostgresWal) -> bool {
     failing(ev)
         || (ev.source == EvidenceSource::ApiOnly
+            && ev.archive_mode.as_deref() != Some("off")
             && ev.failed_count.is_some_and(|n| n > 0)
             && !dead_targets(ev).is_empty())
 }
@@ -1112,6 +1087,12 @@ pub fn diagnosis(ev: &PostgresWal) -> String {
             failure.unwrap_or("unknown"),
             success.unwrap_or("none"),
         ),
+        (EvidenceSource::Psql, _) if !archiving_on(ev) && ev.archive_mode.is_some() => {
+            format!(
+                "archiving is {}",
+                ev.archive_mode.as_deref().unwrap_or("off")
+            )
+        }
         (EvidenceSource::Psql, Some(n)) if n > 0 => {
             let success = success.unwrap_or("unknown");
             match failure {
@@ -1122,12 +1103,6 @@ pub fn diagnosis(ev: &PostgresWal) -> String {
                     "{n} archive failures in total (last failure unknown, last success {success})"
                 ),
             }
-        }
-        (EvidenceSource::Psql, _) if !archiving_on(ev) && ev.archive_mode.is_some() => {
-            format!(
-                "archiving is {}",
-                ev.archive_mode.as_deref().unwrap_or("off")
-            )
         }
         (EvidenceSource::Psql, _) => "the archiver reports no failure".into(),
     };
@@ -1261,48 +1236,13 @@ mod tests {
                 &[],
             ),
             ("x s3://bucket/https://unrelated httpx://guessed", &[]),
-        ] {
-            assert_eq!(analyze_archive_command(command).1, expected, "{command}");
-        }
-    }
-
-    #[test]
-    fn archive_credentials_are_redacted_in_each_supported_form() {
-        for (command, expected) in [
-            (
-                "curl https://user:secret@store:9000/wal",
-                "curl https://***@store:9000/wal",
-            ),
-            (
-                "curl --endpoint=https://user@store:9000/wal",
-                "curl --endpoint=https://***@store:9000/wal",
-            ),
-            (
-                r#"curl -u 'alice:p a$$' --password="two words" https://store/wal"#,
-                "curl -u *** --password=*** https://store/wal",
-            ),
-            (
-                r#"aws_secret_access_key='abc def' PGPASSWORD=abc\ def x --pass=xxx --token yyy --key=zzz"#,
-                "aws_secret_access_key=*** PGPASSWORD=*** x --pass=*** --token *** --key=***",
-            ),
-            (
-                "tool --user='alice' --secret private -psecret -u=alice -p 123",
-                "tool --user=*** --secret *** -p*** -u=*** -p ***",
-            ),
             (
                 "tool --password https://private.example --endpoint https://store",
-                "tool --password *** --endpoint https://store",
+                &["store"],
             ),
         ] {
-            assert_eq!(analyze_archive_command(command).0, expected);
+            assert_eq!(analyze_archive_command(command), expected, "{command}");
         }
-        assert_eq!(
-            analyze_archive_command(
-                "tool --password https://private.example --endpoint https://store"
-            )
-            .1,
-            ["store"]
-        );
     }
 
     #[test]

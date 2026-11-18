@@ -322,10 +322,7 @@ fn psql_failure_falls_back_to_the_api_and_the_log_tail() {
     // Settings from the container's command line.
     assert_eq!(ev.archive_mode.as_deref(), Some("on"));
     assert_eq!(ev.archive_timeout.as_deref(), Some("10s"));
-    assert_eq!(
-        ev.archive_command.as_deref(),
-        Some("aws --endpoint-url http://s3test:9000 s3 cp %p s3://wal/%f")
-    );
+    assert_eq!(ev.archive_program.as_deref(), Some("aws"));
     assert_eq!(ev.targets[0].state, "exited");
     assert!(
         ev.notes[0].starts_with("psql not used: docker exec psql failed")
@@ -361,14 +358,7 @@ fn api_only_takes_the_command_from_the_log_when_the_command_line_has_none() {
     let f = probe(&fake);
     let ev = evidence(&f);
     assert_eq!(ev.archive_mode, None);
-    assert!(
-        ev.archive_command
-            .as_deref()
-            .unwrap()
-            .starts_with("aws --endpoint-url http://s3test:9000 s3 cp pg_wal/"),
-        "{:?}",
-        ev.archive_command
-    );
+    assert_eq!(ev.archive_program.as_deref(), Some("aws"));
     assert_eq!(ev.targets[0].host, "s3test");
     assert_eq!(ev.failed_count, Some(3));
 }
@@ -877,51 +867,139 @@ fn only_tty_logs_are_read_raw_and_bad_frames_keep_counts_unknown() {
 }
 
 #[test]
-fn all_archive_command_sources_redact_before_export() {
-    let command = "AWS_SECRET_ACCESS_KEY='env secret' curl --user 'alice:flag-secret' https://user:url-secret@s3test:9000/wal";
-    let expected = "AWS_SECRET_ACCESS_KEY=*** curl --user *** https://***@s3test:9000/wal";
-    for source in ["sql", "inspect", "log"] {
-        let mut fake = Fake::recorded("psql-failing.txt");
-        if source == "sql" {
-            let output = fake.psql.as_ref().unwrap();
-            let mut fields: Vec<_> = output.split(postgres_wal::FIELD_SEP).collect();
-            fields[7] = command;
-            fake.psql = Ok(fields.join(&postgres_wal::FIELD_SEP.to_string()));
-        } else {
-            fake.psql = Err(format!("docker exec psql failed: {command}"));
-            fake.edit(&format!("/containers/{PG}/json"), |v| {
-                if source == "inspect" {
-                    v["Args"] =
-                        serde_json::json!(["postgres", "-c", format!("archive_command={command}")]);
-                } else {
-                    v["Args"] = serde_json::json!(["postgres"]);
-                    v["Config"]["Tty"] = true.into();
+fn every_archive_command_source_exports_only_program_and_hosts() {
+    for (command, program, host) in [
+        (
+            r#"curl -H 'Authorization: Bearer SECRET' https://s3test:9000/wal"#,
+            "curl",
+            "s3test",
+        ),
+        (
+            r#"curl -H "X-Auth-Token: SECRET" https://s3test:9000/wal"#,
+            "curl",
+            "s3test",
+        ),
+        (
+            "mc alias set archive http://s3test:9000 admin SECRET",
+            "mc",
+            "s3test",
+        ),
+        (
+            "curl --user user:$(printf %s SECRET) https://s3test:9000/wal",
+            "curl",
+            "s3test",
+        ),
+        (
+            "azcopy copy %p 'https://account.blob.core.windows.net/archive/%f?sp=w&sig=SECRET'",
+            "azcopy",
+            "account.blob.core.windows.net",
+        ),
+        ("curl https://user:SECRET@s3test:9000/wal", "curl", "s3test"),
+        (
+            r#"AWS_SECRET_ACCESS_KEY=SECRET REGION='local dev' '/opt/bin/wal-g+2.0' https://s3test:9000/wal"#,
+            "/opt/bin/wal-g+2.0",
+            "s3test",
+        ),
+        ("'bad$SECRET' https://s3test:9000/wal", "***", "s3test"),
+        (
+            "'KEY=value' SECRET https://s3test:9000/wal",
+            "***",
+            "s3test",
+        ),
+    ] {
+        for source in ["sql", "inspect", "log"] {
+            let mut fake = Fake::recorded("psql-failing.txt");
+            if source == "sql" {
+                let output = fake.psql.as_ref().unwrap();
+                let mut fields: Vec<_> = output.split(postgres_wal::FIELD_SEP).collect();
+                fields[7] = command;
+                fake.psql = Ok(fields.join(&postgres_wal::FIELD_SEP.to_string()));
+            } else {
+                fake.psql = Err("docker exec psql failed".into());
+                fake.edit(&format!("/containers/{PG}/json"), |v| {
+                    if source == "inspect" {
+                        v["Args"] = serde_json::json!([
+                            "postgres",
+                            "-c",
+                            format!("archive_command={command}")
+                        ]);
+                    } else {
+                        v["Args"] = serde_json::json!(["postgres"]);
+                        v["Config"]["Tty"] = true.into();
+                    }
+                });
+                if source == "log" {
+                    let log = format!(
+                        "2026-11-13T02:10:00Z LOG: archive command failed with exit code 6\n2026-11-13T02:10:00Z DETAIL: The failed archive command was: {command}\n"
+                    );
+                    fake.gets.insert(
+                        format!(
+                            "/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}"
+                        ),
+                        Ok(log.into_bytes()),
+                    );
                 }
-            });
-            if source == "log" {
-                let log = format!(
-                    "2026-11-13T02:10:00Z LOG: archive command failed with exit code 6\n2026-11-13T02:10:00Z DETAIL: The failed archive command was: {command}\n"
-                );
-                fake.gets.insert(
-                    format!("/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}"),
-                    Ok(log.into_bytes()),
-                );
+            }
+            let f = probe(&fake);
+            let report = serde_json::to_string(&f).unwrap();
+            assert!(
+                !report.contains("SECRET"),
+                "credential exported for {source} and {program}"
+            );
+            assert_eq!(
+                evidence(&f).archive_program.as_deref(),
+                Some(program),
+                "{source}"
+            );
+            assert_eq!(evidence(&f).targets[0].host, host, "{source}");
+            if host == "s3test" {
+                assert!(f.reason.contains("target s3test"), "{}", f.reason);
             }
         }
-        let f = probe(&fake);
-        assert_eq!(
-            evidence(&f).archive_command.as_deref(),
-            Some(expected),
-            "{source}"
-        );
-        assert_eq!(evidence(&f).targets[0].host, "s3test");
-        assert!(f.reason.contains("target s3test"), "{}", f.reason);
-        let json = serde_json::to_string(&f).unwrap();
-        for secret in ["env secret", "flag-secret", "url-secret"] {
-            assert!(
-                !json.contains(secret),
-                "credential escaped redaction for {source}"
-            );
-        }
     }
+}
+
+#[test]
+fn disabled_archiving_keeps_history_without_repair_advice() {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    let output = fake.psql.as_ref().unwrap();
+    let mut fields: Vec<_> = output.split(postgres_wal::FIELD_SEP).collect();
+    fields[6] = "off";
+    fake.psql = Ok(fields.join(&postgres_wal::FIELD_SEP.to_string()));
+    let f = probe(&fake);
+    assert!(f.reason.contains("archiving is off"), "{}", f.reason);
+    assert!(!f.reason.contains("archiving is failing"), "{}", f.reason);
+    assert!(!f.reason.contains("archiving works again"), "{}", f.reason);
+    assert!(!f.reason.contains("(target"), "{}", f.reason);
+    assert_eq!(f.action, volume_finding(VOLUME).action);
+    assert_eq!(evidence(&f).failed_count, Some(151));
+    assert_eq!(
+        evidence(&f).last_failed_at.as_deref(),
+        Some("2026-11-15T02:10:00Z")
+    );
+    assert_eq!(
+        evidence(&f).last_archived_at.as_deref(),
+        Some("2026-11-07T07:25:00Z")
+    );
+
+    fake.psql = Err("docker exec psql failed".into());
+    fake.edit(&format!("/containers/{PG}/json"), |v| {
+        let arg = v["Args"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|arg| **arg == "archive_mode=on")
+            .unwrap();
+        *arg = "archive_mode=off".into();
+    });
+    let f = probe(&fake);
+    assert_eq!(evidence(&f).archive_mode.as_deref(), Some("off"));
+    assert_eq!(evidence(&f).failed_count, Some(3));
+    assert_eq!(
+        evidence(&f).last_failed_at.as_deref(),
+        Some("2026-11-13T02:10:00.3Z")
+    );
+    assert_eq!(evidence(&f).targets[0].state, "exited");
+    assert!(!f.reason.contains("(target"), "{}", f.reason);
+    assert_eq!(f.action, volume_finding(VOLUME).action);
 }

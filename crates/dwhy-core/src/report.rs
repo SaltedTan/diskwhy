@@ -384,8 +384,10 @@ pub struct PostgresWal {
     pub last_failed_wal: Option<String>,
     #[serde(default)]
     pub archive_mode: Option<String>,
+    /// The program `archive_command` runs (its first word). Arguments are
+    /// never reported, as they can hold credentials.
     #[serde(default)]
-    pub archive_command: Option<String>,
+    pub archive_program: Option<String>,
     #[serde(default)]
     pub archive_timeout: Option<String>,
     /// Hosts `archive_command` sends WAL to, matched with containers.

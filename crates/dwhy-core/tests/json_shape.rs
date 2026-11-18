@@ -769,9 +769,7 @@ fn probed_finding() -> Finding {
                 last_failed_at: Some("2026-11-13T02:10:00Z".into()),
                 last_failed_wal: Some("000000010000000000000097".into()),
                 archive_mode: Some("on".into()),
-                archive_command: Some(
-                    "aws --endpoint-url http://s3test:9000 s3 cp %p s3://wal/%f".into(),
-                ),
+                archive_program: Some("aws".into()),
                 archive_timeout: Some("10s".into()),
                 targets: vec![
                     ArchiveTarget {
