@@ -510,13 +510,12 @@ fn run_diff(args: DiffArgs) -> Result<u8> {
 }
 
 fn run_watch(args: WatchArgs) -> Result<u8> {
-    let mounts = MountTable::read().unwrap_or_default();
     let one_fs = !args.cross_filesystems;
     let window = Duration::from_secs(args.window);
     let t0 = std::time::Instant::now();
     let started_at = system::now_rfc3339();
-    let (mut start, docker_start) = watch_sample(&args, one_fs, &mounts)?;
-    start.created_at = started_at;
+    let mut start = watch_sample(&args, one_fs)?;
+    start.snapshot.created_at = started_at;
     // The second walk starts `--for` after the first one started.
     let deadline = t0 + window;
     while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
@@ -530,9 +529,16 @@ fn run_watch(args: WatchArgs) -> Result<u8> {
         std::thread::sleep(left.min(Duration::from_secs(1)));
     }
     let elapsed_ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
-    let (end, docker_end) = watch_sample(&args, one_fs, &mounts)?;
-    let mut r = growth::watch(&start, &end, args.window, elapsed_ms, args.min_change);
-    let mut reasons: Vec<String> = [docker_start.err(), docker_end.err()]
+    let end = watch_sample(&args, one_fs)?;
+    let mut r = growth::watch(
+        &start.snapshot,
+        &end.snapshot,
+        args.window,
+        elapsed_ms,
+        args.min_change,
+        [&start.unreadable, &end.unreadable],
+    );
+    let mut reasons: Vec<String> = [start.docker.err(), end.docker.err()]
         .into_iter()
         .flatten()
         .collect();
@@ -551,23 +557,36 @@ fn run_watch(args: WatchArgs) -> Result<u8> {
     Ok(EXIT_OK)
 }
 
+struct WatchSample {
+    snapshot: dwhy_core::report::Snapshot,
+    unreadable: Vec<String>,
+    docker: std::result::Result<(), String>,
+}
+
 /// One end of a watch window: a walk of the roots recording every
 /// directory, and Docker's figures (`Err` with the reason when there are
 /// none). Nothing is saved.
-fn watch_sample(
-    args: &WatchArgs,
-    one_fs: bool,
-    mounts: &MountTable,
-) -> Result<(dwhy_core::report::Snapshot, std::result::Result<(), String>)> {
+fn watch_sample(args: &WatchArgs, one_fs: bool) -> Result<WatchSample> {
+    let mounts = MountTable::read().unwrap_or_default();
     let result = measure(
         &args.paths,
         one_fs,
         u64::MAX,
         args.threads,
         args.quiet,
-        mounts,
+        &mounts,
     )?;
-    let report = scan_report(&result, mounts);
+    if result.error_count > result.errors.len() as u64 {
+        return Err("watch sample has unrecorded scan errors; coverage is unknown".into());
+    }
+    let unreadable = result
+        .unreadable
+        .iter()
+        .map(|u| &u.path)
+        .chain(result.errors.iter().map(|(path, _)| path))
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let report = scan_report(&result, &mounts);
     let docker = if args.no_docker {
         Err("--no-docker given".to_string())
     } else {
@@ -575,7 +594,11 @@ fn watch_sample(
         docker_now()
     };
     let snap = snapshot::build(&report, &result.tree, docker.as_deref().ok(), 0);
-    Ok((snap, docker.map(|_| ())))
+    Ok(WatchSample {
+        snapshot: snap,
+        unreadable,
+        docker: docker.map(|_| ()),
+    })
 }
 
 /// Docker's figures now, from `GET /system/df` and `/info`.

@@ -648,7 +648,7 @@ fn watch_rates_growth_per_minute_at_the_deepest_dir() {
     );
     // 30 s from the start of one walk to the start of the next: rates
     // per minute are twice the change.
-    let r = growth::watch(&start, &end, 30, 30_000, M);
+    let r = growth::watch(&start, &end, 30, 30_000, M, [&[], &[]]);
     assert_eq!(r.started_at, "2026-11-18T02:00:00Z");
     assert_eq!(r.generated_at, "2026-11-18T02:00:31Z");
     assert_eq!((r.for_secs, r.elapsed_ms, r.min_change), (30, 30_000, M));
@@ -700,6 +700,125 @@ fn watch_rates_growth_per_minute_at_the_deepest_dir() {
     assert!(r.notes.is_empty(), "{:?}", r.notes);
 }
 
+#[test]
+fn watch_omits_directories_when_either_sample_has_unknown_contents() {
+    let start = sample(
+        "2026-11-18T02:00:00Z",
+        &[
+            ("/h", 20 * M),
+            ("/h/data", 8 * M),
+            ("/h/data/logs", 8 * M),
+            ("/h/data/logs/entry", 8 * M),
+            ("/h/data/logs/entry/deep", 6 * M),
+            ("/h/databases", 8 * M),
+            ("/h/quiet", 4 * M),
+        ],
+        50 * G,
+    );
+    let end = sample(
+        "2026-11-18T02:01:00Z",
+        &[
+            ("/h", 17 * M),
+            ("/h/databases", 10 * M),
+            ("/h/quiet", 7 * M),
+        ],
+        50 * G + M,
+    );
+    for failed in ["/h/data", "/h/data/logs", "/h/data/logs/entry"] {
+        let unreadable = vec![failed.to_string(), failed.to_string()];
+        for (before, after, coverage, sign) in [
+            (&start, &end, [&[][..], unreadable.as_slice()], 1),
+            (&end, &start, [unreadable.as_slice(), &[][..]], -1),
+        ] {
+            let r = growth::watch(before, after, 60, 60_000, M, coverage);
+            let changes: HashMap<&str, i64> =
+                r.dirs.iter().map(|d| (d.name.as_str(), d.change)).collect();
+            assert_eq!(
+                changes,
+                HashMap::from([
+                    ("/h/quiet", sign * 3 * M as i64),
+                    ("/h/databases", sign * 2 * M as i64),
+                ]),
+                "{failed}"
+            );
+            assert_eq!(r.fs[0].change, sign * M as i64);
+            assert_eq!(
+                r.notes,
+                [format!(
+                    "not compared, because a sample could not read these paths: {failed}"
+                )]
+            );
+        }
+    }
+}
+
+#[test]
+fn watch_compares_ancestors_when_both_samples_failed_at_the_same_path() {
+    let start = sample(
+        "2026-11-18T02:00:00Z",
+        &[
+            ("/h", 10 * M),
+            ("/h/data", 10 * M),
+            ("/h/data/logs", M),
+            ("/h/data/logs/deep", M),
+        ],
+        50 * G,
+    );
+    let end = sample(
+        "2026-11-18T02:01:00Z",
+        &[("/h", 14 * M), ("/h/data", 14 * M), ("/h/data/logs", 0)],
+        50 * G,
+    );
+    let unreadable = vec!["/h/data/logs".to_string()];
+    let r = growth::watch(&start, &end, 60, 60_000, M, [&unreadable, &unreadable]);
+    assert_eq!(
+        rate_rows(&r.dirs),
+        [(
+            ChangeKind::Dir,
+            "/h/data",
+            Some(10 * M),
+            Some(14 * M),
+            4 * M as i64,
+            4 * M as i64,
+        )]
+    );
+    assert_eq!(
+        r.notes,
+        ["not compared, because a sample could not read these paths: /h/data/logs"]
+    );
+}
+
+#[test]
+fn watch_omits_ancestors_of_entries_that_could_not_be_statted() {
+    let start = sample(
+        "2026-11-18T02:00:00Z",
+        &[("/h", 10 * M), ("/h/data", 10 * M)],
+        50 * G,
+    );
+    let end = sample(
+        "2026-11-18T02:01:00Z",
+        &[("/h", 4 * M), ("/h/data", 4 * M)],
+        50 * G,
+    );
+    let unreadable = vec!["/h/data/file".to_string()];
+    for coverage in [
+        [&[][..], unreadable.as_slice()],
+        [unreadable.as_slice(), &[][..]],
+    ] {
+        let r = growth::watch(&start, &end, 60, 60_000, M, coverage);
+        assert!(r.dirs.is_empty(), "{:?}", r.dirs);
+        assert_eq!(
+            r.notes,
+            ["not compared, because a sample could not read these paths: /h/data/file"]
+        );
+    }
+    let r = growth::watch(&start, &end, 60, 60_000, M, [&unreadable, &unreadable]);
+    assert_eq!(r.dirs.len(), 1);
+    assert_eq!(r.dirs[0].name, "/h/data");
+    assert_eq!(r.dirs[0].change, -6 * M as i64);
+    assert!(r.notes.is_empty());
+}
+
 /// Docker's figures parsed from a `GET /system/df` body.
 fn docker_from(body: &serde_json::Value) -> SnapshotDocker {
     let df = docker::parse_system_df(body.to_string().as_bytes()).unwrap();
@@ -745,7 +864,7 @@ fn watch_compares_docker_from_two_system_df_bodies() {
     let mut end = sample("2026-11-18T02:01:00Z", &[("/h", M)], 50 * G);
     start.docker = Some(docker_from(&first));
     end.docker = Some(docker_from(&second));
-    let r = growth::watch(&start, &end, 60, 60_000, M);
+    let r = growth::watch(&start, &end, 60, 60_000, M, [&[], &[]]);
     assert!(r.docker_compared);
     let rows: Vec<(ChangeKind, &str, i64, i64)> = r
         .docker

@@ -1024,6 +1024,83 @@ fn an_item_that_changed_since_the_plan_is_skipped() {
 }
 
 #[test]
+fn watch_ignores_permission_changes_during_the_window() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if dwhy_core::system::euid() == 0 {
+        return;
+    }
+    struct RestorePermissions(Vec<std::path::PathBuf>);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().canonicalize().unwrap();
+    let locked = root.join("data");
+    let noexec = root.join("entries");
+    fs::create_dir_all(locked.join("logs")).unwrap();
+    fs::create_dir(&noexec).unwrap();
+    fs::create_dir(root.join("quiet")).unwrap();
+    fs::write(locked.join("logs/data"), vec![1u8; 6 << 20]).unwrap();
+    fs::write(noexec.join("data"), vec![1u8; 6 << 20]).unwrap();
+    let _restore = RestorePermissions(vec![locked.clone(), noexec.clone()]);
+    let state = tempfile::tempdir().unwrap();
+
+    for readable_after in [false, true] {
+        let (locked_path, noexec_path, quiet) =
+            (locked.clone(), noexec.clone(), root.join("quiet"));
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            fs::set_permissions(
+                locked_path,
+                fs::Permissions::from_mode(if readable_after { 0o755 } else { 0o000 }),
+            )
+            .unwrap();
+            fs::set_permissions(
+                noexec_path,
+                fs::Permissions::from_mode(if readable_after { 0o755 } else { 0o600 }),
+            )
+            .unwrap();
+            let name = if readable_after { "second" } else { "first" };
+            fs::write(quiet.join(name), vec![2u8; 4 << 20]).unwrap();
+        });
+        let out = dwhy_in(
+            state.path(),
+            &[
+                "watch",
+                root.to_str().unwrap(),
+                "--for",
+                "4s",
+                "--json",
+                "-q",
+                "--no-docker",
+            ],
+        );
+        writer.join().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let r: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let dirs = r["dirs"].as_array().unwrap();
+        assert_eq!(dirs.len(), 1, "{r}");
+        assert_eq!(dirs[0]["name"], root.join("quiet").to_str().unwrap());
+        assert!(dirs[0]["change"].as_i64().unwrap() >= 4 << 20, "{r}");
+        assert_eq!(
+            r["notes"][0],
+            format!(
+                "not compared, because a sample could not read these paths: {}, {}",
+                locked.display(),
+                noexec.display(),
+            )
+        );
+        assert_eq!(fs::read_dir(state.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
 fn watch_reports_a_dir_written_during_the_window() {
     let t = tempfile::tempdir().unwrap();
     let root = t.path().canonicalize().unwrap();

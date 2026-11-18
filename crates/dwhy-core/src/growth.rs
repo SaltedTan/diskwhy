@@ -114,6 +114,7 @@ fn compare(
     new: &Snapshot,
     size_now: &dyn Fn(&str) -> Option<u64>,
     min_change: u64,
+    excluded: &dyn Fn(&str) -> bool,
 ) -> Compared {
     let above: Vec<&str> = if old.scan.one_filesystem != new.scan.one_filesystem {
         left_out(&old.scan, &new.scan)
@@ -136,7 +137,7 @@ fn compare(
         let p = Path::new(path);
         within(p, &old.scan.roots) && within(p, &new.scan.roots)
     };
-    let both = |path: &str| in_roots(path) && blockers(path).is_empty();
+    let both = |path: &str| in_roots(path) && blockers(path).is_empty() && !excluded(path);
     let mut mounts: Vec<&str> = old
         .dirs
         .iter()
@@ -303,7 +304,7 @@ pub fn diff(
         (Some(n), Some(o)) => n - o,
         _ => 0,
     };
-    let c = compare(old, new, size_now, min_change);
+    let c = compare(old, new, size_now, min_change, &|_| false);
     let mut notes: Vec<String> = c.mounts_note.into_iter().collect();
     match (&old.docker, &new.docker) {
         (Some(_), Some(_)) => {}
@@ -365,8 +366,48 @@ pub fn watch(
     for_secs: u64,
     elapsed_ms: u64,
     min_change: u64,
+    unreadable: [&[String]; 2],
 ) -> WatchReport {
-    let c = compare(start, end, &|_| None, min_change);
+    let [old_unreadable, new_unreadable] =
+        unreadable.map(|paths| paths.iter().map(String::as_str).collect::<HashSet<_>>());
+    let changed_coverage: HashSet<&str> = old_unreadable
+        .symmetric_difference(&new_unreadable)
+        .copied()
+        .collect();
+    let all_unreadable: HashSet<&str> = old_unreadable.union(&new_unreadable).copied().collect();
+    let blockers = |path: &str| {
+        let path = Path::new(path);
+        all_unreadable
+            .iter()
+            .copied()
+            .filter(|failed| {
+                path.starts_with(failed)
+                    || (changed_coverage.contains(failed) && Path::new(failed).starts_with(path))
+            })
+            .collect::<Vec<_>>()
+    };
+    let c = compare(start, end, &|_| None, min_change, &|path| {
+        !blockers(path).is_empty()
+    });
+    let mut omitted: Vec<&str> = start
+        .dirs
+        .iter()
+        .chain(&end.dirs)
+        .filter(|d| {
+            let path = Path::new(&d.path);
+            within(path, &start.scan.roots) && within(path, &end.scan.roots)
+        })
+        .flat_map(|d| blockers(&d.path))
+        .collect();
+    omitted.sort_unstable();
+    omitted.dedup();
+    let mut notes: Vec<String> = c.mounts_note.into_iter().collect();
+    if !omitted.is_empty() {
+        notes.push(format!(
+            "not compared, because a sample could not read these paths: {}",
+            omitted.join(", ")
+        ));
+    }
     let rates = |list: Vec<Change>| {
         let mut v: Vec<Rate> = list
             .into_iter()
@@ -404,7 +445,7 @@ pub fn watch(
         dirs: rates(c.dirs),
         docker_compared: c.docker.is_some(),
         docker: rates(c.docker.unwrap_or_default()),
-        notes: c.mounts_note.into_iter().collect(),
+        notes,
     }
 }
 
