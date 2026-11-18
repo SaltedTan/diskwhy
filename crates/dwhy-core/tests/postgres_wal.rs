@@ -196,7 +196,7 @@ fn failing_archiver_with_an_exited_target() {
     assert!(ev.notes.is_empty(), "{:?}", ev.notes);
     assert!(
         f.reason.starts_with(
-            "pg_wal holds 29.0G vs 53.0M data; archive_command has failed 151x (last failure 2026-11-15, last success 2026-11-07) \
+            "pg_wal holds 29.0G vs 53.0M data; archiving is failing, with 151 failures in total (last failure 2026-11-15T02:10:00Z, last success 2026-11-07T07:25:00Z) \
              (target s3test (pgwal-s3test-1) exited); volume pgwal_pg_data holds"
         ),
         "{}",
@@ -263,7 +263,9 @@ fn target_found_by_network_alias_only() {
 #[test]
 fn running_target_gives_generic_advice() {
     let mut fake = Fake::recorded("psql-failing.txt");
-    fake.edit_listed(S3, |c| c["State"] = "running".into());
+    fake.edit(&format!("/containers/{S3}/json"), |v| {
+        v["State"]["Status"] = "running".into()
+    });
     let f = probe(&fake);
     assert_eq!(evidence(&f).targets[0].state, "running");
     assert!(!f.reason.contains("(target"), "{}", f.reason);
@@ -312,7 +314,7 @@ fn psql_failure_falls_back_to_the_api_and_the_log_tail() {
     assert_eq!(ev.data_bytes, None);
     // Three failure lines in the recorded tail.
     assert_eq!(ev.failed_count, Some(3));
-    assert_eq!(ev.last_failed_at.as_deref(), Some("2026-11-13T02:10:00Z"));
+    assert_eq!(ev.last_failed_at.as_deref(), Some("2026-11-13T02:10:00.3Z"));
     assert_eq!(
         ev.last_failed_wal.as_deref(),
         Some("000000010000000000000097")
@@ -333,7 +335,7 @@ fn psql_failure_falls_back_to_the_api_and_the_log_tail() {
     );
     assert!(
         f.reason.starts_with(&format!(
-            "archive_command has failed 3x in the last {LOG_TAIL} log lines (target s3test (pgwal-s3test-1) exited)"
+            "observed 3 archive failures in the last {LOG_TAIL} log lines (last failure 2026-11-13T02:10:00.3Z); current archiver health unknown (target s3test (pgwal-s3test-1) exited)"
         )),
         "{}",
         f.reason
@@ -502,20 +504,14 @@ fn heavy_wal_without_failures_gets_advice() {
 #[test]
 fn log_frames_are_demultiplexed() {
     let raw = data("logs-postgres.bin");
-    let text = String::from_utf8(demux_logs(&raw)).unwrap();
+    let text = String::from_utf8(demux_logs(&raw).unwrap()).unwrap();
     assert_eq!(text.lines().count(), 7);
     assert!(text.starts_with("2026-11-07T07:00:02.000000000Z "));
     assert!(!text.contains('\0'));
 
-    // A TTY container's raw stream passes through.
-    assert_eq!(demux_logs(b"plain text\n"), b"plain text\n");
-    // A truncated last frame keeps what arrived.
-    let mut cut = vec![1, 0, 0, 0, 0, 0, 0, 3];
-    cut.extend_from_slice(b"abc");
-    cut.extend_from_slice(&[2, 0, 0, 0, 0, 0, 0, 10]);
-    cut.extend_from_slice(b"de");
-    assert_eq!(demux_logs(&cut), b"abcde");
-    assert_eq!(demux_logs(b""), b"");
+    assert!(demux_logs(b"plain text\n").is_err());
+    assert!(demux_logs(&raw[..raw.len() - 1]).is_err());
+    assert_eq!(demux_logs(b"").unwrap(), b"");
 }
 
 #[test]
@@ -554,10 +550,10 @@ fn special_hosts_match_identifiers_before_becoming_unresolved() {
             .replace("s3test:9000", "archive.example.com:9000"));
         match identifier {
             "name" => fake.edit_listed(S3, |v| {
-                v["Names"] = serde_json::json!(["/archive.example.com"])
+                v["Names"] = serde_json::json!(["/ARCHIVE.example.com"])
             }),
             "service" => fake.edit_listed(S3, |v| {
-                v["Labels"]["com.docker.compose.service"] = "archive.example.com".into()
+                v["Labels"]["com.docker.compose.service"] = "ARCHIVE.example.com".into()
             }),
             field => fake.edit(&format!("/containers/{S3}/json"), |v| {
                 let key = if field == "alias" {
@@ -566,7 +562,7 @@ fn special_hosts_match_identifiers_before_becoming_unresolved() {
                     "DNSNames"
                 };
                 v["NetworkSettings"]["Networks"]["pgwal_default"][key] =
-                    serde_json::json!(["archive.example.com"]);
+                    serde_json::json!(["ARCHIVE.example.com"]);
             }),
         }
         let f = probe(&fake);
@@ -626,7 +622,7 @@ fn alias_lookup_checks_containers_beyond_the_old_limit() {
         });
         fake.set_json(
             &format!("/containers/{id}/json"),
-            serde_json::json!({"Id": id}),
+            serde_json::json!({"Id": id, "State": {"Status": "running"}}),
         );
     }
     let f = probe(&fake);
@@ -663,16 +659,24 @@ fn incomplete_inspection_never_proves_a_dead_or_missing_target() {
 
 #[test]
 fn only_the_deepest_mount_owns_the_postgres_evidence() {
-    for kind in ["volume", "bind", "tmpfs"] {
+    for kind in ["volume", "bind", "tmpfs", "tmpfs-host-config"] {
         let mut fake = Fake::recorded("psql-failing.txt");
         let edit = |v: &mut Value| {
             v["Mounts"][0]["Destination"] = "/var/lib/postgresql".into();
-            v["Mounts"].as_array_mut().unwrap().push(serde_json::json!({
-                "Type": kind, "Name": "inner-data", "Destination": "/var/lib/postgresql/data"
-            }));
+            if kind != "tmpfs-host-config" {
+                v["Mounts"].as_array_mut().unwrap().push(serde_json::json!({
+                    "Type": kind, "Name": "inner-data", "Destination": "/var/lib/postgresql/data"
+                }));
+            }
         };
         fake.edit_listed(PG, edit);
         fake.edit(&format!("/containers/{PG}/json"), edit);
+        if kind == "tmpfs-host-config" {
+            fake.edit(&format!("/containers/{PG}/json"), |v| {
+                v["HostConfig"]["Tmpfs"] =
+                    serde_json::json!({"/var/lib/postgresql/data": "size=1g"});
+            });
+        }
         let f = probe(&fake);
         assert_untouched(&f);
         assert!(!fake.asked_for("psql"), "{kind}");
@@ -753,4 +757,171 @@ fn doctor_requires_the_volume_detectors_docker_cli() {
         probes::statuses(&ctx)[0].status,
         DetectorAvailability::Unavailable
     );
+}
+
+#[test]
+fn other_networks_are_only_considered_without_a_shared_match() {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    fake.edit(&format!("/containers/{APP}/json"), |v| {
+        v["NetworkSettings"]["Networks"] = serde_json::json!({
+            "pgwal_default": { "Aliases": ["other-app-1"] },
+            "unrelated": { "Aliases": ["S3TEST"] }
+        });
+    });
+    let f = probe(&fake);
+    assert_eq!(evidence(&f).targets[0].state, "exited");
+    assert_eq!(
+        evidence(&f).targets[0].container.as_deref(),
+        Some("pgwal-s3test-1")
+    );
+    fake.remove_container(S3);
+    let f = probe(&fake);
+    assert_eq!(evidence(&f).targets[0].state, "running");
+    assert_eq!(
+        evidence(&f).targets[0].container.as_deref(),
+        Some("other-app-1")
+    );
+}
+
+#[test]
+fn archiver_events_within_one_second_preserve_order() {
+    let s = postgres_wal::FIELD_SEP;
+    for (success, failure, failing) in [
+        ("0.000001", "0.000002", true),
+        ("0.000001", "0.000001", true),
+        ("0.000002", "0.000001", false),
+    ] {
+        let mut fake = Fake::recorded("psql-healthy.txt");
+        fake.psql = Ok(format!(
+            "8589934592{s}104857600{s}151{s}{success}{s}{failure}{s}{s}on{s}/bin/true{s}0\n"
+        ));
+        let f = probe(&fake);
+        assert_eq!(postgres_wal::failing(evidence(&f)), failing);
+        assert!(f.reason.contains("151"), "{}", f.reason);
+        if failing {
+            assert!(
+                f.action.text.starts_with("fix archive_command"),
+                "{}",
+                f.action.text
+            );
+        } else {
+            assert!(f.reason.contains("archiving works again"), "{}", f.reason);
+            assert!(
+                f.reason.contains("1970-01-01T00:00:00.000002Z"),
+                "{}",
+                f.reason
+            );
+            assert!(f.action.text.contains("max_wal_size"), "{}", f.action.text);
+        }
+    }
+}
+
+#[test]
+fn historical_log_failures_do_not_prompt_repairs_to_running_targets() {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    fake.psql = Err("docker exec psql failed".into());
+    fake.edit(&format!("/containers/{S3}/json"), |v| {
+        v["State"]["Status"] = "running".into()
+    });
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert_eq!(ev.failed_count, Some(3));
+    assert!(!postgres_wal::failing(ev));
+    assert!(
+        f.reason.contains("last failure 2026-11-13T02:10:00.3Z"),
+        "{}",
+        f.reason
+    );
+    assert!(
+        f.reason.contains("current archiver health unknown"),
+        "{}",
+        f.reason
+    );
+    assert_eq!(f.action, volume_finding(VOLUME).action);
+}
+
+#[test]
+fn only_tty_logs_are_read_raw_and_bad_frames_keep_counts_unknown() {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    fake.psql = Err("docker exec psql failed".into());
+    let path = format!("/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}");
+    let mut error = vec![3, 0, 0, 0, 0, 0, 0, 11];
+    error.extend_from_slice(b"reader down");
+    let mut late_error = data("logs-postgres.bin");
+    late_error.extend_from_slice(&error);
+    for (payload, message) in [
+        (error, "Docker log stream error: reader down"),
+        (late_error, "Docker log stream error: reader down"),
+        (vec![1, 1, 0, 0, 0, 0, 0, 0], "invalid Docker log header"),
+        (vec![1, 0, 0, 0, 0, 0, 0], "truncated Docker log header"),
+        (
+            vec![1, 0, 0, 0, 0, 0, 0, 2, b'x'],
+            "truncated Docker log payload",
+        ),
+    ] {
+        fake.gets.insert(path.clone(), Ok(payload));
+        let f = probe(&fake);
+        assert_eq!(evidence(&f).failed_count, None);
+        assert!(f.reason.contains(message), "{}", f.reason);
+        assert!(postgres_wal::summary(evidence(&f)).contains(message));
+        assert_eq!(f.action, volume_finding(VOLUME).action);
+    }
+    fake.edit(&format!("/containers/{PG}/json"), |v| {
+        v["Config"]["Tty"] = true.into()
+    });
+    fake.gets.insert(
+        path,
+        Ok(b"2026-11-13T02:10:00Z LOG: archive command failed with exit code 6\n".to_vec()),
+    );
+    assert_eq!(evidence(&probe(&fake)).failed_count, Some(1));
+}
+
+#[test]
+fn all_archive_command_sources_redact_before_export() {
+    let command = "AWS_SECRET_ACCESS_KEY='env secret' curl --user 'alice:flag-secret' https://user:url-secret@s3test:9000/wal";
+    let expected = "AWS_SECRET_ACCESS_KEY=*** curl --user *** https://***@s3test:9000/wal";
+    for source in ["sql", "inspect", "log"] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        if source == "sql" {
+            let output = fake.psql.as_ref().unwrap();
+            let mut fields: Vec<_> = output.split(postgres_wal::FIELD_SEP).collect();
+            fields[7] = command;
+            fake.psql = Ok(fields.join(&postgres_wal::FIELD_SEP.to_string()));
+        } else {
+            fake.psql = Err(format!("docker exec psql failed: {command}"));
+            fake.edit(&format!("/containers/{PG}/json"), |v| {
+                if source == "inspect" {
+                    v["Args"] =
+                        serde_json::json!(["postgres", "-c", format!("archive_command={command}")]);
+                } else {
+                    v["Args"] = serde_json::json!(["postgres"]);
+                    v["Config"]["Tty"] = true.into();
+                }
+            });
+            if source == "log" {
+                let log = format!(
+                    "2026-11-13T02:10:00Z LOG: archive command failed with exit code 6\n2026-11-13T02:10:00Z DETAIL: The failed archive command was: {command}\n"
+                );
+                fake.gets.insert(
+                    format!("/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}"),
+                    Ok(log.into_bytes()),
+                );
+            }
+        }
+        let f = probe(&fake);
+        assert_eq!(
+            evidence(&f).archive_command.as_deref(),
+            Some(expected),
+            "{source}"
+        );
+        assert_eq!(evidence(&f).targets[0].host, "s3test");
+        assert!(f.reason.contains("target s3test"), "{}", f.reason);
+        let json = serde_json::to_string(&f).unwrap();
+        for secret in ["env secret", "flag-secret", "url-secret"] {
+            assert!(
+                !json.contains(secret),
+                "credential escaped redaction for {source}"
+            );
+        }
+    }
 }

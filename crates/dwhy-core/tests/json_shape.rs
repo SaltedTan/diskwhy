@@ -741,7 +741,7 @@ fn probed_finding() -> Finding {
         last_modified: Some("2026-11-13T02:10:00Z".into()),
         growth: None,
         tier: Tier::Review,
-        reason: "pg_wal holds 29G vs 53M data; archive_command has failed 151x (last failure 2026-11-13, last success 2026-11-07) \
+        reason: "pg_wal holds 29G vs 53M data; archiving is failing, with 151 failures in total (last failure 2026-11-13T02:10:00Z, last success 2026-11-07T07:25:00Z) \
                  (target s3test exited); volume example_postgres_data holds 30.8G and is mounted \
                  by example-postgres-1 (running)"
             .into(),

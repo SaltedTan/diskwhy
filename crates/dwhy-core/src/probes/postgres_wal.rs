@@ -14,7 +14,7 @@
 //!   a capped log tail (`/containers/{id}/logs`, [`LOG_TAIL`] lines).
 //! * `docker exec <id> psql` as the database user from the container's
 //!   environment, over the local socket (`PGHOST` empty), with
-//!   `PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=10s`,
+//!   `PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=10s -c search_path=pg_catalog`,
 //!   and the query inside
 //!   `BEGIN READ ONLY`, under a timeout ([`EXEC_TIMEOUT`]).
 //!
@@ -33,7 +33,9 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::detect::{DetectContext, rfc3339};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+use crate::detect::DetectContext;
 use crate::docker::Api;
 use crate::report::{
     ActionKind, ArchiveTarget, DetectorAvailability, EvidenceSource, Finding, PostgresWal,
@@ -54,19 +56,21 @@ pub const API_TIMEOUT: Duration = Duration::from_secs(10);
 const BIG_WAL: u64 = 1 << 30;
 const WAL_RATIO: u64 = 4;
 
+const UNSET_PG_ENV: [&str; 3] = ["PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE"];
+
 /// The read-only queries, as one row. Fields are separated by
 /// [`FIELD_SEP`]; times are seconds since the epoch.
 pub const QUERY: &str = "SELECT \
-(SELECT coalesce(sum(size), 0) FROM pg_ls_waldir()), \
-(SELECT sum(pg_database_size(oid)) FROM pg_database), \
+(SELECT coalesce(sum(size), 0) FROM pg_catalog.pg_ls_waldir()), \
+(SELECT sum(pg_catalog.pg_database_size(oid)) FROM pg_catalog.pg_database), \
 a.failed_count, \
-extract(epoch FROM a.last_archived_time)::bigint, \
-extract(epoch FROM a.last_failed_time)::bigint, \
+extract(epoch FROM a.last_archived_time), \
+extract(epoch FROM a.last_failed_time), \
 a.last_failed_wal, \
-current_setting('archive_mode'), \
-current_setting('archive_command'), \
-current_setting('archive_timeout') \
-FROM pg_stat_archiver a";
+pg_catalog.current_setting('archive_mode'), \
+pg_catalog.current_setting('archive_command'), \
+pg_catalog.current_setting('archive_timeout') \
+FROM pg_catalog.pg_stat_archiver a";
 
 /// psql's field separator (`-F`): ASCII unit separator, which settings and
 /// WAL file names do not contain.
@@ -123,6 +127,9 @@ impl Docker for Live {
         );
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]).current_dir("/");
+        for name in UNSET_PG_ENV {
+            cmd.env_remove(name);
+        }
         let out = run_with_timeout(cmd, self.exec_timeout)?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
@@ -157,18 +164,18 @@ pub fn psql_argv(
         &format!("unix://{socket}"),
         "exec",
         "-e",
-        "PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=10s",
+        "PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=10s -c search_path=pg_catalog",
         "-e",
         "PGCONNECT_TIMEOUT=5",
         // Empty: the local socket, never a server PGHOST names.
         "-e",
         "PGHOST=",
         "-e",
-        "PGHOSTADDR=",
+        UNSET_PG_ENV[0],
         "-e",
-        "PGSERVICE=",
+        UNSET_PG_ENV[1],
         "-e",
-        "PGSERVICEFILE=/dev/null",
+        UNSET_PG_ENV[2],
         container_id,
         "psql",
         "-X",
@@ -308,6 +315,7 @@ pub struct Inspect {
     pub args: Vec<String>,
     pub state: InspectState,
     pub config: InspectConfig,
+    pub host_config: HostConfig,
     pub mounts: Vec<MountPoint>,
     pub network_settings: NetworkSettings,
 }
@@ -324,6 +332,12 @@ pub struct InspectConfig {
     pub env: Option<Vec<String>>,
     pub tty: bool,
     pub labels: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct HostConfig {
+    pub tmpfs: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -371,19 +385,15 @@ impl Inspect {
             n.to_string()
         }
     }
+}
 
-    fn aliases(&self) -> impl Iterator<Item = &str> {
-        self.network_settings
-            .networks
+impl Endpoint {
+    fn matches(&self, host: &str) -> bool {
+        self.aliases
             .iter()
-            .flat_map(|m| m.values())
-            .flat_map(|e| {
-                e.aliases
-                    .iter()
-                    .flatten()
-                    .chain(e.dns_names.iter().flatten())
-            })
-            .map(String::as_str)
+            .flatten()
+            .chain(self.dns_names.iter().flatten())
+            .any(|alias| alias.eq_ignore_ascii_case(host))
     }
 }
 
@@ -460,12 +470,22 @@ fn probe_volume(
         let at_data_dir = insp
             .mounts
             .iter()
-            .filter(|m| {
-                m.destination.starts_with('/')
-                    && Path::new(pgdata).starts_with(Path::new(&m.destination))
+            .map(|m| {
+                (
+                    m.destination.as_str(),
+                    m.kind == "volume" && m.name == volume,
+                )
             })
-            .max_by_key(|m| Path::new(&m.destination).components().count())
-            .is_some_and(|m| m.kind == "volume" && m.name == volume);
+            .chain(
+                insp.host_config
+                    .tmpfs
+                    .iter()
+                    .flat_map(|m| m.keys())
+                    .map(|path| (path.as_str(), false)),
+            )
+            .filter(|(path, _)| path.starts_with('/') && Path::new(pgdata).starts_with(path))
+            .max_by_key(|(path, _)| Path::new(path).components().count())
+            .is_some_and(|(_, is_volume)| is_volume);
         if at_data_dir {
             return Some(gather(&insp, listed, docker, cache));
         }
@@ -502,7 +522,7 @@ fn gather(
         .env("POSTGRES_DB")
         .filter(|d| !d.is_empty())
         .unwrap_or(user);
-    match docker
+    let raw_command = match docker
         .psql(&insp.id, user, db, QUERY)
         .and_then(|out| parse_psql(&out))
     {
@@ -514,62 +534,64 @@ fn gather(
             ev.last_failed_at = row.last_failed_at;
             ev.last_failed_wal = row.last_failed_wal;
             ev.archive_mode = row.archive_mode;
-            ev.archive_command = row.archive_command;
             ev.archive_timeout = row.archive_timeout;
+            row.archive_command
         }
         Err(e) => {
             ev.source = EvidenceSource::ApiOnly;
+            let (detail, _) = analyze_archive_command(&e);
             ev.notes.push(format!(
-                "psql not used: {e}; settings come from the container's command line and \
-                 failures from its last {LOG_TAIL} log lines"
+                "psql not used: {detail}; fallback reads command-line settings and up to {LOG_TAIL} log lines"
             ));
-            api_only(insp, docker, &mut ev);
+            api_only(insp, docker, &mut ev)
         }
+    };
+    if let Some(raw) = raw_command {
+        let (redacted, hosts) = analyze_archive_command(&raw);
+        ev.targets = hosts
+            .iter()
+            .map(|host| resolve_target(host, insp, listed, docker, cache))
+            .collect();
+        ev.archive_command = Some(redacted);
     }
-    let project = insp.label(COMPOSE_PROJECT).map(str::to_string);
-    let hosts = ev
-        .archive_command
-        .as_deref()
-        .map(archive_hosts)
-        .unwrap_or_default();
-    ev.targets = hosts
-        .into_iter()
-        .map(|h| resolve_target(&h, project.as_deref(), listed, docker, cache))
-        .collect();
     ev
 }
 
 /// Settings from the command line, failures from the log tail.
-fn api_only(insp: &Inspect, docker: &dyn Docker, ev: &mut PostgresWal) {
-    let settings = command_settings(&insp.args);
-    ev.archive_mode = settings.get("archive_mode").cloned();
-    ev.archive_command = settings.get("archive_command").cloned();
-    ev.archive_timeout = settings.get("archive_timeout").cloned();
+fn api_only(insp: &Inspect, docker: &dyn Docker, ev: &mut PostgresWal) -> Option<String> {
+    let mut settings = command_settings(&insp.args);
+    ev.archive_mode = settings.remove("archive_mode");
+    ev.archive_timeout = settings.remove("archive_timeout");
+    let command = settings.remove("archive_command");
     let path = format!(
         "/containers/{}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}",
         insp.id
     );
-    match docker.get(&path) {
-        Ok(raw) => {
-            let text = if insp.config.tty {
-                raw
-            } else {
-                crate::docker::demux_logs(&raw)
-            };
+    let logs = docker.get(&path).and_then(|raw| {
+        if insp.config.tty {
+            Ok(raw)
+        } else {
+            crate::docker::demux_logs(&raw)
+        }
+    });
+    match logs {
+        Ok(text) => {
             let scan = scan_log(&String::from_utf8_lossy(&text));
             ev.failed_count = Some(scan.failures);
-            ev.last_failed_at = scan.last_failure.map(rfc3339);
+            ev.last_failed_at = scan.last_failure.and_then(|t| t.format(&Rfc3339).ok());
             ev.last_failed_wal = scan.last_failed_wal;
-            if ev.archive_command.is_none() {
-                ev.archive_command = scan.failed_command;
-            }
             if scan.failures > 0 {
                 ev.notes.push(format!(
                     "failed_count counts failures in the last {LOG_TAIL} log lines only"
                 ));
             }
+            command.or(scan.failed_command)
         }
-        Err(e) => ev.notes.push(format!("log tail not read: {e}")),
+        Err(e) => {
+            let (detail, _) = analyze_archive_command(&e);
+            ev.notes.push(format!("log tail not read: {detail}"));
+            command
+        }
     }
 }
 
@@ -612,9 +634,10 @@ pub fn parse_psql(out: &str) -> Result<PsqlRow, String> {
         if s.is_empty() {
             return Ok(None);
         }
-        s.parse::<i64>()
-            .map(|t| Some(rfc3339(t)))
-            .map_err(|_| format!("unexpected psql output: {s:?} is not a time"))
+        epoch_time(s)
+            .and_then(|t| t.format(&Rfc3339).ok())
+            .map(Some)
+            .ok_or_else(|| "unexpected psql output: invalid archiver time".into())
     };
     Ok(PsqlRow {
         wal_bytes: num(fields[0])?,
@@ -627,6 +650,19 @@ pub fn parse_psql(out: &str) -> Result<PsqlRow, String> {
         archive_command: text(fields[7]),
         archive_timeout: text(fields[8]),
     })
+}
+
+fn epoch_time(s: &str) -> Option<OffsetDateTime> {
+    let magnitude = s.strip_prefix('-').unwrap_or(s);
+    let (seconds, fraction) = magnitude.split_once('.').unwrap_or((magnitude, ""));
+    if fraction.len() > 9 || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let seconds = seconds.parse::<u64>().ok()? as i128;
+    let scale = 10_i128.pow(9 - fraction.len() as u32);
+    let fraction = fraction.parse::<u32>().unwrap_or(0) as i128;
+    let nanos = seconds * 1_000_000_000 + fraction * scale;
+    OffsetDateTime::from_unix_timestamp_nanos(if s.starts_with('-') { -nanos } else { nanos }).ok()
 }
 
 /// `-c name=value` and `--name=value` settings from a `postgres` command
@@ -658,10 +694,8 @@ pub fn command_settings(args: &[String]) -> HashMap<String, String> {
 pub struct LogScan {
     /// `archive command failed …` lines.
     pub failures: u64,
-    /// Seconds since the epoch of the earliest and latest failure line that
-    /// carried a time.
-    pub first_failure: Option<i64>,
-    pub last_failure: Option<i64>,
+    /// The latest timestamped failure.
+    pub last_failure: Option<OffsetDateTime>,
     /// From `archiving write-ahead log file "…" failed too many times`.
     pub last_failed_wal: Option<String>,
     /// From `The failed archive command was: …`.
@@ -673,13 +707,16 @@ pub struct LogScan {
 pub fn scan_log(text: &str) -> LogScan {
     let mut s = LogScan::default();
     for line in text.lines() {
+        if let Some((_, cmd)) = line.split_once("The failed archive command was: ") {
+            s.failed_command = Some(cmd.trim().to_string());
+            continue;
+        }
         let when = line_time(line);
         if line.contains("archive command failed")
             || line.contains("archive command was terminated")
         {
             s.failures += 1;
             if let Some(t) = when {
-                s.first_failure = Some(s.first_failure.map_or(t, |f| f.min(t)));
                 s.last_failure = Some(s.last_failure.map_or(t, |l| l.max(t)));
             }
         }
@@ -688,109 +725,224 @@ pub fn scan_log(text: &str) -> LogScan {
         {
             s.last_failed_wal = Some(wal.to_string());
         }
-        if let Some((_, cmd)) = line.split_once("The failed archive command was: ") {
-            s.failed_command = Some(cmd.trim().to_string());
-        }
     }
     s
 }
 
 /// The time a log line was written: Docker's timestamp prefix, or
 /// Postgres's own `YYYY-MM-DD HH:MM:SS[.fff] UTC` prefix.
-fn line_time(line: &str) -> Option<i64> {
-    use time::format_description::well_known::Rfc3339;
+fn line_time(line: &str) -> Option<OffsetDateTime> {
     let first = line.split_whitespace().next()?;
-    if let Ok(t) = time::OffsetDateTime::parse(first, &Rfc3339) {
-        return Some(t.unix_timestamp());
+    if let Ok(t) = OffsetDateTime::parse(first, &Rfc3339) {
+        return Some(t);
     }
     let mut w = line.split_whitespace();
     let (date, clock, zone) = (w.next()?, w.next()?, w.next()?);
     if zone != "UTC" {
         return None;
     }
-    let clock = clock.split('.').next()?;
-    time::OffsetDateTime::parse(&format!("{date}T{clock}Z"), &Rfc3339)
-        .ok()
-        .map(|t| t.unix_timestamp())
+    OffsetDateTime::parse(&format!("{date}T{clock}Z"), &Rfc3339).ok()
 }
 
-/// Hosts `archive_command` sends WAL to: URL hosts (`http://s3test:9000`),
-/// `host:port` words, and the values of `--endpoint-url`, `--endpoint`,
-/// `--host` and `-h`. In order, without repeats.
-pub fn archive_hosts(cmd: &str) -> Vec<String> {
-    let words: Vec<&str> = cmd
-        .split(|c: char| c.is_whitespace() || "'\"`;|&()<>".contains(c))
-        .filter(|w| !w.is_empty())
-        .collect();
-    let mut out: Vec<String> = Vec::new();
-    let mut add = |h: Option<String>| {
-        if let Some(h) = h
-            && !out.contains(&h)
-        {
-            out.push(h);
-        }
-    };
-    const VALUE_FLAGS: &[&str] = &["--endpoint-url", "--endpoint", "--host", "-h"];
-    let mut i = 0;
-    while i < words.len() {
-        let w = words[i];
-        if VALUE_FLAGS.contains(&w) {
-            if let Some(v) = words.get(i + 1) {
-                add(host_of(v));
-            }
-            i += 2;
-            continue;
-        }
-        if let Some(v) = VALUE_FLAGS
-            .iter()
-            .filter(|f| f.starts_with("--"))
-            .find_map(|f| w.strip_prefix(f)?.strip_prefix('='))
-        {
-            add(host_of(v));
-        } else if w.contains("://") {
-            let parts: Vec<&str> = w.split("://").collect();
-            for (before, part) in parts.iter().zip(&parts[1..]) {
-                let scheme = before
-                    .rsplit(|c: char| !(c.is_ascii_alphanumeric() || "+.-".contains(c)))
-                    .next()
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                // Bucket and path URLs name no host.
-                if !NO_HOST_SCHEMES.contains(&scheme.as_str()) {
-                    add(host_of(part));
+const ENDPOINT_FLAGS: &[&str] = &["--endpoint-url", "--endpoint", "--host"];
+const AUTH_FLAGS: &[&str] = &[
+    "-u",
+    "-p",
+    "--user",
+    "--password",
+    "--pass",
+    "--secret",
+    "--token",
+    "--key",
+];
+const NETWORK_SCHEMES: &[&str] = &[
+    "http",
+    "https",
+    "ssh",
+    "sftp",
+    "ftp",
+    "ftps",
+    "rsync",
+    "tcp",
+    "postgres",
+    "postgresql",
+];
+
+fn shell_separator(c: char) -> bool {
+    c.is_whitespace() || ";|&()<>".contains(c)
+}
+
+fn command_word(input: &str) -> (usize, String, bool) {
+    let mut value = String::new();
+    let mut quote = None;
+    let mut chars = input.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match (quote, c) {
+            (None, c) if shell_separator(c) => return (i, value, true),
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if q == c => quote = None,
+            (q, '\\') if q != Some('\'') => {
+                if let Some(&(_, next)) = chars.peek()
+                    && (q.is_none() || "\"\\$`\n".contains(next))
+                {
+                    chars.next();
+                    if next != '\n' {
+                        value.push(next);
+                    }
+                } else {
+                    value.push(c);
                 }
             }
-        } else if let Some((h, port)) = w.split_once(':') {
-            let port = port.split('/').next().unwrap_or("");
-            if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
-                add(valid_host(h));
-            }
+            _ => value.push(c),
         }
-        i += 1;
     }
-    out
+    (input.len(), value, quote.is_none())
 }
 
-/// URL schemes whose authority is a bucket or nothing, not a host.
-const NO_HOST_SCHEMES: &[&str] = &["s3", "s3a", "gs", "az", "file"];
-
-/// The host of `[scheme://][user@]host[:port][/path]`.
-fn host_of(s: &str) -> Option<String> {
-    let s = s.rsplit("://").next().unwrap_or(s);
-    let authority = s.split(['/', '?', '#']).next().unwrap_or("");
-    let authority = authority.rsplit('@').next().unwrap_or(authority);
-    if let Some(v6) = authority.strip_prefix('[') {
-        return v6
-            .split(']')
-            .next()
-            .filter(|h| !h.is_empty())
-            .map(String::from);
+fn analyze_archive_command(mut input: &str) -> (String, Vec<String>) {
+    let mut redacted = String::with_capacity(input.len());
+    let mut hosts: Vec<String> = Vec::new();
+    let mut endpoint_next = false;
+    let mut auth_next = false;
+    while !input.is_empty() {
+        let sep = input.len() - input.trim_start_matches(shell_separator).len();
+        let separators = &input[..sep];
+        if separators.chars().any(|c| !c.is_whitespace() || c == '\n') {
+            endpoint_next = false;
+            auth_next = false;
+        }
+        redacted.push_str(separators);
+        input = &input[sep..];
+        if input.is_empty() {
+            break;
+        }
+        let (len, word, closed) = command_word(input);
+        let raw = &input[..len];
+        input = &input[len..];
+        let endpoint_value = std::mem::take(&mut endpoint_next);
+        if std::mem::take(&mut auth_next) {
+            redacted.push_str("***");
+            continue;
+        }
+        let (key, has_value) = word
+            .split_once('=')
+            .map_or((word.as_str(), false), |(key, _)| (key, true));
+        if AUTH_FLAGS.contains(&key) {
+            if has_value {
+                redacted.push_str(key);
+                redacted.push_str("=***");
+            } else {
+                redacted.push_str(raw);
+                auth_next = true;
+            }
+            continue;
+        }
+        if let Some(flag) = ["-u", "-p"].into_iter().find(|flag| word.starts_with(flag)) {
+            redacted.push_str(flag);
+            redacted.push_str("***");
+            continue;
+        }
+        let assignment = has_value
+            && !key.is_empty()
+            && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if assignment
+            && ["PASSWORD", "PASSWD", "SECRET", "TOKEN", "KEY", "CREDENTIAL"]
+                .iter()
+                .any(|marker| key.to_ascii_uppercase().contains(marker))
+        {
+            redacted.push_str(key);
+            redacted.push_str("=***");
+            continue;
+        }
+        if !closed {
+            redacted.push_str("***");
+            break;
+        }
+        let endpoint_flag = ENDPOINT_FLAGS.contains(&key);
+        if endpoint_flag && !has_value {
+            endpoint_next = true;
+            redacted.push_str(raw);
+            continue;
+        }
+        let prefix = if assignment || (key.starts_with("--") && has_value) {
+            key.len() + 1
+        } else {
+            0
+        };
+        let address = &word[prefix..];
+        let host = if let Some((scheme, rest)) = address.split_once("://") {
+            if NETWORK_SCHEMES
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(scheme))
+            {
+                let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+                let host_port = authority
+                    .rsplit_once('@')
+                    .map_or(authority, |(_, host)| host);
+                endpoint_host(host_port, false)
+            } else {
+                None
+            }
+        } else if endpoint_value || endpoint_flag {
+            endpoint_host(address, true)
+        } else {
+            None
+        };
+        let inner = (raw != word && word.chars().any(char::is_whitespace))
+            .then(|| analyze_archive_command(&word).0)
+            .filter(|inner| inner != &word);
+        let safe = redact_url_userinfo(inner.as_deref().unwrap_or(&word)).or(inner);
+        redacted.push_str(safe.as_deref().unwrap_or(raw));
+        if let Some(host) = host
+            && !hosts.iter().any(|h| h.eq_ignore_ascii_case(&host))
+        {
+            hosts.push(host);
+        }
     }
-    let host = match authority.rsplit_once(':') {
-        Some((h, p)) if p.bytes().all(|b| b.is_ascii_digit()) => h,
-        _ => authority,
+    (redacted, hosts)
+}
+
+fn redact_url_userinfo(word: &str) -> Option<String> {
+    let mut result = String::new();
+    let mut copied = 0;
+    for (scheme_end, _) in word.match_indices("://") {
+        let after = scheme_end + 3;
+        if after < copied {
+            continue;
+        }
+        let rest = &word[after..];
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        if let Some((userinfo, _)) = rest[..end].rsplit_once('@') {
+            result.push_str(&word[copied..after]);
+            result.push_str("***");
+            copied = after + userinfo.len();
+        }
+    }
+    (copied != 0).then(|| {
+        result.push_str(&word[copied..]);
+        result
+    })
+}
+
+fn endpoint_host(authority: &str, port_required: bool) -> Option<String> {
+    let (host, port) = if let Some(ipv6) = authority.strip_prefix('[') {
+        let (host, port) = ipv6.split_once(']')?;
+        host.parse::<std::net::Ipv6Addr>().ok()?;
+        (host.to_string(), port)
+    } else {
+        let end = authority.find(':').unwrap_or(authority.len());
+        (valid_host(&authority[..end])?, &authority[end..])
     };
-    valid_host(host)
+    if port.is_empty() && !port_required
+        || port
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .is_some()
+    {
+        Some(host)
+    } else {
+        None
+    }
 }
 
 fn valid_host(h: &str) -> Option<String> {
@@ -805,11 +957,9 @@ fn is_ip(h: &str) -> bool {
     h.parse::<std::net::IpAddr>().is_ok()
 }
 
-/// Matches `host` with a container by name, Compose service or network
-/// alias, preferring a running one, then one of the same Compose project.
 fn resolve_target(
     host: &str,
-    project: Option<&str>,
+    source: &Inspect,
     listed: &[Listed],
     docker: &dyn Docker,
     cache: &mut Inspects,
@@ -819,40 +969,53 @@ fn resolve_target(
         container: None,
         state: "unresolved".into(),
     };
-    let rank = |c: &Listed| {
-        (
-            c.state == "running",
-            project.is_some() && c.label(COMPOSE_PROJECT) == project,
-        )
-    };
-    let mut matches = Vec::new();
-    let mut incomplete = false;
+    let project = source.label(COMPOSE_PROJECT);
+    let source_networks = source.network_settings.networks.as_ref();
+    let mut best = None;
     for c in listed {
-        let aliases_match = match cache.get(docker, &c.id) {
-            Some(i) => i.aliases().any(|a| a == host),
-            None => {
-                incomplete = true;
-                false
-            }
+        let Some(inspect) = cache.get(docker, &c.id) else {
+            return unresolved();
         };
-        if c.names.iter().any(|n| n.trim_start_matches('/') == host)
-            || c.label(COMPOSE_SERVICE) == Some(host)
-            || aliases_match
-        {
-            matches.push(c);
+        if inspect.state.status.is_empty() {
+            return unresolved();
+        }
+        let name_or_service = c
+            .names
+            .iter()
+            .any(|name| name.trim_start_matches('/').eq_ignore_ascii_case(host))
+            || c.label(COMPOSE_SERVICE)
+                .is_some_and(|service| service.eq_ignore_ascii_case(host));
+        let mut shared_match = false;
+        let mut matches = name_or_service;
+        for (network, endpoint) in inspect.network_settings.networks.iter().flatten() {
+            let alias = endpoint.matches(host);
+            matches |= alias;
+            shared_match |= (name_or_service || alias)
+                && source_networks.is_some_and(|nets| nets.contains_key(network));
+        }
+        if matches {
+            let rank = (
+                shared_match,
+                inspect.state.status == "running",
+                project.is_some() && c.label(COMPOSE_PROJECT) == project,
+            );
+            if best.as_ref().is_none_or(|(current, _)| rank > *current) {
+                best = Some((
+                    rank,
+                    ArchiveTarget {
+                        host: host.into(),
+                        container: Some(name_of(&c.names, &c.id)),
+                        state: inspect.state.status.clone(),
+                    },
+                ));
+            }
         }
     }
-    if incomplete {
-        return unresolved();
-    }
-    matches.sort_by_key(|c| std::cmp::Reverse(rank(c)));
-    match matches.first() {
-        Some(c) => ArchiveTarget {
-            host: host.into(),
-            container: Some(name_of(&c.names, &c.id)),
-            state: c.state.clone(),
-        },
-        None if host.contains('.') || host == "localhost" || is_ip(host) => unresolved(),
+    match best {
+        Some((_, target)) => target,
+        None if host.contains('.') || host.eq_ignore_ascii_case("localhost") || is_ip(host) => {
+            unresolved()
+        }
         None => ArchiveTarget {
             host: host.into(),
             container: None,
@@ -869,33 +1032,46 @@ fn archiving_on(ev: &PostgresWal) -> bool {
     matches!(ev.archive_mode.as_deref(), Some("on" | "always"))
 }
 
-/// The archiver is failing now: failures and none succeeded since.
+/// Whether SQL evidence shows the latest archive attempt failed.
 pub fn failing(ev: &PostgresWal) -> bool {
-    if ev.failed_count.unwrap_or(0) == 0 {
+    if ev.source != EvidenceSource::Psql || ev.failed_count.unwrap_or(0) == 0 {
         return false;
     }
     match (&ev.last_failed_at, &ev.last_archived_at) {
-        (Some(f), Some(a)) => f > a,
-        // pg_stat_archiver failures without a time, or never archived.
         (_, None) => true,
-        (None, Some(_)) => ev.source == EvidenceSource::ApiOnly,
+        (Some(f), Some(a)) => OffsetDateTime::parse(f, &Rfc3339)
+            .ok()
+            .zip(OffsetDateTime::parse(a, &Rfc3339).ok())
+            .is_some_and(|(failure, archived)| failure >= archived),
+        (None, Some(_)) => false,
     }
+}
+
+fn needs_archive_repair(ev: &PostgresWal) -> bool {
+    failing(ev)
+        || (ev.source == EvidenceSource::ApiOnly
+            && ev.failed_count.is_some_and(|n| n > 0)
+            && !dead_targets(ev).is_empty())
 }
 
 /// WAL far larger than the data with archiving on.
 pub fn wal_heavy(ev: &PostgresWal) -> bool {
     match (ev.wal_bytes, ev.data_bytes) {
-        (Some(w), Some(d)) => archiving_on(ev) && w >= BIG_WAL && w > d.saturating_mul(WAL_RATIO),
+        (Some(w), Some(d)) => {
+            ev.source == EvidenceSource::Psql
+                && archiving_on(ev)
+                && w >= BIG_WAL
+                && w > d.saturating_mul(WAL_RATIO)
+        }
         _ => false,
     }
 }
 
-/// Targets that cannot be receiving WAL: a container not running, or a
-/// container name nothing answers to.
+/// Exited containers and container names nothing answers to.
 pub fn dead_targets(ev: &PostgresWal) -> Vec<&ArchiveTarget> {
     ev.targets
         .iter()
-        .filter(|t| !matches!(t.state.as_str(), "running" | "unresolved"))
+        .filter(|t| matches!(t.state.as_str(), "exited" | "missing"))
         .collect()
 }
 
@@ -906,13 +1082,7 @@ fn describe_target(t: &ArchiveTarget) -> String {
     }
 }
 
-fn date(rfc: &str) -> &str {
-    rfc.split('T').next().unwrap_or(rfc)
-}
-
-/// The one-line diagnosis that leads the finding's reason, e.g. "pg_wal
-/// holds 29G vs 53M data; archive_command has failed 151x (last failure
-/// 2026-11-15, last success 2026-11-07) (target s3test exited)".
+/// The one-line diagnosis that leads the finding's reason.
 pub fn diagnosis(ev: &PostgresWal) -> String {
     let mut parts = Vec::new();
     match (ev.wal_bytes, ev.data_bytes) {
@@ -920,57 +1090,69 @@ pub fn diagnosis(ev: &PostgresWal) -> String {
         (Some(w), None) => parts.push(format!("pg_wal holds {}", human(w))),
         _ => {}
     }
-    if ev.source == EvidenceSource::ApiOnly && ev.failed_count.is_none() {
-        parts.push(format!(
-            "archive failures unknown ({})",
-            ev.notes.join("; ")
-        ));
-    } else if failing(ev) {
-        let n = ev.failed_count.unwrap_or(0);
-        let mut s = format!("archive_command has failed {n}x");
-        if ev.source == EvidenceSource::ApiOnly {
-            s.push_str(&format!(" in the last {LOG_TAIL} log lines"));
-        } else {
-            s.push_str(&format!(
-                " (last failure {}, last success {})",
-                ev.last_failed_at.as_deref().map(date).unwrap_or("unknown"),
-                ev.last_archived_at.as_deref().map(date).unwrap_or("none"),
-            ));
+    let failure = ev.last_failed_at.as_deref();
+    let success = ev.last_archived_at.as_deref();
+    let mut archive = match (ev.source, ev.failed_count) {
+        (EvidenceSource::ApiOnly, None) => {
+            format!("archive failures unknown ({})", ev.notes.join("; "))
         }
+        (EvidenceSource::ApiOnly, Some(n)) => {
+            let last = failure
+                .map(|t| format!(" (last failure {t})"))
+                .unwrap_or_default();
+            let observed = if n == 0 {
+                format!("no archive failures in the last {LOG_TAIL} log lines")
+            } else {
+                format!("observed {n} archive failures in the last {LOG_TAIL} log lines{last}")
+            };
+            format!("{observed}; current archiver health unknown")
+        }
+        (EvidenceSource::Psql, Some(n)) if failing(ev) => format!(
+            "archiving is failing, with {n} failures in total (last failure {}, last success {})",
+            failure.unwrap_or("unknown"),
+            success.unwrap_or("none"),
+        ),
+        (EvidenceSource::Psql, Some(n)) if n > 0 => {
+            let success = success.unwrap_or("unknown");
+            match failure {
+                Some(failure) => format!(
+                    "archiving works again (last success {success}; {n} failures in total, last {failure})"
+                ),
+                None => format!(
+                    "{n} archive failures in total (last failure unknown, last success {success})"
+                ),
+            }
+        }
+        (EvidenceSource::Psql, _) if !archiving_on(ev) && ev.archive_mode.is_some() => {
+            format!(
+                "archiving is {}",
+                ev.archive_mode.as_deref().unwrap_or("off")
+            )
+        }
+        (EvidenceSource::Psql, _) => "the archiver reports no failure".into(),
+    };
+    if needs_archive_repair(ev) {
         let dead = dead_targets(ev);
         if !dead.is_empty() {
             let list: Vec<String> = dead.iter().map(|t| describe_target(t)).collect();
-            s.push_str(&format!(
+            archive.push_str(&format!(
                 " (target{} {})",
                 if dead.len() == 1 { "" } else { "s" },
                 list.join(", ")
             ));
         }
-        parts.push(s);
     } else if wal_heavy(ev) {
         let ratio = ev.wal_bytes.unwrap_or(0) / ev.data_bytes.unwrap_or(1).max(1);
-        parts.push(format!(
-            "WAL is {ratio}x the data with archiving on, though the archiver reports no failure"
-        ));
-    } else if !archiving_on(ev) && ev.archive_mode.is_some() {
-        parts.push(format!(
-            "archiving is {}",
-            ev.archive_mode.as_deref().unwrap_or("off")
-        ));
-    } else if ev.source == EvidenceSource::Psql {
-        parts.push("the archiver reports no failure".into());
-    } else {
-        parts.push(format!(
-            "no archive failures in the last {LOG_TAIL} log lines"
-        ));
+        parts.push(format!("WAL is {ratio}x the data with archiving on"));
     }
+    parts.push(archive);
     parts.join("; ")
 }
 
 /// The advice that replaces the detector's, when WAL is the problem. Never
 /// removing the volume: it holds the database.
 pub fn advice(ev: &PostgresWal) -> Option<String> {
-    if failing(ev) {
+    if needs_archive_repair(ev) {
         let dead: Vec<&str> = dead_targets(ev).iter().map(|t| t.host.as_str()).collect();
         Some(if dead.is_empty() {
             "fix archive_command so archiving succeeds; WAL is freed at the next checkpoint \
@@ -1053,37 +1235,74 @@ mod tests {
 
     #[test]
     fn hosts_from_archive_commands() {
+        for (command, expected) in [
+            (
+                "aws --endpoint-url http://minio:9000 s3 cp %p s3://wal/%f",
+                &["minio"][..],
+            ),
+            ("curl 'http://user:pw@archive:8080/put/%f'", &["archive"]),
+            (
+                "AWS_ENDPOINT_URL=https://minio.local:9000/x wal-g wal-push %p",
+                &["minio.local"],
+            ),
+            (
+                "x --host=db2:5432 --endpoint minio:9000 --endpoint-url=s3test:9000",
+                &["db2", "minio", "s3test"],
+            ),
+            ("curl http://[::1]:9000/x", &["::1"]),
+            ("cp %p backup:2026/%f", &[]),
+            ("pg_receivewal -h backup -p 5432", &[]),
+            (
+                "x --host backup --endpoint-url s3://bucket --endpoint=gs://bucket",
+                &[],
+            ),
+            (
+                "x --endpoint-url=abfs://bucket --host wasb://bucket file:///tmp/backup",
+                &[],
+            ),
+            ("x s3://bucket/https://unrelated httpx://guessed", &[]),
+        ] {
+            assert_eq!(analyze_archive_command(command).1, expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn archive_credentials_are_redacted_in_each_supported_form() {
+        for (command, expected) in [
+            (
+                "curl https://user:secret@store:9000/wal",
+                "curl https://***@store:9000/wal",
+            ),
+            (
+                "curl --endpoint=https://user@store:9000/wal",
+                "curl --endpoint=https://***@store:9000/wal",
+            ),
+            (
+                r#"curl -u 'alice:p a$$' --password="two words" https://store/wal"#,
+                "curl -u *** --password=*** https://store/wal",
+            ),
+            (
+                r#"aws_secret_access_key='abc def' PGPASSWORD=abc\ def x --pass=xxx --token yyy --key=zzz"#,
+                "aws_secret_access_key=*** PGPASSWORD=*** x --pass=*** --token *** --key=***",
+            ),
+            (
+                "tool --user='alice' --secret private -psecret -u=alice -p 123",
+                "tool --user=*** --secret *** -p*** -u=*** -p ***",
+            ),
+            (
+                "tool --password https://private.example --endpoint https://store",
+                "tool --password *** --endpoint https://store",
+            ),
+        ] {
+            assert_eq!(analyze_archive_command(command).0, expected);
+        }
         assert_eq!(
-            archive_hosts("aws --endpoint-url http://s3test:9000 s3 cp %p s3://wal/%f && echo ok"),
-            ["s3test"]
+            analyze_archive_command(
+                "tool --password https://private.example --endpoint https://store"
+            )
+            .1,
+            ["store"]
         );
-        assert_eq!(
-            archive_hosts("wal-g wal-push %p gs://bucket/x file:///mnt/wal"),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            archive_hosts("AWS_ENDPOINT_URL=https://minio.local:9000/x wal-g wal-push %p"),
-            ["minio.local"]
-        );
-        assert_eq!(
-            archive_hosts("curl -fsS -T %p 'http://user:pw@archive:8080/put/%f'"),
-            ["archive"]
-        );
-        assert_eq!(archive_hosts("pg_receivewal -h backup -p 5432"), ["backup"]);
-        assert_eq!(
-            archive_hosts("x --host=db2 --endpoint-url=s3test:9000"),
-            ["db2", "s3test"]
-        );
-        assert_eq!(archive_hosts("nc store:7000 < %p"), ["store"]);
-        assert_eq!(
-            archive_hosts("rsync -ah %p /mnt/wal/%f"),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            archive_hosts("test ! -f /wal/%f && cp %p /wal/%f"),
-            Vec::<String>::new()
-        );
-        assert_eq!(archive_hosts("curl http://[::1]:9000/x"), ["::1"]);
     }
 
     #[test]
@@ -1129,14 +1348,9 @@ mod tests {
         let s: Vec<&str> = a.iter().map(String::as_str).collect();
         assert_eq!(&s[..4], ["docker", "-H", "unix:///run/d.sock", "exec"]);
         assert!(
-            s.contains(&"PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=10s")
+            s.contains(&"PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=10s -c search_path=pg_catalog")
         );
-        for setting in [
-            "PGHOST=",
-            "PGHOSTADDR=",
-            "PGSERVICE=",
-            "PGSERVICEFILE=/dev/null",
-        ] {
+        for setting in ["PGHOST=", "PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE"] {
             assert!(s.windows(2).any(|w| w == ["-e", setting]), "{setting}");
         }
         assert_eq!(
@@ -1188,12 +1402,8 @@ mod tests {
         let s = scan_log(log);
         assert_eq!(s.failures, 2);
         assert_eq!(
-            s.first_failure.map(rfc3339).as_deref(),
-            Some("2026-11-13T02:09:00Z")
-        );
-        assert_eq!(
-            s.last_failure.map(rfc3339).as_deref(),
-            Some("2026-11-13T02:10:00Z")
+            s.last_failure.unwrap().format(&Rfc3339).unwrap(),
+            "2026-11-13T02:10:00.5Z"
         );
         assert_eq!(
             s.last_failed_wal.as_deref(),
@@ -1205,8 +1415,8 @@ mod tests {
             "2026-11-13 02:09:00.100 UTC [61] LOG:  archive command failed with exit code 1",
         );
         assert_eq!(
-            s.last_failure.map(rfc3339).as_deref(),
-            Some("2026-11-13T02:09:00Z")
+            s.last_failure.unwrap().format(&Rfc3339).unwrap(),
+            "2026-11-13T02:09:00.1Z"
         );
     }
 

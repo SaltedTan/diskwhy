@@ -281,23 +281,30 @@ fn dechunk(mut b: &[u8]) -> Result<Vec<u8>, String> {
 /// The text of a `GET /containers/{id}/logs` body for a container without a
 /// TTY: the daemon multiplexes stdout and stderr in frames, each with an
 /// 8-byte header (stream byte, three zero bytes, big-endian payload
-/// length). The payloads are joined in order. A body that does not start
-/// with such a header (a TTY container's raw stream) is returned as is; a
-/// truncated last frame keeps what arrived.
-pub fn demux_logs(raw: &[u8]) -> Vec<u8> {
-    let framed = |b: &[u8]| b.len() >= 8 && b[0] <= 2 && b[1..4] == [0, 0, 0];
-    if !framed(raw) {
-        return raw.to_vec();
-    }
+/// length). The payloads are joined in order.
+pub fn demux_logs(mut raw: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(raw.len());
-    let mut b = raw;
-    while framed(b) {
-        let len = u32::from_be_bytes([b[4], b[5], b[6], b[7]]) as usize;
-        let end = (8 + len).min(b.len());
-        out.extend_from_slice(&b[8..end]);
-        b = &b[end..];
+    while !raw.is_empty() {
+        let Some((header, rest)) = raw.split_at_checked(8) else {
+            return Err("truncated Docker log header".into());
+        };
+        if !matches!(header[0], 1..=3) || header[1..4] != [0, 0, 0] {
+            return Err("invalid Docker log header".into());
+        }
+        let len = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let Some((payload, remaining)) = rest.split_at_checked(len) else {
+            return Err("truncated Docker log payload".into());
+        };
+        if header[0] == 3 {
+            return Err(format!(
+                "Docker log stream error: {}",
+                String::from_utf8_lossy(payload)
+            ));
+        }
+        out.extend_from_slice(payload);
+        raw = remaining;
     }
-    out
+    Ok(out)
 }
 
 /// One Docker snapshot per run, fetched on first use and shared by all

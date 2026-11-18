@@ -9,36 +9,17 @@
 pub mod postgres_wal;
 
 use crate::detect::DetectContext;
-use crate::report::{DetectorAvailability, DetectorStatus, Finding};
-
-/// Every built probe: name and what it adds to.
-pub const PROBES: &[(&str, &str)] = &[(
-    postgres_wal::NAME,
-    "docker-volume findings of a running Postgres container's data directory",
-)];
-
-/// Whether a probe can run, with a one-line reason (for `dwhy doctor`).
-pub fn availability(name: &str, ctx: &DetectContext) -> (DetectorAvailability, String) {
-    match name {
-        postgres_wal::NAME => postgres_wal::availability(ctx),
-        _ => (DetectorAvailability::NotImplemented, "unknown probe".into()),
-    }
-}
+use crate::report::{DetectorStatus, Finding};
 
 /// `dwhy doctor`'s view of the probes.
 pub fn statuses(ctx: &DetectContext) -> Vec<DetectorStatus> {
-    PROBES
-        .iter()
-        .map(|(name, _)| {
-            let (status, detail) = availability(name, ctx);
-            DetectorStatus {
-                name: (*name).into(),
-                milestone: "M3".into(),
-                status,
-                detail,
-            }
-        })
-        .collect()
+    let (status, detail) = postgres_wal::availability(ctx);
+    vec![DetectorStatus {
+        name: postgres_wal::NAME.into(),
+        milestone: "M3".into(),
+        status,
+        detail,
+    }]
 }
 
 /// Runs every probe on the findings it applies to, against the real system.
