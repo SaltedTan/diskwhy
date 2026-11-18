@@ -13,8 +13,9 @@
 //! * Engine API GETs: `/containers/json?all=1`, `/containers/{id}/json`, and
 //!   a capped log tail (`/containers/{id}/logs`, [`LOG_TAIL`] lines).
 //! * `docker exec <id> psql` as the database user from the container's
-//!   environment, over the local socket, with
-//!   `PGOPTIONS=-c default_transaction_read_only=on` and the query inside
+//!   environment, over the local socket (`PGHOST` empty), with
+//!   `PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=10s`,
+//!   and the query inside
 //!   `BEGIN READ ONLY`, under a timeout ([`EXEC_TIMEOUT`]).
 //!
 //! When `docker` is not available or psql fails, the evidence comes from
@@ -139,8 +140,10 @@ impl Docker for Live {
 }
 
 /// The `docker exec` command line: psql without a psqlrc, never prompting
-/// for a password, every transaction read-only (`PGOPTIONS`) and the query
-/// inside `BEGIN READ ONLY`. Run as argv, never through a shell.
+/// for a password, over the container's local socket, every transaction
+/// read-only and each statement limited to 10 s (`PGOPTIONS`, so a query
+/// outlives a killed `docker exec` by at most that), and the query inside
+/// `BEGIN READ ONLY`. Run as argv, never through a shell.
 pub fn psql_argv(
     docker: &str,
     socket: &str,
@@ -155,9 +158,12 @@ pub fn psql_argv(
         &format!("unix://{socket}"),
         "exec",
         "-e",
-        "PGOPTIONS=-c default_transaction_read_only=on",
+        "PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=10s",
         "-e",
         "PGCONNECT_TIMEOUT=5",
+        // Empty: the local socket, never a server PGHOST names.
+        "-e",
+        "PGHOST=",
         container_id,
         "psql",
         "-X",
@@ -1138,7 +1144,10 @@ mod tests {
         let a = psql_argv("docker", "/run/d.sock", "abc", "app", "appdb", QUERY);
         let s: Vec<&str> = a.iter().map(String::as_str).collect();
         assert_eq!(&s[..4], ["docker", "-H", "unix:///run/d.sock", "exec"]);
-        assert!(s.contains(&"PGOPTIONS=-c default_transaction_read_only=on"));
+        assert!(
+            s.contains(&"PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=10s")
+        );
+        assert!(s.contains(&"PGHOST="), "local socket only");
         // No terminal and no stdin for docker exec (psql's own -t comes after "psql").
         let psql = s.iter().position(|x| *x == "psql").unwrap();
         assert!(
