@@ -36,7 +36,7 @@ use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::detect::DetectContext;
-use crate::docker::Api;
+use crate::docker::{Api, GetError};
 use crate::report::{
     ActionKind, ArchiveTarget, DetectorAvailability, EvidenceSource, Finding, PostgresWal,
 };
@@ -79,10 +79,49 @@ pub const FIELD_SEP: char = '\x1f';
 /// What the probe needs from the system. Every method only reads.
 pub trait Docker {
     /// An Engine API GET; the response body.
-    fn get(&self, path: &str) -> Result<Vec<u8>, String>;
+    fn get(&self, path: &str) -> Result<Vec<u8>, GetError>;
     /// Runs [`QUERY`]-style SQL with psql in the container, read-only, as
     /// `user` on database `db`; psql's stdout.
-    fn psql(&self, container_id: &str, user: &str, db: &str, sql: &str) -> Result<String, String>;
+    fn psql(
+        &self,
+        container_id: &str,
+        user: &str,
+        db: &str,
+        sql: &str,
+    ) -> Result<String, PsqlError>;
+}
+
+#[derive(Debug, Clone)]
+pub enum PsqlError {
+    Exec,
+    Timeout,
+    Stderr(String),
+}
+
+impl PsqlError {
+    fn category(&self) -> &'static str {
+        let error = match self {
+            Self::Exec => return "docker exec failed",
+            Self::Timeout => return "psql: timed out",
+            Self::Stderr(error) => error,
+        };
+        let text = error.to_ascii_lowercase();
+        let contains = |phrase: &str| text.split('"').step_by(2).any(|part| part.contains(phrase));
+        if contains("error response from daemon") {
+            "docker exec failed"
+        } else if contains("permission denied") {
+            "psql: permission denied"
+        } else if contains("password authentication failed") {
+            "psql: authentication failed"
+        } else if contains("could not connect")
+            || contains("connection refused")
+            || contains("no such file or directory")
+        {
+            "psql: connection failed"
+        } else {
+            "psql failed"
+        }
+    }
 }
 
 /// The real daemon and docker CLI.
@@ -108,15 +147,18 @@ impl Live {
 }
 
 impl Docker for Live {
-    fn get(&self, path: &str) -> Result<Vec<u8>, String> {
+    fn get(&self, path: &str) -> Result<Vec<u8>, GetError> {
         self.api.get(path)
     }
 
-    fn psql(&self, container_id: &str, user: &str, db: &str, sql: &str) -> Result<String, String> {
-        let docker = self
-            .docker
-            .as_deref()
-            .ok_or("`docker` is not installed, so psql cannot be run in the container")?;
+    fn psql(
+        &self,
+        container_id: &str,
+        user: &str,
+        db: &str,
+        sql: &str,
+    ) -> Result<String, PsqlError> {
+        let docker = self.docker.as_deref().ok_or(PsqlError::Exec)?;
         let argv = psql_argv(
             docker,
             &self.api.socket.to_string_lossy(),
@@ -138,7 +180,7 @@ impl Docker for Live {
                 .map(str::trim)
                 .find(|l| !l.is_empty())
                 .unwrap_or("no error message");
-            return Err(format!("docker exec psql failed ({}): {line}", out.status));
+            return Err(PsqlError::Stderr(line.to_string()));
         }
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
@@ -205,13 +247,13 @@ pub fn psql_argv(
 }
 
 /// Runs `cmd` with no stdin, killing it after `timeout`.
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
+fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Output, PsqlError> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("cannot run docker: {e}"))?;
+        .map_err(|_| PsqlError::Exec)?;
     let drain = |r: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -240,12 +282,10 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Output, Strin
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!(
-                    "docker exec psql gave no answer within {timeout:?}"
-                ));
+                return Err(PsqlError::Timeout);
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => return Err(format!("docker exec psql: {e}")),
+            Err(_) => return Err(PsqlError::Exec),
         }
     };
     Ok(Output {
@@ -358,13 +398,6 @@ pub struct Endpoint {
 const COMPOSE_SERVICE: &str = "com.docker.compose.service";
 const COMPOSE_PROJECT: &str = "com.docker.compose.project";
 
-fn name_of(names: &[String], id: &str) -> String {
-    names
-        .first()
-        .map(|n| n.trim_start_matches('/').to_string())
-        .unwrap_or_else(|| id.chars().take(12).collect())
-}
-
 impl Inspect {
     pub fn env(&self, key: &str) -> Option<&str> {
         self.config
@@ -389,12 +422,13 @@ impl Inspect {
 }
 
 impl Endpoint {
-    fn matches(&self, host: &str) -> bool {
+    fn matching_name(&self, host: &str) -> Option<&str> {
         self.aliases
             .iter()
             .flatten()
             .chain(self.dns_names.iter().flatten())
-            .any(|alias| alias.eq_ignore_ascii_case(host))
+            .find(|alias| alias.eq_ignore_ascii_case(host))
+            .map(String::as_str)
     }
 }
 
@@ -414,9 +448,10 @@ pub fn probe_all(findings: &mut [Finding], docker: &dyn Docker) {
     if !findings.iter().any(applies_to) {
         return;
     }
-    let Ok(listed) = docker
+    let Some(listed) = docker
         .get("/containers/json?all=1")
-        .and_then(|b| serde_json::from_slice::<Vec<Listed>>(&b).map_err(|e| e.to_string()))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<Listed>>(&b).ok())
     else {
         return;
     };
@@ -512,6 +547,7 @@ fn gather(
         archive_program: None,
         archive_timeout: None,
         targets: Vec::new(),
+        unmatched_hosts: 0,
         source: EvidenceSource::Psql,
         notes: Vec::new(),
     };
@@ -525,7 +561,8 @@ fn gather(
         .unwrap_or(user);
     let raw_command = match docker
         .psql(&insp.id, user, db, QUERY)
-        .and_then(|out| parse_psql(&out))
+        .map_err(|e| e.category())
+        .and_then(|out| parse_psql(&out).map_err(|_| "psql failed"))
     {
         Ok(row) => {
             ev.wal_bytes = row.wal_bytes;
@@ -538,9 +575,8 @@ fn gather(
             ev.archive_timeout = row.archive_timeout;
             row.archive_command
         }
-        Err(e) => {
+        Err(category) => {
             ev.source = EvidenceSource::ApiOnly;
-            let category = psql_failure_category(&e);
             ev.notes.push(format!(
                 "psql not used: {category}; fallback reads command-line settings and up to {LOG_TAIL} log lines"
             ));
@@ -549,40 +585,16 @@ fn gather(
     };
     if let Some(raw) = raw_command {
         let (program, hosts) = analyze_archive_command(&raw);
-        ev.targets = hosts
-            .iter()
-            .map(|host| resolve_target(host, insp, listed, docker, cache))
-            .collect();
+        for host in &hosts {
+            match resolve_target(host, insp, listed, docker, cache) {
+                Ok(Some(target)) => ev.targets.push(target),
+                Ok(None) => ev.unmatched_hosts += 1,
+                Err(()) => break,
+            }
+        }
         ev.archive_program = Some(program);
     }
     ev
-}
-
-fn psql_failure_category(error: &str) -> &'static str {
-    let error = error.to_ascii_lowercase();
-    if error.contains("error response from daemon")
-        || error.starts_with("cannot run docker:")
-        || error.starts_with("`docker` is not installed")
-        || error.starts_with("docker exec psql:")
-    {
-        "docker exec failed"
-    } else if error.contains("gave no answer within")
-        || error.contains("timed out")
-        || error.contains("timeout")
-    {
-        "psql: timed out"
-    } else if error.contains("authentication failed") {
-        "psql: authentication failed"
-    } else if error.contains("permission denied") {
-        "psql: permission denied"
-    } else if error.contains("could not connect")
-        || error.contains("connection refused")
-        || error.contains("no such file")
-    {
-        "psql: connection failed"
-    } else {
-        "psql failed"
-    }
 }
 
 /// Settings from the command line, failures from the log tail.
@@ -595,16 +607,32 @@ fn api_only(insp: &Inspect, docker: &dyn Docker, ev: &mut PostgresWal) -> Option
         "/containers/{}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}",
         insp.id
     );
-    let logs = docker.get(&path).and_then(|raw| {
-        if insp.config.tty {
-            Ok(raw)
-        } else {
-            crate::docker::demux_logs(&raw)
-        }
-    });
+    let logs = docker
+        .get(&path)
+        .map_err(|error| match error {
+            GetError::Http(status, _) => Some(status),
+            GetError::Other(_) => None,
+        })
+        .and_then(|raw| {
+            let body = if insp.config.tty {
+                raw
+            } else {
+                crate::docker::demux_logs(&raw).map_err(|_| None)?
+            };
+            let text = String::from_utf8_lossy(&body);
+            if insp.config.tty
+                && text.lines().any(|line| {
+                    !line.trim().is_empty()
+                        && docker_log_message(line)
+                            .is_none_or(|message| message.starts_with("Error grabbing logs:"))
+                })
+            {
+                return Err(None);
+            }
+            Ok(scan_log(&text))
+        });
     match logs {
-        Ok(text) => {
-            let scan = scan_log(&String::from_utf8_lossy(&text));
+        Ok(scan) => {
             ev.failed_count = Some(scan.failures);
             ev.last_failed_at = scan.last_failure.and_then(|t| t.format(&Rfc3339).ok());
             ev.last_failed_wal = scan.last_failed_wal;
@@ -615,8 +643,11 @@ fn api_only(insp: &Inspect, docker: &dyn Docker, ev: &mut PostgresWal) -> Option
             }
             command.or(scan.failed_command)
         }
-        Err(e) => {
-            ev.notes.push(format!("log tail not read: {e}"));
+        Err(status) => {
+            ev.notes.push(match status {
+                Some(status) => format!("log tail unreadable (HTTP {status})"),
+                None => "log tail unreadable (daemon error)".into(),
+            });
             command
         }
     }
@@ -739,12 +770,42 @@ pub struct LogScan {
 /// RFC 3339 timestamp, as `timestamps=1` gives) for archiver failures.
 pub fn scan_log(text: &str) -> LogScan {
     let mut s = LogScan::default();
+    let mut command_detail = false;
     for line in text.lines() {
-        if let Some((_, cmd)) = line.split_once("The failed archive command was: ") {
-            s.failed_command = Some(cmd.trim().to_string());
+        let message = docker_log_message(line).unwrap_or(line);
+        let when = line_time(line);
+        let starts_record = !message.starts_with([' ', '\t'])
+            && message.split_ascii_whitespace().any(|word| {
+                matches!(
+                    word,
+                    "DEBUG:"
+                        | "INFO:"
+                        | "NOTICE:"
+                        | "WARNING:"
+                        | "ERROR:"
+                        | "LOG:"
+                        | "FATAL:"
+                        | "PANIC:"
+                        | "DETAIL:"
+                        | "HINT:"
+                        | "CONTEXT:"
+                        | "STATEMENT:"
+                )
+            });
+        if command_detail
+            && !starts_record
+            && let Some(command) = &mut s.failed_command
+        {
+            command.push('\n');
+            command.push_str(message);
             continue;
         }
-        let when = line_time(line);
+        command_detail = false;
+        if let Some((_, cmd)) = line.split_once("The failed archive command was: ") {
+            s.failed_command = Some(cmd.trim().to_string());
+            command_detail = true;
+            continue;
+        }
         if line.contains("archive command failed")
             || line.contains("archive command was terminated")
         {
@@ -760,6 +821,12 @@ pub fn scan_log(text: &str) -> LogScan {
         }
     }
     s
+}
+
+fn docker_log_message(line: &str) -> Option<&str> {
+    let (timestamp, message) = line.split_once(' ')?;
+    OffsetDateTime::parse(timestamp, &Rfc3339).ok()?;
+    Some(message)
 }
 
 /// The time a log line was written: Docker's timestamp prefix, or
@@ -972,75 +1039,65 @@ fn valid_host(h: &str) -> Option<String> {
     .then(|| h.to_string())
 }
 
-fn is_ip(h: &str) -> bool {
-    h.parse::<std::net::IpAddr>().is_ok()
-}
-
 fn resolve_target(
     host: &str,
     source: &Inspect,
     listed: &[Listed],
     docker: &dyn Docker,
     cache: &mut Inspects,
-) -> ArchiveTarget {
-    let unresolved = || ArchiveTarget {
-        host: host.into(),
-        container: None,
-        state: "unresolved".into(),
-    };
+) -> Result<Option<ArchiveTarget>, ()> {
     let project = source.label(COMPOSE_PROJECT);
     let source_networks = source.network_settings.networks.as_ref();
     let mut best = None;
     for c in listed {
-        let Some(inspect) = cache.get(docker, &c.id) else {
-            return unresolved();
-        };
+        let inspect = cache.get(docker, &c.id).ok_or(())?;
         if inspect.state.status.is_empty() {
-            return unresolved();
+            return Err(());
         }
         let name_or_service = c
             .names
             .iter()
-            .any(|name| name.trim_start_matches('/').eq_ignore_ascii_case(host))
-            || c.label(COMPOSE_SERVICE)
-                .is_some_and(|service| service.eq_ignore_ascii_case(host));
-        let mut shared_match = false;
-        let mut matches = name_or_service;
+            .map(|name| name.trim_start_matches('/'))
+            .chain(c.label(COMPOSE_SERVICE))
+            .find(|name| name.eq_ignore_ascii_case(host));
+        let mut matched = name_or_service.map(|name| (false, name));
         for (network, endpoint) in inspect.network_settings.networks.iter().flatten() {
-            let alias = endpoint.matches(host);
-            matches |= alias;
-            shared_match |= (name_or_service || alias)
-                && source_networks.is_some_and(|nets| nets.contains_key(network));
+            if let Some(name) = name_or_service.or_else(|| endpoint.matching_name(host)) {
+                let shared = source_networks.is_some_and(|nets| nets.contains_key(network));
+                let candidate = (shared, name);
+                if matched.is_none_or(|previous| candidate > previous) {
+                    matched = Some(candidate);
+                }
+            }
         }
-        if matches {
+        if let Some((shared_match, name)) = matched {
             let rank = (
                 shared_match,
                 inspect.state.status == "running",
                 project.is_some() && c.label(COMPOSE_PROJECT) == project,
             );
             if best.as_ref().is_none_or(|(current, _)| rank > *current) {
+                let container = c
+                    .names
+                    .first()
+                    .map(String::as_str)
+                    .into_iter()
+                    .chain([inspect.name.as_str()])
+                    .map(|name| name.trim_start_matches('/'))
+                    .find(|name| !name.is_empty())
+                    .unwrap_or(name);
                 best = Some((
                     rank,
                     ArchiveTarget {
-                        host: host.into(),
-                        container: Some(name_of(&c.names, &c.id)),
+                        host: name.into(),
+                        container: Some(container.into()),
                         state: inspect.state.status.clone(),
                     },
                 ));
             }
         }
     }
-    match best {
-        Some((_, target)) => target,
-        None if host.contains('.') || host.eq_ignore_ascii_case("localhost") || is_ip(host) => {
-            unresolved()
-        }
-        None => ArchiveTarget {
-            host: host.into(),
-            container: None,
-            state: "missing".into(),
-        },
-    }
+    Ok(best.map(|(_, target)| target))
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,11 +1144,11 @@ pub fn wal_heavy(ev: &PostgresWal) -> bool {
     }
 }
 
-/// Exited containers and container names nothing answers to.
+/// Matched containers that have stopped.
 pub fn dead_targets(ev: &PostgresWal) -> Vec<&ArchiveTarget> {
     ev.targets
         .iter()
-        .filter(|t| matches!(t.state.as_str(), "exited" | "missing"))
+        .filter(|t| matches!(t.state.as_str(), "exited" | "dead"))
         .collect()
 }
 
@@ -1166,6 +1223,13 @@ pub fn diagnosis(ev: &PostgresWal) -> String {
         parts.push(format!("WAL is {ratio}x the data with archiving on"));
     }
     parts.push(archive);
+    match ev.unmatched_hosts {
+        0 => {}
+        1 => parts.push("archive_command names 1 host that matches no container".into()),
+        n => parts.push(format!(
+            "archive_command names {n} hosts that match no container"
+        )),
+    }
     parts.join("; ")
 }
 
@@ -1174,7 +1238,16 @@ pub fn diagnosis(ev: &PostgresWal) -> String {
 pub fn advice(ev: &PostgresWal) -> Option<String> {
     if needs_archive_repair(ev) {
         let dead: Vec<&str> = dead_targets(ev).iter().map(|t| t.host.as_str()).collect();
-        Some(if dead.is_empty() {
+        Some(if dead.is_empty() && ev.unmatched_hosts > 0 {
+            let unmatched = match ev.unmatched_hosts {
+                1 => "1 host matches no container".into(),
+                n => format!("{n} hosts match no container"),
+            };
+            format!(
+                "fix archive_command or start its target ({unmatched}); WAL is freed at the next checkpoint \
+                 once it is archived (do not remove the volume: it holds the database)"
+            )
+        } else if dead.is_empty() {
             "fix archive_command so archiving succeeds; WAL is freed at the next checkpoint \
              once it is archived (do not remove the volume: it holds the database)"
                 .into()
@@ -1416,7 +1489,7 @@ mod tests {
         c.arg("5");
         let start = Instant::now();
         let e = run_with_timeout(c, Duration::from_millis(200)).unwrap_err();
-        assert!(e.contains("no answer within"), "{e}");
+        assert!(matches!(e, PsqlError::Timeout), "{e:?}");
         assert!(start.elapsed() < Duration::from_secs(3));
         let mut c = Command::new("echo");
         c.arg("hi");

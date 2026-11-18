@@ -45,18 +45,9 @@ expression: f
           "host": "s3test",
           "container": "example-s3test-1",
           "state": "exited"
-        },
-        {
-          "host": "backup",
-          "container": null,
-          "state": "missing"
-        },
-        {
-          "host": "s3.example.com",
-          "container": null,
-          "state": "unresolved"
         }
       ],
+      "unmatched_hosts": 2,
       "source": "psql",
       "notes": []
     }

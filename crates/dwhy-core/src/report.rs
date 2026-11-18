@@ -393,20 +393,24 @@ pub struct PostgresWal {
     /// Hosts `archive_command` sends WAL to, matched with containers.
     #[serde(default)]
     pub targets: Vec<ArchiveTarget>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unmatched_hosts: u64,
     pub source: EvidenceSource,
     #[serde(default)]
     pub notes: Vec<String>,
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveTarget {
-    /// As written in `archive_command`.
+    /// The matched name, service, alias or DNS name reported by Docker.
     pub host: String,
     /// The container it names (by name, Compose service or network alias).
     pub container: Option<String>,
-    /// The container's state (`running`, `exited`, …); `missing` when the
-    /// name matches no container; `unresolved` when it is not a container
-    /// name (a domain name or an address of none), so it was not checked.
+    /// The matched container's state (`running`, `exited`, …).
     pub state: String,
 }
 

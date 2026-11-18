@@ -6,8 +6,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use dwhy_core::detect::finding_id;
-use dwhy_core::docker::demux_logs;
-use dwhy_core::probes::postgres_wal::{self, Docker, LOG_TAIL};
+use dwhy_core::docker::{GetError, demux_logs};
+use dwhy_core::probes::postgres_wal::{self, Docker, LOG_TAIL, PsqlError};
 use dwhy_core::report::*;
 use serde_json::Value;
 
@@ -30,8 +30,8 @@ fn json(name: &str) -> Value {
 
 /// Replays recorded responses and records what was asked for.
 struct Fake {
-    gets: HashMap<String, Result<Vec<u8>, String>>,
-    psql: Result<String, String>,
+    gets: HashMap<String, Result<Vec<u8>, GetError>>,
+    psql: Result<String, PsqlError>,
     asked: RefCell<Vec<String>>,
 }
 
@@ -97,15 +97,15 @@ impl Fake {
 }
 
 impl Docker for Fake {
-    fn get(&self, path: &str) -> Result<Vec<u8>, String> {
+    fn get(&self, path: &str) -> Result<Vec<u8>, GetError> {
         self.asked.borrow_mut().push(format!("GET {path}"));
         self.gets
             .get(path)
             .cloned()
-            .unwrap_or_else(|| Err(format!("404 {path}")))
+            .unwrap_or_else(|| Err(GetError::Http(404, format!("404 {path}"))))
     }
 
-    fn psql(&self, id: &str, user: &str, db: &str, sql: &str) -> Result<String, String> {
+    fn psql(&self, id: &str, user: &str, db: &str, sql: &str) -> Result<String, PsqlError> {
         assert_eq!(sql, postgres_wal::QUERY);
         self.asked
             .borrow_mut()
@@ -220,25 +220,25 @@ fn failing_archiver_with_an_exited_target() {
 }
 
 #[test]
-fn missing_target_is_named() {
+fn unmatched_targets_are_counted_without_names() {
     let mut fake = Fake::recorded("psql-failing.txt");
     fake.remove_container(S3);
     let f = probe(&fake);
     let ev = evidence(&f);
-    assert_eq!(
-        ev.targets,
-        [ArchiveTarget {
-            host: "s3test".into(),
-            container: None,
-            state: "missing".into(),
-        }]
+    assert!(ev.targets.is_empty());
+    assert_eq!(ev.unmatched_hosts, 1);
+    assert!(
+        f.reason
+            .contains("archive_command names 1 host that matches no container"),
+        "{}",
+        f.reason
     );
-    assert!(f.reason.contains("(target s3test missing)"), "{}", f.reason);
     assert!(
         f.action
             .text
-            .starts_with("restore the archive target s3test;")
+            .starts_with("fix archive_command or start its target (1 host matches no container);")
     );
+    assert!(!serde_json::to_string(&f).unwrap().contains("s3test"));
 }
 
 #[test]
@@ -303,10 +303,9 @@ fn healthy_archiver_gives_no_advice() {
 #[test]
 fn psql_failure_falls_back_to_the_api_and_the_log_tail() {
     let mut fake = Fake::recorded("psql-failing.txt");
-    fake.psql = Err(
-        "docker exec psql failed (exit status: 2): psql: error: FATAL: role \"app\" does not exist"
-            .into(),
-    );
+    fake.psql = Err(PsqlError::Stderr(
+        r#"psql: error: FATAL: role "app" does not exist"#.into(),
+    ));
     let f = probe(&fake);
     let ev = evidence(&f);
     assert_eq!(ev.source, EvidenceSource::ApiOnly);
@@ -345,46 +344,63 @@ fn psql_failure_falls_back_to_the_api_and_the_log_tail() {
 
 #[test]
 fn fallback_notes_export_only_psql_failure_categories() {
-    for (error, category) in [
+    let stderr = |text: &str| Err(PsqlError::Stderr(text.into()));
+    let sep = postgres_wal::FIELD_SEP;
+    for (reply, category, private) in [
         (
-            r#"ERROR: permission denied for database "tenant_a""#,
+            stderr(r#"ERROR: permission denied for database "tenant_a""#),
             "psql: permission denied",
+            "tenant_a",
         ),
         (
-            r#"FATAL: password authentication failed for user "tenant_a""#,
-            "psql: authentication failed",
+            stderr(r#"ERROR: permission denied for database "session_timeout""#),
+            "psql: permission denied",
+            "session_timeout",
         ),
         (
-            "could not connect to tenant_a: Connection refused",
-            "psql: connection failed",
-        ),
-        (
-            "connection to tenant_a failed: No such file or directory",
-            "psql: connection failed",
-        ),
-        (
-            "canceling statement due to statement timeout for tenant_a",
-            "psql: timed out",
-        ),
-        (
-            "docker exec psql gave no answer within 10s",
-            "psql: timed out",
-        ),
-        (
-            "Error response from daemon: container tenant_a has stopped",
-            "docker exec failed",
-        ),
-        (
-            "cannot run docker: /tenant_a/docker: No such file or directory",
-            "docker exec failed",
-        ),
-        (
-            "unexpected psql output: invalid tenant_a row",
+            stderr(r#"FATAL: database "permission denied" does not exist"#),
             "psql failed",
+            "does not exist",
+        ),
+        (
+            stderr(r#"FATAL: password authentication failed for user "tenant_a""#),
+            "psql: authentication failed",
+            "tenant_a",
+        ),
+        (
+            stderr(
+                r#"connection to server on socket "/tenant_a" failed: No such file or directory"#,
+            ),
+            "psql: connection failed",
+            "tenant_a",
+        ),
+        (
+            stderr(r#"could not connect: Connection refused by "tenant_a""#),
+            "psql: connection failed",
+            "tenant_a",
+        ),
+        (
+            stderr("canceling statement due to statement timeout for tenant_a"),
+            "psql failed",
+            "tenant_a",
+        ),
+        (Err(PsqlError::Timeout), "psql: timed out", "tenant_a"),
+        (
+            stderr("Error response from daemon: container tenant_a has stopped"),
+            "docker exec failed",
+            "tenant_a",
+        ),
+        (Err(PsqlError::Exec), "docker exec failed", "tenant_a"),
+        (
+            Ok(format!(
+                "permission denied for tenant_a{sep}0{sep}0{sep}{sep}{sep}{sep}on{sep}aws{sep}1s"
+            )),
+            "psql failed",
+            "tenant_a",
         ),
     ] {
         let mut fake = Fake::recorded("psql-failing.txt");
-        fake.psql = Err(error.into());
+        fake.psql = reply;
         fake.gets.retain(|k, _| !k.contains("/logs"));
         let f = probe(&fake);
         let ev = evidence(&f);
@@ -400,7 +416,7 @@ fn fallback_notes_export_only_psql_failure_categories() {
             postgres_wal::summary(ev),
         ] {
             assert!(output.contains(category));
-            assert!(!output.contains("tenant_a"));
+            assert!(!output.contains(private));
         }
     }
 }
@@ -408,7 +424,7 @@ fn fallback_notes_export_only_psql_failure_categories() {
 #[test]
 fn api_only_takes_the_command_from_the_log_when_the_command_line_has_none() {
     let mut fake = Fake::recorded("psql-failing.txt");
-    fake.psql = Err("docker exec psql failed".into());
+    fake.psql = Err(PsqlError::Exec);
     // archive settings in postgresql.conf instead of on the command line
     fake.edit(&format!("/containers/{PG}/json"), |v| {
         v["Args"] = serde_json::json!(["postgres"]);
@@ -424,27 +440,30 @@ fn api_only_takes_the_command_from_the_log_when_the_command_line_has_none() {
 #[test]
 fn api_only_with_an_unreadable_log_says_so() {
     let mut fake = Fake::recorded("psql-failing.txt");
-    fake.psql = Err("docker exec psql failed".into());
-    fake.gets.retain(|k, _| !k.contains("/logs"));
+    fake.psql = Err(PsqlError::Exec);
+    let secret = "/daemon/private/rotated.log";
+    fake.gets.insert(
+        format!("/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}"),
+        Err(GetError::Http(404, format!("log not found at {secret}"))),
+    );
     let f = probe(&fake);
     let ev = evidence(&f);
     assert_eq!(ev.source, EvidenceSource::ApiOnly);
     assert_eq!(ev.failed_count, None);
-    assert!(
-        ev.notes.iter().any(|n| n.starts_with("log tail not read")),
-        "{:?}",
-        ev.notes
-    );
+    let category = "log tail unreadable (HTTP 404)";
+    assert!(ev.notes.iter().any(|note| note == category));
     assert!(
         f.reason.contains("archive failures unknown"),
         "{}",
         f.reason
     );
-    assert!(f.reason.contains("log tail not read: 404"), "{}", f.reason);
+    assert!(f.reason.contains(category), "{}", f.reason);
     assert!(!f.reason.contains("no archive failures"), "{}", f.reason);
     let summary = postgres_wal::summary(ev);
-    assert!(summary.contains("log tail not read: 404"), "{summary}");
+    assert!(summary.contains(category), "{summary}");
     assert!(summary.contains("psql not used:"), "{summary}");
+    assert!(!summary.contains(secret));
+    assert!(!serde_json::to_string(&f).unwrap().contains(secret));
     assert_eq!(f.action, volume_finding(VOLUME).action);
 }
 
@@ -563,7 +582,7 @@ fn log_frames_are_demultiplexed() {
 }
 
 #[test]
-fn special_hosts_match_identifiers_before_becoming_unresolved() {
+fn special_hosts_use_docker_identifiers_or_only_count() {
     for host in ["archive.example.com", "127.0.0.1", "localhost", "::1"] {
         let mut fake = Fake::recorded("psql-failing.txt");
         let url = if host == "::1" {
@@ -578,14 +597,8 @@ fn special_hosts_match_identifiers_before_becoming_unresolved() {
             .replace("http://s3test:9000", &url);
         fake.psql = Ok(output);
         let f = probe(&fake);
-        assert_eq!(
-            evidence(&f).targets[0],
-            ArchiveTarget {
-                host: host.into(),
-                container: None,
-                state: "unresolved".into(),
-            }
-        );
+        assert!(evidence(&f).targets.is_empty());
+        assert_eq!(evidence(&f).unmatched_hosts, 1);
         assert!(!f.reason.contains("(target"), "{}", f.reason);
         assert!(f.action.text.starts_with("fix archive_command"));
     }
@@ -615,8 +628,10 @@ fn special_hosts_match_identifiers_before_becoming_unresolved() {
         }
         let f = probe(&fake);
         assert_eq!(evidence(&f).targets[0].state, "exited", "{identifier}");
+        assert_eq!(evidence(&f).targets[0].host, "ARCHIVE.example.com");
+        assert_eq!(evidence(&f).unmatched_hosts, 0);
         assert!(
-            f.reason.contains("(target archive.example.com"),
+            f.reason.contains("(target ARCHIVE.example.com"),
             "{}",
             f.reason
         );
@@ -692,13 +707,13 @@ fn incomplete_inspection_never_proves_a_dead_or_missing_target() {
             let response = if invalid_json {
                 Ok(b"not json".to_vec())
             } else {
-                Err("inspection denied".into())
+                Err(GetError::Other("inspection denied".into()))
             };
             fake.gets
                 .insert(format!("/containers/{APP}/json"), response);
             let f = probe(&fake);
-            assert_eq!(evidence(&f).targets[0].state, "unresolved");
-            assert_eq!(evidence(&f).targets[0].container, None);
+            assert!(evidence(&f).targets.is_empty());
+            assert_eq!(evidence(&f).unmatched_hosts, 0);
             assert!(!f.reason.contains("(target"), "{}", f.reason);
             assert!(f.action.text.starts_with("fix archive_command"));
         }
@@ -740,7 +755,7 @@ fn only_the_deepest_mount_owns_the_postgres_evidence() {
 #[test]
 fn an_empty_readable_log_tail_reports_zero_failures() {
     let mut fake = Fake::recorded("psql-failing.txt");
-    fake.psql = Err("docker exec psql failed".into());
+    fake.psql = Err(PsqlError::Exec);
     fake.gets.insert(
         format!("/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}"),
         Ok(Vec::new()),
@@ -867,7 +882,7 @@ fn archiver_events_within_one_second_preserve_order() {
 #[test]
 fn historical_log_failures_do_not_prompt_repairs_to_running_targets() {
     let mut fake = Fake::recorded("psql-failing.txt");
-    fake.psql = Err("docker exec psql failed".into());
+    fake.psql = Err(PsqlError::Exec);
     fake.edit(&format!("/containers/{S3}/json"), |v| {
         v["State"]["Status"] = "running".into()
     });
@@ -891,113 +906,232 @@ fn historical_log_failures_do_not_prompt_repairs_to_running_targets() {
 #[test]
 fn only_tty_logs_are_read_raw_and_bad_frames_keep_counts_unknown() {
     let mut fake = Fake::recorded("psql-failing.txt");
-    fake.psql = Err("docker exec psql failed".into());
+    fake.psql = Err(PsqlError::Exec);
     let path = format!("/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}");
     let mut error = vec![3, 0, 0, 0, 0, 0, 0, 11];
     error.extend_from_slice(b"reader down");
     let mut late_error = data("logs-postgres.bin");
     late_error.extend_from_slice(&error);
-    for (payload, message) in [
-        (error, "Docker log stream error: reader down"),
-        (late_error, "Docker log stream error: reader down"),
-        (vec![1, 1, 0, 0, 0, 0, 0, 0], "invalid Docker log header"),
-        (vec![1, 0, 0, 0, 0, 0, 0], "truncated Docker log header"),
-        (
-            vec![1, 0, 0, 0, 0, 0, 0, 2, b'x'],
-            "truncated Docker log payload",
-        ),
+    for payload in [
+        error,
+        late_error,
+        vec![1, 1, 0, 0, 0, 0, 0, 0],
+        vec![1, 0, 0, 0, 0, 0, 0],
+        vec![1, 0, 0, 0, 0, 0, 0, 2, b'x'],
     ] {
         fake.gets.insert(path.clone(), Ok(payload));
-        let f = probe(&fake);
-        assert_eq!(evidence(&f).failed_count, None);
-        assert!(f.reason.contains(message), "{}", f.reason);
-        assert!(postgres_wal::summary(evidence(&f)).contains(message));
-        assert_eq!(f.action, volume_finding(VOLUME).action);
+        assert_unreadable_daemon_log(&probe(&fake), "reader down");
     }
     fake.edit(&format!("/containers/{PG}/json"), |v| {
         v["Config"]["Tty"] = true.into()
     });
-    fake.gets.insert(
-        path,
-        Ok(b"2026-11-13T02:10:00Z LOG: archive command failed with exit code 6\n".to_vec()),
-    );
+    let failure = "2026-11-13T02:10:00Z LOG: archive command failed with exit code 6\n";
+    fake.gets
+        .insert(path.clone(), Ok(failure.as_bytes().to_vec()));
     assert_eq!(evidence(&probe(&fake)).failed_count, Some(1));
+
+    for body in [
+        "Error grabbing logs: cannot open /private/reader.log".to_string(),
+        format!("{failure}Error grabbing logs: cannot open /private/reader.log"),
+        "cannot read /private/reader.log".to_string(),
+    ] {
+        fake.gets.insert(path.clone(), Ok(body.into_bytes()));
+        assert_unreadable_daemon_log(&probe(&fake), "/private/reader.log");
+    }
+}
+
+fn assert_unreadable_daemon_log(f: &Finding, private: &str) {
+    let ev = evidence(f);
+    assert_eq!(ev.failed_count, None);
+    let category = "log tail unreadable (daemon error)";
+    assert!(ev.notes.iter().any(|note| note == category));
+    assert!(f.reason.contains(category), "{}", f.reason);
+    let summary = postgres_wal::summary(ev);
+    assert!(summary.contains(category), "{summary}");
+    assert!(!summary.contains(private));
+    assert!(!serde_json::to_string(f).unwrap().contains(private));
+    assert_eq!(f.action, volume_finding(VOLUME).action);
+}
+
+#[test]
+fn curl_operands_only_name_hosts_backed_by_docker() {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    let mut fields: Vec<_> = fake
+        .psql
+        .as_ref()
+        .unwrap()
+        .split(postgres_wal::FIELD_SEP)
+        .collect();
+    fields[7] = "curl --proxy-user 'https://SECRET' -T %p https://minio/wal/%f";
+    fake.psql = Ok(fields.join(&postgres_wal::FIELD_SEP.to_string()));
+
+    let f = probe(&fake);
+    assert!(evidence(&f).targets.is_empty());
+    assert_eq!(evidence(&f).unmatched_hosts, 2);
+    assert!(!f.reason.contains("minio"));
+    let json = serde_json::to_string(&f).unwrap();
+    assert!(!json.contains("SECRET"));
+    assert!(!json.contains("minio"));
+
+    fake.edit_listed(S3, |c| c["Names"] = serde_json::json!(["/MINIO"]));
+    let f = probe(&fake);
+    assert_eq!(evidence(&f).unmatched_hosts, 1);
+    assert_eq!(
+        evidence(&f).targets,
+        [ArchiveTarget {
+            host: "MINIO".into(),
+            container: Some("MINIO".into()),
+            state: "exited".into(),
+        }]
+    );
+    assert!(
+        f.action
+            .text
+            .starts_with("restore the archive target MINIO;")
+    );
+    assert!(!serde_json::to_string(&f).unwrap().contains("SECRET"));
+    assert!(!postgres_wal::summary(evidence(&f)).contains("SECRET"));
+}
+
+#[test]
+fn multiline_failed_log_command_does_not_hide_expansions() {
+    for tty in [false, true] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        fake.psql = Err(PsqlError::Exec);
+        fake.edit(&format!("/containers/{PG}/json"), |v| {
+            v["Args"] = serde_json::json!(["postgres"]);
+            v["Config"]["Tty"] = tty.into();
+        });
+        let path = format!("/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}");
+        for (header, expected_targets) in [("Bearer literal", 1), ("Bearer ${TOKEN_SECRET}", 0)] {
+            let log = format!(
+                "2026-11-13T02:10:00Z LOG: archive command failed with exit code 6\n\
+                 2026-11-13T02:10:00Z DETAIL: The failed archive command was: curl -T %p https://s3test/wal/%f \\\n\
+                 2026-11-13T02:10:00Z \t-H 'Authorization: {header}'\n\
+                 2026-11-13T02:10:01Z LOG: checkpoint starting\n"
+            );
+            let bytes = if tty {
+                log.into_bytes()
+            } else {
+                let mut framed = vec![2, 0, 0, 0];
+                framed.extend_from_slice(&(log.len() as u32).to_be_bytes());
+                framed.extend_from_slice(log.as_bytes());
+                framed
+            };
+            fake.gets.insert(path.clone(), Ok(bytes));
+            let f = probe(&fake);
+            let ev = evidence(&f);
+            assert_eq!(ev.failed_count, Some(1));
+            assert_eq!(ev.archive_program.as_deref(), Some("curl"));
+            assert_eq!(ev.targets.len(), expected_targets);
+            assert_eq!(ev.unmatched_hosts, 0);
+            assert!(!serde_json::to_string(&f).unwrap().contains("TOKEN_SECRET"));
+            if expected_targets == 0 {
+                assert_eq!(f.action, volume_finding(VOLUME).action);
+            } else {
+                assert!(
+                    f.action
+                        .text
+                        .starts_with("restore the archive target s3test;")
+                );
+            }
+        }
+    }
 }
 
 #[test]
 fn every_archive_command_source_exports_only_program_and_hosts() {
-    for (command, program, host) in [
+    for (command, program, host, unmatched) in [
         (
             r#"curl -H 'Authorization: Bearer SECRET' https://s3test:9000/wal"#,
             "curl",
             "s3test",
+            0,
         ),
         (
             r#"curl -H "X-Auth-Token: SECRET" https://s3test:9000/wal"#,
             "curl",
             "s3test",
+            0,
         ),
         (
             "mc alias set archive http://s3test:9000 admin SECRET",
             "mc",
             "s3test",
+            0,
         ),
         (
             "PGPASSWORD=$(printf '%s' 'https://SECRET') /usr/local/bin/archive-wal %p",
             "***",
             "",
+            0,
         ),
         (
             "curl --user $(printf '%s' 'https://SECRET') https://minio/wal/%f",
             "curl",
             "",
+            0,
         ),
         (
             "curl --user `printf '%s' 'https://SECRET'` https://minio/wal/%f",
             "curl",
             "",
+            0,
         ),
         (
             "PGPASSWORD=SECRET curl --user ${VAR} https://minio/wal/%f",
             "***",
             "",
+            0,
         ),
         (
             "curl --user ${VAR} https://SECRET https://minio/wal/%f",
             "curl",
             "",
+            0,
         ),
         (
             "azcopy copy %p 'https://account.blob.core.windows.net/archive/%f?sp=w&sig=SECRET'",
             "azcopy",
-            "account.blob.core.windows.net",
+            "",
+            1,
         ),
-        ("curl https://user:SECRET@s3test:9000/wal", "curl", "s3test"),
+        (
+            "curl https://user:SECRET@s3test:9000/wal",
+            "curl",
+            "s3test",
+            0,
+        ),
         (
             r#"AWS_SECRET_ACCESS_KEY=SECRET REGION='local dev' '/opt/bin/wal-g+2.0' https://s3test:9000/wal"#,
             "/opt/bin/wal-g+2.0",
             "s3test",
+            0,
         ),
-        ("'bad$SECRET' https://s3test:9000/wal", "***", "s3test"),
+        ("'bad$SECRET' https://s3test:9000/wal", "***", "s3test", 0),
         (
             "'KEY=value' SECRET https://s3test:9000/wal",
             "***",
             "s3test",
+            0,
         ),
         (
             "PGPASSWORD='https://SECRET' /usr/local/bin/archive-wal %p",
             "/usr/local/bin/archive-wal",
             "",
+            0,
         ),
         (
             "X=http://SECRET:9000 curl -T %p https://minio:9000/wal/%f",
             "curl",
-            "minio",
+            "",
+            1,
         ),
         (
             "curl X=http://SECRET:9000 --other=https://SECRET --endpoint-url=https://minio:9000",
             "curl",
-            "minio",
+            "",
+            1,
         ),
     ] {
         for source in ["sql", "inspect", "log"] {
@@ -1008,7 +1142,7 @@ fn every_archive_command_source_exports_only_program_and_hosts() {
                 fields[7] = command;
                 fake.psql = Ok(fields.join(&postgres_wal::FIELD_SEP.to_string()));
             } else {
-                fake.psql = Err("docker exec psql failed".into());
+                fake.psql = Err(PsqlError::Exec);
                 fake.edit(&format!("/containers/{PG}/json"), |v| {
                     if source == "inspect" {
                         v["Args"] = serde_json::json!([
@@ -1054,6 +1188,7 @@ fn every_archive_command_source_exports_only_program_and_hosts() {
                 (!host.is_empty()).then_some(host).as_slice(),
                 "{source}"
             );
+            assert_eq!(evidence(&f).unmatched_hosts, unmatched, "{source}");
             if host == "s3test" {
                 assert!(f.reason.contains("target s3test"), "{}", f.reason);
             } else if host.is_empty() {
@@ -1095,7 +1230,7 @@ fn disabled_archiving_keeps_history_without_repair_advice() {
         Some("2026-11-07T07:25:00Z")
     );
 
-    fake.psql = Err("docker exec psql failed".into());
+    fake.psql = Err(PsqlError::Exec);
     fake.edit(&format!("/containers/{PG}/json"), |v| {
         let arg = v["Args"]
             .as_array_mut()

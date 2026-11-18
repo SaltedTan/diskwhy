@@ -912,6 +912,7 @@ mod tests {
                     container: Some("s3test".into()),
                     state: "exited".into(),
                 }],
+                unmatched_hosts: 0,
                 source: EvidenceSource::Psql,
                 notes: vec![],
             }),

@@ -777,17 +777,8 @@ fn probed_finding() -> Finding {
                         container: Some("example-s3test-1".into()),
                         state: "exited".into(),
                     },
-                    ArchiveTarget {
-                        host: "backup".into(),
-                        container: None,
-                        state: "missing".into(),
-                    },
-                    ArchiveTarget {
-                        host: "s3.example.com".into(),
-                        container: None,
-                        state: "unresolved".into(),
-                    },
                 ],
+                unmatched_hosts: 2,
                 source: EvidenceSource::Psql,
                 notes: vec![],
             }),
@@ -801,6 +792,24 @@ fn postgres_wal_evidence_shape() {
     insta::assert_json_snapshot!(f);
     let back: Finding = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
     assert_eq!(back, f);
+
+    let mut without_count = serde_json::to_value(&f).unwrap();
+    without_count["evidence"]["postgres_wal"]
+        .as_object_mut()
+        .unwrap()
+        .remove("unmatched_hosts");
+    let back: Finding = serde_json::from_value(without_count.clone()).unwrap();
+    assert_eq!(
+        back.evidence
+            .as_ref()
+            .unwrap()
+            .postgres_wal
+            .as_ref()
+            .unwrap()
+            .unmatched_hosts,
+        0
+    );
+    assert_eq!(serde_json::to_value(&back).unwrap(), without_count);
 }
 
 #[test]
