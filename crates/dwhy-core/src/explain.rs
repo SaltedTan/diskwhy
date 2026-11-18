@@ -327,8 +327,8 @@ pub fn saved_object(snap: &Snapshot, path: &str) -> Option<SavedObject> {
 /// What the daemon lists now for a [`SavedObject`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
-    /// Listed under its saved id. `path` is its pseudo-path now, which
-    /// differs from the saved one when it was renamed or retagged.
+    /// `path` is the listed object's current pseudo-path. A volume can be
+    /// present by name alone if the daemon omitted its creation time.
     /// `measured` is false when the daemon gave no size for it.
     Present { path: String, measured: bool },
     /// The saved id is not listed, but its name now names another object.
@@ -339,8 +339,7 @@ pub enum Identity {
     Unknown,
 }
 
-/// Looks for `saved` in the daemon's lists by its immutable id, then by
-/// its name.
+/// Checks the daemon's lists for the saved object or a replacement.
 pub fn identity(saved: &SavedObject, now: &docker::Snapshot) -> Identity {
     use crate::detectors::{container_name, image_label, image_named, short_id};
     let at = |name: String| format!("{}{name}", saved.kind.prefix());

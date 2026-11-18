@@ -770,9 +770,9 @@ pub struct SnapshotVolume {
     pub name: String,
     /// `None` when the daemon did not compute it.
     pub bytes: Option<u64>,
-    /// Docker's `CreatedAt`, as the daemon reported it. A volume has no id,
-    /// so its name and creation time identify it. Absent from snapshots
-    /// saved before it was added.
+    /// Docker's `CreatedAt`, as the daemon reported it. Omitted when the
+    /// daemon supplies no creation time and in snapshots saved before
+    /// this field was added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
 }
