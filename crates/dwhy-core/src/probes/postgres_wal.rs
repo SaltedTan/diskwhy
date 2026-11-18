@@ -145,10 +145,11 @@ impl Docker for Live {
 }
 
 /// The `docker exec` command line: psql without a psqlrc, never prompting
-/// for a password, over the container's local socket, every transaction
-/// read-only and each statement limited to 10 s (`PGOPTIONS`, so a query
-/// outlives a killed `docker exec` by at most that), and the query inside
-/// `BEGIN READ ONLY`. Run as argv, never through a shell.
+/// for a password, over the container's local socket. On timeout, diskwhy
+/// kills the Docker CLI. Inside the container, psql has its own limits:
+/// `PGCONNECT_TIMEOUT` (5 s) for connecting and `statement_timeout` (10 s)
+/// per statement. The query only reads and runs inside `BEGIN READ ONLY`.
+/// Run as argv, never through a shell.
 pub fn psql_argv(
     docker: &str,
     socket: &str,
@@ -668,7 +669,13 @@ pub fn command_settings(args: &[String]) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let mut put = |kv: &str| {
         if let Some((k, v)) = kv.split_once('=') {
-            out.insert(k.trim().replace('-', "_"), v.to_string());
+            let key = k.trim().to_ascii_lowercase().replace('-', "_");
+            let value = if key == "archive_mode" {
+                v.to_ascii_lowercase()
+            } else {
+                v.to_string()
+            };
+            out.insert(key, value);
         }
     };
     let mut it = args.iter();
@@ -828,6 +835,7 @@ fn archive_program(mut input: &str) -> String {
 
 fn analyze_archive_command(mut input: &str) -> Vec<String> {
     let mut hosts: Vec<String> = Vec::new();
+    let mut seen_program = false;
     let mut endpoint_next = false;
     let mut auth_next = false;
     while !input.is_empty() {
@@ -844,33 +852,36 @@ fn analyze_archive_command(mut input: &str) -> Vec<String> {
         let (len, word, closed) = command_word(input);
         input = &input[len..];
         let endpoint_value = std::mem::take(&mut endpoint_next);
-        if std::mem::take(&mut auth_next) {
-            continue;
-        }
-        let (key, has_value) = word
-            .split_once('=')
-            .map_or((word.as_str(), false), |(key, _)| (key, true));
-        if AUTH_FLAGS.contains(&key) {
-            auth_next = !has_value;
-            continue;
-        }
-        if word.starts_with("-u") || word.starts_with("-p") {
+        if std::mem::take(&mut auth_next) || assignment_name(&word).is_some() {
             continue;
         }
         if !closed {
             break;
         }
-        let endpoint_flag = ENDPOINT_FLAGS.contains(&key);
-        if endpoint_flag && !has_value {
-            endpoint_next = true;
+        if !seen_program {
+            seen_program = true;
             continue;
         }
-        let prefix = if assignment_name(&word).is_some() || (key.starts_with("--") && has_value) {
-            key.len() + 1
+        let (key, value) = word
+            .split_once('=')
+            .map_or((word.as_str(), None), |(key, value)| (key, Some(value)));
+        if AUTH_FLAGS.contains(&key) {
+            auth_next = value.is_none();
+            continue;
+        }
+        if word.starts_with("-u") || word.starts_with("-p") {
+            continue;
+        }
+        let endpoint_flag = ENDPOINT_FLAGS.contains(&key);
+        let address = if endpoint_flag {
+            let Some(value) = value else {
+                endpoint_next = true;
+                continue;
+            };
+            value
         } else {
-            0
+            word.as_str()
         };
-        let address = &word[prefix..];
         let host = if let Some((scheme, rest)) = address.split_once("://") {
             if NETWORK_SCHEMES
                 .iter()
@@ -1218,7 +1229,7 @@ mod tests {
             ("curl 'http://user:pw@archive:8080/put/%f'", &["archive"]),
             (
                 "AWS_ENDPOINT_URL=https://minio.local:9000/x wal-g wal-push %p",
-                &["minio.local"],
+                &[],
             ),
             (
                 "x --host=db2:5432 --endpoint minio:9000 --endpoint-url=s3test:9000",
@@ -1236,6 +1247,11 @@ mod tests {
                 &[],
             ),
             ("x s3://bucket/https://unrelated httpx://guessed", &[]),
+            ("https://program x --other=https://argument", &[]),
+            (
+                "x X=https://assignment --endpoint-url https://endpoint",
+                &["endpoint"],
+            ),
             (
                 "tool --password https://private.example --endpoint https://store",
                 &["store"],
@@ -1250,9 +1266,9 @@ mod tests {
         let args: Vec<String> = [
             "postgres",
             "-c",
-            "archive_mode=on",
-            "-carchive_timeout=10s",
-            "--archive-command=curl -T %p http://s3test:9000/%f",
+            "Archive_Mode=On",
+            "-cArchive_Timeout=10s",
+            "--ARCHIVE-COMMAND=curl -T %p http://s3test:9000/%f",
             "-c",
         ]
         .map(String::from)

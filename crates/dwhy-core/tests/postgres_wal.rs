@@ -906,6 +906,21 @@ fn every_archive_command_source_exports_only_program_and_hosts() {
             "***",
             "s3test",
         ),
+        (
+            "PGPASSWORD='https://SECRET' /usr/local/bin/archive-wal %p",
+            "/usr/local/bin/archive-wal",
+            "",
+        ),
+        (
+            "X=http://SECRET:9000 curl -T %p https://minio:9000/wal/%f",
+            "curl",
+            "minio",
+        ),
+        (
+            "curl X=http://SECRET:9000 --other=https://SECRET --endpoint-url=https://minio:9000",
+            "curl",
+            "minio",
+        ),
     ] {
         for source in ["sql", "inspect", "log"] {
             let mut fake = Fake::recorded("psql-failing.txt");
@@ -951,7 +966,16 @@ fn every_archive_command_source_exports_only_program_and_hosts() {
                 Some(program),
                 "{source}"
             );
-            assert_eq!(evidence(&f).targets[0].host, host, "{source}");
+            let hosts: Vec<_> = evidence(&f)
+                .targets
+                .iter()
+                .map(|target| target.host.as_str())
+                .collect();
+            assert_eq!(
+                hosts,
+                (!host.is_empty()).then_some(host).as_slice(),
+                "{source}"
+            );
             if host == "s3test" {
                 assert!(f.reason.contains("target s3test"), "{}", f.reason);
             }
@@ -990,7 +1014,7 @@ fn disabled_archiving_keeps_history_without_repair_advice() {
             .iter_mut()
             .find(|arg| **arg == "archive_mode=on")
             .unwrap();
-        *arg = "archive_mode=off".into();
+        *arg = "ARCHIVE_MODE=OFF".into();
     });
     let f = probe(&fake);
     assert_eq!(evidence(&f).archive_mode.as_deref(), Some("off"));
