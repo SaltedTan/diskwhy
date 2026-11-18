@@ -819,6 +819,102 @@ fn watch_omits_ancestors_of_entries_that_could_not_be_statted() {
     assert!(r.notes.is_empty());
 }
 
+#[test]
+fn watch_omits_directory_rates_when_coverage_can_move_hardlink_attribution() {
+    let mut start = sample(
+        "2026-11-18T02:00:00Z",
+        &[
+            ("/h", 10 * M),
+            ("/h/a", 6 * M),
+            ("/h/b", 0),
+            ("/h/quiet", 4 * M),
+        ],
+        50 * G,
+    );
+    let mut end = sample(
+        "2026-11-18T02:01:00Z",
+        &[
+            ("/h", 14 * M),
+            ("/h/a", 0),
+            ("/h/b", 6 * M),
+            ("/h/quiet", 8 * M),
+        ],
+        50 * G + M,
+    );
+    start.docker = Some(docker(&[], &[], &[], M));
+    end.docker = Some(docker(&[], &[], &[], 3 * M));
+    let unreadable = vec!["/h/a".to_string()];
+
+    for b_existed in [true, false] {
+        let mut start = start.clone();
+        if !b_existed {
+            start.dirs.retain(|d| d.path != "/h/b");
+        }
+        for deduped_at_start in [true, false] {
+            let mut end = end.clone();
+            start.scan.totals.hardlinks_deduped = u64::from(deduped_at_start);
+            end.scan.totals.hardlinks_deduped = u64::from(!deduped_at_start);
+            for (before, after, coverage, sign) in [
+                (&start, &end, [&[][..], unreadable.as_slice()], 1),
+                (&end, &start, [unreadable.as_slice(), &[][..]], -1),
+            ] {
+                let r = growth::watch(before, after, 60, 60_000, M, coverage);
+                assert!(r.dirs.is_empty(), "{:?}", r.dirs);
+                assert_eq!(r.fs.len(), 1);
+                assert_eq!(r.fs[0].change, sign * M as i64);
+                assert!(r.docker_compared);
+                assert_eq!(r.docker.len(), 1);
+                assert_eq!(r.docker[0].kind, ChangeKind::BuildCache);
+                assert_eq!(r.docker[0].change, sign * 2 * M as i64);
+                assert_eq!(
+                    r.notes,
+                    [
+                        "not compared, because a sample could not read these paths: /h/a",
+                        "directories not compared: coverage changed during the window, and files with several hard links may be counted in different places",
+                    ]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn watch_keeps_directory_rates_with_hardlinks_when_coverage_matches() {
+    let mut start = sample(
+        "2026-11-18T02:00:00Z",
+        &[("/h", 6 * M), ("/h/a", M), ("/h/b", 5 * M)],
+        50 * G,
+    );
+    let mut end = sample(
+        "2026-11-18T02:01:00Z",
+        &[("/h", 9 * M), ("/h/a", M), ("/h/b", 8 * M)],
+        50 * G,
+    );
+    start.scan.totals.hardlinks_deduped = 1;
+    end.scan.totals.hardlinks_deduped = 2;
+    let unreadable = vec!["/h/a".to_string()];
+    for coverage in [[&[][..], &[][..]], [&unreadable[..], &unreadable[..]]] {
+        let r = growth::watch(&start, &end, 60, 60_000, M, coverage);
+        assert_eq!(
+            rate_rows(&r.dirs),
+            [(
+                ChangeKind::Dir,
+                "/h/b",
+                Some(5 * M),
+                Some(8 * M),
+                3 * M as i64,
+                3 * M as i64,
+            )]
+        );
+        assert_eq!(
+            r.notes.len(),
+            usize::from(!coverage[0].is_empty()),
+            "{:?}",
+            r.notes
+        );
+    }
+}
+
 /// Docker's figures parsed from a `GET /system/df` body.
 fn docker_from(body: &serde_json::Value) -> SnapshotDocker {
     let df = docker::parse_system_df(body.to_string().as_bytes()).unwrap();

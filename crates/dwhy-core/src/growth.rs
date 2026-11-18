@@ -374,6 +374,10 @@ pub fn watch(
         .symmetric_difference(&new_unreadable)
         .copied()
         .collect();
+    let uncertain_hardlinks = !changed_coverage.is_empty()
+        && [start, end]
+            .iter()
+            .any(|s| s.scan.totals.hardlinks_deduped > 0);
     let all_unreadable: HashSet<&str> = old_unreadable.union(&new_unreadable).copied().collect();
     let blockers = |path: &str| {
         let path = Path::new(path);
@@ -387,7 +391,7 @@ pub fn watch(
             .collect::<Vec<_>>()
     };
     let c = compare(start, end, &|_| None, min_change, &|path| {
-        !blockers(path).is_empty()
+        uncertain_hardlinks || !blockers(path).is_empty()
     });
     let mut omitted: Vec<&str> = start
         .dirs
@@ -407,6 +411,12 @@ pub fn watch(
             "not compared, because a sample could not read these paths: {}",
             omitted.join(", ")
         ));
+    }
+    if uncertain_hardlinks {
+        notes.push(
+            "directories not compared: coverage changed during the window, and files with several hard links may be counted in different places"
+                .into(),
+        );
     }
     let rates = |list: Vec<Change>| {
         let mut v: Vec<Rate> = list
