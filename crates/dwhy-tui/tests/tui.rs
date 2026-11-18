@@ -514,6 +514,7 @@ fn long_names_are_shortened_in_the_middle() {
     // Wide characters count two columns.
     let s = ui::middle("目录目录目录目录目录", 9);
     assert!(s.chars().count() <= 5 && s.contains('…'), "{s}");
+    assert_eq!(ui::middle("👩‍💻abcdef👩‍💻", 5), "👩‍💻…👩‍💻");
     assert_eq!(ui::middle("abc", 0), "");
 
     // A long name in the list is cut to fit 80 columns, ends kept.
@@ -882,10 +883,19 @@ fn no_findings_and_failed_detectors_are_explicit() {
     let run = data
         .report
         .detectors
-        .iter_mut()
+        .iter()
         .find(|d| d.name == "cargo-target")
-        .unwrap();
-    run.error = Some("cannot read Cargo.toml".into());
+        .unwrap()
+        .clone();
+    for (name, error) in [
+        ("docker-volume", "daemon did not answer"),
+        ("docker-build-cache", "cache usage unavailable"),
+    ] {
+        let mut failed = run.clone();
+        failed.name = name.into();
+        failed.error = Some(error.into());
+        data.report.detectors.push(failed);
+    }
     let mut with_finding = data.clone();
     let mut app = app_with(data);
     press(&mut app, &[KeyCode::Tab]);
@@ -895,15 +905,57 @@ fn no_findings_and_failed_detectors_are_explicit() {
         "{screen}"
     );
     assert!(
-        screen.contains("    cargo-target: cannot read Cargo.toml"),
+        screen.contains("    docker-volume: daemon did not answer"),
         "{screen}"
     );
-    // With findings, the failure is counted in the status line.
+    assert!(
+        screen.contains("    docker-build-cache: cache usage unavailable"),
+        "{screen}"
+    );
     with_finding.report.findings = vec![cargo_finding()];
     let mut app = app_with(with_finding);
     press(&mut app, &[KeyCode::Tab]);
     let screen = render(&mut app, 80, 24, None);
-    assert!(screen.contains("1 detector failed"), "{screen}");
+    let status = screen.lines().nth(22).unwrap();
+    assert!(
+        status.contains("docker-volume, docker-build-cache failed"),
+        "{screen}"
+    );
+    press(&mut app, &[KeyCode::Char('t')]);
+    let screen = render(&mut app, 80, 24, None);
+    assert!(screen.contains("no regenerable findings"), "{screen}");
+    assert!(
+        screen.contains("    docker-volume: daemon did not answer"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("    docker-build-cache: cache usage unavailable"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn paging_moves_by_the_finding_rows_on_screen() {
+    let findings = (1..=25)
+        .map(|i| {
+            hand_finding(
+                "cargo-target",
+                &format!("/p/{i:02}"),
+                1024,
+                Tier::Rebuildable,
+            )
+        })
+        .collect();
+    let (_f, mut app) = findings_app(findings, None);
+    press(&mut app, &[KeyCode::Tab]);
+    let first_page = render(&mut app, 80, 24, None);
+    assert!(first_page.lines().nth(21).unwrap().contains("/p/20"));
+    press(&mut app, &[KeyCode::PageDown]);
+    assert_eq!(selected_path(&app), "/p/21");
+    press(&mut app, &[KeyCode::End]);
+    render(&mut app, 80, 24, None);
+    press(&mut app, &[KeyCode::PageUp]);
+    assert_eq!(selected_path(&app), "/p/05");
 }
 
 #[test]
@@ -945,6 +997,30 @@ fn findings_list_80x24() {
 }
 
 #[test]
+fn findings_list_50x24() {
+    let finding = grows(
+        hand_finding(
+            "docker-build-cache",
+            "docker://build-cache",
+            4 * GIB,
+            Tier::Regenerable,
+        ),
+        125_829_120,
+    );
+    let (_f, mut app) = findings_app(vec![finding], Some(BASE));
+    press(&mut app, &[KeyCode::Tab]);
+    let screen = render(&mut app, 50, 24, None);
+    insta::assert_snapshot!(screen);
+
+    let screen = render(&mut app, 66, 24, None);
+    let header = screen.lines().nth(1).unwrap();
+    let row = screen.lines().nth(2).unwrap();
+    assert!(header.contains("detector") && !header.contains("growth"));
+    assert!(row.contains("docker-build-cache") && !row.contains("/d"));
+    assert_eq!(header.find("path"), row.find("docker://build-cache"));
+}
+
+#[test]
 fn findings_list_120x40() {
     let mut findings = mixed_findings();
     for f in &mut findings {
@@ -953,7 +1029,10 @@ fn findings_list_120x40() {
     let (_f, mut app) = findings_app(findings, None);
     press(&mut app, &[KeyCode::Tab]);
     let screen = render(&mut app, 120, 40, None);
-    assert!(screen.contains("no growth data (no snapshot of these roots ≥ 1h old)"));
+    assert_eq!(
+        screen.lines().nth(38).unwrap().trim_matches('"').trim(),
+        "1/7 · no growth data"
+    );
     insta::assert_snapshot!(screen);
 }
 
@@ -1002,7 +1081,9 @@ fn detail_says_when_there_is_no_growth_to_show() {
     press(&mut app, &[KeyCode::Enter]);
     let screen = render(&mut app, 80, 24, None);
     assert!(
-        screen.contains("growth: no growth data (no snapshot of these roots ≥ 1h old)"),
+        screen
+            .lines()
+            .any(|l| l.trim_matches('"').trim_end() == "growth: no growth data"),
         "{screen}"
     );
     // A base snapshot that does not list the finding.
@@ -1010,8 +1091,85 @@ fn detail_says_when_there_is_no_growth_to_show() {
     press(&mut app, &[KeyCode::Tab, KeyCode::Enter]);
     let screen = render(&mut app, 80, 24, None);
     assert!(
-        screen.contains("growth: unknown (not in the snapshot of 2026-11-17T09:00:00Z)"),
+        screen
+            .lines()
+            .any(|l| l.trim_matches('"').trim_end() == "growth: unknown"),
         "{screen}"
+    );
+}
+
+#[test]
+fn finding_paths_and_commands_escape_controls() {
+    let path = "/p/repo\nx/target";
+    let mut finding = hand_finding("cargo-target", path, 3 * GIB, Tier::Rebuildable);
+    finding.action.kind = ActionKind::Command;
+    finding.action.text = format!(
+        "cargo clean --target-dir {}",
+        dwhy_core::detect::shell_quote(path)
+    );
+    finding.recovery.how = Some("cd '/p/repo\nx' && cargo build".into());
+    let lookalike = hand_finding("cargo-target", r"/p/repo\nx/target", GIB, Tier::Rebuildable);
+    let (_f, mut app) = findings_app(vec![finding, lookalike], None);
+    press(&mut app, &[KeyCode::Tab]);
+    let list = render(&mut app, 80, 24, None);
+    assert!(
+        list.lines().nth(2).unwrap().contains(r"/p/repo\nx/target"),
+        "{list}"
+    );
+    assert!(
+        list.lines().nth(3).unwrap().contains(r"/p/repo\\nx/target"),
+        "{list}"
+    );
+
+    press(&mut app, &[KeyCode::Enter]);
+    let detail = render(&mut app, 80, 24, None);
+    assert!(
+        detail
+            .lines()
+            .next()
+            .unwrap()
+            .contains(r"/p/repo\nx/target"),
+        "{detail}"
+    );
+    assert!(
+        detail
+            .lines()
+            .nth(2)
+            .unwrap()
+            .trim_matches('"')
+            .trim_end()
+            .ends_with(r"/p/repo\nx/target"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(r"cargo clean --target-dir '/p/repo\nx/target'"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(r"cd '/p/repo\nx' && cargo build"),
+        "{detail}"
+    );
+    assert_eq!(
+        detail
+            .matches("(contains control characters, shown escaped)")
+            .count(),
+        2,
+        "{detail}"
+    );
+}
+
+#[test]
+fn detail_wrap_keeps_a_grapheme_at_the_right_edge() {
+    let end_of_line = format!("/{}👩‍💻", "x".repeat(69));
+    let path = format!("{end_of_line}/target");
+    let finding = hand_finding("cargo-target", &path, GIB, Tier::Rebuildable);
+    let (_f, mut app) = findings_app(vec![finding], None);
+    press(&mut app, &[KeyCode::Tab, KeyCode::Enter]);
+    let detail = render(&mut app, 80, 24, None);
+    let quoted_line = format!("\"        {end_of_line}\"");
+    assert!(
+        detail.lines().any(|line| line.starts_with(&quoted_line)),
+        "{detail}"
     );
 }
 
