@@ -374,9 +374,18 @@ pub fn watch(
         .symmetric_difference(&new_unreadable)
         .copied()
         .collect();
-    let [old_mounts, new_mounts] =
-        [start, end].map(|s| s.scan.skipped_mounts.iter().collect::<HashSet<_>>());
-    let uncertain_hardlinks = (!changed_coverage.is_empty() || old_mounts != new_mounts)
+    let [old_mounts, new_mounts] = [start, end].map(|s| {
+        s.scan
+            .skipped_mounts
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>()
+    });
+    let changed_mounts: Vec<&str> = old_mounts
+        .symmetric_difference(&new_mounts)
+        .copied()
+        .collect();
+    let uncertain_hardlinks = (!changed_coverage.is_empty() || !changed_mounts.is_empty())
         && [start, end]
             .iter()
             .any(|s| s.scan.totals.hardlinks_deduped > 0);
@@ -392,8 +401,16 @@ pub fn watch(
             })
             .collect::<Vec<_>>()
     };
+    let mount_blockers = |path: &str| {
+        let path = Path::new(path);
+        changed_mounts
+            .iter()
+            .copied()
+            .filter(|mount| Path::new(mount).starts_with(path) && Path::new(mount) != path)
+            .collect::<Vec<_>>()
+    };
     let c = compare(start, end, &|_| None, min_change, &|path| {
-        uncertain_hardlinks || !blockers(path).is_empty()
+        uncertain_hardlinks || !blockers(path).is_empty() || !mount_blockers(path).is_empty()
     });
     let mut omitted: Vec<&str> = start
         .dirs
@@ -407,11 +424,29 @@ pub fn watch(
         .collect();
     omitted.sort_unstable();
     omitted.dedup();
+    let mut omitted_mounts: Vec<&str> = start
+        .dirs
+        .iter()
+        .chain(&end.dirs)
+        .filter(|d| {
+            let path = Path::new(&d.path);
+            within(path, &start.scan.roots) && within(path, &end.scan.roots)
+        })
+        .flat_map(|d| mount_blockers(&d.path))
+        .collect();
+    omitted_mounts.sort_unstable();
+    omitted_mounts.dedup();
     let mut notes: Vec<String> = c.mounts_note.into_iter().collect();
     if !omitted.is_empty() {
         notes.push(format!(
             "not compared, because a sample could not read these paths: {}",
             omitted.join(", ")
+        ));
+    }
+    if !omitted_mounts.is_empty() {
+        notes.push(format!(
+            "not compared, because a mount changed during the window: {}",
+            omitted_mounts.join(", ")
         ));
     }
     if uncertain_hardlinks {

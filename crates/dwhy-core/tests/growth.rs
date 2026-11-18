@@ -880,13 +880,12 @@ fn watch_omits_directory_rates_when_coverage_can_move_hardlink_attribution() {
                     assert_eq!(r.docker.len(), 1);
                     assert_eq!(r.docker[0].kind, ChangeKind::BuildCache);
                     assert_eq!(r.docker[0].change, sign * 2 * M as i64);
-                    assert_eq!(
-                        r.notes,
-                        [
-                            coverage_note,
-                            "directories not compared: coverage changed during the window, and files with several hard links may be counted in different places",
-                        ]
-                    );
+                    let mut notes = vec![coverage_note];
+                    if skipped_mount {
+                        notes.push("not compared, because a mount changed during the window: /h/a");
+                    }
+                    notes.push("directories not compared: coverage changed during the window, and files with several hard links may be counted in different places");
+                    assert_eq!(r.notes, notes);
                 }
             }
         }
@@ -894,7 +893,7 @@ fn watch_omits_directory_rates_when_coverage_can_move_hardlink_attribution() {
 }
 
 #[test]
-fn watch_keeps_directory_rates_when_mounts_change_without_hardlinks() {
+fn watch_omits_mount_ancestors_and_keeps_unaffected_directory_rates() {
     let start = sample(
         "2026-11-18T02:00:00Z",
         &[("/h", 10 * M), ("/h/a", 6 * M), ("/h/b", 4 * M)],
@@ -912,15 +911,82 @@ fn watch_keeps_directory_rates_when_mounts_change_without_hardlinks() {
         let r = growth::watch(before, after, 60, 60_000, M, [&[], &[]]);
         let changes: HashMap<&str, i64> =
             r.dirs.iter().map(|d| (d.name.as_str(), d.change)).collect();
-        assert_eq!(
-            changes,
-            HashMap::from([("/h", -sign * 2 * M as i64), ("/h/b", sign * 4 * M as i64),])
-        );
+        assert_eq!(changes, HashMap::from([("/h/b", sign * 4 * M as i64)]));
         assert_eq!(
             r.notes,
-            ["not compared, because one side did not enter these mount points: /h/a"]
+            [
+                "not compared, because one side did not enter these mount points: /h/a",
+                "not compared, because a mount changed during the window: /h/a",
+            ]
         );
     }
+}
+
+#[test]
+fn watch_omits_ancestors_of_mounts_appearing_during_the_window() {
+    let start = sample(
+        "2026-11-18T02:00:00Z",
+        &[("/h", 6 * M), ("/h/a", 6 * M)],
+        50 * G,
+    );
+    let end = skipping(
+        sample(
+            "2026-11-18T02:01:00Z",
+            &[("/h", 3 * M), ("/h/new", 3 * M)],
+            50 * G,
+        ),
+        &["/h/a", "/h/new/volume"],
+    );
+    let r = growth::watch(&start, &end, 60, 60_000, M, [&[], &[]]);
+    assert!(r.dirs.is_empty(), "{:?}", r.dirs);
+    assert_eq!(
+        r.notes,
+        [
+            "not compared, because one side did not enter these mount points: /h/a",
+            "not compared, because a mount changed during the window: /h/a, /h/new/volume",
+        ]
+    );
+}
+
+#[test]
+fn watch_omits_ancestors_of_mounts_disappearing_during_the_window() {
+    let start = skipping(
+        sample("2026-11-18T02:00:00Z", &[("/h", 0), ("/h/a", 0)], 50 * G),
+        &["/h/a/volume"],
+    );
+    let end = sample(
+        "2026-11-18T02:01:00Z",
+        &[("/h", 6 * M), ("/h/a", 6 * M), ("/h/a/volume", 6 * M)],
+        50 * G,
+    );
+    let r = growth::watch(&start, &end, 60, 60_000, M, [&[], &[]]);
+    assert!(r.dirs.is_empty(), "{:?}", r.dirs);
+    assert_eq!(
+        r.notes,
+        [
+            "not compared, because one side did not enter these mount points: /h/a/volume",
+            "not compared, because a mount changed during the window: /h/a/volume",
+        ]
+    );
+}
+
+#[test]
+fn watch_does_not_note_mount_changes_outside_compared_ancestors() {
+    let start = skipping(
+        sample(
+            "2026-11-18T02:00:00Z",
+            &[("/h", 4 * M), ("/h/b", 4 * M)],
+            50 * G,
+        ),
+        &["/h/a"],
+    );
+    let mut end = sample("2026-11-18T02:01:00Z", &[("/h/b", 6 * M)], 50 * G);
+    end.scan.roots = vec!["/h/b".into()];
+    let r = growth::watch(&start, &end, 60, 60_000, M, [&[], &[]]);
+    assert_eq!(r.dirs.len(), 1);
+    assert_eq!(r.dirs[0].name, "/h/b");
+    assert_eq!(r.dirs[0].change, 2 * M as i64);
+    assert!(r.notes.is_empty(), "{:?}", r.notes);
 }
 
 #[test]
