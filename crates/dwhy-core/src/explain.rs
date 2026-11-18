@@ -39,9 +39,7 @@ pub enum Place {
     Path(PathBuf),
 }
 
-/// Whether `arg` is taken as a finding id: exactly the format of
-/// [`crate::detect::finding_id`], `f_` and as many lowercase hex digits.
-/// Anything else is a path; a file named like an id can be given as `./f_…`.
+/// Whether `arg` matches the format of [`crate::detect::finding_id`].
 pub fn is_finding_id(arg: &str) -> bool {
     let len = crate::detect::finding_id("", "").len();
     arg.len() == len
@@ -83,11 +81,9 @@ pub enum Walk {
 }
 
 /// Decides what to walk for `abs`, an absolute path whose parent is
-/// canonical (as [`crate::scan::prepare_roots`] makes it). The path itself
-/// when it is `/` or has no parent, is not a directory (no detector reports
-/// a file, and the parent's tree has no node for one), is a mount point
-/// (its parent is on another filesystem, or it is a bind mount, which the
-/// walk would not enter), or its parent cannot be opened.
+/// canonical (as [`crate::scan::prepare_roots`] makes it). Walking a file's
+/// parent would leave the query without its own node in the tree. Walking
+/// a mount point's parent could skip the query at the filesystem boundary.
 pub fn walk_for(abs: &Path, mounts: &MountTable) -> Walk {
     if mounts.at(abs).is_some() {
         return Walk::Itself(Some(format!(
@@ -301,7 +297,7 @@ pub fn finding_ref(f: &Finding) -> FindingRef {
 }
 
 /// Notes on the selected detectors that could not run or failed. `only`
-/// is the selection passed to [`crate::detect::run_with`].
+/// is the selection passed to [`crate::detect::run_candidates`].
 pub fn detector_notes(runs: &[DetectorRun], only: Option<&[String]>) -> Vec<String> {
     let selected = |r: &&DetectorRun| only.is_none_or(|o| o.contains(&r.name));
     let unavailable: Vec<&str> = runs

@@ -1,6 +1,5 @@
-//! Guards: checks that run before removal and end in pass, warn or block,
-//! with evidence (docs/DESIGN.md "Guard"). They run at `plan` and `apply`,
-//! not during `scan`, because they read every process and run git.
+//! Guards check proposed removals and return pass, warn or block with
+//! evidence. See the Guards decision in docs/DESIGN.md.
 //!
 //! For a filesystem finding:
 //!

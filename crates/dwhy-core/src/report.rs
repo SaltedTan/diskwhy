@@ -9,7 +9,8 @@
 //!
 //! All sizes are bytes. "Allocated" means `st_blocks * 512` (what deleting
 //! frees); "apparent" means `st_size` of non-directories (directories count
-//! 0, as in GNU du >= 9.2). Paths are rendered lossily as UTF-8.
+//! 0, as in GNU du >= 9.2). Paths are UTF-8 strings. A filesystem path
+//! can be rendered lossily.
 
 use serde::{Deserialize, Serialize};
 
@@ -956,17 +957,17 @@ pub struct ExplainReport {
     /// The path examined: absolute for a filesystem path, else the
     /// pseudo-path.
     pub path: String,
-    /// The finding at `path` (with the id asked for, when `query` is an id),
-    /// with guards, growth and probe evidence filled in. `None` when no
-    /// finding matched.
+    /// The finding at `path` (with the requested id for an id query).
+    /// Guards, growth and probe evidence are included when available.
+    /// `None` when no finding matched.
     #[serde(default)]
     pub finding: Option<Finding>,
-    /// True when `query` named a saved finding id and its filesystem path
-    /// or Docker object was confirmed absent.
+    /// True for an unmatched saved id when the presence check reports its
+    /// saved filesystem path or Docker pseudo-path absent.
     #[serde(default)]
     pub gone: bool,
-    /// What is at a filesystem `path` now; absent for pseudo-paths and for a
-    /// path that no longer exists.
+    /// Measured totals for a filesystem `path`, including when a finding
+    /// matches. Omitted when the path has no measurement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<ExplainSize>,
     /// Findings at or below `path`, when `finding` is `None`; largest first.
@@ -1002,7 +1003,9 @@ pub struct ExplainSnapshot {
     pub created_at: String,
 }
 
-/// Size of a path, each hardlinked file counted once.
+/// Allocated and apparent bytes attributed to the queried path in the walk.
+/// Each hardlinked inode is counted once in the walk at its lexicographically
+/// smallest scanned path, which can lie outside the query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainSize {
     pub allocated: u64,

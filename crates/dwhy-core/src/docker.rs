@@ -29,6 +29,8 @@ pub struct SystemDf {
     pub build_cache: Option<Vec<BuildCacheRecord>>,
 }
 
+/// Preserve whether the daemon sent the key so presence checks can
+/// distinguish an empty list from an unavailable one.
 fn reported_list<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
