@@ -374,7 +374,9 @@ pub fn watch(
         .symmetric_difference(&new_unreadable)
         .copied()
         .collect();
-    let uncertain_hardlinks = !changed_coverage.is_empty()
+    let [old_mounts, new_mounts] =
+        [start, end].map(|s| s.scan.skipped_mounts.iter().collect::<HashSet<_>>());
+    let uncertain_hardlinks = (!changed_coverage.is_empty() || old_mounts != new_mounts)
         && [start, end]
             .iter()
             .any(|s| s.scan.totals.hardlinks_deduped > 0);

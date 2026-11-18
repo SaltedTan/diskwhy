@@ -854,27 +854,72 @@ fn watch_omits_directory_rates_when_coverage_can_move_hardlink_attribution() {
             let mut end = end.clone();
             start.scan.totals.hardlinks_deduped = u64::from(deduped_at_start);
             end.scan.totals.hardlinks_deduped = u64::from(!deduped_at_start);
-            for (before, after, coverage, sign) in [
-                (&start, &end, [&[][..], unreadable.as_slice()], 1),
-                (&end, &start, [unreadable.as_slice(), &[][..]], -1),
-            ] {
-                let r = growth::watch(before, after, 60, 60_000, M, coverage);
-                assert!(r.dirs.is_empty(), "{:?}", r.dirs);
-                assert_eq!(r.fs.len(), 1);
-                assert_eq!(r.fs[0].change, sign * M as i64);
-                assert!(r.docker_compared);
-                assert_eq!(r.docker.len(), 1);
-                assert_eq!(r.docker[0].kind, ChangeKind::BuildCache);
-                assert_eq!(r.docker[0].change, sign * 2 * M as i64);
-                assert_eq!(
-                    r.notes,
-                    [
+            for skipped_mount in [false, true] {
+                let mut end = end.clone();
+                let (paths, coverage_note) = if skipped_mount {
+                    end.scan.skipped_mounts = unreadable.clone();
+                    (
+                        &[][..],
+                        "not compared, because one side did not enter these mount points: /h/a",
+                    )
+                } else {
+                    (
+                        unreadable.as_slice(),
                         "not compared, because a sample could not read these paths: /h/a",
-                        "directories not compared: coverage changed during the window, and files with several hard links may be counted in different places",
-                    ]
-                );
+                    )
+                };
+                for (before, after, coverage, sign) in [
+                    (&start, &end, [&[][..], paths], 1),
+                    (&end, &start, [paths, &[][..]], -1),
+                ] {
+                    let r = growth::watch(before, after, 60, 60_000, M, coverage);
+                    assert!(r.dirs.is_empty(), "{:?}", r.dirs);
+                    assert_eq!(r.fs.len(), 1);
+                    assert_eq!(r.fs[0].change, sign * M as i64);
+                    assert!(r.docker_compared);
+                    assert_eq!(r.docker.len(), 1);
+                    assert_eq!(r.docker[0].kind, ChangeKind::BuildCache);
+                    assert_eq!(r.docker[0].change, sign * 2 * M as i64);
+                    assert_eq!(
+                        r.notes,
+                        [
+                            coverage_note,
+                            "directories not compared: coverage changed during the window, and files with several hard links may be counted in different places",
+                        ]
+                    );
+                }
             }
         }
+    }
+}
+
+#[test]
+fn watch_keeps_directory_rates_when_mounts_change_without_hardlinks() {
+    let start = sample(
+        "2026-11-18T02:00:00Z",
+        &[("/h", 10 * M), ("/h/a", 6 * M), ("/h/b", 4 * M)],
+        50 * G,
+    );
+    let end = skipping(
+        sample(
+            "2026-11-18T02:01:00Z",
+            &[("/h", 8 * M), ("/h/b", 8 * M)],
+            50 * G,
+        ),
+        &["/h/a"],
+    );
+    for (before, after, sign) in [(&start, &end, 1), (&end, &start, -1)] {
+        let r = growth::watch(before, after, 60, 60_000, M, [&[], &[]]);
+        let changes: HashMap<&str, i64> =
+            r.dirs.iter().map(|d| (d.name.as_str(), d.change)).collect();
+        assert_eq!(
+            changes,
+            HashMap::from([("/h", -sign * 2 * M as i64), ("/h/b", sign * 4 * M as i64),])
+        );
+        assert_eq!(
+            r.notes,
+            ["not compared, because one side did not enter these mount points: /h/a"]
+        );
     }
 }
 
@@ -892,6 +937,8 @@ fn watch_keeps_directory_rates_with_hardlinks_when_coverage_matches() {
     );
     start.scan.totals.hardlinks_deduped = 1;
     end.scan.totals.hardlinks_deduped = 2;
+    start.scan.skipped_mounts = vec!["/h/skip".into(), "/h/other".into()];
+    end.scan.skipped_mounts = vec!["/h/other".into(), "/h/skip".into(), "/h/skip".into()];
     let unreadable = vec!["/h/a".to_string()];
     for coverage in [[&[][..], &[][..]], [&unreadable[..], &unreadable[..]]] {
         let r = growth::watch(&start, &end, 60, 60_000, M, coverage);
