@@ -18,7 +18,7 @@ crates/dwhy-core   engine: scan (walker), tree (the ScanTree detectors read: per
                    detectors/ (one file per detector), probes/ (one file per probe; run by scan
                    after the detectors: postgres-wal reads the Engine API and runs read-only psql
                    through docker exec), docker (read-only Engine API client:
-                   GET /system/df and /info over the unix socket), guard (pre-removal checks:
+                   GETs over the unix socket), guard (pre-removal checks:
                    processes, git, container mounts; run at plan and apply, never in scan),
                    plan (selection, fingerprints, expiry), apply (re-detect, tier policy, run
                    ready items, audit log), remove (path removal: no symlinks, one filesystem),

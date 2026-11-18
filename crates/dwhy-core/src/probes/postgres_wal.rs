@@ -3,24 +3,7 @@
 //! `archive_command` keeps failing, often because the archive target (a
 //! fake S3 container, say) has exited.
 //!
-//! It probes a `docker-volume` finding only when a **running** container
-//! mounts the volume at its Postgres data directory (`PGDATA` from the
-//! container's environment, `/var/lib/postgresql/data` by default) or at a
-//! parent of it.
-//!
-//! Everything it does is read-only:
-//!
-//! * Engine API GETs: `/containers/json?all=1`, `/containers/{id}/json`, and
-//!   a capped log tail (`/containers/{id}/logs`, [`LOG_TAIL`] lines).
-//! * `docker exec <id> psql` as the database user from the container's
-//!   environment, over the local socket (`PGHOST` empty), with
-//!   `PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=10s -c search_path=pg_catalog`,
-//!   and the query inside
-//!   `BEGIN READ ONLY`, under a timeout ([`EXEC_TIMEOUT`]).
-//!
-//! When exec or psql fails, the evidence comes from
-//! the GETs alone (`source: api-only`): settings from the container's
-//! command line and archive failures from the log tail.
+//! The read-only probe is specified under Decisions taken in `docs/DESIGN.md`.
 //!
 //! The system is behind the [`Docker`] trait so tests can replay recorded
 //! responses.
@@ -51,8 +34,8 @@ pub const LOG_TAIL: u32 = 200;
 pub const EXEC_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long one Engine API GET may take.
 pub const API_TIMEOUT: Duration = Duration::from_secs(10);
-/// WAL at least this large and [`WAL_RATIO`] times the data, with archiving
-/// on, is worth advice even when the archiver reports no failure.
+/// WAL at least this large and more than [`WAL_RATIO`] times the data, with
+/// archiving on, is worth advice even when the archiver reports no failure.
 const BIG_WAL: u64 = 1 << 30;
 const WAL_RATIO: u64 = 4;
 

@@ -1,8 +1,8 @@
 //! Read-only access to the Docker Engine API over its unix socket.
 //!
-//! Only `GET /system/df` and `GET /info` are used. They give exact byte
-//! counts (the CLI's `docker system df` prints rounded strings). Removal
-//! commands that findings suggest use the docker CLI instead.
+//! The Docker usage snapshot uses `GET /system/df` and `GET /info` for
+//! exact byte counts (the CLI's `docker system df` prints rounded strings).
+//! Docker findings use the CLI for removal commands.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;

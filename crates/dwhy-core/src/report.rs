@@ -322,6 +322,7 @@ pub struct DeletedOpen {
 pub struct Finding {
     pub id: String,
     pub detector: String,
+    /// The probe that added evidence to this finding, when one did.
     pub probe: Option<String>,
     /// Filesystem path, or a pseudo-path such as `docker://volume/<name>`.
     pub path: String,
@@ -344,7 +345,7 @@ pub struct Finding {
     pub guards: Vec<GuardResult>,
     pub action: Action,
     pub recovery: Recovery,
-    /// What the probe named in `probe` found; absent when no probe ran.
+    /// Evidence from the probe named in `probe`, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Evidence>,
 }
@@ -370,8 +371,8 @@ pub struct PostgresWal {
     /// Sum of `pg_database_size` over all databases.
     #[serde(default)]
     pub data_bytes: Option<u64>,
-    /// `pg_stat_archiver.failed_count`; with `api-only`, failures in the
-    /// log tail (a lower bound).
+    /// `pg_stat_archiver.failed_count`. With `api-only`, this counts observed
+    /// failures in the log tail and is null if the tail could not be read.
     #[serde(default)]
     pub failed_count: Option<u64>,
     /// RFC 3339 (UTC).
@@ -380,19 +381,25 @@ pub struct PostgresWal {
     /// RFC 3339 (UTC).
     #[serde(default)]
     pub last_failed_at: Option<String>,
+    /// Failed archive filename, if available and in a recognized Postgres
+    /// format (WAL segment, partial segment, timeline history or backup history).
     #[serde(default)]
     pub last_failed_wal: Option<String>,
     #[serde(default)]
     pub archive_mode: Option<String>,
-    /// The program `archive_command` runs (its first word). Arguments are
-    /// never reported, as they can hold credentials.
+    /// The program word extracted from `archive_command`. Reported words
+    /// contain only ASCII letters, digits or `_./+-`, with `***` used when
+    /// extraction fails. The raw command and its arguments are omitted.
     #[serde(default)]
     pub archive_program: Option<String>,
     #[serde(default)]
     pub archive_timeout: Option<String>,
-    /// Hosts `archive_command` sends WAL to, matched with containers.
+    /// Inferred archive hosts that match Docker container identifiers.
     #[serde(default)]
     pub targets: Vec<ArchiveTarget>,
+    /// Count of inferred hosts with a completed lookup and no Docker match.
+    /// Host names are omitted, as is the field when the count is zero.
+    /// The count can be partial if inspection fails.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub unmatched_hosts: u64,
     pub source: EvidenceSource,
@@ -408,7 +415,7 @@ fn is_zero(value: &u64) -> bool {
 pub struct ArchiveTarget {
     /// The matched name, service, alias or DNS name reported by Docker.
     pub host: String,
-    /// The container it names (by name, Compose service or network alias).
+    /// The name of the matched container.
     pub container: Option<String>,
     /// The matched container's state (`running`, `exited`, …).
     pub state: String,
