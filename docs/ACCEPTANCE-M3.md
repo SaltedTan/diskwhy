@@ -32,7 +32,7 @@ DESIGN.md says M3 is done when a test Compose file, Postgres with a failing `arc
 
 ## How to run it
 
-It needs Docker Engine 28 or later for the isolated bridge, `postgres:16-alpine` already pulled, and access to the daemon at `/var/run/docker.sock` or an absolute Unix socket set through `DOCKER_HOST`. Docker and `dwhy` use that same socket regardless of the active Docker context. The demo takes about 6 minutes. It is `#[ignore]`d and also returns at once unless `DWHY_DOCKER_E2E=1` is set. The normal `cargo test` and CI never contact the daemon.
+It needs Docker Engine 28 or later for the isolated bridge, `postgres:16-alpine` already pulled, and access to the daemon at `/var/run/docker.sock` or an absolute Unix socket set through `DOCKER_HOST`. Docker and `dwhy` use that same socket regardless of the active Docker context. The demo takes about 6 minutes. It is `#[ignore]`d and also returns at once unless `DWHY_DOCKER_E2E=1` is set. The WAL demo is disabled in normal test runs and in CI.
 
 ```
 DWHY_DOCKER_E2E=1 cargo test -p dwhy-cli --test wal_demo_e2e -- --ignored --nocapture
@@ -42,20 +42,20 @@ DWHY_DOCKER_E2E=1 cargo test -p dwhy-cli --test wal_demo_e2e -- --ignored --noca
 
 ## Run on pc-ubuntu
 
-On 2026-11-18 (Docker 29.1.3, Compose 2.40.3), the original fixture passed in 342 s as project `dwhye2e16837461794997736`, with the machine's own Compose projects running alongside.
+On 2026-11-18, the maintainer ran the final fixture at `0dbb25c` by hand on pc-ubuntu with Docker 29.1.3 and Compose 2.40.3. The fixture used an internal network with an isolated gateway, a ten-minute writer limit, and `--pull never`. Project `dwhye2e2927735da2d31fe95824348` passed in 322 s while the machine's `bmc-*` Compose projects were running alongside it.
 
 | Step | What it saw |
 |---|---|
-| Growth to 1.1 GiB | 64 MiB after start, 1168 MiB after 262 s (~250 MiB a minute) |
-| `watch --for 30s` | volume 1,224,957,789 → 1,343,192,925 bytes, +118,235,136; `bytes_per_minute` 236,470,272 (~225 MiB/min) |
-| `diff` | volume 67,052,885 → 1,362,313,053 bytes, +1,295,260,168 (~1.2 GiB in ~290 s); `bytes_per_day` 381,947,025,649 |
-| `explain` | `docker-volume` finding, evidence from `psql`: `wal_bytes` 654,311,424, `data_bytes` 709,695,060, `failed_count` 52, `last_archived_at` null, `archive_program` `wget`, `archive_timeout` `10s`, target `s3test` (container `dwhye2e16837461794997736-s3test-1`) `exited` |
-| Teardown | `down -v --remove-orphans` removed the 3 containers, the network and the volume; the three label-filtered listings were empty afterwards, and the `bmc-prod-test` containers were still up |
+| `watch --for 30s` | Right after the baseline, volume 67,052,892 → 187,630,940 bytes (+120,578,048). `bytes_per_minute` was 241,156,096 (~230 MiB/min). |
+| Growth to 1.1 GiB | Reached 1168 MiB after 232 s. |
+| `diff` | Volume 67,052,892 → 1,224,957,796 bytes (+1,157,904,904). `bytes_per_day` was 380,391,573,025. |
+| `explain` | `docker-volume` finding with `psql` evidence. `wal_bytes` was 587,202,560, `data_bytes` was 641,791,572, `failed_count` was 47, and `last_archived_at` was null. `archive_program` was `wget` and `archive_timeout` was `10s`. Target `s3test` (container `dwhye2e2927735da2d31fe95824348-s3test-1`) was `exited`. |
+| Teardown | `down -v --remove-orphans` exited 0 and removed all three containers, the `_default` network and the `_pgdata` volume. No container, volume or network named `dwhye2e*` remained, and the `bmc-*` containers were still up. |
 
-Explain's reason:
+**Explain reason**
 
-> pg_wal holds 624.0M vs 676.8M data; archiving is failing, with 52 failures in total (last failure 2026-11-18T10:34:25.967373Z, last success none) (target s3test (dwhye2e16837461794997736-s3test-1) exited); volume dwhye2e16837461794997736_pgdata holds 1.3G and is mounted by dwhye2e16837461794997736-postgres-1 (running) (a running container uses it)
+> pg_wal holds 560.0M vs 612.1M data; archiving is failing, with 47 failures in total (last failure 2026-11-18T11:29:27.019439Z, last success none) (target s3test (dwhye2e2927735da2d31fe95824348-s3test-1) exited); volume dwhye2e2927735da2d31fe95824348_pgdata holds 1.1G and is mounted by dwhye2e2927735da2d31fe95824348-postgres-1 (running) (a running container uses it)
 
-and its advice:
+**Explain advice**
 
 > restore the archive target s3test; WAL is freed at the next checkpoint once it is archived (do not remove the volume: it holds the database)
