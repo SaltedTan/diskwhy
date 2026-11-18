@@ -20,6 +20,7 @@ pub use docker::{
     BUILD_CACHE_AGE_HOURS, DockerBuildCache, DockerContainer, DockerImage, DockerPresence,
     DockerVolume, docker_presence, object_id,
 };
+pub(crate) use docker::{container_name, image_label, image_named, short_id};
 pub use git_worktree::{GitWorktree, STALE_DAYS, WorktreeEntry, parse_porcelain};
 pub use node_modules::NodeModules;
 pub use stale_tree::{SCRATCH_LOCATIONS, SCRATCH_MARKER, SCRATCH_STALE_DAYS, StaleTree};

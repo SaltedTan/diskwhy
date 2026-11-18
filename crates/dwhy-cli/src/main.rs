@@ -17,14 +17,13 @@ use clap::{Args, Parser, Subcommand};
 use dwhy_core::account::{self, ReportEnv};
 use dwhy_core::apply::{self, Audit, Check, Policy};
 use dwhy_core::detect::{self, DetectContext};
-use dwhy_core::detectors::{DockerPresence, docker_presence};
 use dwhy_core::explain::{self, Place, Query, Walk};
 use dwhy_core::guard::Processes;
 use dwhy_core::mounts::{self, MountTable};
 use dwhy_core::plan::{self, Selection};
 use dwhy_core::report::{
     ActionKind, ExplainReport, ExplainResolved, ExplainSize, ExplainVia, Plan, PlanScan,
-    SavedSnapshot, ScanReport, Tier, Totals,
+    SavedSnapshot, ScanReport, SnapshotFinding, Tier, Totals,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::tree::ScanTree;
@@ -662,16 +661,20 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
     let mut notes = Vec::new();
 
     // A finding id becomes the path it had in the newest snapshot listing it.
-    let (place, saved, snap) = match explain::classify(query) {
+    let (place, resolved) = match explain::classify(query) {
         Query::Id(id) => {
             let dir = dir.as_deref().ok_or_else(|| format!(
                 "cannot find snapshots: neither XDG_STATE_HOME nor HOME is an absolute path; {}",
                 explain::PATH_HINT
             ))?;
-            let (snap, found) = explain::resolve_id(dir, &host, uid, &id)?;
-            (explain::place(&found.path), Some(found), Some(snap))
+            let resolved = explain::resolve_id(dir, &host, uid, &id)?;
+            (explain::place(&resolved.finding.path), Some(resolved))
         }
-        Query::Place(p) => (p, None, None),
+        Query::Place(p) => (p, None),
+    };
+    let (snap, saved, saved_object) = match resolved {
+        Some(r) => (Some(r.snapshot), Some(r.finding), r.docker),
+        None => (None, None, None),
     };
 
     let generated_at = system::now_rfc3339();
@@ -729,24 +732,41 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
         (candidates, runs)
     });
     notes.extend(explain::detector_notes(&runs, only.as_deref()));
-    let (mut finding, inside) =
-        explain::pick(findings, &path, saved.as_ref().map(|f| f.id.as_str()));
+    let detector_issue = |saved: &SnapshotFinding| {
+        tree.as_ref()
+            .and_then(|_| explain::detector_gap(&runs, only.as_deref(), &saved.detector))
+    };
+    let daemon = ctx.docker.fetched();
+    let mut path = path;
     let mut gone = false;
-    if let Some(saved) = &saved
-        && finding.is_none()
-    {
-        let detector_issue = tree
-            .as_ref()
-            .and_then(|_| explain::detector_gap(&runs, only.as_deref(), &saved.detector));
-        gone = explain_missing(
-            &saved.path,
-            is_docker,
-            &ctx,
-            detector_issue,
-            scan_issue,
-            &mut notes,
-        );
-    }
+    let mut growth_allowed = true;
+    let (mut finding, inside) = match &saved {
+        // A saved Docker object is matched by its immutable id.
+        Some(saved) if is_docker => {
+            let out = explain::explain_docker_id(
+                saved,
+                saved_object.as_ref(),
+                daemon.as_deref(),
+                findings,
+                detector_issue(saved),
+            );
+            path = out.path;
+            gone = out.gone;
+            growth_allowed = out.growth;
+            notes.extend(out.notes);
+            (out.finding, out.inside)
+        }
+        _ => {
+            let (finding, inside) =
+                explain::pick(findings, &path, saved.as_ref().map(|f| f.id.as_str()));
+            if let Some(saved) = &saved
+                && finding.is_none()
+            {
+                gone = explain_missing(&saved.path, detector_issue(saved), scan_issue, &mut notes);
+            }
+            (finding, inside)
+        }
+    };
     if let (Some(f), Some(tree)) = (&mut finding, &tree) {
         let one = std::slice::from_mut(f);
         probes::run(one, &ctx);
@@ -758,10 +778,14 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
         };
         dwhy_core::guard::check(one, tree, &ctx, &processes);
         drop(status);
-        if let Some(dir) = &dir
+        if growth_allowed
+            && let Some(dir) = &dir
             && let Some(base) = explain::growth_base(dir, &host, uid, &one[0].id, &generated_at)
         {
-            growth::fill_growth(one, &base, &generated_at);
+            match explain::growth_across_replacement(&base, &one[0].path, daemon.as_deref()) {
+                Some(note) => notes.push(note),
+                None => growth::fill_growth(one, &base, &generated_at),
+            }
         }
     }
     let report = ExplainReport {
@@ -796,64 +820,26 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
     Ok(EXIT_OK)
 }
 
+/// Notes on a saved filesystem path that no finding matched now.
 fn explain_missing(
     path: &str,
-    is_docker: bool,
-    ctx: &DetectContext,
     detector_issue: Option<String>,
     scan_issue: Option<String>,
     notes: &mut Vec<String>,
 ) -> bool {
-    let mut size_issue = None;
-    let exists = if is_docker {
-        match ctx.docker.fetched() {
-            Some(snapshot) => match docker_presence(&snapshot, path) {
-                Some(DockerPresence::Missing) => Ok(false),
-                Some(DockerPresence::Present) => Ok(true),
-                Some(DockerPresence::Unmeasured) => {
-                    size_issue = Some("the Docker daemon did not report a size".to_string());
-                    Ok(true)
-                }
-                None => Err("the Docker daemon did not report the relevant list".to_string()),
-            },
-            None => Err(detector_issue
-                .clone()
-                .unwrap_or_else(|| "no answer from the Docker daemon".into())),
+    let exists = match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
         }
-    } else {
-        match std::fs::symlink_metadata(path) {
-            Ok(_) => Ok(true),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                Ok(false)
-            }
-            Err(e) => Err(format!("{path}: {e}")),
-        }
+        Err(e) => Err(format!("{path}: {e}")),
     };
-    match exists {
-        Ok(false) => {
-            notes.push(format!("{path} no longer exists"));
-            true
-        }
-        Ok(true) => {
-            notes.push(format!("still present at {path}, but not detected now"));
-            if detector_issue.is_none() && scan_issue.is_none() && size_issue.is_none() {
-                notes.push("it may be below the detector's size or age threshold, covered by a finding above it, or need context above the walked directory".into());
-            }
-            notes.extend(detector_issue);
-            notes.extend(scan_issue);
-            notes.extend(size_issue);
-            false
-        }
-        Err(reason) => {
-            notes.push(format!("could not check: {reason}"));
-            false
-        }
-    }
+    explain::absence(path, exists, detector_issue, scan_issue, None, notes)
 }
 
 fn explain_path(

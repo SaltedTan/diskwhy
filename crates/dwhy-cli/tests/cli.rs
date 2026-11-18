@@ -1813,3 +1813,55 @@ fn explain_does_not_alias_a_lossy_finding_to_a_utf8_path() {
         assert_eq!(report["inside"], serde_json::json!([]));
     }
 }
+
+#[test]
+fn explain_refuses_an_id_whose_saved_path_was_lossy() {
+    let (_data, root) = cargo_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "scan",
+            &root,
+            "-q",
+            "--json",
+            "--snapshot",
+            "--detectors",
+            "cargo-target",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let scan = json_of(&out);
+    let path = Path::new(scan["snapshot"]["path"].as_str().unwrap());
+    // What v1 saves for a target dir named `target\xff`.
+    let mut snap = dwhy_core::snapshot::load(path).unwrap();
+    let lossy = format!("{root}/app/target\u{FFFD}");
+    let id = dwhy_core::detect::finding_id("cargo-target", &lossy);
+    snap.findings[0].path = lossy;
+    snap.findings[0].id = id.clone();
+    fs::remove_file(path).unwrap();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    dwhy_core::snapshot::save(path.parent().unwrap(), &snap, now).unwrap();
+
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "explain",
+            &id,
+            "-q",
+            "--json",
+            "--detectors",
+            "cargo-target",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(&format!(
+            "the saved path for {id} was not valid UTF-8 and can't be checked reliably; \
+             run `dwhy explain <path>` with the real path"
+        )),
+        "{err}"
+    );
+}

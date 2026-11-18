@@ -9,7 +9,7 @@
 //! and the prune command is limited to those records.
 
 use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
-use crate::docker::{Container, Snapshot};
+use crate::docker::{Container, Image, Snapshot};
 use crate::report::{Action, ActionKind, Finding, GuardResult, GuardStatus, Recovery, Tier};
 use crate::tree::ScanTree;
 use crate::units::human;
@@ -78,15 +78,41 @@ fn finding(
     }
 }
 
-fn container_name(c: &Container) -> String {
+/// A container's name, as its findings' pseudo-paths use it.
+pub(crate) fn container_name(c: &Container) -> String {
     c.names
         .first()
         .map(|n| n.trim_start_matches('/').to_string())
         .unwrap_or_else(|| c.id.chars().take(12).collect())
 }
 
-fn short_id(id: &str) -> String {
+pub(crate) fn short_id(id: &str) -> String {
     id.trim_start_matches("sha256:").chars().take(12).collect()
+}
+
+fn image_tags(img: &Image) -> impl Iterator<Item = &str> {
+    img.repo_tags
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .filter(|t| *t != "<none>:<none>")
+}
+
+/// An image's label, as its findings' pseudo-paths use it: its first tag,
+/// else its short id.
+pub(crate) fn image_label(img: &Image) -> String {
+    image_tags(img)
+        .next()
+        .map_or_else(|| short_id(&img.id), str::to_string)
+}
+
+/// Whether `label` names `img`: one of its tags, or its short id when it
+/// has none.
+pub(crate) fn image_named(img: &Image, label: &str) -> bool {
+    match image_tags(img).next() {
+        Some(_) => image_tags(img).any(|t| t == label),
+        None => short_id(&img.id) == label,
+    }
 }
 
 pub enum DockerPresence {

@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::detect::{self, CATALOG, Needs};
+use crate::detectors::DockerPresence;
+use crate::docker;
 use crate::mounts::MountTable;
 use crate::report::{
     DetectorAvailability, DetectorRun, ExplainSnapshot, Finding, FindingRef, Snapshot,
@@ -183,23 +185,40 @@ fn newest_listing(
     Ok((newest.map(|(_, listing)| listing), first_err))
 }
 
+/// A finding id turned into its path by [`resolve_id`].
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    pub snapshot: ExplainSnapshot,
+    pub finding: SnapshotFinding,
+    /// The Docker object the snapshot recorded at the finding's pseudo-path.
+    /// `None` for filesystem paths, build cache, and snapshots without the
+    /// object's id.
+    pub docker: Option<SavedObject>,
+}
+
 /// Turns a finding id into its path: the newest snapshot of this host and
-/// uid that lists it, and the finding's path there.
-pub fn resolve_id(
-    dir: &Path,
-    host: &str,
-    uid: u32,
-    id: &str,
-) -> Result<(ExplainSnapshot, SnapshotFinding), String> {
+/// uid that lists it, and the finding's path there. A path saved lossily
+/// (v1 snapshots store a non-UTF-8 path with U+FFFD) is refused: it could
+/// name another file.
+pub fn resolve_id(dir: &Path, host: &str, uid: u32, id: &str) -> Result<Resolved, String> {
     match newest_listing(dir, host, uid, id, None).map_err(|e| format!("{e}; {PATH_HINT}"))? {
-        (Some(found), _) => Ok((
-            ExplainSnapshot {
-                id: found.entry.id,
-                path: found.entry.path.to_string_lossy().into_owned(),
-                created_at: found.snapshot.created_at,
-            },
-            found.finding,
-        )),
+        (Some(found), _) => {
+            if found.finding.path.contains(char::REPLACEMENT_CHARACTER) {
+                return Err(format!(
+                    "the saved path for {id} was not valid UTF-8 and can't be checked reliably; \
+                     run `dwhy explain <path>` with the real path"
+                ));
+            }
+            Ok(Resolved {
+                docker: saved_object(&found.snapshot, &found.finding.path),
+                snapshot: ExplainSnapshot {
+                    id: found.entry.id,
+                    path: found.entry.path.to_string_lossy().into_owned(),
+                    created_at: found.snapshot.created_at,
+                },
+                finding: found.finding,
+            })
+        }
         (None, err) => {
             let mut msg = format!(
                 "no snapshot lists finding {id}; {PATH_HINT}, \
@@ -222,6 +241,325 @@ pub fn growth_base(dir: &Path, host: &str, uid: u32, id: &str, now: &str) -> Opt
         OffsetDateTime::parse(now, &Rfc3339).ok()? - Duration::seconds(crate::growth::MIN_AGE_SECS);
     let (found, _) = newest_listing(dir, host, uid, id, Some(cutoff)).ok()?;
     Some(found?.snapshot)
+}
+
+/// The kinds of Docker object a finding can name, other than build cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerKind {
+    Image,
+    Container,
+    Volume,
+}
+
+impl DockerKind {
+    fn prefix(self) -> &'static str {
+        match self {
+            DockerKind::Image => "docker://image/",
+            DockerKind::Container => "docker://container/",
+            DockerKind::Volume => "docker://volume/",
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            DockerKind::Image => "image",
+            DockerKind::Container => "container",
+            DockerKind::Volume => "volume",
+        }
+    }
+}
+
+/// The kind and name (image label, container or volume name) a Docker
+/// pseudo-path names; `None` for build cache and other paths.
+pub fn docker_kind(path: &str) -> Option<(DockerKind, &str)> {
+    [DockerKind::Image, DockerKind::Container, DockerKind::Volume]
+        .into_iter()
+        .find_map(|k| Some((k, path.strip_prefix(k.prefix())?)))
+}
+
+/// The Docker object a snapshot recorded at a pseudo-path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedObject {
+    pub kind: DockerKind,
+    /// The image label, or the container or volume name, in the pseudo-path.
+    pub name: String,
+    /// The immutable id: the image or container id, or a volume's creation
+    /// time (a volume has none; a volume recreated under its name is
+    /// created again).
+    pub id: String,
+}
+
+/// The object `snap` recorded at the Docker pseudo-path `path`, the way
+/// the detectors name it. `None` when the snapshot has no Docker figures,
+/// or (for volumes) no creation times.
+pub fn saved_object(snap: &Snapshot, path: &str) -> Option<SavedObject> {
+    let (kind, name) = docker_kind(path)?;
+    let docker = snap.docker.as_ref()?;
+    let id = match kind {
+        DockerKind::Image => docker
+            .images
+            .iter()
+            .find(|i| match i.tags.first() {
+                Some(tag) => tag == name,
+                None => crate::detectors::short_id(&i.id) == name,
+            })
+            .map(|i| i.id.clone()),
+        DockerKind::Container => docker
+            .containers
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.id.clone()),
+        DockerKind::Volume => docker
+            .volumes
+            .iter()
+            .find(|v| v.name == name)
+            .and_then(|v| v.created_at.clone()),
+    }?;
+    Some(SavedObject {
+        kind,
+        name: name.to_string(),
+        id,
+    })
+}
+
+/// What the daemon lists now for a [`SavedObject`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Identity {
+    /// Listed under its saved id. `path` is its pseudo-path now, which
+    /// differs from the saved one when it was renamed or retagged.
+    /// `measured` is false when the daemon gave no size for it.
+    Present { path: String, measured: bool },
+    /// The saved id is not listed, but its name now names another object.
+    Replaced { note: String },
+    /// Neither the id nor the name is listed.
+    Gone,
+    /// The daemon did not report the list to look in.
+    Unknown,
+}
+
+/// Looks for `saved` in the daemon's lists by its immutable id, then by
+/// its name.
+pub fn identity(saved: &SavedObject, now: &docker::Snapshot) -> Identity {
+    use crate::detectors::{container_name, image_label, image_named, short_id};
+    let replaced = |was: String, is: String| Identity::Replaced {
+        note: format!(
+            "replaced: {} {} is now a different object (was {was}, now {is})",
+            saved.kind.word(),
+            saved.name
+        ),
+    };
+    let at = |name: String| format!("{}{name}", saved.kind.prefix());
+    match saved.kind {
+        DockerKind::Image => {
+            let Some(images) = now.df.images.as_ref() else {
+                return Identity::Unknown;
+            };
+            if let Some(img) = images.iter().find(|i| i.id == saved.id) {
+                Identity::Present {
+                    path: at(image_label(img)),
+                    measured: img.size >= 0,
+                }
+            } else if let Some(img) = images.iter().find(|i| image_named(i, &saved.name)) {
+                replaced(short_id(&saved.id), short_id(&img.id))
+            } else {
+                Identity::Gone
+            }
+        }
+        DockerKind::Container => {
+            let Some(containers) = now.df.containers.as_ref() else {
+                return Identity::Unknown;
+            };
+            if let Some(c) = containers.iter().find(|c| c.id == saved.id) {
+                Identity::Present {
+                    path: at(container_name(c)),
+                    measured: c.size_rw.is_some_and(|s| s >= 0),
+                }
+            } else if let Some(c) = containers.iter().find(|c| container_name(c) == saved.name) {
+                replaced(short_id(&saved.id), short_id(&c.id))
+            } else {
+                Identity::Gone
+            }
+        }
+        DockerKind::Volume => {
+            let Some(volumes) = now.df.volumes.as_ref() else {
+                return Identity::Unknown;
+            };
+            match volumes.iter().find(|v| v.name == saved.name) {
+                Some(v) if v.created_at == saved.id => Identity::Present {
+                    path: at(v.name.clone()),
+                    measured: v.usage_data.as_ref().is_some_and(|u| u.size >= 0),
+                },
+                Some(v) => replaced(
+                    format!("created {}", saved.id),
+                    format!("created {}", v.created_at),
+                ),
+                None => Identity::Gone,
+            }
+        }
+    }
+}
+
+/// A note when growth for the finding at `path` would compare two
+/// different Docker objects: the one `base` recorded there and the one
+/// listed there now. `None` when they are the same, or either is unknown.
+pub fn growth_across_replacement(
+    base: &Snapshot,
+    path: &str,
+    now: Option<&docker::Snapshot>,
+) -> Option<String> {
+    let saved = saved_object(base, path)?;
+    match identity(&saved, now?) {
+        Identity::Replaced { .. } => Some(format!(
+            "growth not computed: {} {} was a different object in the snapshot of {}",
+            saved.kind.word(),
+            saved.name,
+            base.created_at
+        )),
+        _ => None,
+    }
+}
+
+/// The outcome of explaining a saved id whose path is a Docker pseudo-path.
+#[derive(Debug, Clone, Default)]
+pub struct DockerExplained {
+    /// The pseudo-path examined: the object's current one when renamed.
+    pub path: String,
+    pub finding: Option<Finding>,
+    pub inside: Vec<FindingRef>,
+    pub gone: bool,
+    /// Whether growth may be measured for `finding`: false across a
+    /// replacement.
+    pub growth: bool,
+    pub notes: Vec<String>,
+}
+
+/// Explains the saved finding `saved` at a Docker pseudo-path from the
+/// Docker detectors' `findings` and the daemon's lists `now` (`None` when
+/// the daemon did not answer or was not asked). `object` is what the
+/// snapshot recorded there ([`Resolved::docker`]). `detector_issue` is the
+/// saved detector's gap, as [`detector_gap`] gives it.
+pub fn explain_docker_id(
+    saved: &SnapshotFinding,
+    object: Option<&SavedObject>,
+    now: Option<&docker::Snapshot>,
+    findings: Vec<Finding>,
+    detector_issue: Option<String>,
+) -> DockerExplained {
+    let mut out = DockerExplained {
+        path: saved.path.clone(),
+        growth: true,
+        ..Default::default()
+    };
+    let identity = match (object, now) {
+        (Some(object), Some(now)) => identity(object, now),
+        _ => Identity::Unknown,
+    };
+    if object.is_none() && now.is_some() && docker_kind(&saved.path).is_some() {
+        out.notes
+            .push("identity not checked: the snapshot has no Docker ids".into());
+    }
+    match identity {
+        Identity::Present { path, measured } => {
+            if path != saved.path {
+                let (_, name) = docker_kind(&path).unwrap_or((DockerKind::Image, &path));
+                out.notes.push(format!("renamed: now {name}"));
+            }
+            let id = detect::finding_id(&saved.detector, &path);
+            (out.finding, out.inside) = pick(findings, &path, Some(&id));
+            if out.finding.is_none() {
+                let size_issue =
+                    (!measured).then(|| "the Docker daemon did not report a size".to_string());
+                absence(
+                    &path,
+                    Ok(true),
+                    detector_issue,
+                    None,
+                    size_issue,
+                    &mut out.notes,
+                );
+            }
+            out.path = path;
+        }
+        Identity::Replaced { note } => {
+            out.notes.push(note);
+            out.growth = false;
+            (out.finding, out.inside) = pick(findings, &saved.path, Some(&saved.id));
+            if out.finding.is_none() {
+                out.notes.extend(detector_issue);
+            }
+        }
+        Identity::Gone => {
+            out.gone = absence(&saved.path, Ok(false), None, None, None, &mut out.notes);
+        }
+        // Today's name match: the snapshot has no id, the list is missing
+        // or the daemon did not answer.
+        Identity::Unknown => {
+            (out.finding, out.inside) = pick(findings, &saved.path, Some(&saved.id));
+            if out.finding.is_none() {
+                let (exists, size_issue) = match now {
+                    Some(now) => match crate::detectors::docker_presence(now, &saved.path) {
+                        Some(DockerPresence::Missing) => (Ok(false), None),
+                        Some(DockerPresence::Present) => (Ok(true), None),
+                        Some(DockerPresence::Unmeasured) => (
+                            Ok(true),
+                            Some("the Docker daemon did not report a size".to_string()),
+                        ),
+                        None => (
+                            Err("the Docker daemon did not report the relevant list".to_string()),
+                            None,
+                        ),
+                    },
+                    None => (
+                        Err(detector_issue
+                            .clone()
+                            .unwrap_or_else(|| "no answer from the Docker daemon".into())),
+                        None,
+                    ),
+                };
+                out.gone = absence(
+                    &saved.path,
+                    exists,
+                    detector_issue,
+                    None,
+                    size_issue,
+                    &mut out.notes,
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Notes on an unmatched saved id from whether its path exists (`Err`
+/// when that could not be checked). Returns whether it is gone.
+pub fn absence(
+    path: &str,
+    exists: Result<bool, String>,
+    detector_issue: Option<String>,
+    scan_issue: Option<String>,
+    size_issue: Option<String>,
+    notes: &mut Vec<String>,
+) -> bool {
+    match exists {
+        Ok(false) => {
+            notes.push(format!("{path} no longer exists"));
+            true
+        }
+        Ok(true) => {
+            notes.push(format!("still present at {path}, but not detected now"));
+            if detector_issue.is_none() && scan_issue.is_none() && size_issue.is_none() {
+                notes.push("it may be below the detector's size or age threshold, covered by a finding above it, or need context above the walked directory".into());
+            }
+            notes.extend(detector_issue);
+            notes.extend(scan_issue);
+            notes.extend(size_issue);
+            false
+        }
+        Err(reason) => {
+            notes.push(format!("could not check: {reason}"));
+            false
+        }
+    }
 }
 
 /// `--detectors` for a `docker://` query: the Docker detectors, limited

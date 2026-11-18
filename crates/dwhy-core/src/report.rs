@@ -770,6 +770,11 @@ pub struct SnapshotVolume {
     pub name: String,
     /// `None` when the daemon did not compute it.
     pub bytes: Option<u64>,
+    /// Docker's `CreatedAt`, as the daemon reported it. A volume has no id,
+    /// so its name and creation time identify it. Absent from snapshots
+    /// saved before it was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -955,7 +960,7 @@ pub struct ExplainReport {
     pub query: String,
     pub resolved: ExplainResolved,
     /// The path examined: absolute for a filesystem path, else the
-    /// pseudo-path.
+    /// pseudo-path (for a saved Docker object renamed since, its current one).
     pub path: String,
     /// The finding at `path` (with the requested id for an id query).
     /// Guards, growth and probe evidence are included when available.

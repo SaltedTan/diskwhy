@@ -555,10 +555,12 @@ fn snapshot_shape() {
                 SnapshotVolume {
                     name: "example_postgres_data".into(),
                     bytes: Some(33_041_965_056),
+                    created_at: Some("2026-11-01T10:00:00Z".into()),
                 },
                 SnapshotVolume {
                     name: "unsized".into(),
                     bytes: None,
+                    created_at: None,
                 },
             ],
         }),
