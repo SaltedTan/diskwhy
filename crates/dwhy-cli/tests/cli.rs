@@ -1022,3 +1022,63 @@ fn an_item_that_changed_since_the_plan_is_skipped() {
     );
     assert!(Path::new(&root).join("app/target/debug/app").exists());
 }
+
+#[test]
+fn watch_reports_a_dir_written_during_the_window() {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().canonicalize().unwrap();
+    fs::create_dir_all(root.join("app/logs")).unwrap();
+    fs::create_dir_all(root.join("quiet")).unwrap();
+    fs::write(root.join("quiet/data"), vec![1u8; 4 << 20]).unwrap();
+    let state = tempfile::tempdir().unwrap();
+
+    // The first walk of this small tree is over well before the write; the
+    // second starts 4 s after the first did.
+    let logs = root.join("app/logs");
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        fs::write(logs.join("run.log"), vec![7u8; 6 << 20]).unwrap();
+    });
+    let r = root.to_str().unwrap();
+    let out = dwhy_in(
+        state.path(),
+        &["watch", r, "--for", "4s", "--json", "-q", "--no-docker"],
+    );
+    writer.join().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["schema"], "diskwhy/v1");
+    assert_eq!(v["for_secs"], 4);
+    let elapsed = v["elapsed_ms"].as_u64().unwrap();
+    assert!((4000..10_000).contains(&elapsed), "{elapsed}");
+    // Only the directory that grew, and the deepest one holding it.
+    let dirs = v["dirs"].as_array().unwrap();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    let d = &dirs[0];
+    assert_eq!(d["kind"], "dir");
+    assert_eq!(d["name"], format!("{r}/app/logs"));
+    let change = d["change"].as_i64().unwrap();
+    assert!(change >= 6 << 20, "{d}");
+    let rate = d["bytes_per_minute"].as_i64().unwrap();
+    assert_eq!(rate, (change as i128 * 60_000 / elapsed as i128) as i64);
+    assert_eq!(v["docker_compared"], false);
+    assert_eq!(v["notes"][0], "Docker not compared: --no-docker given");
+
+    // Text output, over a window in which nothing changed.
+    let out = dwhy_in(
+        state.path(),
+        &["watch", r, "--for", "1s", "-q", "--no-docker"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("dwhy watch · "), "{text}");
+    assert!(text.contains("directories (the deepest that holds most of each change): nothing changed by 1.0M or more"), "{text}");
+
+    // watch writes nothing, not even a snapshot.
+    assert_eq!(fs::read_dir(state.path()).unwrap().count(), 0);
+
+    // --for needs at least a second.
+    let out = dwhy_in(state.path(), &["watch", r, "--for", "0s"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("at least 1s"));
+}

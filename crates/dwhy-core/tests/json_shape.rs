@@ -661,3 +661,69 @@ fn diff_report_shape() {
         }),
     });
 }
+
+#[test]
+fn watch_report_shape() {
+    let rate = |kind, name: &str, before: Option<u64>, after: Option<u64>| {
+        let c = after.unwrap_or(0) as i64 - before.unwrap_or(0) as i64;
+        Rate {
+            kind,
+            name: name.into(),
+            id: None,
+            before,
+            after,
+            change: c,
+            bytes_per_minute: c,
+        }
+    };
+    let mut container = rate(
+        ChangeKind::Container,
+        "example-db-1",
+        Some(4_096),
+        Some(8_192),
+    );
+    container.id = Some("c1d2e3f4a5b6".into());
+    insta::assert_json_snapshot!(WatchReport {
+        schema: SCHEMA.into(),
+        tool: Tool {
+            name: "diskwhy".into(),
+            version: "0.0.1".into(),
+        },
+        host: "pc-ubuntu".into(),
+        uid: 1000,
+        started_at: "2026-11-18T02:00:00Z".into(),
+        generated_at: "2026-11-18T02:01:01Z".into(),
+        roots: vec!["/home/u".into()],
+        one_filesystem: true,
+        for_secs: 60,
+        elapsed_ms: 60_000,
+        min_change: 1_048_576,
+        fs: vec![rate(
+            ChangeKind::Fs,
+            "/",
+            Some(350_000_000_000),
+            Some(350_100_663_296)
+        )],
+        dirs: vec![
+            rate(
+                ChangeKind::Dir,
+                "/home/u/pg/pg_wal",
+                Some(838_860_800),
+                Some(939_524_096)
+            ),
+            rate(ChangeKind::Dir, "/home/u/tmp/new", None, Some(2_097_152)),
+            rate(ChangeKind::Dir, "/home/u/tmp/gone", Some(3_145_728), None),
+        ],
+        docker_compared: true,
+        docker: vec![
+            rate(
+                ChangeKind::Volume,
+                "example_pg_wal",
+                Some(1_073_741_824),
+                Some(1_174_405_120)
+            ),
+            container,
+        ],
+        notes: vec![],
+    });
+}

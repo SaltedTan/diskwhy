@@ -116,7 +116,8 @@ pub fn build(
     }
 }
 
-fn docker_part(s: &docker::Snapshot) -> SnapshotDocker {
+/// The Docker part of a snapshot, from the daemon's figures.
+pub fn docker_part(s: &docker::Snapshot) -> SnapshotDocker {
     let pos = |v: i64| v.max(0) as u64;
     SnapshotDocker {
         usage: docker::usage(s),

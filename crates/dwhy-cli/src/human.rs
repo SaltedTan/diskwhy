@@ -7,7 +7,8 @@ use std::path::Path;
 use dwhy_core::apply::{self, tier_name};
 use dwhy_core::report::{
     ActionKind, ApplyOutcome, ApplyReport, Change, ChangeKind, DetectorAvailability, DiffReport,
-    DirEntry, DoctorReport, Finding, FsReport, GuardStatus, Plan, ScanReport, SkipReason, Tier,
+    DirEntry, DoctorReport, Finding, FsReport, GuardStatus, Plan, Rate, ScanReport, SkipReason,
+    Tier, WatchReport,
 };
 use dwhy_core::units::{age, human, signed, thousands};
 
@@ -190,7 +191,7 @@ pub fn render_diff(w: &mut impl Write, d: &DiffReport, top: usize) -> io::Result
                 "  {:>9}  {:>12}  {}  ({span})",
                 change,
                 format!("{}/day", signed(c.bytes_per_day)),
-                label(c)
+                label(c.kind, &c.name, c.detector.as_deref())
             )?;
         }
         if list.len() > top {
@@ -214,15 +215,81 @@ pub fn render_diff(w: &mut impl Write, d: &DiffReport, top: usize) -> io::Result
     Ok(())
 }
 
-fn label(c: &Change) -> String {
-    match c.kind {
-        ChangeKind::Fs | ChangeKind::Dir => c.name.clone(),
-        ChangeKind::Image => format!("image {}", c.name),
-        ChangeKind::Container => format!("container {}", c.name),
-        ChangeKind::Volume => format!("volume {}", c.name),
+fn label(kind: ChangeKind, name: &str, detector: Option<&str>) -> String {
+    match kind {
+        ChangeKind::Fs | ChangeKind::Dir => name.to_string(),
+        ChangeKind::Image => format!("image {name}"),
+        ChangeKind::Container => format!("container {name}"),
+        ChangeKind::Volume => format!("volume {name}"),
         ChangeKind::BuildCache => "build cache".into(),
-        ChangeKind::Finding => format!("{} {}", c.detector.as_deref().unwrap_or("finding"), c.name),
+        ChangeKind::Finding => format!("{} {name}", detector.unwrap_or("finding")),
     }
+}
+
+/// Growth over a watch window, per section, fastest first.
+pub fn render_watch(w: &mut impl Write, r: &WatchReport, top: usize) -> io::Result<()> {
+    writeln!(
+        w,
+        "dwhy watch · {} · {:.1}s window · {}",
+        r.host,
+        r.elapsed_ms as f64 / 1000.0,
+        r.roots.join(" ")
+    )?;
+    let sections: [(&str, &[Rate]); 3] = [
+        ("filesystems (df used)", &r.fs),
+        (
+            "directories (the deepest that holds most of each change)",
+            &r.dirs,
+        ),
+        ("docker", &r.docker),
+    ];
+    for (i, (title, list)) in sections.into_iter().enumerate() {
+        writeln!(w)?;
+        if list.is_empty() {
+            if i == 0 {
+                writeln!(w, "{title}: none")?;
+            } else if i == 2 && !r.docker_compared {
+                writeln!(w, "{title}: not compared (see note)")?;
+            } else {
+                writeln!(
+                    w,
+                    "{title}: nothing changed by {} or more",
+                    human(r.min_change)
+                )?;
+            }
+            continue;
+        }
+        writeln!(w, "{title}:")?;
+        for c in list.iter().take(top) {
+            let span = match (c.before, c.after) {
+                (Some(b), Some(a)) => format!("{} → {}", human(b), human(a)),
+                (None, Some(a)) => format!("new, {}", human(a)),
+                (Some(b), None) => format!("gone, was {}", human(b)),
+                (None, None) => String::new(),
+            };
+            writeln!(
+                w,
+                "  {:>9}  {:>12}  {}  ({span})",
+                signed(c.change),
+                format!("{}/min", signed(c.bytes_per_minute)),
+                label(c.kind, &c.name, None)
+            )?;
+        }
+        if list.len() > top {
+            writeln!(
+                w,
+                "  … {} more (--top or --json lists them)",
+                list.len() - top
+            )?;
+        }
+    }
+    if !r.notes.is_empty() {
+        writeln!(w)?;
+    }
+    for n in &r.notes {
+        writeln!(w, "note: {n}")?;
+    }
+    Ok(())
 }
 
 /// Summary of a plan: its items by tier, what is blocked, and how to apply it.

@@ -1,14 +1,16 @@
-//! Growth: comparing two snapshots (`dwhy diff`) and growth on findings.
-//! Snapshots are built by hand; no scan or daemon is involved.
+//! Growth: comparing two snapshots (`dwhy diff`), growth over a window
+//! (`dwhy watch`) and growth on findings. Snapshots are built by hand (Docker
+//! figures from fixed `/system/df` bodies); no scan or daemon is involved.
 
 use std::collections::HashMap;
 
 use dwhy_core::growth::{self, per_day};
 use dwhy_core::report::{
-    Action, ActionKind, Change, ChangeKind, DockerUsage, Finding, Recovery, SCHEMA, Snapshot,
+    Action, ActionKind, Change, ChangeKind, DockerUsage, Finding, Rate, Recovery, SCHEMA, Snapshot,
     SnapshotContainer, SnapshotDir, SnapshotDocker, SnapshotFinding, SnapshotFs, SnapshotImage,
     SnapshotScan, SnapshotVolume, Tier, Tool, UsageLine,
 };
+use dwhy_core::{docker, snapshot};
 
 const M: u64 = 1 << 20;
 const G: u64 = 1 << 30;
@@ -589,4 +591,200 @@ fn findings_get_growth_from_an_older_snapshot_by_id() {
     let mut findings = vec![finding("f_grew", 400 * M)];
     growth::fill_growth(&mut findings, &old, "2026-11-15T12:00:00Z");
     assert_eq!(findings[0].growth, None);
+}
+
+/// A `watch` end: every directory recorded (no threshold).
+fn sample(created_at: &str, list: &[(&str, u64)], used: u64) -> Snapshot {
+    let mut s = snap(created_at, &["/h"], &[]);
+    s.scan.min_dir_bytes = 0;
+    s.dirs = dirs(list);
+    s.fs = fs_used(used);
+    s
+}
+
+/// (kind, name, before, after, change, bytes_per_minute) of one rate.
+type RateRow<'a> = (ChangeKind, &'a str, Option<u64>, Option<u64>, i64, i64);
+
+fn rate_rows(v: &[Rate]) -> Vec<RateRow<'_>> {
+    v.iter()
+        .map(|r| {
+            (
+                r.kind,
+                r.name.as_str(),
+                r.before,
+                r.after,
+                r.change,
+                r.bytes_per_minute,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn watch_rates_growth_per_minute_at_the_deepest_dir() {
+    let start = sample(
+        "2026-11-18T02:00:00Z",
+        &[
+            ("/h", 10 * M),
+            ("/h/a", 4 * M),
+            ("/h/a/logs", M),
+            ("/h/b", 6 * M),
+            ("/h/b/small", M / 2),
+            ("/h/gone", 2 * M),
+        ],
+        50 * G,
+    );
+    let end = sample(
+        "2026-11-18T02:00:31Z",
+        &[
+            ("/h", 23 * M + M / 4),
+            ("/h/a", 16 * M),
+            ("/h/a/logs", 13 * M),
+            ("/h/b", 6 * M + M / 4),
+            ("/h/b/small", M / 2 + M / 4),
+            ("/h/new", 3 * M),
+        ],
+        50 * G + 13 * M,
+    );
+    // 30 s from the start of one walk to the start of the next: rates
+    // per minute are twice the change.
+    let r = growth::watch(&start, &end, 30, 30_000, M);
+    assert_eq!(r.started_at, "2026-11-18T02:00:00Z");
+    assert_eq!(r.generated_at, "2026-11-18T02:00:31Z");
+    assert_eq!((r.for_secs, r.elapsed_ms, r.min_change), (30, 30_000, M));
+    assert_eq!(
+        rate_rows(&r.fs),
+        [(
+            ChangeKind::Fs,
+            "/",
+            Some(50 * G),
+            Some(50 * G + 13 * M),
+            13 * M as i64,
+            26 * M as i64
+        )]
+    );
+    // logs holds most of /h/a's and so of /h's growth: only it is listed.
+    // A new directory is new, not "at least" (every directory was
+    // recorded); changes under 1M (/h/b) are left out.
+    assert_eq!(
+        rate_rows(&r.dirs),
+        [
+            (
+                ChangeKind::Dir,
+                "/h/a/logs",
+                Some(M),
+                Some(13 * M),
+                12 * M as i64,
+                24 * M as i64
+            ),
+            (
+                ChangeKind::Dir,
+                "/h/new",
+                None,
+                Some(3 * M),
+                3 * M as i64,
+                6 * M as i64
+            ),
+            (
+                ChangeKind::Dir,
+                "/h/gone",
+                Some(2 * M),
+                None,
+                -2 * M as i64,
+                -4 * M as i64
+            ),
+        ]
+    );
+    assert!(!r.docker_compared && r.docker.is_empty());
+    // Docker's absence is the caller's to explain.
+    assert!(r.notes.is_empty(), "{:?}", r.notes);
+}
+
+/// Docker's figures parsed from a `GET /system/df` body.
+fn docker_from(body: &serde_json::Value) -> SnapshotDocker {
+    let df = docker::parse_system_df(body.to_string().as_bytes()).unwrap();
+    snapshot::docker_part(&docker::Snapshot {
+        df,
+        info: Default::default(),
+    })
+}
+
+#[test]
+fn watch_compares_docker_from_two_system_df_bodies() {
+    let first: serde_json::Value =
+        serde_json::from_str(include_str!("data/docker-system-df.json")).unwrap();
+    let mut second = first.clone();
+    // A minute later: app-1 wrote 40M into its layer, orphan_pg grew 64M, a
+    // volume appeared, old-job was removed, and build cache grew 20M.
+    let containers = second["Containers"].as_array_mut().unwrap();
+    containers.retain(|c| c["Names"][0] != "/old-job");
+    for c in containers.iter_mut() {
+        if c["Names"][0] == "/app-1" {
+            c["SizeRw"] = (2_900_000 + 40 * M).into();
+        }
+    }
+    let volumes = second["Volumes"].as_array_mut().unwrap();
+    for v in volumes.iter_mut() {
+        if v["Name"] == "orphan_pg" {
+            v["UsageData"]["Size"] = (300 * M + 64 * M).into();
+        }
+    }
+    let mut fresh = volumes[0].clone();
+    fresh["Name"] = "fresh".into();
+    fresh["UsageData"]["Size"] = (8 * M).into();
+    volumes.push(fresh);
+    let cache = second["BuildCache"].as_array_mut().unwrap();
+    let mut layer = cache[0].clone();
+    layer["ID"] = "watch-new-layer".into();
+    layer["Size"] = (20 * M).into();
+    layer["InUse"] = false.into();
+    layer["Shared"] = false.into();
+    cache.push(layer);
+
+    let mut start = sample("2026-11-18T02:00:00Z", &[("/h", M)], 50 * G);
+    let mut end = sample("2026-11-18T02:01:00Z", &[("/h", M)], 50 * G);
+    start.docker = Some(docker_from(&first));
+    end.docker = Some(docker_from(&second));
+    let r = growth::watch(&start, &end, 60, 60_000, M);
+    assert!(r.docker_compared);
+    let rows: Vec<(ChangeKind, &str, i64, i64)> = r
+        .docker
+        .iter()
+        .map(|d| (d.kind, d.name.as_str(), d.change, d.bytes_per_minute))
+        .collect();
+    // Unchanged images, the volume whose size the daemon did not compute,
+    // and changes under 1M are left out.
+    assert_eq!(
+        rows,
+        [
+            (
+                ChangeKind::Volume,
+                "orphan_pg",
+                64 * M as i64,
+                64 * M as i64
+            ),
+            (ChangeKind::Container, "app-1", 40 * M as i64, 40 * M as i64),
+            (
+                ChangeKind::BuildCache,
+                "build cache",
+                20 * M as i64,
+                20 * M as i64
+            ),
+            (ChangeKind::Volume, "fresh", 8 * M as i64, 8 * M as i64),
+            (ChangeKind::Container, "old-job", -500_000_000, -500_000_000),
+        ]
+    );
+    let app = &r.docker[1];
+    assert_eq!(app.id.as_deref(), Some(containers_id(&first, "/app-1")));
+    assert_eq!(r.docker[0].id, None, "volumes are named, not id'd");
+}
+
+fn containers_id<'a>(df: &'a serde_json::Value, name: &str) -> &'a str {
+    df["Containers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["Names"][0] == name)
+        .and_then(|c| c["Id"].as_str())
+        .unwrap()
 }

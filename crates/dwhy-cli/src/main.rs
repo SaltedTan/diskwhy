@@ -52,6 +52,8 @@ enum Command {
     Apply(ApplyArgs),
     /// Show what grew since a snapshot (`scan --snapshot`): rescans now and compares.
     Diff(DiffArgs),
+    /// Measure growth now: walks twice, --for apart, and reports bytes per minute (writes nothing).
+    Watch(WatchArgs),
     /// Show permissions, optional tools on PATH, and which detectors they enable.
     Doctor {
         /// Print diskwhy/v1 JSON instead of text.
@@ -137,6 +139,48 @@ struct DiffArgs {
     /// No progress line on stderr.
     #[arg(short, long)]
     quiet: bool,
+}
+
+#[derive(Args, Debug)]
+struct WatchArgs {
+    /// Directories to watch (default: the current directory).
+    paths: Vec<PathBuf>,
+    /// How long to watch: the second walk starts this long after the first one started
+    /// (30s, 5m, 1h).
+    #[arg(long = "for", default_value = "60s", value_name = "DURATION", value_parser = parse_window)]
+    window: u64,
+    /// Print diskwhy/v1 JSON instead of text.
+    #[arg(long)]
+    json: bool,
+    /// Leave out directories and Docker objects that changed by less than this.
+    #[arg(long, value_name = "SIZE", value_parser = units::parse_size, default_value = "1M")]
+    min_change: u64,
+    /// Stay on one filesystem (the default; accepted for du muscle memory).
+    #[arg(short = 'x', long = "one-file-system")]
+    one_file_system: bool,
+    /// Descend into other filesystems mounted below the roots (never into proc, sysfs, ...).
+    #[arg(long, conflicts_with = "one_file_system")]
+    cross_filesystems: bool,
+    /// Do not ask the Docker daemon for its figures.
+    #[arg(long)]
+    no_docker: bool,
+    /// Text output: entries listed per section.
+    #[arg(long, default_value_t = 15)]
+    top: usize,
+    /// Worker threads [default: one per CPU].
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+    /// No progress line on stderr.
+    #[arg(short, long)]
+    quiet: bool,
+}
+
+/// `--for`: a duration of at least a second.
+fn parse_window(s: &str) -> std::result::Result<u64, String> {
+    match units::parse_duration(s)? {
+        n if n >= 1 => Ok(n as u64),
+        _ => Err("must be at least 1s".into()),
+    }
 }
 
 /// Tiers `--tier` accepts (`blocked` is never selected).
@@ -232,6 +276,7 @@ fn main() -> ExitCode {
         Some(Command::Plan(args)) => run_plan(args),
         Some(Command::Apply(args)) => run_apply(args),
         Some(Command::Diff(args)) => run_diff(args),
+        Some(Command::Watch(args)) => run_watch(args),
         Some(Command::Doctor { json }) => run_doctor(json),
         None => {
             Err("the TUI is not built yet (milestone M4); try `dwhy scan` or `dwhy --help`".into())
@@ -462,6 +507,90 @@ fn run_diff(args: DiffArgs) -> Result<u8> {
         return Ok(EXIT_ERROR);
     }
     Ok(EXIT_OK)
+}
+
+fn run_watch(args: WatchArgs) -> Result<u8> {
+    let mounts = MountTable::read().unwrap_or_default();
+    let one_fs = !args.cross_filesystems;
+    let window = Duration::from_secs(args.window);
+    let t0 = std::time::Instant::now();
+    let started_at = system::now_rfc3339();
+    let (mut start, docker_start) = watch_sample(&args, one_fs, &mounts)?;
+    start.created_at = started_at;
+    // The second walk starts `--for` after the first one started.
+    let deadline = t0 + window;
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        if left.is_zero() {
+            break;
+        }
+        let _status = status_line(
+            args.quiet,
+            &format!("watching… {}s left", left.as_secs_f64().ceil() as u64),
+        );
+        std::thread::sleep(left.min(Duration::from_secs(1)));
+    }
+    let elapsed_ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let (end, docker_end) = watch_sample(&args, one_fs, &mounts)?;
+    let mut r = growth::watch(&start, &end, args.window, elapsed_ms, args.min_change);
+    let mut reasons: Vec<String> = [docker_start.err(), docker_end.err()]
+        .into_iter()
+        .flatten()
+        .collect();
+    reasons.dedup();
+    if !reasons.is_empty() {
+        r.notes
+            .push(format!("Docker not compared: {}", reasons.join("; ")));
+    }
+    let mut out = std::io::stdout().lock();
+    if args.json {
+        serde_json::to_writer_pretty(&mut out, &r)?;
+        writeln!(out)?;
+    } else {
+        human::render_watch(&mut out, &r, args.top)?;
+    }
+    Ok(EXIT_OK)
+}
+
+/// One end of a watch window: a walk of the roots recording every
+/// directory, and Docker's figures (`Err` with the reason when there are
+/// none). Nothing is saved.
+fn watch_sample(
+    args: &WatchArgs,
+    one_fs: bool,
+    mounts: &MountTable,
+) -> Result<(dwhy_core::report::Snapshot, std::result::Result<(), String>)> {
+    let result = measure(
+        &args.paths,
+        one_fs,
+        u64::MAX,
+        args.threads,
+        args.quiet,
+        mounts,
+    )?;
+    let report = scan_report(&result, mounts);
+    let docker = if args.no_docker {
+        Err("--no-docker given".to_string())
+    } else {
+        let _status = status_line(args.quiet, "asking Docker…");
+        docker_now()
+    };
+    let snap = snapshot::build(&report, &result.tree, docker.as_deref().ok(), 0);
+    Ok((snap, docker.map(|_| ())))
+}
+
+/// Docker's figures now, from `GET /system/df` and `/info`.
+fn docker_now() -> std::result::Result<Arc<docker::Snapshot>, String> {
+    let sock = doctor::docker_socket();
+    if !sock.exists {
+        return Err(format!("no Docker socket at {}", sock.path));
+    }
+    if !sock.accessible {
+        return Err(format!(
+            "cannot use {} (not root and not in the docker group)",
+            sock.path
+        ));
+    }
+    docker::Source::socket(std::path::Path::new(&sock.path), docker::DEFAULT_TIMEOUT).get()
 }
 
 fn run_plan(args: PlanArgs) -> Result<u8> {

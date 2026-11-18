@@ -793,6 +793,64 @@ pub enum ChangeKind {
     Finding,
 }
 
+/// Output of `dwhy watch --json`: growth over a short window, from two
+/// walks of the roots (and Docker's figures) `elapsed_ms` apart. Each list
+/// is ranked by `bytes_per_minute`, fastest growth first and fastest
+/// shrinkage last.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchReport {
+    pub schema: String,
+    pub tool: Tool,
+    pub host: String,
+    pub uid: u32,
+    /// When the first walk started, RFC 3339 (UTC).
+    pub started_at: String,
+    /// When the second walk finished.
+    pub generated_at: String,
+    /// The roots walked, absolute.
+    pub roots: Vec<String>,
+    pub one_filesystem: bool,
+    /// The window asked for (`--for`): the second walk starts this long
+    /// after the first one started, or right away if the first took longer.
+    pub for_secs: u64,
+    /// Milliseconds from the start of the first walk to the start of the
+    /// second; rates are over this.
+    pub elapsed_ms: u64,
+    /// Directories and Docker objects that changed by less than this many
+    /// bytes are left out.
+    pub min_change: u64,
+    /// `df` used per filesystem, whether it changed or not.
+    pub fs: Vec<Rate>,
+    /// Directories, each change attributed to the deepest directory that
+    /// holds most of it, as in `diff`.
+    pub dirs: Vec<Rate>,
+    /// False when Docker's figures are missing at either end (see `notes`).
+    pub docker_compared: bool,
+    /// Docker images, containers and volumes (by id or name; ones whose size
+    /// the daemon did not compute are left out), and build cache.
+    pub docker: Vec<Rate>,
+    /// What could not be compared, and why.
+    pub notes: Vec<String>,
+}
+
+/// How one thing's size changed over a `watch` window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Rate {
+    pub kind: ChangeKind,
+    /// A path, mount point, image tag, container or volume name.
+    pub name: String,
+    /// Image or container id.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// `None`: not there at the start.
+    pub before: Option<u64>,
+    /// `None`: gone by the end.
+    pub after: Option<u64>,
+    /// `after - before`, absent sides counting 0.
+    pub change: i64,
+    pub bytes_per_minute: i64,
+}
+
 /// Output of `dwhy doctor --json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DoctorReport {
