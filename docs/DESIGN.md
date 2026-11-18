@@ -86,7 +86,8 @@ dwhy explain <finding-id|path> [--json]           # evidence, guards, growth, re
 dwhy plan [PATH…] [--tier regenerable|rebuildable|review] [--select ID|PATH,…] [-o plan.json] [--json]
 dwhy apply plan.json [--max-tier regenerable] [--confirm ID,…] [--yes] [--dry-run] [--json]
 dwhy doctor                                       # available tools, detectors, probes and permissions
-dwhy                                              # opens the TUI
+dwhy                                              # opens the TUI on the current directory
+dwhy tui [PATH…] [-x|--cross-filesystems] [--plan FILE]  # the TUI on these roots (--plan: M4c)
 ```
 
 Exit codes: `0` ok · `1` error · `2` some items were skipped because of a guard or changed fingerprint · `3` refused by policy.
