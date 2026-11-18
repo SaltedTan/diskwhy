@@ -4,7 +4,7 @@ DESIGN.md says M3 is done when a test Compose file, Postgres with a failing `arc
 
 ## The demo
 
-[`crates/dwhy-cli/tests/data/wal-demo/compose.yaml`](../crates/dwhy-cli/tests/data/wal-demo/compose.yaml) has three services, all using `postgres:16-alpine` on the project's internal network.
+[`crates/dwhy-cli/tests/data/wal-demo/compose.yaml`](../crates/dwhy-cli/tests/data/wal-demo/compose.yaml) has three services, all using `postgres:16-alpine` on the project's internal network with an isolated bridge gateway. The bridge has no host IPv4 address.
 
 - `s3test` exits at once (`entrypoint: ["true"]`). It plays the dead fake S3.
 - `postgres` runs with `archive_mode=on`, `archive_command=wget -Y off -q -O /dev/null http://s3test:9000/wal/%f` and `archive_timeout=10s`. The archive command bypasses proxies and fails because `s3test` has exited, so WAL segments awaiting archival cannot be recycled.
@@ -14,8 +14,8 @@ DESIGN.md says M3 is done when a test Compose file, Postgres with a failing `arc
 
 1. `docker compose -p dwhye2e<pid><16 random hex digits> up -d --pull never`, then wait for `postgres` to be healthy over TCP.
 2. `dwhy scan <empty temp dir> --snapshot --detectors docker-build-cache`. `docker-build-cache` reads `GET /system/df`, so the snapshot records every volume's size. No `docker-volume` finding exists, so no probe runs.
-3. Poll the volume with `du` inside the project's own Postgres container until it holds 1.1 GiB. The `docker-volume` detector reports an in-use volume from 1 GiB. The test gives up after 10 minutes.
-4. `dwhy watch <empty temp dir> --for 30s`. The test checks that the volume grows faster than 20 MiB a minute.
+3. `dwhy watch <empty temp dir> --for 30s`. The test checks that the volume grows faster than 20 MiB a minute.
+4. Poll the apparent file sizes with `find` and `stat` inside the project's own Postgres container until they total 1.1 GiB. The test uses the sizes it read even if files disappear during a walk. The `docker-volume` detector reports an in-use volume from 1 GiB. The poll gives up after 10 minutes.
 5. `dwhy diff --detectors docker-build-cache`. The test checks that the volume grew by more than 512 MiB since the snapshot.
 6. `dwhy explain docker://volume/<project>_pgdata`. The test checks for a `docker-volume` finding whose `postgres_wal` evidence has `archive_mode` `on`, archive failures, and the target `s3test` in state `exited`, and whose advice starts with `restore the archive target s3test`.
 7. A Drop guard runs `docker compose -p <project> down -v --remove-orphans` when the test finishes or unwinds from a panic. On success the test also checks that `docker ps -a`, `docker volume ls` and `docker network ls`, filtered by `label=com.docker.compose.project=<project>`, are empty. Ctrl-C skips the guard. After an interrupt, run the cleanup command printed at startup, which includes the socket and Compose file.
@@ -28,13 +28,13 @@ DESIGN.md says M3 is done when a test Compose file, Postgres with a failing `arc
 
 ## How to run it
 
-It needs `postgres:16-alpine` already pulled and access to the daemon at `/var/run/docker.sock` or an absolute Unix socket set through `DOCKER_HOST`. Docker and `dwhy` use that same socket regardless of the active Docker context. The demo takes about 6 minutes. It is `#[ignore]`d and also returns at once unless `DWHY_DOCKER_E2E=1` is set. The normal `cargo test` and CI never contact the daemon.
+It needs Docker Engine 28 or later for the isolated bridge, `postgres:16-alpine` already pulled, and access to the daemon at `/var/run/docker.sock` or an absolute Unix socket set through `DOCKER_HOST`. Docker and `dwhy` use that same socket regardless of the active Docker context. The demo takes about 6 minutes. It is `#[ignore]`d and also returns at once unless `DWHY_DOCKER_E2E=1` is set. The normal `cargo test` and CI never contact the daemon.
 
 ```
 DWHY_DOCKER_E2E=1 cargo test -p dwhy-cli --test wal_demo_e2e -- --ignored --nocapture
 ```
 
-`--nocapture` prints the volume size while it waits, then the watch rate, the diff change and the explain reason, advice and evidence.
+`--nocapture` prints the watch rate, then the volume size while it waits, the diff change and the explain reason, advice and evidence.
 
 ## Run on pc-ubuntu
 

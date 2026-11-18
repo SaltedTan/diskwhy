@@ -28,8 +28,8 @@ const COMPOSE: &str = concat!(
 const GIB: u64 = 1 << 30;
 const MIB: i64 = 1 << 20;
 /// The docker-volume detector reports an in-use volume from 1 GiB; wait
-/// for a margin above it, as du in the container and the daemon's sizing
-/// can differ slightly.
+/// for a margin above it, as the container's apparent-size sample can
+/// differ slightly from the daemon's volume size.
 const WAIT_FOR_BYTES: u64 = GIB + GIB / 10;
 const GROW_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -112,23 +112,37 @@ impl<'a> Project<'a> {
         }
     }
 
-    /// Allocated bytes in the volume, measured inside this project's own
-    /// Postgres container.
+    /// Apparent file bytes in the volume, measured inside this project's
+    /// own Postgres container.
     fn volume_bytes(&self) -> u64 {
-        let out = run(self.compose().args([
+        let mut cmd = self.compose();
+        cmd.args([
             "exec",
             "-T",
             "postgres",
-            "du",
-            "-sk",
+            "find",
             "/var/lib/postgresql/data",
-        ]));
-        let kib: u64 = stdout(&out)
-            .split_whitespace()
-            .next()
-            .and_then(|k| k.parse().ok())
-            .expect("du output");
-        kib * 1024
+            "-type",
+            "f",
+            "-exec",
+            "stat",
+            "-c",
+            "%s",
+            "{}",
+            "+",
+        ]);
+        let out = cmd.output().unwrap_or_else(|e| panic!("run {cmd:?}: {e}"));
+        let sizes = stdout(&out);
+        assert!(
+            !sizes.is_empty(),
+            "{cmd:?} returned no file sizes ({}):\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        sizes
+            .lines()
+            .map(|size| size.parse::<u64>().expect("stat size in bytes"))
+            .sum()
     }
 }
 
@@ -239,6 +253,17 @@ fn wal_demo_is_flagged_and_explained() {
     );
     assert!(scan["snapshot"].is_object(), "no snapshot saved");
 
+    let watch = dwhy(
+        &docker_host,
+        state.path(),
+        &["watch", walk, "--for", "30s", "--json"],
+    );
+    assert_eq!(watch["docker_compared"], true, "notes: {}", watch["notes"]);
+    let rate = volume_entry(&watch, &volume);
+    let per_min = rate["bytes_per_minute"].as_i64().unwrap();
+    eprintln!("watch: {rate}");
+    assert!(per_min > 20 * MIB, "volume grows only {per_min} B/min");
+
     let grow_start = Instant::now();
     loop {
         let bytes = project.volume_bytes();
@@ -254,17 +279,6 @@ fn wal_demo_is_flagged_and_explained() {
         std::thread::sleep(Duration::from_secs(10));
     }
     eprintln!("reached 1.1 GiB in {:?}", grow_start.elapsed());
-
-    let watch = dwhy(
-        &docker_host,
-        state.path(),
-        &["watch", walk, "--for", "30s", "--json"],
-    );
-    assert_eq!(watch["docker_compared"], true, "notes: {}", watch["notes"]);
-    let rate = volume_entry(&watch, &volume);
-    let per_min = rate["bytes_per_minute"].as_i64().unwrap();
-    eprintln!("watch: {rate}");
-    assert!(per_min > 20 * MIB, "volume grows only {per_min} B/min");
 
     let diff = dwhy(
         &docker_host,

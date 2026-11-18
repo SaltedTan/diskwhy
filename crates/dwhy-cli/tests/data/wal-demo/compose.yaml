@@ -42,16 +42,18 @@ services:
       PGPASSWORD: demo
     tmpfs:
       - /var/lib/postgresql/data
-    entrypoint: ["timeout", "-s", "KILL", "600", "sh", "-ec"]
+    entrypoint: ["timeout", "-s", "KILL", "600", "sh", "-c"]
     command:
       - |
-        psql -h postgres -U postgres -d demo -q -v ON_ERROR_STOP=1 -c 'create table if not exists w(x text)'
+        psql -h postgres -U postgres -d demo -q -c 'create table if not exists w(x text)' || exit 1
         while true; do
-          psql -h postgres -U postgres -d demo -q -v ON_ERROR_STOP=1 -c "insert into w select repeat('x', 1000) from generate_series(1, 2000)"
+          psql -h postgres -U postgres -d demo -q -c "insert into w select repeat('x', 1000) from generate_series(1, 2000)"
           sleep 1
         done
 networks:
   default:
     internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
 volumes:
   pgdata:
