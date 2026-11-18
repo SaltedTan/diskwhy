@@ -1067,7 +1067,7 @@ fn watch_keeps_directory_rates_with_hardlinks_when_coverage_matches() {
     end.scan.totals.hardlinks_deduped = 2;
     start.scan.skipped_mounts = vec!["/h/skip".into(), "/h/other".into()];
     end.scan.skipped_mounts = vec!["/h/other".into(), "/h/skip".into(), "/h/skip".into()];
-    let unreadable = vec!["/h/a".to_string()];
+    let unreadable = ["/h/a".to_string()];
     for coverage in [[&[][..], &[][..]], [&unreadable[..], &unreadable[..]]] {
         let r = growth::watch(&start, &end, 60, 60_000, M, coverage);
         assert_eq!(
