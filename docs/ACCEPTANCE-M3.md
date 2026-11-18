@@ -4,31 +4,31 @@ DESIGN.md says M3 is done when a test Compose file, Postgres with a failing `arc
 
 ## The demo
 
-[`crates/dwhy-cli/tests/data/wal-demo/compose.yaml`](../crates/dwhy-cli/tests/data/wal-demo/compose.yaml) has three services, all on `postgres:16-alpine`:
+[`crates/dwhy-cli/tests/data/wal-demo/compose.yaml`](../crates/dwhy-cli/tests/data/wal-demo/compose.yaml) has three services, all using `postgres:16-alpine` on the project's internal network.
 
 - `s3test` exits at once (`entrypoint: ["true"]`). It plays the dead fake S3.
-- `postgres` runs with `archive_mode=on`, `archive_command=wget -q -O /dev/null http://s3test:9000/wal/%f` and `archive_timeout=10s`, so every archive attempt fails and no WAL segment can be recycled.
-- `writer` inserts 2000 rows of 1 KB every second, which keeps segments filling and switching.
+- `postgres` runs with `archive_mode=on`, `archive_command=wget -Y off -q -O /dev/null http://s3test:9000/wal/%f` and `archive_timeout=10s`. The archive command bypasses proxies and fails because `s3test` has exited, so WAL segments awaiting archival cannot be recycled.
+- `writer` inserts 2000 rows of 1 KB about once a second to keep segments filling and switching. It stops after ten minutes.
 
 [`crates/dwhy-cli/tests/wal_demo_e2e.rs`](../crates/dwhy-cli/tests/wal_demo_e2e.rs) drives the built `dwhy` binary against it:
 
-1. `docker compose -p dwhye2e<pid><unix-secs> up -d`, then wait for `postgres` to be healthy.
+1. `docker compose -p dwhye2e<pid><16 random hex digits> up -d --pull never`, then wait for `postgres` to be healthy over TCP.
 2. `dwhy scan <empty temp dir> --snapshot --detectors docker-build-cache`. `docker-build-cache` reads `GET /system/df`, so the snapshot records every volume's size. No `docker-volume` finding exists, so no probe runs.
 3. Poll the volume with `du` inside the project's own Postgres container until it holds 1.1 GiB. The `docker-volume` detector reports an in-use volume from 1 GiB. The test gives up after 10 minutes.
 4. `dwhy watch <empty temp dir> --for 30s`. The test checks that the volume grows faster than 20 MiB a minute.
 5. `dwhy diff --detectors docker-build-cache`. The test checks that the volume grew by more than 512 MiB since the snapshot.
 6. `dwhy explain docker://volume/<project>_pgdata`. The test checks for a `docker-volume` finding whose `postgres_wal` evidence has `archive_mode` `on`, archive failures, and the target `s3test` in state `exited`, and whose advice starts with `restore the archive target s3test`.
-7. A Drop guard runs `docker compose -p <project> down -v --remove-orphans` on every path, including a panic. The test then checks that `docker ps -a`, `docker volume ls` and `docker network ls`, filtered by `label=com.docker.compose.project=<project>`, are empty.
+7. A Drop guard runs `docker compose -p <project> down -v --remove-orphans` when the test finishes or unwinds from a panic. On success the test also checks that `docker ps -a`, `docker volume ls` and `docker network ls`, filtered by `label=com.docker.compose.project=<project>`, are empty. Ctrl-C skips the guard. After an interrupt, run the cleanup command printed at startup, which includes the socket and Compose file.
 
 ### What it never does
 
 - It never runs `scan` with the `docker-volume` detector or with the default detectors. That would run the `postgres-wal` probe on every large in-use volume on the machine and `docker exec psql` into other people's Postgres containers. `watch` and `diff` skip probes, and `explain` probes only the finding it explains.
-- It touches no container, volume or network outside its own Compose project, pulls no image, never uses sudo and never runs `dwhy apply`.
+- It changes only its own Compose containers, named volume and internal network. The archive request stays within that network. It pulls no image, never uses sudo and never runs `dwhy apply`.
 - Every `dwhy` call gets `XDG_STATE_HOME` set to a temp dir, so its snapshots never reach `~/.local/state/diskwhy`.
 
 ## How to run it
 
-It needs a Docker daemon the user can reach and `postgres:16-alpine` already pulled. It takes about 6 minutes. It is `#[ignore]`d and also returns at once unless `DWHY_DOCKER_E2E=1` is set. The normal `cargo test` and CI never contact the daemon.
+It needs `postgres:16-alpine` already pulled and access to the daemon at `/var/run/docker.sock` or an absolute Unix socket set through `DOCKER_HOST`. Docker and `dwhy` use that same socket regardless of the active Docker context. The demo takes about 6 minutes. It is `#[ignore]`d and also returns at once unless `DWHY_DOCKER_E2E=1` is set. The normal `cargo test` and CI never contact the daemon.
 
 ```
 DWHY_DOCKER_E2E=1 cargo test -p dwhy-cli --test wal_demo_e2e -- --ignored --nocapture
@@ -38,7 +38,7 @@ DWHY_DOCKER_E2E=1 cargo test -p dwhy-cli --test wal_demo_e2e -- --ignored --noca
 
 ## Run on pc-ubuntu
 
-On 2026-11-18 (Docker 29.1.3, Compose 2.40.3), with the machine's own Compose projects running alongside, project `dwhye2e16837461794997736` passed in 342 s:
+On 2026-11-18 (Docker 29.1.3, Compose 2.40.3), the original fixture passed in 342 s as project `dwhye2e16837461794997736`, with the machine's own Compose projects running alongside.
 
 | Step | What it saw |
 |---|---|

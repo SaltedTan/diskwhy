@@ -7,15 +7,17 @@
 //! ```
 //!
 //! It starts `tests/data/wal-demo/compose.yaml` under a project name of its
-//! own and removes that project (containers, volume, network) on every path.
+//! own. See the acceptance record for teardown instructions.
 //! It never runs `scan` with the `docker-volume` detector: the postgres-wal
 //! probe would then `docker exec` into every big in-use Postgres volume on
 //! the machine. `watch` and `diff` skip probes, and `explain` probes only the
 //! finding it explains.
 
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Output};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -46,28 +48,45 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A Compose project that is taken down, volume included, when dropped.
-struct Project {
-    name: String,
+fn docker_command(program: &str, docker_host: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env("DOCKER_HOST", docker_host)
+        .env_remove("DOCKER_CONTEXT");
+    cmd
 }
 
-impl Project {
-    fn up() -> Project {
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let p = Project {
-            name: format!("dwhye2e{}{secs}", std::process::id()),
+/// A Compose project that is taken down, volume included, when dropped.
+struct Project<'a> {
+    name: String,
+    docker_host: &'a str,
+}
+
+impl<'a> Project<'a> {
+    fn up(docker_host: &'a str) -> Self {
+        let mut random = [0; 8];
+        File::open("/dev/urandom")
+            .and_then(|mut source| source.read_exact(&mut random))
+            .expect("read random project suffix from /dev/urandom");
+        let suffix = u64::from_ne_bytes(random);
+        let p = Self {
+            name: format!("dwhye2e{}{suffix:016x}", std::process::id()),
+            docker_host,
         };
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+        eprintln!(
+            "To clean up after an interrupt, run: env -u DOCKER_CONTEXT DOCKER_HOST={} docker compose -f {} -p {} down -v --remove-orphans",
+            quote(docker_host),
+            quote(COMPOSE),
+            p.name
+        );
         // From here on, Drop tears down whatever `up` managed to create.
-        run(p.compose().args(["up", "-d"]));
+        run(p.compose().args(["up", "-d", "--pull", "never"]));
         p
     }
 
     fn compose(&self) -> Command {
-        let mut c = Command::new("docker");
-        c.args(["compose", "-p", &self.name, "-f", COMPOSE]);
+        let mut c = docker_command("docker", self.docker_host);
+        c.args(["compose", "-f", COMPOSE, "-p", &self.name]);
         c
     }
 
@@ -79,7 +98,7 @@ impl Project {
         let id = stdout(&run(self.compose().args(["ps", "-q", "postgres"])));
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            let health = stdout(&run(Command::new("docker").args([
+            let health = stdout(&run(docker_command("docker", self.docker_host).args([
                 "inspect",
                 "-f",
                 "{{.State.Health.Status}}",
@@ -113,7 +132,7 @@ impl Project {
     }
 }
 
-impl Drop for Project {
+impl Drop for Project<'_> {
     fn drop(&mut self) {
         let status = self
             .compose()
@@ -124,7 +143,7 @@ impl Drop for Project {
 }
 
 /// What Docker still holds for Compose project `name`, one line per object.
-fn leftovers(name: &str) -> Vec<String> {
+fn leftovers(name: &str, docker_host: &str) -> Vec<String> {
     let label = format!("label=com.docker.compose.project={name}");
     let mut v = Vec::new();
     for what in [
@@ -132,7 +151,9 @@ fn leftovers(name: &str) -> Vec<String> {
         &["volume", "ls", "-q"],
         &["network", "ls", "-q"],
     ] {
-        let out = run(Command::new("docker").args(what).args(["--filter", &label]));
+        let out = run(docker_command("docker", docker_host)
+            .args(what)
+            .args(["--filter", &label]));
         v.extend(
             stdout(&out)
                 .lines()
@@ -143,8 +164,8 @@ fn leftovers(name: &str) -> Vec<String> {
 }
 
 /// Runs `dwhy` with its state dir in `state` and parses its JSON output.
-fn dwhy(state: &Path, args: &[&str]) -> Value {
-    let out = run(Command::new(env!("CARGO_BIN_EXE_dwhy"))
+fn dwhy(docker_host: &str, state: &Path, args: &[&str]) -> Value {
+    let out = run(docker_command(env!("CARGO_BIN_EXE_dwhy"), docker_host)
         .args(args)
         .arg("--quiet")
         .env("XDG_STATE_HOME", state));
@@ -153,12 +174,20 @@ fn dwhy(state: &Path, args: &[&str]) -> Value {
 
 /// The Docker change or rate entry for volume `name`.
 fn volume_entry<'a>(report: &'a Value, name: &str) -> &'a Value {
-    report["docker"]
+    let entry = report["docker"]
         .as_array()
         .expect("docker list")
         .iter()
         .find(|c| c["kind"] == "volume" && c["name"] == name)
-        .unwrap_or_else(|| panic!("no entry for volume {name} in {:#}", report["docker"]))
+        .unwrap_or_else(|| panic!("no entry for volume {name}"));
+    assert!(
+        entry["before"]
+            .as_u64()
+            .zip(entry["after"].as_u64())
+            .is_some_and(|(before, after)| after > before),
+        "expected measured growth for volume {name}: {entry}"
+    );
+    entry
 }
 
 #[test]
@@ -168,12 +197,27 @@ fn wal_demo_is_flagged_and_explained() {
         eprintln!("skipped: set DWHY_DOCKER_E2E=1 to run the WAL demo against Docker");
         return;
     }
+    if std::env::var_os("DOCKER_HOST")
+        .is_some_and(|v| v.to_str().is_none_or(|s| !s.starts_with("unix:///")))
+    {
+        eprintln!(
+            "skipped: the WAL demo needs DOCKER_HOST unset or set to an absolute Unix socket URL"
+        );
+        return;
+    }
+    let socket = dwhy_core::doctor::docker_socket();
+    assert!(
+        socket.accessible,
+        "cannot use Docker socket {}",
+        socket.path
+    );
+    let docker_host = format!("unix://{}", socket.path);
     let started = Instant::now();
     let state = tempfile::tempdir().unwrap();
     let walk = tempfile::tempdir().unwrap();
     let walk = walk.path().to_str().unwrap();
 
-    let project = Project::up();
+    let project = Project::up(&docker_host);
     let name = project.name.clone();
     let volume = project.volume();
     eprintln!("project {name}, volume {volume}");
@@ -182,6 +226,7 @@ fn wal_demo_is_flagged_and_explained() {
     // First snapshot. docker-build-cache reads /system/df, so the snapshot
     // records every volume; no docker-volume finding means no probe.
     let scan = dwhy(
+        &docker_host,
         state.path(),
         &[
             "scan",
@@ -210,7 +255,11 @@ fn wal_demo_is_flagged_and_explained() {
     }
     eprintln!("reached 1.1 GiB in {:?}", grow_start.elapsed());
 
-    let watch = dwhy(state.path(), &["watch", walk, "--for", "30s", "--json"]);
+    let watch = dwhy(
+        &docker_host,
+        state.path(),
+        &["watch", walk, "--for", "30s", "--json"],
+    );
     assert_eq!(watch["docker_compared"], true, "notes: {}", watch["notes"]);
     let rate = volume_entry(&watch, &volume);
     let per_min = rate["bytes_per_minute"].as_i64().unwrap();
@@ -218,6 +267,7 @@ fn wal_demo_is_flagged_and_explained() {
     assert!(per_min > 20 * MIB, "volume grows only {per_min} B/min");
 
     let diff = dwhy(
+        &docker_host,
         state.path(),
         &["diff", "--detectors", "docker-build-cache", "--json"],
     );
@@ -230,7 +280,7 @@ fn wal_demo_is_flagged_and_explained() {
     );
 
     let path = format!("docker://volume/{volume}");
-    let explain = dwhy(state.path(), &["explain", &path, "--json"]);
+    let explain = dwhy(&docker_host, state.path(), &["explain", &path, "--json"]);
     let f = &explain["finding"];
     eprintln!(
         "explain: reason: {}\nexplain: advice: {}\nexplain: evidence: {:#}",
@@ -248,7 +298,15 @@ fn wal_demo_is_flagged_and_explained() {
         .find(|t| t["host"] == "s3test")
         .unwrap_or_else(|| panic!("s3test not among the targets: {wal:#}"));
     assert_eq!(dead["state"], "exited");
-    assert_eq!(dead["container"], format!("{name}-s3test-1").as_str());
+    let s3test = stdout(&run(project.compose().args([
+        "ps",
+        "-a",
+        "--format",
+        "{{.Name}}",
+        "s3test",
+    ])));
+    assert!(!s3test.is_empty(), "no s3test container in project {name}");
+    assert_eq!(dead["container"], s3test.as_str());
     let advice = f["action"]["text"].as_str().unwrap();
     assert!(
         advice.starts_with("restore the archive target s3test"),
@@ -256,7 +314,7 @@ fn wal_demo_is_flagged_and_explained() {
     );
 
     drop(project);
-    let left = leftovers(&name);
+    let left = leftovers(&name, &docker_host);
     assert!(left.is_empty(), "left behind: {left:?}");
     eprintln!("done in {:?}", started.elapsed());
 }

@@ -12,6 +12,8 @@ services:
     image: postgres:16-alpine
     entrypoint: ["true"]
     restart: "no"
+    tmpfs:
+      - /var/lib/postgresql/data
   postgres:
     image: postgres:16-alpine
     environment:
@@ -21,22 +23,35 @@ services:
       - -c
       - archive_mode=on
       - -c
-      - archive_command=wget -q -O /dev/null http://s3test:9000/wal/%f
+      - archive_command=wget -Y off -q -O /dev/null http://s3test:9000/wal/%f
       - -c
       - archive_timeout=10s
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "/var/run/postgresql"]
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "127.0.0.1"]
       interval: 2s
       retries: 30
   writer:
     image: postgres:16-alpine
+    init: true
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       PGPASSWORD: demo
-    entrypoint: ["sh", "-c", "psql -h postgres -U postgres -d demo -q -c 'create table if not exists w(x text)'; while true; do psql -h postgres -U postgres -d demo -q -c \"insert into w select repeat('x', 1000) from generate_series(1, 2000)\"; sleep 1; done"]
+    tmpfs:
+      - /var/lib/postgresql/data
+    entrypoint: ["timeout", "-s", "KILL", "600", "sh", "-ec"]
+    command:
+      - |
+        psql -h postgres -U postgres -d demo -q -v ON_ERROR_STOP=1 -c 'create table if not exists w(x text)'
+        while true; do
+          psql -h postgres -U postgres -d demo -q -v ON_ERROR_STOP=1 -c "insert into w select repeat('x', 1000) from generate_series(1, 2000)"
+          sleep 1
+        done
+networks:
+  default:
+    internal: true
 volumes:
   pgdata:
