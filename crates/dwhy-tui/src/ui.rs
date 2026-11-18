@@ -2,6 +2,8 @@
 //! line per filesystem (at most three, tree view only), the list, a status
 //! line, key help.
 
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 use dwhy_core::apply::{action_kind_name, guard_status_name, tier_name};
@@ -95,7 +97,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 .filter_map(|d| d.error.as_deref().map(|e| (d.name.as_str(), e)))
                 .collect();
             f.render_widget(title_line("findings", &count, width), title);
-            app.viewport = draw_findings(f, &mut b.findings, &b.data, list, &failed);
+            app.viewport =
+                draw_findings(f, &mut b.findings, &b.data, list, &failed, &b.lossy_paths);
             f.render_widget(Paragraph::new(findings_status(b, &failed, width)), status);
             let help = " ↑↓ PgUp PgDn · Enter details · t tier filter · Tab tree · q quit";
             f.render_widget(Paragraph::new(Span::styled(help, dim)), keys);
@@ -105,10 +108,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 return;
             };
             f.render_widget(
-                title_line(&display_path(&finding.path), tier_name(finding.tier), width),
+                title_with(tier_name(finding.tier), width, |room| {
+                    middle_units(display_units(&finding.path), room)
+                }),
                 title,
             );
-            let lines = detail_lines(finding, b.data.growth_base.as_deref(), width);
+            let lossy = b.lossy_paths.contains(&finding.path);
+            let lines = detail_lines(finding, lossy, b.data.growth_base.as_deref(), width);
             let height = list.height as usize;
             let scroll = b
                 .findings
@@ -177,6 +183,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 /// ` dwhy  <place>` on the left, `<right>` on the right.
 fn title_line(place: &str, right: &str, width: usize) -> Paragraph<'static> {
+    title_with(right, width, |room| middle(place, room))
+}
+
+fn title_with(
+    right: &str,
+    width: usize,
+    place: impl FnOnce(usize) -> String,
+) -> Paragraph<'static> {
     const LEFT: &str = " dwhy  ";
     let right = if right.is_empty() {
         String::new()
@@ -184,7 +198,7 @@ fn title_line(place: &str, right: &str, width: usize) -> Paragraph<'static> {
         format!(" {right} ")
     };
     let room = width.saturating_sub(LEFT.len() + right.len() + 1);
-    let place = middle(place, room);
+    let place = place(room);
     let pad = width.saturating_sub(LEFT.len() + grapheme_width(&place) + right.len());
     let style = Style::new().add_modifier(Modifier::REVERSED);
     Paragraph::new(Line::from(vec![
@@ -299,10 +313,11 @@ fn draw_findings(
     data: &Scanned,
     area: Rect,
     failed: &[(&str, &str)],
+    lossy_paths: &HashSet<String>,
 ) -> usize {
-    const REQUIRED_W: usize = 2 + TIER_W + 2 + 7 + 2;
     const MIN_PATH_W: usize = 12;
     let width = area.width as usize;
+    let height = area.height as usize;
     let all = &data.report.findings;
     if l.shown.is_empty() {
         let empty = if let Some(t) = l.filter.filter(|_| !all.is_empty()) {
@@ -316,18 +331,32 @@ fn draw_findings(
             "; detectors failed:"
         };
         let mut lines = vec![Line::raw(format!("{empty}{suffix}"))];
-        lines.extend(failed.iter().map(|(name, error)| {
-            let prefix = format!("    {name}: ");
-            let message = middle(
-                &escape_controls(error),
-                width.saturating_sub(prefix.width()),
+        for (name, error) in failed {
+            lines.extend(
+                wrap(&format!("    {name}: {error}"), width)
+                    .into_iter()
+                    .map(Line::raw),
             );
-            Line::raw(format!("{prefix}{message}"))
-        }));
-        f.render_widget(Paragraph::new(lines), area);
-        return 0;
+        }
+        l.offset = l.offset.min(lines.len().saturating_sub(height.max(1)));
+        let shown: Vec<_> = lines.into_iter().skip(l.offset).take(height).collect();
+        f.render_widget(Paragraph::new(shown), area);
+        return height;
     }
-    if width < REQUIRED_W + "path".len() {
+    let (gap, tier_w, size_w) = if width < 28 {
+        let (tier_w, size_w) = l.shown.iter().fold((4, 4), |(tier_w, size_w), &i| {
+            let finding = &all[i];
+            (
+                tier_w.max(tier_name(finding.tier).len()),
+                size_w.max(human(finding.bytes).len()),
+            )
+        });
+        (" ", tier_w, size_w)
+    } else {
+        ("  ", TIER_W, 7)
+    };
+    let required_w = 2 + tier_w + size_w + 2 * gap.len();
+    if width < required_w + "path".len() {
         let msg = middle("  Widen to view findings", width);
         f.render_widget(Paragraph::new(msg), area);
         return 0;
@@ -339,10 +368,10 @@ fn draw_findings(
         .max()
         .unwrap_or(0)
         .max("detector".len());
-    let show_detector = width >= REQUIRED_W + det_w + 2 + MIN_PATH_W;
-    let show_growth = width >= REQUIRED_W + GROWTH_W + 2 + det_w + 2 + MIN_PATH_W;
+    let show_detector = width >= required_w + det_w + 2 + MIN_PATH_W;
+    let show_growth = width >= required_w + GROWTH_W + 2 + det_w + 2 + MIN_PATH_W;
     let columns = |marker: &str, tier: &str, size: &str, growth: &str, detector: &str| {
-        let mut cols = format!("{marker}{tier:<TIER_W$}  {size:>7}  ");
+        let mut cols = format!("{marker}{tier:<tier_w$}{gap}{size:>size_w$}{gap}");
         if show_growth {
             cols.push_str(&format!("{growth:>GROWTH_W$}  "));
         }
@@ -358,7 +387,7 @@ fn draw_findings(
         format!("{header}path"),
         Style::new().add_modifier(Modifier::DIM),
     )];
-    let height = (area.height as usize).saturating_sub(1);
+    let height = height.saturating_sub(1);
     if l.selected < l.offset {
         l.offset = l.selected;
     } else if height > 0 && l.selected >= l.offset + height {
@@ -372,16 +401,22 @@ fn draw_findings(
             Some(g) => format!("{}/d", signed(g.bytes_per_day)),
             None => "–".into(),
         };
+        let marker = match (sel, lossy_paths.contains(&finding.path)) {
+            (true, true) => ">!",
+            (true, false) => "> ",
+            (false, true) => " !",
+            (false, false) => "  ",
+        };
         let mut line = Line::from(vec![
             Span::raw(columns(
-                if sel { "> " } else { "  " },
+                marker,
                 tier_name(finding.tier),
                 &human(finding.bytes),
                 &growth,
                 &finding.detector,
             )),
             Span::styled(
-                middle(&display_path(&finding.path), path_w),
+                middle_units(display_units(&finding.path), path_w),
                 Style::new().add_modifier(Modifier::BOLD),
             ),
         ]);
@@ -396,63 +431,72 @@ fn draw_findings(
 
 fn findings_status(b: &Browser, failed: &[(&str, &str)], width: usize) -> Line<'static> {
     let l = &b.findings;
-    let mut parts = Vec::new();
-    if !l.shown.is_empty() {
-        parts.push(format!("{}/{}", l.selected + 1, l.shown.len()));
-    }
-    parts.push(match &b.data.growth_base {
+    let growth = match &b.data.growth_base {
         Some(at) => format!("growth since {at}"),
         None => "no growth data".into(),
-    });
-    let status = format!(" {}", parts.join(" · "));
+    };
+    let status = if l.shown.is_empty() {
+        format!(" {growth}")
+    } else {
+        format!(" {}/{} · {growth}", l.selected + 1, l.shown.len())
+    };
     let Some(&(first, _)) = failed.first().filter(|_| !l.shown.is_empty()) else {
-        return Line::raw(status);
+        return Line::raw(middle(&status, width));
     };
     let names = failed
         .iter()
         .map(|&(name, _)| name)
         .collect::<Vec<_>>()
         .join(", ");
-    let room = width.saturating_sub(status.width() + " ·  failed".width());
-    if names.width() <= room {
-        return Line::raw(format!("{status} · {names} failed"));
-    }
-    let (prefix, room) = if first.width() + ", …".width() <= room {
-        (format!("{status} · "), room)
+    let overhead = " ·  failed".width();
+    let min_names = first.width() + if failed.len() > 1 { " …".width() } else { 0 };
+    let prefix = if status.width() + overhead + min_names <= width {
+        status
+    } else if 1 + growth.width() + overhead + min_names <= width {
+        format!(" {growth}")
     } else {
-        (" ".into(), width.saturating_sub("  failed".width()))
+        match &b.data.growth_base {
+            Some(at) => format!(" since {}", at.split('T').next().unwrap_or(at)),
+            None => format!(" {growth}"),
+        }
     };
+    let room = width.saturating_sub(prefix.width() + overhead);
     if names.width() > room {
         let mut shown = names.as_str();
         while let Some((head, _)) = shown.rsplit_once(", ") {
-            if head.width() + ", …".width() <= room {
-                return Line::raw(format!("{prefix}{head}, … failed"));
+            if head.width() + " …".width() <= room {
+                return Line::raw(format!("{prefix} · {head} … failed"));
             }
             shown = head;
         }
     }
-    Line::raw(format!("{prefix}{} failed", middle(&names, room)))
+    let names = middle(&names, room);
+    Line::raw(middle(&format!("{prefix} · {names} failed"), width))
 }
 
-fn escape_controls(s: &str) -> String {
-    let mut escaped = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_control() {
-            escaped.extend(c.escape_default());
+fn display_units(s: &str) -> impl DoubleEndedIterator<Item = Cow<'_, str>> + Clone {
+    s.graphemes(true).map(|g| {
+        if g.contains(|c: char| c.is_control() || c == '\\') {
+            let mut escaped = String::new();
+            for c in g.chars() {
+                if c.is_control() || c == '\\' {
+                    escaped.extend(c.escape_default());
+                } else {
+                    escaped.push(c);
+                }
+            }
+            Cow::Owned(escaped)
         } else {
-            escaped.push(c);
+            Cow::Borrowed(g)
         }
-    }
-    escaped
-}
-
-fn display_path(path: &str) -> String {
-    escape_controls(&path.replace('\\', "\\\\"))
+    })
 }
 
 fn command_note(s: &str) -> &'static str {
     if s.contains(char::is_control) {
         " (contains control characters, shown escaped)"
+    } else if s.contains('\\') {
+        " (contains backslashes, shown escaped)"
     } else {
         ""
     }
@@ -461,11 +505,12 @@ fn command_note(s: &str) -> &'static str {
 /// What `dwhy explain` shows for a finding, in the same order, wrapped to
 /// `width`. Guards are the ones the scan recorded; growth comes from the
 /// scan's base snapshot (`base`, its `created_at`).
-fn detail_lines(f: &Finding, base: Option<&str>, width: usize) -> Vec<Line<'static>> {
+fn detail_lines(f: &Finding, lossy: bool, base: Option<&str>, width: usize) -> Vec<Line<'static>> {
+    const WITHHELD: &str = "command withheld because the path cannot be shown exactly";
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut text = |s: String| {
-        for l in wrap(&escape_controls(&s), width) {
+        for l in wrap(&s, width) {
             out.push(Line::raw(l));
         }
     };
@@ -475,11 +520,10 @@ fn detail_lines(f: &Finding, base: Option<&str>, width: usize) -> Vec<Line<'stat
         f.detector,
         tier_name(f.tier)
     ));
-    text(format!(
-        "  {:>8}  {}",
-        human(f.bytes),
-        display_path(&f.path)
-    ));
+    text(format!("  {:>8}  {}", human(f.bytes), f.path));
+    if lossy {
+        text("  path is not valid UTF-8; shown approximately — do not copy".into());
+    }
     if let Some(t) = &f.last_modified {
         text(format!("  last written {t}"));
     }
@@ -520,19 +564,30 @@ fn detail_lines(f: &Finding, base: Option<&str>, width: usize) -> Vec<Line<'stat
     text(format!(
         "action ({}):{}",
         action_kind_name(f.action.kind),
-        command_note(&f.action.text)
+        if lossy {
+            ""
+        } else {
+            command_note(&f.action.text)
+        }
     ));
-    text(format!("  {}", f.action.text));
+    text(format!(
+        "  {}",
+        if lossy { WITHHELD } else { &f.action.text }
+    ));
 
     text(String::new());
     text("recovery:".into());
     text(format!("  cost: {}", f.recovery.cost));
     if let Some(how) = &f.recovery.how {
-        let note = command_note(how);
-        if !note.is_empty() {
-            text(format!(" {note}"));
+        if lossy {
+            text(format!("  how:  {WITHHELD}"));
+        } else {
+            let note = command_note(how);
+            if !note.is_empty() {
+                text(format!(" {note}"));
+            }
+            text(format!("  how:  {how}"));
         }
-        text(format!("  how:  {how}"));
     }
     if let Some(first) = out.first_mut() {
         *first = std::mem::take(first).style(bold);
@@ -544,43 +599,47 @@ fn detail_lines(f: &Finding, base: Option<&str>, width: usize) -> Vec<Line<'stat
 /// and anywhere in a word too long for a line. Continuation lines keep the
 /// first line's indent, plus two columns.
 fn wrap(s: &str, width: usize) -> Vec<String> {
-    if grapheme_width(s) <= width || width == 0 {
-        return vec![s.to_string()];
+    let units: Vec<_> = display_units(s).collect();
+    if units.iter().map(|g| g.width()).sum::<usize>() <= width || width == 0 {
+        return vec![units.into_iter().collect()];
     }
     let indent = s.len() - s.trim_start_matches(' ').len();
     let cont = " ".repeat((indent + 2).min(width / 2).min(width.saturating_sub(2)));
     let mut out = Vec::new();
     let mut line = String::new();
     let mut line_w = 0;
-    let mut start = 0;
     let mut push_line = |line: &str| {
         let spaces = line.graphemes(true).rev().take_while(|g| *g == " ").count();
         if spaces < line.len() {
             out.push(line[..line.len() - spaces].to_string());
         }
     };
-    let breaks = s.grapheme_indices(true).filter(|&(_, g)| g == " ");
-    for (end, sep) in breaks.chain([(s.len(), "")]) {
-        let word = &s[start..end];
-        start = end + sep.len();
-        let word_w = grapheme_width(word);
+    for word in units.split_inclusive(|g| g == " ") {
+        let word_w = word
+            .iter()
+            .filter(|g| *g != " ")
+            .map(|g| g.width())
+            .sum::<usize>();
         if line_w + word_w > width && !line.trim().is_empty() {
             push_line(&line);
             line = cont.clone();
             line_w = cont.len();
         }
-        for g in word.graphemes(true) {
+        for g in word {
+            let g = if g.width() <= width {
+                g.as_ref()
+            } else {
+                "…"
+            };
             let gw = g.width();
-            if line_w + gw > width {
+            if g != " " && line_w + gw > width {
                 push_line(&line);
-                line = cont.clone();
-                line_w = cont.len();
+                line_w = cont.len().min(width - gw);
+                line = cont[..line_w].to_string();
             }
             line.push_str(g);
             line_w += gw;
         }
-        line.push_str(sep);
-        line_w += sep.len();
     }
     push_line(&line);
     out
@@ -676,35 +735,41 @@ pub fn bar(pct: u64) -> String {
 /// Shortens `s` to at most `max` columns by replacing its middle with `…`,
 /// keeping both ends (the start of a path and its last component).
 pub fn middle(s: &str, max: usize) -> String {
-    if grapheme_width(s) <= max {
-        return s.to_string();
+    middle_units(s.graphemes(true).map(Cow::Borrowed), max)
+}
+
+fn middle_units<'a>(
+    units: impl DoubleEndedIterator<Item = Cow<'a, str>> + Clone,
+    max: usize,
+) -> String {
+    if units.clone().map(|g| g.width()).sum::<usize>() <= max {
+        return units.collect();
     }
     if max == 0 {
         return String::new();
     }
     let keep = max - 1;
     // Favour the end: it holds the name that tells entries apart.
-    let head_w = keep / 2;
-    let tail_w = keep - head_w;
-    let mut head_end = 0;
-    let mut w = 0;
-    for (i, g) in s.grapheme_indices(true) {
-        let gw = g.width();
-        if w + gw > head_w {
-            break;
-        }
-        head_end = i + g.len();
-        w += gw;
+    let mut head_room = keep / 2;
+    let mut tail_room = keep - head_room;
+    let mut text: String = units
+        .clone()
+        .take_while(|g| take_columns(&mut head_room, g))
+        .collect();
+    let tail: Vec<_> = units
+        .rev()
+        .take_while(|g| take_columns(&mut tail_room, g))
+        .collect();
+    text.push('…');
+    text.extend(tail.into_iter().rev());
+    text
+}
+
+fn take_columns(room: &mut usize, unit: &str) -> bool {
+    if let Some(left) = room.checked_sub(unit.width()) {
+        *room = left;
+        true
+    } else {
+        false
     }
-    let mut tail_start = s.len();
-    let mut w = 0;
-    for (i, g) in s.grapheme_indices(true).rev() {
-        let gw = g.width();
-        if w + gw > tail_w {
-            break;
-        }
-        tail_start = i;
-        w += gw;
-    }
-    format!("{}…{}", &s[..head_end], &s[tail_start..])
 }

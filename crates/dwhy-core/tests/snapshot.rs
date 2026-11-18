@@ -554,6 +554,16 @@ fn scan_growth_comes_from_the_newest_snapshot_of_the_same_roots_an_hour_old() {
     }
     let saved = snapshot::list(&dir).unwrap().len();
 
+    let mut sampled_earlier = report.clone();
+    for sampled_at in ["2026-11-16T03:30:00Z", "2026-11-16T04:00:00Z", "invalid"] {
+        sampled_earlier.generated_at = sampled_at.into();
+        assert_eq!(
+            dwhy_core::growth::fill_scan_growth(&mut sampled_earlier, &dir, now),
+            None
+        );
+        assert!(sampled_earlier.findings.iter().all(|f| f.growth.is_none()));
+    }
+
     let base = dwhy_core::growth::fill_scan_growth(&mut report, &dir, now);
     assert_eq!(base.as_deref(), Some("2026-11-16T04:00:00Z"));
     let g = report.findings[0].growth.as_ref().unwrap();

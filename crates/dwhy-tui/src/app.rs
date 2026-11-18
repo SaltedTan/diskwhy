@@ -1,9 +1,11 @@
 //! The TUI as a state machine: scan messages and key events in, state out.
 //! Nothing here touches the terminal, so tests drive it directly.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use dwhy_core::explain::lossy_finding_paths;
 use dwhy_core::report::{Finding, Tier};
 use dwhy_core::scan::Progress;
 use dwhy_core::tree::NodeId;
@@ -91,6 +93,7 @@ pub struct FindingList {
 #[derive(Debug)]
 pub struct Browser {
     pub data: Scanned,
+    pub(crate) lossy_paths: HashSet<String>,
     pub view: View,
     pub place: Place,
     pub rows: Vec<Row>,
@@ -148,6 +151,7 @@ impl App {
             _ => Place::Roots,
         };
         let mut b = Browser {
+            lossy_paths: lossy_finding_paths(&data.report.findings, &data.tree),
             data,
             view: View::Tree,
             place,
@@ -196,7 +200,7 @@ impl App {
         match b.view {
             View::Tree => {}
             View::Findings => {
-                b.on_findings_key(key.code, page);
+                b.on_findings_key(key.code, self.viewport);
                 return false;
             }
             View::Detail => {
@@ -288,42 +292,36 @@ impl Browser {
         self.data.report.findings.get(i)
     }
 
-    fn on_findings_key(&mut self, code: KeyCode, page: usize) {
+    fn on_findings_key(&mut self, code: KeyCode, viewport: usize) {
         let l = &mut self.findings;
         let last = l.shown.len().saturating_sub(1);
+        let page = viewport.max(1);
         match code {
+            KeyCode::Char('t') => {
+                let at = FILTERS.iter().position(|&f| f == l.filter).unwrap_or(0);
+                self.refilter(FILTERS[(at + 1) % FILTERS.len()]);
+            }
+            code if l.shown.is_empty() => scroll_lines(&mut l.offset, code, page),
             KeyCode::Up | KeyCode::Char('k') => l.selected = l.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => l.selected = (l.selected + 1).min(last),
             KeyCode::PageUp => l.selected = l.selected.saturating_sub(page),
             KeyCode::PageDown => l.selected = (l.selected + page).min(last),
             KeyCode::Home | KeyCode::Char('g') => l.selected = 0,
             KeyCode::End | KeyCode::Char('G') => l.selected = last,
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if !l.shown.is_empty() => {
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if viewport > 0 => {
                 l.scroll = 0;
                 self.view = View::Detail;
-            }
-            KeyCode::Char('t') => {
-                let at = FILTERS.iter().position(|&f| f == l.filter).unwrap_or(0);
-                self.refilter(FILTERS[(at + 1) % FILTERS.len()]);
             }
             _ => {}
         }
     }
 
     fn on_detail_key(&mut self, code: KeyCode, page: usize) {
-        // Scrolling past the end is clamped when drawn, once the height is known.
-        let s = &mut self.findings.scroll;
         match code {
-            KeyCode::Up | KeyCode::Char('k') => *s = s.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => *s = s.saturating_add(1),
-            KeyCode::PageUp => *s = s.saturating_sub(page),
-            KeyCode::PageDown => *s = s.saturating_add(page),
-            KeyCode::Home | KeyCode::Char('g') => *s = 0,
-            KeyCode::End | KeyCode::Char('G') => *s = usize::MAX,
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
                 self.view = View::Findings;
             }
-            _ => {}
+            _ => scroll_lines(&mut self.findings.scroll, code, page),
         }
     }
 
@@ -447,4 +445,16 @@ pub fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect()
+}
+
+fn scroll_lines(offset: &mut usize, code: KeyCode, page: usize) {
+    *offset = match code {
+        KeyCode::Up | KeyCode::Char('k') => offset.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => offset.saturating_add(1),
+        KeyCode::PageUp => offset.saturating_sub(page),
+        KeyCode::PageDown => offset.saturating_add(page),
+        KeyCode::Home | KeyCode::Char('g') => 0,
+        KeyCode::End | KeyCode::Char('G') => usize::MAX,
+        _ => *offset,
+    };
 }

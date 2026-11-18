@@ -633,14 +633,14 @@ pub fn deepest(dirs: Vec<Change>) -> Vec<Change> {
 }
 
 /// Sets `growth` on each finding `old` also has (matched by id), measured
-/// from `old` to `now` (RFC 3339). Nothing is set when `old` is not older.
-pub fn fill_growth(findings: &mut [Finding], old: &Snapshot, now: &str) {
+/// from `old` to `now` (RFC 3339). Returns whether the interval is valid.
+pub fn fill_growth(findings: &mut [Finding], old: &Snapshot, now: &str) -> bool {
     let (Some(t_now), Some(t_old)) = (parse_time(now), parse_time(&old.created_at)) else {
-        return;
+        return false;
     };
     let elapsed = t_now - t_old;
     if elapsed <= 0 {
-        return;
+        return false;
     }
     let before: HashMap<&str, u64> = old
         .findings
@@ -655,6 +655,7 @@ pub fn fill_growth(findings: &mut [Finding], old: &Snapshot, now: &str) {
             });
         }
     }
+    true
 }
 
 /// Puts growth on a scan report's findings, as `dwhy scan` and the TUI do:
@@ -677,8 +678,8 @@ pub fn fill_scan_growth(report: &mut ScanReport, dir: &Path, now: i64) -> Option
         now,
     )
     .ok()?;
-    fill_growth(&mut report.findings, &found.snapshot, &report.generated_at);
-    Some(found.snapshot.created_at)
+    fill_growth(&mut report.findings, &found.snapshot, &report.generated_at)
+        .then_some(found.snapshot.created_at)
 }
 
 #[cfg(test)]

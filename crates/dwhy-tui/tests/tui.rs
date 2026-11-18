@@ -1,7 +1,10 @@
 //! The TUI as a state machine on temp-dir fixtures, rendered with ratatui's
 //! TestBackend. No terminal and no pty.
 
+use std::ffi::OsStr;
 use std::fs;
+use std::io::ErrorKind;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -935,6 +938,90 @@ fn no_findings_and_failed_detectors_are_explicit() {
 }
 
 #[test]
+fn detector_errors_scroll_at_45x24() {
+    let f = fixture(false);
+    let mut data = scan(&[&f.root()]);
+    for run in &mut data.report.detectors {
+        match run.name.as_str() {
+            "docker-volume" => {
+                run.error = Some(format!(
+                    "{}retry-exhausted",
+                    "request timed out. ".repeat(55)
+                ));
+            }
+            "docker-build-cache" => run.error = Some("cache result unavailable".into()),
+            _ => {}
+        }
+    }
+    for filtered in [false, true] {
+        let mut data = data.clone();
+        if filtered {
+            data.report.findings.push(cargo_finding());
+        }
+        let mut app = app_with(data);
+        press(&mut app, &[KeyCode::Tab]);
+        let empty = if filtered {
+            let screen = render(&mut app, 45, 24, None);
+            let status = screen.lines().nth(22).unwrap();
+            assert!(status.contains("no growth data"), "{screen}");
+            assert!(
+                status.contains("docker-build-cache") && status.contains("failed"),
+                "{screen}"
+            );
+            press(&mut app, &[KeyCode::Char('t')]);
+            "no regenerable findings"
+        } else {
+            "no findings"
+        };
+        let at_top = render(&mut app, 45, 24, None);
+        assert!(at_top.contains(empty), "{at_top}");
+        assert!(!at_top.contains("retry-exhausted"), "{at_top}");
+        assert!(
+            at_top.contains("docker-build-cache: cache result"),
+            "{at_top}"
+        );
+        press(&mut app, &[KeyCode::Down]);
+        assert!(!render(&mut app, 45, 24, None).contains(empty));
+        press(&mut app, &[KeyCode::Up]);
+        assert!(render(&mut app, 45, 24, None).contains(empty));
+        for (down, up) in [
+            (KeyCode::End, KeyCode::Home),
+            (KeyCode::PageDown, KeyCode::PageUp),
+        ] {
+            press(&mut app, &[down]);
+            let later = render(&mut app, 45, 24, None);
+            assert!(later.contains("retry-exhausted"), "{later}");
+            assert!(!later.contains(empty), "{later}");
+            press(&mut app, &[up]);
+            assert!(render(&mut app, 45, 24, None).contains(empty));
+        }
+    }
+}
+
+#[test]
+fn compact_findings_only_open_when_a_row_fits() {
+    let finding = hand_finding("cargo-target", "/abc", GIB, Tier::Rebuildable);
+    let (_f, mut app) = findings_app(vec![finding], None);
+    press(&mut app, &[KeyCode::Tab]);
+    let screen = render(&mut app, 22, 24, None);
+    assert!(
+        screen.contains("Widen") && !screen.contains("/abc"),
+        "{screen}"
+    );
+    for key in [KeyCode::Enter, KeyCode::Right, KeyCode::Char('l')] {
+        press(&mut app, &[key]);
+        assert_eq!(view(&app), View::Findings);
+    }
+    for width in [23, 27] {
+        let screen = render(&mut app, width, 24, None);
+        assert!(screen.contains("rebuildable 1.0G /abc"), "{screen}");
+        assert!(!screen.contains("Widen"), "{screen}");
+    }
+    press(&mut app, &[KeyCode::Enter]);
+    assert_eq!(view(&app), View::Detail);
+}
+
+#[test]
 fn paging_moves_by_the_finding_rows_on_screen() {
     let findings = (1..=25)
         .map(|i| {
@@ -1108,7 +1195,10 @@ fn finding_paths_and_commands_escape_controls() {
         dwhy_core::detect::shell_quote(path)
     );
     finding.recovery.how = Some("cd '/p/repo\nx' && cargo build".into());
-    let lookalike = hand_finding("cargo-target", r"/p/repo\nx/target", GIB, Tier::Rebuildable);
+    finding.reason = "Cargo build output of /p/repo\nx".into();
+    let mut lookalike = hand_finding("cargo-target", r"/p/repo\nx/target", GIB, Tier::Rebuildable);
+    lookalike.reason = r"Cargo build output of /p/repo\nx".into();
+    lookalike.recovery.how = Some(r"cd '/p/repo\nx' && cargo build".into());
     let (_f, mut app) = findings_app(vec![finding, lookalike], None);
     press(&mut app, &[KeyCode::Tab]);
     let list = render(&mut app, 80, 24, None);
@@ -1149,6 +1239,10 @@ fn finding_paths_and_commands_escape_controls() {
         detail.contains(r"cd '/p/repo\nx' && cargo build"),
         "{detail}"
     );
+    assert!(
+        detail.contains(r"Cargo build output of /p/repo\nx"),
+        "{detail}"
+    );
     assert_eq!(
         detail
             .matches("(contains control characters, shown escaped)")
@@ -1156,6 +1250,116 @@ fn finding_paths_and_commands_escape_controls() {
         2,
         "{detail}"
     );
+    press(&mut app, &[KeyCode::Esc, KeyCode::Down, KeyCode::Enter]);
+    let detail = render(&mut app, 80, 24, None);
+    assert!(
+        detail.contains(r"Cargo build output of /p/repo\\nx"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains(r"cd '/p/repo\\nx' && cargo build"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("(contains backslashes, shown escaped)"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn finding_escapes_stay_whole_at_layout_boundaries() {
+    let head = format!("/{}", "x".repeat(13));
+    let tail = "yyyyyyyyy/tail";
+    let path = format!("{head}\n{}\n{tail}", "m".repeat(20));
+    let mut finding = hand_finding("cargo-target", &path, GIB, Tier::Rebuildable);
+    finding.reason = format!("project /{}\nnext", "x".repeat(74));
+    let (_f, mut app) = findings_app(vec![finding], None);
+    press(&mut app, &[KeyCode::Tab]);
+    let list = render(&mut app, 80, 24, None);
+    assert!(
+        list.lines()
+            .nth(2)
+            .unwrap()
+            .contains(&format!("{head}…{tail}")),
+        "{list}"
+    );
+    press(&mut app, &[KeyCode::Enter]);
+    let title = render(&mut app, 52, 24, None);
+    assert!(
+        title
+            .lines()
+            .next()
+            .unwrap()
+            .contains(&format!("{head}…{tail}")),
+        "{title}"
+    );
+    let detail = render(&mut app, 80, 24, None);
+    assert!(
+        detail
+            .lines()
+            .any(|line| line.starts_with(r#""    \nnext"#)),
+        "{detail}"
+    );
+}
+
+#[test]
+fn lossy_cargo_path_is_marked_and_commands_are_withheld() {
+    let f = fixture(false);
+    let root = f.root();
+    let project = root.join(OsStr::from_bytes(b"app\xff"));
+    match fs::create_dir(&project) {
+        Ok(()) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::InvalidInput | ErrorKind::InvalidData | ErrorKind::Unsupported
+            ) =>
+        {
+            return;
+        }
+        Err(e) => panic!("cannot create non-UTF-8 path: {e}"),
+    }
+    fs::create_dir_all(root.join("app�/target")).unwrap();
+    fs::create_dir(project.join("target")).unwrap();
+    fs::write(project.join("Cargo.toml"), b"[package]\n").unwrap();
+    fs::write(project.join("target/.rustc_info.json"), b"{}").unwrap();
+    fs::write(project.join("target/out"), vec![5u8; 2 * MIB]).unwrap();
+    let mut data = scan(&[&root]);
+    assert_eq!(data.report.findings.len(), 1);
+    let finding = &mut data.report.findings[0];
+    assert!(finding.path.ends_with("/app�/target"));
+    let action = finding.action.text.clone();
+    finding.recovery.how = Some("cargo build --manifest-path app�/Cargo.toml".into());
+    let mut app = app_with(data);
+    press(&mut app, &[KeyCode::Tab]);
+    let list = render(&mut app, 80, 24, None);
+    let row = list.lines().nth(2).unwrap();
+    assert!(row.contains(">!") && row.contains("/app�/target"), "{list}");
+    press(&mut app, &[KeyCode::Enter]);
+    let detail = render(&mut app, 80, 24, None);
+    assert!(
+        detail.contains("path is not valid UTF-8; shown approximately — do not copy"),
+        "{detail}"
+    );
+    assert_eq!(
+        detail
+            .matches("command withheld because the path cannot be shown exactly")
+            .count(),
+        2,
+        "{detail}"
+    );
+    assert!(
+        !detail.contains(
+            action
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ")
+                .as_str()
+        ),
+        "{detail}"
+    );
+    assert!(!detail.contains("cargo build --manifest-path"), "{detail}");
 }
 
 #[test]

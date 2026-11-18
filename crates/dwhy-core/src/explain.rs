@@ -587,18 +587,27 @@ pub fn docker_selection(only: Option<&[String]>) -> Vec<String> {
 }
 
 pub fn exclude_lossy_paths(findings: &mut Vec<Finding>, tree: &ScanTree) {
+    let lossy = lossy_finding_paths(findings, tree);
+    findings.retain(|f| !lossy.contains(&f.path));
+}
+
+pub fn lossy_finding_paths(findings: &[Finding], tree: &ScanTree) -> HashSet<String> {
     if !findings
         .iter()
         .any(|f| f.path.contains(char::REPLACEMENT_CHARACTER))
     {
-        return;
+        return HashSet::new();
     }
     let lossy: HashSet<PathBuf> = tree
         .ids()
         .filter(|&id| tree.name(id).to_str().is_none())
         .map(|id| PathBuf::from(tree.path(id).to_string_lossy().into_owned()))
         .collect();
-    findings.retain(|f| !Path::new(&f.path).ancestors().any(|p| lossy.contains(p)));
+    findings
+        .iter()
+        .filter(|f| Path::new(&f.path).ancestors().any(|p| lossy.contains(p)))
+        .map(|f| f.path.clone())
+        .collect()
 }
 
 /// Picks the finding explained from a rescan's `findings`: the one with
