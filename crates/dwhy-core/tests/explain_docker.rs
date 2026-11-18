@@ -146,7 +146,6 @@ fn a_renamed_container_is_present_under_its_new_name() {
     container(&mut now, OLD_JOB).names = vec!["/old-job-kept".into()];
     let out = explain_now("docker-container", "docker://container/old-job", &now);
     assert!(!out.gone);
-    assert!(out.growth);
     assert_eq!(out.path, "docker://container/old-job-kept");
     let f = out
         .finding
@@ -168,22 +167,24 @@ fn a_renamed_container_is_present_under_its_new_name() {
 }
 
 #[test]
-fn a_container_recreated_under_its_name_is_replaced_without_growth() {
+fn a_container_recreated_under_its_name_leaves_the_saved_finding_gone() {
     let mut now = daemon();
     let new_id = "c9000000000000000000000000000000000000000000000000000000000000f9";
     container(&mut now, OLD_JOB).id = new_id.into();
     let path = "docker://container/old-job";
     let out = explain_now("docker-container", path, &now);
-    assert!(!out.gone);
-    assert!(!out.growth, "no growth across a replacement");
+    assert!(out.gone);
     assert_eq!(out.path, path);
-    // The finding at that name now is the new container's.
-    let f = out.finding.expect("the new container is detected");
+    assert!(out.finding.is_none());
+    assert!(out.inside.is_empty());
+    let (current, _) = explain::pick(findings(&now), path, None);
+    let f = current.expect("a direct path lookup finds the new container");
     assert_eq!(f.action.argv.as_ref().unwrap().last().unwrap(), new_id);
     assert_eq!(
         out.notes,
         [
-            "replaced: container old-job is now a different object (was c20000000000, now c90000000000)"
+            "docker://container/old-job now belongs to a different object (id c90000000000); \
+             the saved finding's object is no longer listed. Run `dwhy explain <path>` to see the current one."
         ]
     );
 
@@ -227,19 +228,23 @@ fn a_volume_recreated_with_a_new_creation_time_is_replaced() {
         }
     }
     let out = explain_now("docker-volume", path, &now);
-    assert!(!out.gone);
-    assert!(!out.growth);
-    assert_eq!(out.finding.unwrap().path, path);
+    assert!(out.gone);
+    assert_eq!(out.path, path);
+    assert!(out.finding.is_none());
+    assert!(out.inside.is_empty());
+    let (current, _) = explain::pick(findings(&now), path, None);
+    assert_eq!(current.unwrap().path, path);
     assert_eq!(
         out.notes,
         [
-            "replaced: volume orphan_pg is now a different object (was created 2026-10-01T00:00:00Z, now created 2026-11-14T12:00:00Z)"
+            "docker://volume/orphan_pg now belongs to a different object (id 2026-11-14T12:00:00Z); \
+             the saved finding's object is no longer listed. Run `dwhy explain <path>` to see the current one."
         ]
     );
 
     // The same volume, unchanged: its finding, no notes.
     let out = explain_now("docker-volume", path, &daemon());
-    assert!(out.growth && !out.gone);
+    assert!(!out.gone);
     assert_eq!(out.finding.unwrap().path, path);
     assert!(out.notes.is_empty(), "{:?}", out.notes);
 }
@@ -256,7 +261,7 @@ fn images_are_matched_by_id_across_tags() {
     rebuilt.repo_tags = Some(vec!["ci-runner:local".into()]);
     images.push(rebuilt);
     let out = explain_now("docker-image", "docker://image/ci-runner:local", &now);
-    assert!(!out.gone && out.growth);
+    assert!(!out.gone);
     assert_eq!(out.path, "docker://image/ci-runner:v2");
     assert_eq!(out.finding.unwrap().path, "docker://image/ci-runner:v2");
     assert_eq!(out.notes, ["renamed: now ci-runner:v2"]);
@@ -267,12 +272,19 @@ fn images_are_matched_by_id_across_tags() {
         .as_mut()
         .unwrap()
         .retain(|i| !i.id.contains("dddd"));
-    let out = explain_now("docker-image", "docker://image/ci-runner:local", &now);
-    assert!(!out.gone && !out.growth);
+    let path = "docker://image/ci-runner:local";
+    let out = explain_now("docker-image", path, &now);
+    assert!(out.gone);
+    assert_eq!(out.path, path);
+    assert!(out.finding.is_none());
+    assert!(out.inside.is_empty());
+    let (current, _) = explain::pick(findings(&now), path, None);
+    assert_eq!(current.unwrap().path, path);
     assert_eq!(
         out.notes,
         [
-            "replaced: image ci-runner:local is now a different object (was dddd00000000, now 999900000000)"
+            "docker://image/ci-runner:local now belongs to a different object (id 999900000000); \
+             the saved finding's object is no longer listed. Run `dwhy explain <path>` to see the current one."
         ]
     );
 }
@@ -298,7 +310,7 @@ fn without_saved_ids_or_a_daemon_it_falls_back_to_the_name() {
     let mut now = daemon();
     container(&mut now, OLD_JOB).id = "c9".repeat(32);
     let out = explain::explain_docker_id(&saved, None, Some(&now), findings(&now), None);
-    assert!(!out.gone && out.growth);
+    assert!(!out.gone);
     assert_eq!(out.finding.unwrap().path, path);
     assert_eq!(
         out.notes,

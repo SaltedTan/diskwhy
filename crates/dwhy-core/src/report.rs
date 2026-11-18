@@ -967,8 +967,8 @@ pub struct ExplainReport {
     /// `None` when no finding matched.
     #[serde(default)]
     pub finding: Option<Finding>,
-    /// True for an unmatched saved id when the presence check reports its
-    /// saved filesystem path or Docker pseudo-path absent.
+    /// True when the saved filesystem path or saved Docker object is
+    /// confirmed absent.
     #[serde(default)]
     pub gone: bool,
     /// Measured totals for a filesystem `path`, including when a finding

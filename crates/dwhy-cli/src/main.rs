@@ -739,7 +739,6 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
     let daemon = ctx.docker.fetched();
     let mut path = path;
     let mut gone = false;
-    let mut growth_allowed = true;
     let (mut finding, inside) = match &saved {
         // A saved Docker object is matched by its immutable id.
         Some(saved) if is_docker => {
@@ -752,7 +751,6 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
             );
             path = out.path;
             gone = out.gone;
-            growth_allowed = out.growth;
             notes.extend(out.notes);
             (out.finding, out.inside)
         }
@@ -778,8 +776,7 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
         };
         dwhy_core::guard::check(one, tree, &ctx, &processes);
         drop(status);
-        if growth_allowed
-            && let Some(dir) = &dir
+        if let Some(dir) = &dir
             && let Some(base) = explain::growth_base(dir, &host, uid, &one[0].id, &generated_at)
         {
             match explain::growth_across_replacement(&base, &one[0].path, daemon.as_deref()) {

@@ -330,7 +330,7 @@ pub enum Identity {
     /// `measured` is false when the daemon gave no size for it.
     Present { path: String, measured: bool },
     /// The saved id is not listed, but its name now names another object.
-    Replaced { note: String },
+    Replaced { replacement_id: String },
     /// Neither the id nor the name is listed.
     Gone,
     /// The daemon did not report the list to look in.
@@ -341,13 +341,6 @@ pub enum Identity {
 /// its name.
 pub fn identity(saved: &SavedObject, now: &docker::Snapshot) -> Identity {
     use crate::detectors::{container_name, image_label, image_named, short_id};
-    let replaced = |was: String, is: String| Identity::Replaced {
-        note: format!(
-            "replaced: {} {} is now a different object (was {was}, now {is})",
-            saved.kind.word(),
-            saved.name
-        ),
-    };
     let at = |name: String| format!("{}{name}", saved.kind.prefix());
     match saved.kind {
         DockerKind::Image => {
@@ -360,7 +353,9 @@ pub fn identity(saved: &SavedObject, now: &docker::Snapshot) -> Identity {
                     measured: img.size >= 0,
                 }
             } else if let Some(img) = images.iter().find(|i| image_named(i, &saved.name)) {
-                replaced(short_id(&saved.id), short_id(&img.id))
+                Identity::Replaced {
+                    replacement_id: short_id(&img.id),
+                }
             } else {
                 Identity::Gone
             }
@@ -375,7 +370,9 @@ pub fn identity(saved: &SavedObject, now: &docker::Snapshot) -> Identity {
                     measured: c.size_rw.is_some_and(|s| s >= 0),
                 }
             } else if let Some(c) = containers.iter().find(|c| container_name(c) == saved.name) {
-                replaced(short_id(&saved.id), short_id(&c.id))
+                Identity::Replaced {
+                    replacement_id: short_id(&c.id),
+                }
             } else {
                 Identity::Gone
             }
@@ -389,10 +386,9 @@ pub fn identity(saved: &SavedObject, now: &docker::Snapshot) -> Identity {
                     path: at(v.name.clone()),
                     measured: v.usage_data.as_ref().is_some_and(|u| u.size >= 0),
                 },
-                Some(v) => replaced(
-                    format!("created {}", saved.id),
-                    format!("created {}", v.created_at),
-                ),
+                Some(v) => Identity::Replaced {
+                    replacement_id: v.created_at.clone(),
+                },
                 None => Identity::Gone,
             }
         }
@@ -427,9 +423,6 @@ pub struct DockerExplained {
     pub finding: Option<Finding>,
     pub inside: Vec<FindingRef>,
     pub gone: bool,
-    /// Whether growth may be measured for `finding`: false across a
-    /// replacement.
-    pub growth: bool,
     pub notes: Vec<String>,
 }
 
@@ -447,7 +440,6 @@ pub fn explain_docker_id(
 ) -> DockerExplained {
     let mut out = DockerExplained {
         path: saved.path.clone(),
-        growth: true,
         ..Default::default()
     };
     let identity = match (object, now) {
@@ -480,13 +472,13 @@ pub fn explain_docker_id(
             }
             out.path = path;
         }
-        Identity::Replaced { note } => {
-            out.notes.push(note);
-            out.growth = false;
-            (out.finding, out.inside) = pick(findings, &saved.path, Some(&saved.id));
-            if out.finding.is_none() {
-                out.notes.extend(detector_issue);
-            }
+        Identity::Replaced { replacement_id } => {
+            out.gone = true;
+            out.notes.push(format!(
+                "{} now belongs to a different object (id {replacement_id}); the saved finding's \
+                 object is no longer listed. Run `dwhy explain <path>` to see the current one.",
+                saved.path
+            ));
         }
         Identity::Gone => {
             out.gone = absence(&saved.path, Ok(false), None, None, None, &mut out.notes);
