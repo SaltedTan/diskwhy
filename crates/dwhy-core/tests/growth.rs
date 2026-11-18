@@ -753,6 +753,68 @@ fn watch_omits_directories_when_either_sample_has_unknown_contents() {
 }
 
 #[test]
+fn watch_handles_twenty_thousand_unreadable_or_mounted_siblings_quickly() {
+    let paths: Vec<String> = (0..20_000).map(|i| format!("/h/blocked-{i:05}")).collect();
+    let mut start = sample(
+        "2026-11-18T02:00:00Z",
+        &[("/h", 20_001 * M), ("/h/quiet", M)],
+        50 * G,
+    );
+    start.dirs.extend(dirs(
+        &paths
+            .iter()
+            .map(|path| (path.as_str(), M))
+            .collect::<Vec<_>>(),
+    ));
+    let mut end = sample(
+        "2026-11-18T02:01:00Z",
+        &[("/h", 4 * M), ("/h/quiet", 4 * M)],
+        50 * G,
+    );
+    end.dirs.extend(dirs(
+        &paths
+            .iter()
+            .map(|path| (path.as_str(), 0))
+            .collect::<Vec<_>>(),
+    ));
+    let names = paths.join(", ");
+    for mounted in [false, true] {
+        let unreadable = if mounted {
+            end.scan.skipped_mounts = paths.clone();
+            &[][..]
+        } else {
+            paths.as_slice()
+        };
+        let started = std::time::Instant::now();
+        let r = growth::watch(&start, &end, 60, 60_000, M, [&[], unreadable]);
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(
+            rate_rows(&r.dirs),
+            [(
+                ChangeKind::Dir,
+                "/h/quiet",
+                Some(M),
+                Some(4 * M),
+                3 * M as i64,
+                3 * M as i64,
+            )]
+        );
+        let notes = if mounted {
+            vec![
+                format!("not compared, because one side did not enter these mount points: {names}"),
+                format!("not compared, because a mount changed during the window: {names}"),
+            ]
+        } else {
+            vec![format!(
+                "not compared, because a sample could not read these paths: {names}"
+            )]
+        };
+        assert_eq!(r.notes, notes);
+    }
+}
+
+#[test]
 fn watch_compares_ancestors_when_both_samples_failed_at_the_same_path() {
     let start = sample(
         "2026-11-18T02:00:00Z",

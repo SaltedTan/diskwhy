@@ -49,43 +49,56 @@ fn within(path: &Path, roots: &[String]) -> bool {
 
 /// The mount point the scan skipped that kept its walk from `path`, a
 /// path under its roots: one between the deepest root above it and it.
-fn blocked_by<'a>(path: &Path, scan: &'a SnapshotScan) -> Option<&'a str> {
+fn blocked_by<'a>(
+    path: &Path,
+    scan: &SnapshotScan,
+    skipped: &HashMap<&Path, &'a str>,
+) -> Option<&'a str> {
     let root = scan
         .roots
         .iter()
         .filter(|r| path.starts_with(r))
         .map(|r| depth(r))
         .max()?;
+    path.ancestors()
+        .take(path.components().count().saturating_sub(root))
+        .find_map(|ancestor| skipped.get(ancestor).copied())
+}
+
+fn skipped_mounts(scan: &SnapshotScan) -> HashMap<&Path, &str> {
     scan.skipped_mounts
         .iter()
-        .filter(|m| path.starts_with(m) && depth(m) > root)
-        .max_by_key(|m| depth(m))
-        .map(String::as_str)
+        .map(|mount| (Path::new(mount), mount.as_str()))
+        .collect()
 }
 
 /// Whether the scan walked `path`: it is under a root, and no mount point
 /// the walk skipped lies between that root and it.
-fn walked(path: &Path, scan: &SnapshotScan) -> bool {
-    within(path, &scan.roots) && blocked_by(path, scan).is_none()
+fn walked(path: &Path, scan: &SnapshotScan, skipped: &HashMap<&Path, &str>) -> bool {
+    within(path, &scan.roots) && blocked_by(path, scan, skipped).is_none()
 }
 
 /// Mount points `side` skipped where `other` walked something it would
 /// otherwise compare.
 fn left_out<'a>(side: &'a SnapshotScan, other: &'a SnapshotScan) -> impl Iterator<Item = &'a str> {
-    side.skipped_mounts.iter().map(String::as_str).filter(|m| {
-        let m = Path::new(m);
-        other.roots.iter().any(|r| {
-            let r = Path::new(r);
-            let top = if r.starts_with(m) {
-                r
-            } else if m.starts_with(r) {
-                m
-            } else {
-                return false;
-            };
-            walked(top, other) && !walked(top, side)
+    let skipped = [skipped_mounts(side), skipped_mounts(other)];
+    side.skipped_mounts
+        .iter()
+        .map(String::as_str)
+        .filter(move |m| {
+            let m = Path::new(m);
+            other.roots.iter().any(|r| {
+                let r = Path::new(r);
+                let top = if r.starts_with(m) {
+                    r
+                } else if m.starts_with(r) {
+                    m
+                } else {
+                    return false;
+                };
+                walked(top, other, &skipped[1]) && !walked(top, side, &skipped[0])
+            })
         })
-    })
 }
 
 /// What two snapshots differ by, before rates and ranking.
@@ -116,6 +129,7 @@ fn compare(
     min_change: u64,
     excluded: &dyn Fn(&str) -> bool,
 ) -> Compared {
+    let skipped = [skipped_mounts(&old.scan), skipped_mounts(&new.scan)];
     let above: Vec<&str> = if old.scan.one_filesystem != new.scan.one_filesystem {
         left_out(&old.scan, &new.scan)
             .chain(left_out(&new.scan, &old.scan))
@@ -126,10 +140,13 @@ fn compare(
     // The mount points that keep a path inside the roots of both out.
     let blockers = |path: &str| {
         let p = Path::new(path);
-        let mut v: Vec<&str> = [blocked_by(p, &old.scan), blocked_by(p, &new.scan)]
-            .into_iter()
-            .flatten()
-            .collect();
+        let mut v: Vec<&str> = [
+            blocked_by(p, &old.scan, &skipped[0]),
+            blocked_by(p, &new.scan, &skipped[1]),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         v.extend(above.iter().filter(|m| Path::new(m).starts_with(p)));
         v
     };
@@ -381,7 +398,7 @@ pub fn watch(
             .map(String::as_str)
             .collect::<HashSet<_>>()
     });
-    let changed_mounts: Vec<&str> = old_mounts
+    let changed_mounts: HashSet<&str> = old_mounts
         .symmetric_difference(&new_mounts)
         .copied()
         .collect();
@@ -389,30 +406,25 @@ pub fn watch(
         && [start, end]
             .iter()
             .any(|s| s.scan.totals.hardlinks_deduped > 0);
-    let all_unreadable: HashSet<&str> = old_unreadable.union(&new_unreadable).copied().collect();
-    let blockers = |path: &str| {
-        let path = Path::new(path);
-        all_unreadable
-            .iter()
-            .copied()
-            .filter(|failed| {
-                path.starts_with(failed)
-                    || (changed_coverage.contains(failed) && Path::new(failed).starts_with(path))
-            })
-            .collect::<Vec<_>>()
-    };
-    let mount_blockers = |path: &str| {
-        let path = Path::new(path);
-        changed_mounts
-            .iter()
-            .copied()
-            .filter(|mount| Path::new(mount).starts_with(path) && Path::new(mount) != path)
-            .collect::<Vec<_>>()
-    };
+    let all_unreadable: HashMap<&Path, &str> = old_unreadable
+        .union(&new_unreadable)
+        .map(|&failed| (Path::new(failed), failed))
+        .collect();
+    let above: HashSet<&Path> = changed_coverage
+        .iter()
+        .chain(&changed_mounts)
+        .flat_map(|path| Path::new(path).ancestors().skip(1))
+        .filter(|path| within(path, &start.scan.roots) && within(path, &end.scan.roots))
+        .collect();
     let c = compare(start, end, &|_| None, min_change, &|path| {
-        uncertain_hardlinks || !blockers(path).is_empty() || !mount_blockers(path).is_empty()
+        let path = Path::new(path);
+        uncertain_hardlinks
+            || above.contains(path)
+            || path
+                .ancestors()
+                .any(|ancestor| all_unreadable.contains_key(ancestor))
     });
-    let mut omitted: Vec<&str> = start
+    let recorded: HashSet<&Path> = start
         .dirs
         .iter()
         .chain(&end.dirs)
@@ -420,19 +432,30 @@ pub fn watch(
             let path = Path::new(&d.path);
             within(path, &start.scan.roots) && within(path, &end.scan.roots)
         })
-        .flat_map(|d| blockers(&d.path))
+        .map(|d| Path::new(&d.path))
+        .collect();
+    let mut omitted: Vec<&str> = recorded
+        .iter()
+        .flat_map(|path| path.ancestors())
+        .filter_map(|ancestor| all_unreadable.get(ancestor).copied())
+        .chain(changed_coverage.iter().copied().filter(|failed| {
+            Path::new(failed)
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| recorded.contains(ancestor))
+        }))
         .collect();
     omitted.sort_unstable();
     omitted.dedup();
-    let mut omitted_mounts: Vec<&str> = start
-        .dirs
+    let mut omitted_mounts: Vec<&str> = changed_mounts
         .iter()
-        .chain(&end.dirs)
-        .filter(|d| {
-            let path = Path::new(&d.path);
-            within(path, &start.scan.roots) && within(path, &end.scan.roots)
+        .copied()
+        .filter(|mount| {
+            Path::new(mount)
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| recorded.contains(ancestor))
         })
-        .flat_map(|d| mount_blockers(&d.path))
         .collect();
     omitted_mounts.sort_unstable();
     omitted_mounts.dedup();
