@@ -14,16 +14,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use dwhy_core::account::{self, ReportEnv};
+use dwhy_core::account;
 use dwhy_core::apply::{self, Audit, Check, Policy};
 use dwhy_core::detect::{self, DetectContext};
 use dwhy_core::explain::{self, Place, Query, Walk};
 use dwhy_core::guard::Processes;
-use dwhy_core::mounts::{self, MountTable};
+use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection};
 use dwhy_core::report::{
     ActionKind, ExplainReport, ExplainResolved, ExplainSize, ExplainVia, Plan, PlanScan,
-    SavedSnapshot, ScanReport, SnapshotFinding, Tier, Totals,
+    SavedSnapshot, SnapshotFinding, Tier, Totals,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::tree::ScanTree;
@@ -61,6 +61,8 @@ enum Command {
     Watch(WatchArgs),
     /// Explain one finding, by id or path: evidence, guards, growth, action and recovery cost.
     Explain(ExplainArgs),
+    /// Open the TUI (what bare `dwhy` does on the current directory): browse sizes; writes nothing.
+    Tui(TuiArgs),
     /// Show permissions, optional tools on PATH, and which detectors they enable.
     Doctor {
         /// Print diskwhy/v1 JSON instead of text.
@@ -109,6 +111,18 @@ struct ScanArgs {
     /// Save a snapshot for `dwhy diff` under ~/.local/state/diskwhy/snapshots (old ones are pruned).
     #[arg(long)]
     snapshot: bool,
+}
+
+#[derive(Args, Debug)]
+struct TuiArgs {
+    /// Directories to scan (default: the current directory).
+    paths: Vec<PathBuf>,
+    /// Stay on one filesystem (the default; accepted for du muscle memory).
+    #[arg(short = 'x', long = "one-file-system")]
+    one_file_system: bool,
+    /// Descend into other filesystems mounted below the roots (never into proc, sysfs, ...).
+    #[arg(long, conflicts_with = "one_file_system")]
+    cross_filesystems: bool,
 }
 
 #[derive(Args, Debug)]
@@ -305,9 +319,12 @@ fn main() -> ExitCode {
         Some(Command::Watch(args)) => run_watch(args),
         Some(Command::Explain(args)) => run_explain(args),
         Some(Command::Doctor { json }) => run_doctor(json),
-        None => {
-            Err("the TUI is not built yet (milestone M4); try `dwhy scan` or `dwhy --help`".into())
-        }
+        Some(Command::Tui(args)) => run_tui(args),
+        None => run_tui(TuiArgs {
+            paths: Vec::new(),
+            one_file_system: false,
+            cross_filesystems: false,
+        }),
     };
     match res {
         Ok(code) => ExitCode::from(code),
@@ -319,6 +336,26 @@ fn main() -> ExitCode {
 }
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+fn run_tui(args: TuiArgs) -> Result<u8> {
+    dwhy_tui::run(dwhy_tui::Options {
+        paths: args.paths,
+        cross_filesystems: args.cross_filesystems,
+        detectors: None,
+        threads: 0,
+    })
+    .map_err(|e| {
+        let mut message = String::new();
+        for c in e.to_string().chars() {
+            if c.is_control() {
+                message.extend(c.escape_default());
+            } else {
+                message.push(c);
+            }
+        }
+        message.into()
+    })
+}
 
 fn run_scan(args: ScanArgs) -> Result<u8> {
     if let Some(names) = &args.detectors {
@@ -342,11 +379,11 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
     result.dirs.retain(|d| d.totals.allocated >= threshold);
     result.min_dir_bytes = threshold;
 
-    let mut report = scan_report(&result, &mounts);
+    let mut report = account::system_scan_report(&result, &mounts);
     let docker_snap = if args.no_detectors {
         None
     } else {
-        detect_into(&mut report, &result.tree, args.detectors.as_deref(), true)
+        detect::detect_into(&mut report, &result.tree, args.detectors.as_deref(), true)
     };
 
     // Growth on findings, from a snapshot of the same roots old enough for
@@ -394,46 +431,6 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
         return Ok(EXIT_ERROR);
     }
     Ok(EXIT_OK)
-}
-
-/// The scan report for a finished walk, before detectors run.
-fn scan_report(result: &scan::ScanResult, mounts: &MountTable) -> ScanReport {
-    let euid = system::euid();
-    let env = ReportEnv {
-        host: system::hostname(),
-        uid: euid,
-        root: euid == 0,
-        generated_at: system::now_rfc3339(),
-        users: system::users(),
-        deleted_open: system::deleted_open_files(),
-        exe: std::env::current_exe()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "dwhy".into()),
-        docker_access: doctor::docker_access(),
-    };
-    account::build_scan_report(result, mounts, &env, &|p| mounts::statvfs(p).ok())
-}
-
-/// Runs the detectors (all, or `only`), then the probes when `probe`, and
-/// puts their findings and Docker's totals in `report`. Returns the Docker
-/// state when it was fetched.
-fn detect_into(
-    report: &mut ScanReport,
-    tree: &ScanTree,
-    only: Option<&[String]>,
-    probe: bool,
-) -> Option<Arc<docker::Snapshot>> {
-    let ctx = DetectContext::from_system();
-    let (mut findings, runs) =
-        detect::run_with(tree, &ctx, &dwhy_core::detectors::registry(), only);
-    if probe {
-        probes::run(&mut findings, &ctx);
-    }
-    report.findings = findings;
-    report.detectors = runs;
-    let snap = ctx.docker.fetched()?;
-    account::attach_docker(report, &docker::usage(&snap));
-    Some(snap)
 }
 
 /// Saves `snap` in the snapshot directory, warning when pruning failed.
@@ -495,11 +492,11 @@ fn run_diff(args: DiffArgs) -> Result<u8> {
     let mounts = MountTable::read().unwrap_or_default();
     // The snapshot records directories from the tree; no list is needed.
     let result = measure(&roots, one_fs, u64::MAX, args.threads, args.quiet, &mounts)?;
-    let mut report = scan_report(&result, &mounts);
+    let mut report = account::system_scan_report(&result, &mounts);
     let docker_snap = if args.no_detectors {
         None
     } else {
-        detect_into(&mut report, &result.tree, args.detectors.as_deref(), false)
+        detect::detect_into(&mut report, &result.tree, args.detectors.as_deref(), false)
     };
     let fresh = snapshot::build(
         &report,
@@ -619,7 +616,7 @@ fn watch_sample(args: &WatchArgs, one_fs: bool) -> Result<WatchSample> {
         .chain(result.errors.iter().map(|(path, _)| path))
         .map(|path| path.to_string_lossy().into_owned())
         .collect();
-    let report = scan_report(&result, &mounts);
+    let report = account::system_scan_report(&result, &mounts);
     let docker = if args.no_docker {
         Err("--no-docker given".to_string())
     } else {

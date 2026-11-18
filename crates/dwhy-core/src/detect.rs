@@ -282,6 +282,27 @@ pub fn validate_selection(names: &[String]) -> Result<(), String> {
     }
 }
 
+/// Runs the detectors (all, or `only`), then the probes when `probe`, and
+/// puts their findings and Docker's totals in `report`. Returns the Docker
+/// state when it was fetched. What `dwhy scan` and the TUI both run.
+pub fn detect_into(
+    report: &mut crate::report::ScanReport,
+    tree: &ScanTree,
+    only: Option<&[String]>,
+    probe: bool,
+) -> Option<Arc<crate::docker::Snapshot>> {
+    let ctx = DetectContext::from_system();
+    let (mut findings, runs) = run_with(tree, &ctx, &detectors::registry(), only);
+    if probe {
+        crate::probes::run(&mut findings, &ctx);
+    }
+    report.findings = findings;
+    report.detectors = runs;
+    let snap = ctx.docker.fetched()?;
+    crate::account::attach_docker(report, &crate::docker::usage(&snap));
+    Some(snap)
+}
+
 /// Like [`run`], limited to the named detectors when `only` is given.
 pub fn run_with(
     tree: &ScanTree,

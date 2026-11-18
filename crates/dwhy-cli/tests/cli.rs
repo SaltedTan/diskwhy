@@ -211,8 +211,39 @@ fn exit_codes() {
     // Help and version are not errors.
     assert_eq!(dwhy(&["--help"]).status.code(), Some(0));
     assert_eq!(dwhy(&["--version"]).status.code(), Some(0));
-    // No TUI yet.
-    assert_eq!(dwhy(&[]).status.code(), Some(1));
+}
+
+#[test]
+fn tui_needs_a_terminal() {
+    // Bare `dwhy` and `dwhy tui` open the TUI; here stdin and stdout are not
+    // terminals, so both refuse and point to `dwhy scan`.
+    for args in [&[][..], &["tui", "."][..]] {
+        let out = dwhy(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("needs a terminal") && err.contains("dwhy scan"),
+            "{err}"
+        );
+        assert!(out.stdout.is_empty(), "no escape codes on a pipe");
+    }
+    // Paths go after `dwhy tui`, not bare `dwhy`.
+    let out = dwhy(&["."]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("unexpected argument '.'") || err.contains("unrecognized subcommand '.'"),
+        "{err}"
+    );
+    let out = dwhy(&["tui", "-x", "--cross-filesystems"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("cannot be used with")
+            && err.contains("--cross-filesystems")
+            && (err.contains("--one-file-system") || err.contains("'-x'")),
+        "{err}"
+    );
 }
 
 #[test]

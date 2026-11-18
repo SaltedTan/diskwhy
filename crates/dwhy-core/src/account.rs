@@ -300,6 +300,26 @@ fn mount_for_dev(mounts: &MountTable, dev: u64) -> Option<&Mount> {
     mounts.mounts.iter().rev().find(|m| m.dev() == dev)
 }
 
+/// The scan report for a finished walk on this system (host, uid, clock,
+/// users, deleted-open files, Docker access, `statvfs`), before detectors
+/// run. What `dwhy scan` and the TUI both start from.
+pub fn system_scan_report(result: &ScanResult, mounts: &MountTable) -> ScanReport {
+    let euid = crate::system::euid();
+    let env = ReportEnv {
+        host: crate::system::hostname(),
+        uid: euid,
+        root: euid == 0,
+        generated_at: crate::system::now_rfc3339(),
+        users: crate::system::users(),
+        deleted_open: crate::system::deleted_open_files(),
+        exe: std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "dwhy".into()),
+        docker_access: crate::doctor::docker_access(),
+    };
+    build_scan_report(result, mounts, &env, &|p| crate::mounts::statvfs(p).ok())
+}
+
 /// Builds the JSON report. Calls `statvfs` for each filesystem the scan touched.
 pub fn build_scan_report(
     result: &ScanResult,

@@ -29,9 +29,10 @@ crates/dwhy-core   engine: scan (walker), tree (the ScanTree detectors read: per
                    deepest-dir attribution; growth on findings)
                    explain (dwhy explain: id vs path, id → path through the snapshots, picking the finding at a path)
 crates/dwhy-cli    clap front end, text rendering (human.rs), exit codes; binary `dwhy`
+crates/dwhy-tui    ratatui + crossterm TUI (`dwhy`, `dwhy tui`): app state machine driven by key events, scan in a background thread, tree browser; calls dwhy-core directly
 ```
 
-Don't create empty crates for later milestones (`dwhy-tui`, `dwhy-mcp`); add them when that work starts.
+Don't create empty crates for later milestones (`dwhy-mcp`); add them when that work starts.
 
 ## Commands
 
@@ -62,6 +63,7 @@ Insta snapshots in `crates/*/tests/snapshots/` pin the shape. When a snapshot ch
 ## Tests
 
 - Use `tempfile` fixtures and assert behaviour through public APIs or the `dwhy` binary. Never assert on the text of source code.
+- TUI tests render with ratatui's TestBackend and pin 80×24 screens with insta; no pty.
 - Tests that rely on permissions (mode 000 dirs) skip themselves when running as root. Restore permissions in a `Drop` guard so temp dirs can be cleaned up.
 - Docker detector tests use the fixed snapshot in `crates/dwhy-core/tests/data/docker-system-df.json`; never depend on the machine's daemon. CLI tests that check findings pass `--detectors cargo-target` so local Docker state and the machine's own caches can't leak into snapshots. `user-cache` tests build a fake home and pass the environment through `UserCache::with_env`.
 - Mount tests read the real mount table (mounts under `/dev`) and skip when nothing is there. Don't mount anything.

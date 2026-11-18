@@ -404,6 +404,8 @@ pub fn scan(
                 is_dir: false,
                 name,
                 own,
+                directory_allocated: 0,
+                has_direct_files: false,
                 total: Totals::default(),
                 markers: Markers::empty(),
                 newest_mtime: mtime(&st),
@@ -551,10 +553,11 @@ fn walk_dir(
     name: Box<OsStr>,
 ) -> u32 {
     let dev = st.st_dev;
+    let directory_allocated = bytes(st);
     // Like GNU du (coreutils >= 9.2), a directory's st_size is not counted as
     // apparent size: it is filesystem-specific bookkeeping, not data.
     let mut own = Totals {
-        allocated: bytes(st),
+        allocated: directory_allocated,
         dirs: 1,
         ..Totals::default()
     };
@@ -572,7 +575,7 @@ fn walk_dir(
                     dev,
                     reason: UnreadableReason::PermissionDenied,
                     entries_unknown: 0,
-                    known_bytes: bytes(st),
+                    known_bytes: directory_allocated,
                     owner_uid: st.st_uid,
                 });
             } else if e != Errno::NOENT {
@@ -663,6 +666,7 @@ fn walk_dir(
     }
     sh.add_dev(dev, own);
     own += foreign;
+    let has_direct_files = own.files > 0 || own.symlinks > 0 || own.other > 0 || !linked.is_empty();
     sh.progress
         .allocated
         .fetch_add(own.allocated, Ordering::Relaxed);
@@ -673,6 +677,8 @@ fn walk_dir(
         is_dir: true,
         name,
         own,
+        directory_allocated,
+        has_direct_files,
         total: Totals::default(),
         markers,
         newest_mtime,
