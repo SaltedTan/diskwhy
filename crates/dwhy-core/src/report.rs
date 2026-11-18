@@ -696,7 +696,7 @@ pub struct SnapshotFinding {
 }
 
 // ---------------------------------------------------------------------------
-// Growth (M3): `dwhy diff`
+// Growth (M3): `dwhy diff` and `dwhy watch`
 // ---------------------------------------------------------------------------
 
 /// Output of `dwhy diff --json`: what changed between a saved snapshot and
@@ -819,7 +819,7 @@ pub struct WatchReport {
     /// Directories and Docker objects that changed by less than this many
     /// bytes are left out.
     pub min_change: u64,
-    /// `df` used per filesystem, whether it changed or not.
+    /// `df` used per filesystem present in both samples, whether it changed or not.
     pub fs: Vec<Rate>,
     /// Directories, each change attributed to the deepest directory that
     /// holds most of it, as in `diff`.

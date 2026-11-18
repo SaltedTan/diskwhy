@@ -375,7 +375,10 @@ pub fn diff(
 /// Growth over a `watch` window: `start` and `end` are snapshots of two
 /// walks of the same roots that record every directory (`min_dir_bytes`
 /// 0), taken `elapsed_ms` apart (from the start of one walk to the start
-/// of the next). Compared as in [`diff`], with rates in bytes per minute.
+/// of the next), with rates in bytes per minute. `unreadable` must include
+/// every unreadable or failed entry path from each walk: snapshots alone
+/// do not preserve this coverage information. Coverage exclusions follow
+/// the Watch decision in `docs/DESIGN.md`, in addition to [`diff`]'s rules.
 /// `notes` says nothing about Docker; the caller knows why it is missing.
 pub fn watch(
     start: &Snapshot,

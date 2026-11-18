@@ -44,7 +44,7 @@ pub fn default_dir() -> Option<PathBuf> {
 }
 
 /// Builds the snapshot of a finished scan. `docker` is the daemon's state
-/// when the Docker detectors fetched it.
+/// fetched for that scan, either by the Docker detectors or by `watch`.
 pub fn build(
     report: &ScanReport,
     tree: &ScanTree,
