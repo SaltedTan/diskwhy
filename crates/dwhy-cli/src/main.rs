@@ -16,7 +16,7 @@ use clap::{Args, Parser, Subcommand};
 use dwhy_core::account::{self, ReportEnv};
 use dwhy_core::apply::{self, Audit, Check, Policy};
 use dwhy_core::detect::{self, DetectContext};
-use dwhy_core::explain::{self, Place, Query};
+use dwhy_core::explain::{self, Place, Query, Walk};
 use dwhy_core::guard::Processes;
 use dwhy_core::mounts::{self, MountTable};
 use dwhy_core::plan::{self, Selection};
@@ -695,26 +695,59 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
             notes.push(format!("{} no longer exists", p.display()));
             (p.to_string_lossy().into_owned(), None)
         }
+        // The parent is walked, one level up on one filesystem, so detectors
+        // that recognise the path from its parent see it; the path itself
+        // when that cannot be done (explain::walk_for).
         Place::Path(p) => {
             let mounts = MountTable::read().unwrap_or_default();
-            let result = measure(
-                std::slice::from_ref(&p),
-                true,
-                u64::MAX,
-                args.threads,
-                args.quiet,
-                &mounts,
-            )?;
-            let root = result
-                .roots
-                .first()
-                .ok_or_else(|| format!("{}: nothing scanned", p.display()))?;
+            let abs = scan::prepare_roots(std::slice::from_ref(&p), true)?
+                .pop()
+                .ok_or_else(|| format!("{}: nothing to scan", p.display()))?;
+            let scan = |root: &PathBuf| {
+                measure(
+                    std::slice::from_ref(root),
+                    true,
+                    u64::MAX,
+                    args.threads,
+                    args.quiet,
+                    &mounts,
+                )
+            };
+            let mut walked = None;
+            match explain::walk_for(&abs, &mounts) {
+                Walk::Parent(parent) => {
+                    let result = scan(&parent)?;
+                    match result.tree.find(&abs) {
+                        Some(node) => {
+                            let n = result.tree.node(node);
+                            walked = Some((n.total, result.tree));
+                        }
+                        None => notes.push(format!(
+                            "{} was not in the scan of its parent {}: scanned it alone",
+                            abs.display(),
+                            parent.display()
+                        )),
+                    }
+                }
+                Walk::Itself(note) => notes.extend(note),
+            }
+            let (totals, tree) = match walked {
+                Some(w) => w,
+                None => {
+                    let result = scan(&abs)?;
+                    let root = result
+                        .roots
+                        .first()
+                        .ok_or_else(|| format!("{}: nothing scanned", p.display()))?;
+                    (root.totals, result.tree)
+                }
+            };
             size = Some(ExplainSize {
-                allocated: root.totals.allocated,
-                apparent: root.totals.apparent,
+                allocated: totals.allocated,
+                apparent: totals.apparent,
             });
-            let abs = root.path.to_string_lossy().into_owned();
-            (abs, Some((result.tree, args.detectors.clone())))
+            let abs = abs.to_string_lossy().into_owned();
+            (abs, Some((tree, args.detectors.clone())))
         }
     };
     let tree = examine.as_ref().map(|(t, _)| t);

@@ -1268,6 +1268,58 @@ fn explain_a_finding_by_path() {
 }
 
 #[test]
+fn explain_a_node_modules_dir_through_its_parent() {
+    // node-modules recognises node_modules from the project holding it, so
+    // explain finds it only by walking the parent.
+    let t = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    let web = root.join("web");
+    fs::create_dir_all(web.join("node_modules/left-pad")).unwrap();
+    fs::write(web.join("package.json"), r#"{"name":"web"}"#).unwrap();
+    fs::write(web.join("package-lock.json"), "{}").unwrap();
+    fs::write(
+        web.join("node_modules/left-pad/index.js"),
+        vec![1u8; 2 << 20],
+    )
+    .unwrap();
+    // A sibling outside the queried path is not listed.
+    fs::write(web.join("big.bin"), vec![1u8; 4 << 20]).unwrap();
+    let nm = web.join("node_modules").to_str().unwrap().to_string();
+    let state = tempfile::tempdir().unwrap();
+    let before = listing(&root);
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "explain",
+            &nm,
+            "--json",
+            "-q",
+            "--detectors",
+            "node-modules",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["path"], nm.as_str());
+    assert_eq!(v["notes"], serde_json::json!([]), "{v}");
+    let f = &v["finding"];
+    assert_eq!(f["detector"], "node-modules", "{v}");
+    assert_eq!(f["path"], nm.as_str());
+    assert_eq!(
+        f["id"],
+        dwhy_core::detect::finding_id("node-modules", &nm).as_str()
+    );
+    assert!(!f["guards"].as_array().unwrap().is_empty(), "{v}");
+    // The size is the node_modules dir's own, not its parent's.
+    let allocated = v["size"]["allocated"].as_u64().unwrap();
+    assert!((2 << 20..4 << 20).contains(&allocated), "{v}");
+    let apparent = v["size"]["apparent"].as_u64().unwrap();
+    assert!((2 << 20..3 << 20).contains(&apparent), "{v}");
+    assert_eq!(listing(&root), before, "explain writes nothing");
+    assert!(state_listing(state.path()).is_empty());
+}
+
+#[test]
 fn explain_a_path_no_detector_claims_lists_the_findings_inside() {
     let (_t, root) = cargo_fixture();
     let app = format!("{root}/app");

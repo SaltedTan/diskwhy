@@ -27,6 +27,7 @@ crates/dwhy-core   engine: scan (walker), tree (the ScanTree detectors read: per
                    snapshot (scan --snapshot: build, save gzip JSON under the state dir, list, prune, load),
                    growth (diff: compare snapshots; watch: rates over a short window;
                    deepest-dir attribution; growth on findings)
+                   explain (dwhy explain: id vs path, id → path through the snapshots, picking the finding at a path)
 crates/dwhy-cli    clap front end, text rendering (human.rs), exit codes; binary `dwhy`
 ```
 

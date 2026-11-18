@@ -1,10 +1,13 @@
 //! `dwhy explain` (docs/DESIGN.md, Explain): what the argument names, how
-//! a finding id becomes a path through the saved snapshots, and which
-//! finding of a rescan is the one explained. The CLI rescans, runs the
-//! detectors, the probes and the guards; nothing here writes.
+//! a finding id becomes a path through the saved snapshots, what is walked
+//! for a path, and which finding of the rescan is the one explained. The
+//! CLI rescans, runs the detectors, the probes and the guards; nothing here
+//! writes.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use crate::mounts::MountTable;
 use crate::report::{DetectorAvailability, DetectorRun, Finding, FindingRef};
 use crate::snapshot::{self, Found};
 
@@ -33,11 +36,16 @@ pub enum Place {
     Path(PathBuf),
 }
 
-/// Whether `arg` is taken as a finding id: anything starting with `f_`,
-/// which covers the format of [`crate::detect::finding_id`]. A file named
-/// `f_…` can still be explained as `./f_…`.
+/// Whether `arg` is taken as a finding id: exactly the format of
+/// [`crate::detect::finding_id`], `f_` and as many lowercase hex digits.
+/// Anything else is a path; a file named like an id can be given as `./f_…`.
 pub fn is_finding_id(arg: &str) -> bool {
-    arg.starts_with("f_")
+    let len = crate::detect::finding_id("", "").len();
+    arg.len() == len
+        && arg.strip_prefix("f_").is_some_and(|hex| {
+            hex.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
 }
 
 pub fn classify(arg: &str) -> Query {
@@ -54,6 +62,52 @@ pub fn place(path: &str) -> Place {
         Place::Docker(path.to_string())
     } else {
         Place::Path(PathBuf::from(path))
+    }
+}
+
+/// What explain walks for a filesystem path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Walk {
+    /// The path's parent directory, one level up, so that detectors which
+    /// recognise a directory from its parent (a `target/` next to its
+    /// `Cargo.toml`, a project's `node_modules`) see it.
+    Parent(PathBuf),
+    /// The path itself, with a note when that is because the parent could
+    /// not be used.
+    Itself(Option<String>),
+}
+
+/// Decides what to walk for `abs`, an absolute path whose parent is
+/// canonical (as [`crate::scan::prepare_roots`] makes it). The path itself
+/// when it is `/` or has no parent, is not a directory (no detector reports
+/// a file, and the parent's tree has no node for one), is a mount point
+/// (its parent is on another filesystem, or it is a bind mount, which the
+/// walk would not enter), or its parent cannot be opened.
+pub fn walk_for(abs: &Path, mounts: &MountTable) -> Walk {
+    let Ok(md) = std::fs::symlink_metadata(abs) else {
+        // The scan of the path reports the error.
+        return Walk::Itself(None);
+    };
+    let Some(parent) = abs.parent().filter(|_| md.is_dir()) else {
+        return Walk::Itself(None);
+    };
+    let alone = |why: String| {
+        Walk::Itself(Some(format!(
+            "{why}: scanned {} alone, so detectors that recognise it from its parent may miss it",
+            abs.display()
+        )))
+    };
+    let open = std::fs::symlink_metadata(parent).and_then(|pmd| {
+        std::fs::read_dir(parent)?;
+        Ok(pmd)
+    });
+    match open {
+        Ok(pmd) if pmd.dev() != md.dev() || mounts.at(abs).is_some() => alone(format!(
+            "{} is a mount point and its parent is another filesystem",
+            abs.display()
+        )),
+        Ok(_) => Walk::Parent(parent.to_path_buf()),
+        Err(e) => alone(format!("cannot open its parent {}: {e}", parent.display())),
     }
 }
 
@@ -236,9 +290,29 @@ mod tests {
     fn classifies_ids_pseudo_paths_and_paths() {
         let id = crate::detect::finding_id("cargo-target", "/p/target");
         assert_eq!(classify(&id), Query::Id(id.clone()));
-        // Anything starting with f_ is an id, even if it is not the format.
-        assert_eq!(classify("f_zz"), Query::Id("f_zz".into()));
+        assert_eq!(
+            classify("f_0123456789ab"),
+            Query::Id("f_0123456789ab".into())
+        );
         let path = |p: &str| Query::Place(Place::Path(p.into()));
+        // Only the exact format is an id: not shorter, longer, other
+        // digits or upper case.
+        for not_id in [
+            "f_x",
+            "f_zz",
+            "f_",
+            "f_0123456789a",
+            "f_0123456789abc",
+            "f_0123456789aG",
+            "f_0123456789AB",
+            "f_0123456789ab/",
+            "F_0123456789ab",
+        ] {
+            assert_eq!(classify(not_id), path(not_id), "{not_id}");
+        }
+        // A path named like an id inside a directory is a path.
+        assert_eq!(classify("dir/f_0123456789ab"), path("dir/f_0123456789ab"));
+        assert_eq!(classify("./f_0123456789ab"), path("./f_0123456789ab"));
         assert_eq!(
             classify("docker://volume/pg"),
             Query::Place(Place::Docker("docker://volume/pg".into()))
@@ -249,6 +323,63 @@ mod tests {
         assert_eq!(classify("F_abc"), path("F_abc"));
         // A path from a snapshot is never an id.
         assert_eq!(place("f_x"), Place::Path("f_x".into()));
+    }
+
+    #[test]
+    fn walks_the_parent_of_a_directory() {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let dir = root.join("app");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(root.join("file"), b"x").unwrap();
+        let mounts = MountTable::read().unwrap_or_default();
+        assert_eq!(walk_for(&dir, &mounts), Walk::Parent(root.clone()));
+        // A file, a missing path and / are walked themselves, with no note.
+        assert_eq!(walk_for(&root.join("file"), &mounts), Walk::Itself(None));
+        assert_eq!(walk_for(&root.join("nope"), &mounts), Walk::Itself(None));
+        assert_eq!(walk_for(Path::new("/"), &mounts), Walk::Itself(None));
+    }
+
+    #[test]
+    fn walks_a_mount_point_itself_with_a_note() {
+        let mounts = MountTable::read().unwrap_or_default();
+        let Some(m) = mounts.mounts.iter().find(|m| {
+            m.mount_point.starts_with("/dev/")
+                && std::fs::symlink_metadata(&m.mount_point).is_ok_and(|md| md.is_dir())
+        }) else {
+            return;
+        };
+        let Walk::Itself(Some(note)) = walk_for(&m.mount_point, &mounts) else {
+            panic!("{} is a mount point", m.mount_point.display());
+        };
+        assert!(note.contains("is a mount point"), "{note}");
+    }
+
+    #[test]
+    fn walks_the_path_itself_when_its_parent_cannot_be_opened() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::system::euid() == 0 {
+            return;
+        }
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let parent = root.join("locked");
+        std::fs::create_dir_all(parent.join("app")).unwrap();
+        // Searchable, not readable: the path can be statted, its parent not listed.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let _restore = Restore(parent.clone());
+        let Walk::Itself(Some(note)) =
+            walk_for(&parent.join("app"), &MountTable::read().unwrap_or_default())
+        else {
+            panic!("the parent cannot be opened");
+        };
+        assert!(note.contains("cannot open its parent"), "{note}");
     }
 
     #[test]
