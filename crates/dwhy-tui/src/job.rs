@@ -13,7 +13,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dwhy_core::account;
 use dwhy_core::detect::{self, DetectContext};
-use dwhy_core::explain::lossy_finding_paths;
 use dwhy_core::growth;
 use dwhy_core::guard::Processes;
 use dwhy_core::mounts::MountTable;
@@ -175,7 +174,6 @@ impl From<&Finding> for PlanMark {
 pub struct BuiltPlan {
     pub plan: Plan,
     pub unplanned: Vec<UnplannedMark>,
-    pub lossy_paths: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -246,7 +244,6 @@ impl PlanJob {
                 .collect::<Vec<_>>()
                 .join(" · "));
         }
-        let lossy_paths = lossy_finding_paths(&findings, &result.tree);
         let plan = plan::build(
             findings,
             &Selection { tier: None, select },
@@ -264,11 +261,7 @@ impl PlanJob {
                 detectors: opts.detectors,
             },
         )?;
-        Ok(BuiltPlan {
-            plan,
-            unplanned,
-            lossy_paths,
-        })
+        Ok(BuiltPlan { plan, unplanned })
     }
 }
 

@@ -256,10 +256,13 @@ fn compare(
     let in_scope = |path: &str| !path.starts_with('/') || both(path);
     let mut findings = Vec::new();
     let mut skipped: Vec<&str> = Vec::new();
+    let ambiguous_old = duplicate_finding_ids(old.findings.iter().map(|f| f.id.as_str()));
+    let ambiguous_new = duplicate_finding_ids(new.findings.iter().map(|f| f.id.as_str()));
+    let ambiguous = |id: &str| ambiguous_old.contains(id) || ambiguous_new.contains(id);
     let old_f: HashMap<&str, _> = old.findings.iter().map(|f| (f.id.as_str(), f)).collect();
     let new_f: HashMap<&str, _> = new.findings.iter().map(|f| (f.id.as_str(), f)).collect();
     for f in &old.findings {
-        if !in_scope(&f.path) {
+        if ambiguous(&f.id) || !in_scope(&f.path) {
             continue;
         }
         let after = match new_f.get(f.id.as_str()) {
@@ -276,7 +279,7 @@ fn compare(
         findings.push(c);
     }
     for f in &new.findings {
-        if old_f.contains_key(f.id.as_str()) || !in_scope(&f.path) {
+        if ambiguous(&f.id) || old_f.contains_key(f.id.as_str()) || !in_scope(&f.path) {
             continue;
         }
         if !ran_old.contains(f.detector.as_str()) {
@@ -632,7 +635,18 @@ pub fn deepest(dirs: Vec<Change>) -> Vec<Change> {
         .collect()
 }
 
-/// Sets `growth` on each finding `old` also has (matched by id). Returns
+fn duplicate_finding_ids<'a>(ids: impl Iterator<Item = &'a str>) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    let mut duplicates = HashSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            duplicates.insert(id.to_owned());
+        }
+    }
+    duplicates
+}
+
+/// Sets `growth` on each finding with a unique id in both scans. Returns
 /// whether the RFC 3339 timestamps define a positive interval, even when no
 /// findings match.
 pub fn fill_growth(findings: &mut [Finding], old: &Snapshot, now: &str) -> bool {
@@ -643,13 +657,17 @@ pub fn fill_growth(findings: &mut [Finding], old: &Snapshot, now: &str) -> bool 
     if elapsed <= 0 {
         return false;
     }
+    let ambiguous_before = duplicate_finding_ids(old.findings.iter().map(|f| f.id.as_str()));
+    let ambiguous_now = duplicate_finding_ids(findings.iter().map(|f| f.id.as_str()));
     let before: HashMap<&str, u64> = old
         .findings
         .iter()
         .map(|f| (f.id.as_str(), f.bytes))
         .collect();
     for f in findings {
-        if let Some(&b) = before.get(f.id.as_str()) {
+        if ambiguous_before.contains(&f.id) || ambiguous_now.contains(&f.id) {
+            f.growth = None;
+        } else if let Some(&b) = before.get(f.id.as_str()) {
             f.growth = Some(Growth {
                 bytes_per_day: per_day(delta(Some(b), Some(f.bytes)), elapsed),
                 since: old.created_at.clone(),

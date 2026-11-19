@@ -49,7 +49,7 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
-use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
+use crate::detect::{Candidate, DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
 use crate::report::{Action, ActionKind, Finding, Recovery, Tier};
 use crate::tree::{Markers, NodeId, ScanTree};
 use crate::units::human;
@@ -188,7 +188,11 @@ impl Detector for Venv {
         "venv"
     }
 
-    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
+    fn detect_candidates(
+        &self,
+        tree: &ScanTree,
+        ctx: &DetectContext,
+    ) -> Result<Vec<Candidate>, String> {
         let mut out = Vec::new();
         // A root inside a venv belongs to that venv: nothing below it counts.
         let mut stack: Vec<NodeId> = tree
@@ -278,7 +282,7 @@ fn runner_env(venv: &Path) -> Option<&'static str> {
 }
 
 impl Venv {
-    fn finding(&self, tree: &ScanTree, ctx: &DetectContext, id: NodeId) -> Option<Finding> {
+    fn finding(&self, tree: &ScanTree, ctx: &DetectContext, id: NodeId) -> Option<Candidate> {
         let n = tree.node(id);
         let bytes = n.freeable();
         if bytes < MIN_BYTES {
@@ -366,7 +370,7 @@ impl Venv {
             age(ctx.now, n.newest_mtime)
         ));
 
-        Some(Finding {
+        let finding = Finding {
             id: finding_id(self.name(), &path_s),
             detector: self.name().into(),
             probe: None,
@@ -385,7 +389,8 @@ impl Venv {
             },
             recovery,
             path: path_s,
-        })
+        };
+        Some(Candidate::new(path, finding))
     }
 }
 

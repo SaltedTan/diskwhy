@@ -14,8 +14,8 @@ use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection};
 use dwhy_core::remove::remove_tree;
 use dwhy_core::report::{
-    Action, ActionKind, ApplyOutcome, AuditEvent, AuditRecord, DockerSocket, Finding, Plan,
-    PlanScan, Recovery, Tier, ToolStatus,
+    Action, ActionKind, ApplyOutcome, AuditEvent, AuditRecord, DockerSocket, Finding, GuardResult,
+    GuardStatus, Plan, PlanScan, Recovery, Tier, ToolStatus,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::tree::ScanTree;
@@ -728,6 +728,17 @@ fn a_lossy_path_or_command_is_never_applied() {
     // A fresh finding that names a lossy path, as if a detector had
     // slipped past `detect::block_lossy`, matching its plan item.
     let mut fresh = found.clone();
+    let guard = GuardResult {
+        name: "locked".into(),
+        status: GuardStatus::Block,
+        detail: "locked after planning".into(),
+    };
+    fresh
+        .iter_mut()
+        .find(|f| f.detector == "user-cache")
+        .unwrap()
+        .guards
+        .push(guard.clone());
     for f in fresh
         .iter_mut()
         .chain(plan.items.iter_mut().map(|i| &mut i.finding))
@@ -754,7 +765,10 @@ fn a_lossy_path_or_command_is_never_applied() {
             "{}",
             c.item.detail
         );
-        assert_eq!(c.item.guards[0].name, "path-not-utf8");
+        assert_eq!(c.item.guards.last().unwrap().name, "path-not-utf8");
+        if d == "user-cache" {
+            assert!(c.item.guards.contains(&guard));
+        }
     }
     let stale = checks
         .iter()
@@ -792,5 +806,12 @@ fn a_lossy_path_or_command_is_never_applied() {
         checks[0].item.detail
     );
     assert!(!marker.exists());
+    assert!(
+        checks[0]
+            .item
+            .guards
+            .iter()
+            .any(|g| g.name == "path-not-utf8")
+    );
     assert!(b.join("scratch/file").exists());
 }

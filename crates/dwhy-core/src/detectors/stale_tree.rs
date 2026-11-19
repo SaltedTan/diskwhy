@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
+use crate::detect::{Candidate, DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
 use crate::report::{Action, ActionKind, Finding, Recovery, Tier};
 use crate::tree::{Markers, NodeId, ScanTree};
 use crate::units::human;
@@ -63,7 +63,11 @@ impl Detector for StaleTree {
         "stale-tree"
     }
 
-    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
+    fn detect_candidates(
+        &self,
+        tree: &ScanTree,
+        ctx: &DetectContext,
+    ) -> Result<Vec<Candidate>, String> {
         let mut locations: BTreeMap<NodeId, Origin> = BTreeMap::new();
         for id in tree.ids() {
             let n = tree.node(id);
@@ -105,7 +109,7 @@ impl StaleTree {
         id: NodeId,
         location: Option<NodeId>,
         origin: Origin,
-    ) -> Option<Finding> {
+    ) -> Option<Candidate> {
         let n = tree.node(id);
         let bytes = n.freeable();
         if bytes < MIN_BYTES {
@@ -140,7 +144,7 @@ impl StaleTree {
             "); scratch counts as stale after {SCRATCH_STALE_DAYS} days"
         ));
 
-        Some(Finding {
+        let finding = Finding {
             id: finding_id(self.name(), &path_s),
             detector: self.name().into(),
             probe: None,
@@ -162,7 +166,8 @@ impl StaleTree {
                 how: None,
             },
             path: path_s,
-        })
+        };
+        Some(Candidate::new(path, finding))
     }
 }
 

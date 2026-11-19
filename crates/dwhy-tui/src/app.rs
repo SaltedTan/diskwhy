@@ -140,7 +140,6 @@ pub struct PlanView {
     uid: u32,
     /// The file it was opened from (`dwhy tui --plan`); `None` when built here.
     pub file: Option<PathBuf>,
-    pub(crate) lossy_paths: HashSet<String>,
     pub(crate) unplanned: Vec<UnplannedMark>,
     pub(crate) lines: Option<(usize, Vec<Line<'static>>)>,
     /// First line on screen.
@@ -191,7 +190,7 @@ impl App {
 
     /// `dwhy tui --plan FILE`: previews `plan`, read from `file`.
     pub fn open_plan(plan: Plan, file: PathBuf, host: &str, uid: u32) -> App {
-        let mut view = PlanView::new(plan, host, uid, HashSet::new(), Vec::new());
+        let mut view = PlanView::new(plan, host, uid, Vec::new());
         view.file = Some(file);
         App {
             roots: Vec::new(),
@@ -225,12 +224,8 @@ impl App {
             return;
         }
         match result {
-            Ok(BuiltPlan {
-                plan,
-                unplanned,
-                lossy_paths,
-            }) => {
-                let view = PlanView::new(plan, host, uid, lossy_paths, unplanned);
+            Ok(BuiltPlan { plan, unplanned }) => {
+                let view = PlanView::new(plan, host, uid, unplanned);
                 b.plan = PlanState::Ready(Box::new(view));
             }
             Err(e) => {
@@ -632,19 +627,12 @@ enum Effect {
 }
 
 impl PlanView {
-    fn new(
-        plan: Plan,
-        host: &str,
-        uid: u32,
-        lossy_paths: HashSet<String>,
-        unplanned: Vec<UnplannedMark>,
-    ) -> PlanView {
+    fn new(plan: Plan, host: &str, uid: u32, unplanned: Vec<UnplannedMark>) -> PlanView {
         PlanView {
             plan,
             host: host.into(),
             uid,
             file: None,
-            lossy_paths,
             unplanned,
             lines: None,
             scroll: 0,

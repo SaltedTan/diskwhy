@@ -583,12 +583,9 @@ fn own_bytes(f: &Finding) -> u64 {
 fn reclaimable(findings: &[&Finding]) -> (String, String) {
     let advice = findings
         .iter()
-        .filter(|f| f.action.kind == ActionKind::Advice)
+        .filter(|f| f.tier != Tier::Blocked && f.action.kind == ActionKind::Advice)
         .count();
-    let blocked = findings
-        .iter()
-        .filter(|f| f.action.kind != ActionKind::Advice && f.tier == Tier::Blocked)
-        .count();
+    let blocked = findings.iter().filter(|f| f.tier == Tier::Blocked).count();
     let bytes: u64 = findings
         .iter()
         .filter(|f| f.action.kind != ActionKind::Advice && f.tier != Tier::Blocked)

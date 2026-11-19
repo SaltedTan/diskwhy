@@ -2142,6 +2142,15 @@ fn scan_json_blocks_a_finding_whose_path_is_not_utf8() {
     normalize(&mut v, &root);
     insta::assert_json_snapshot!(v);
 
+    let out = dwhy_in(
+        state.path(),
+        &["scan", &root, "-q", "--detectors", "cargo-target"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let rendered = String::from_utf8(out.stdout).unwrap();
+    assert!(rendered.contains("; 1 blocked, not counted"), "{rendered}");
+    assert!(!rendered.contains("in use, not counted"), "{rendered}");
+
     // `plan --select` refuses it: it has advice only, nothing to apply.
     let id = dwhy_core::detect::finding_id("cargo-target", &lossy);
     let out = dwhy_in(
@@ -2247,4 +2256,53 @@ fn apply_never_runs_a_lossy_path_or_command() {
         !state.path().join("diskwhy/audit.jsonl").exists(),
         "dry runs write nothing"
     );
+}
+
+#[test]
+fn apply_refuses_a_plan_with_a_lossy_scan_root() {
+    let (_t, root) = cargo_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let plan = state.path().join("p.json");
+    let file = plan.to_str().unwrap();
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "plan",
+            &root,
+            "-q",
+            "--detectors",
+            "cargo-target",
+            "--tier",
+            "rebuildable",
+            "-o",
+            file,
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let mut saved: Value = serde_json::from_slice(&fs::read(&plan).unwrap()).unwrap();
+    let lossy = format!("{root}/app�");
+    saved["scan"]["roots"] = serde_json::json!([root, lossy]);
+    fs::write(&plan, serde_json::to_vec(&saved).unwrap()).unwrap();
+    for mode in ["--dry-run", "--yes"] {
+        let out = dwhy_in(
+            state.path(),
+            &[
+                "apply",
+                file,
+                mode,
+                "--max-tier",
+                "rebuildable",
+                "--json",
+                "-q",
+            ],
+        );
+        assert_eq!(out.status.code(), Some(3), "{out:?}");
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!("dwhy: refused: plan root {lossy} is not valid UTF-8; nothing applied\n")
+        );
+        assert!(out.stdout.is_empty());
+    }
+    assert!(Path::new(&root).join("app/target/debug/app").exists());
+    assert!(!state.path().join("diskwhy/audit.jsonl").exists());
 }

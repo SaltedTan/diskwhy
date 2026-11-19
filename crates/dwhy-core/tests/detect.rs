@@ -230,7 +230,7 @@ fn nested_target_dirs_yield_only_the_outermost() {
     let tree = scan_tree(&root);
     let raw = CargoTarget.detect(&tree, &ctx(Some("cargo"))).unwrap();
     assert_eq!(raw.len(), 2);
-    let kept = detect::outermost(raw);
+    let (kept, _) = detect::run_with(&tree, &ctx(Some("cargo")), &[Box::new(CargoTarget)], None);
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].path, outer.to_str().unwrap());
 }
@@ -430,4 +430,38 @@ fn a_cargo_project_under_a_non_utf8_name_is_blocked() {
         };
         assert_eq!(good.action.kind, kind);
     }
+}
+
+#[test]
+fn lossy_path_aliases_do_not_nest() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let t = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    let lossy = root.join(OsStr::from_bytes(b"app\xff"));
+    if !create_non_utf8(&lossy) {
+        return;
+    }
+    let outer = cargo_crate(&lossy, "target", 20, Some(CARGO_TAG));
+    let sibling = cargo_crate(&root.join("app�"), "target", 40, Some(CARGO_TAG));
+    let child = cargo_crate(&outer.join("pkg"), "target", 2, Some(CARGO_TAG));
+    let tree = scan_tree(&root);
+    let bytes = |path: &Path| tree.node(tree.find(path).unwrap()).freeable();
+    let (found, _) = detect::run_with(&tree, &ctx(Some("cargo")), &[Box::new(CargoTarget)], None);
+    assert_eq!(found.len(), 3, "{found:?}");
+    assert_eq!(found[0].id, found[1].id);
+    assert_eq!(found[0].path, found[1].path);
+    assert_eq!(
+        (found[0].bytes, found[0].nested_bytes),
+        (bytes(&sibling), None)
+    );
+    assert_eq!(
+        (found[1].bytes, found[1].nested_bytes),
+        (bytes(&outer), Some(bytes(&child)))
+    );
+    assert_eq!(
+        (found[2].bytes, found[2].nested_bytes),
+        (bytes(&child), None)
+    );
 }

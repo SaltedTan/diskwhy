@@ -8,7 +8,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::Ordering;
 
 use dwhy_core::apply::{action_kind_name, guard_status_name, tier_name};
-use dwhy_core::detect::rfc3339;
+use dwhy_core::detect::{PATH_NOT_UTF8_RECOVERY_NOTE, is_lossy, rfc3339};
 use dwhy_core::plan;
 use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{ActionKind, Finding, FsReport, GuardStatus};
@@ -394,7 +394,7 @@ fn plan_lines(v: &PlanView, width: usize) -> Vec<Line<'static>> {
 
     for item in &p.items {
         let f = &item.finding;
-        let lossy = v.lossy_paths.contains(&f.path);
+        let lossy = is_lossy(&f.path);
         push(&mut out, "");
         let header = format!(
             "{:<TIER_W$} {:>8}  {}",
@@ -425,6 +425,12 @@ fn plan_lines(v: &PlanView, width: usize) -> Vec<Line<'static>> {
             f.action.kind != ActionKind::Advice,
             width,
         ));
+        if f.recovery.how.as_deref() == Some(PATH_NOT_UTF8_RECOVERY_NOTE) {
+            push(
+                &mut out,
+                &format!("  recovery: {PATH_NOT_UTF8_RECOVERY_NOTE}"),
+            );
+        }
         push(&mut out, "  guards:");
         for g in &f.guards {
             push(
@@ -451,6 +457,15 @@ fn plan_lines(v: &PlanView, width: usize) -> Vec<Line<'static>> {
                 &format!("  {:>8}  {}  {}", human(f.bytes), f.detector, f.path),
             );
             push(&mut out, &format!("            {}", f.id));
+            if f.action.kind == ActionKind::Advice {
+                push(&mut out, &format!("            {}", f.action.text));
+            }
+            if f.recovery.how.as_deref() == Some(PATH_NOT_UTF8_RECOVERY_NOTE) {
+                push(
+                    &mut out,
+                    &format!("            recovery: {PATH_NOT_UTF8_RECOVERY_NOTE}"),
+                );
+            }
             let mut blocks = f
                 .guards
                 .iter()
@@ -834,7 +849,9 @@ fn command_lines(
     is_command: bool,
     width: usize,
 ) -> impl Iterator<Item = Line<'static>> {
-    let withheld = if text.contains(char::REPLACEMENT_CHARACTER) {
+    let withheld = if !is_command {
+        None
+    } else if is_lossy(text) {
         Some(
             "command withheld: it names a path that is not valid UTF-8 and cannot be shown exactly",
         )
@@ -925,7 +942,13 @@ fn detail_lines(f: &Finding, lossy: bool, base: Option<&str>, width: usize) -> V
     out.extend(render("recovery:"));
     out.extend(render(&format!("  cost: {}", f.recovery.cost)));
     if let Some(how) = &f.recovery.how {
-        out.extend(command_lines("  how:  ", how, lossy, true, width));
+        out.extend(command_lines(
+            "  how:  ",
+            how,
+            lossy,
+            how != PATH_NOT_UTF8_RECOVERY_NOTE,
+            width,
+        ));
     }
     if let Some(first) = out.first_mut() {
         *first = std::mem::take(first).style(bold);

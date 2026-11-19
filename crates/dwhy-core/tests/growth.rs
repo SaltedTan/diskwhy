@@ -595,6 +595,54 @@ fn findings_get_growth_from_an_older_snapshot_by_id() {
     assert_eq!(findings[0].growth, None);
 }
 
+#[test]
+fn lossy_finding_ids_are_omitted_when_ambiguous_on_either_side() {
+    let alias = "f_app�";
+    let exact = "f_exact";
+    let before = "2026-11-14T00:00:00Z";
+    let after = "2026-11-15T00:00:00Z";
+    for (old_count, new_count) in [(2, 2), (1, 2), (2, 1), (2, 0), (0, 2)] {
+        let mut old = snap(before, &["/h"], &["cargo-target"]);
+        let mut new = snap(after, &["/h"], &["cargo-target"]);
+        for (snapshot, count, size) in [(&mut old, old_count, 20), (&mut new, new_count, 30)] {
+            snapshot
+                .findings
+                .push(sfinding(exact, "cargo-target", "/h/f_exact", size * M));
+            for n in 0..count {
+                snapshot.findings.push(sfinding(
+                    alias,
+                    "cargo-target",
+                    "/h/app�/target",
+                    (size + 20 * n) * M,
+                ));
+            }
+        }
+        let d = growth::diff(&old, None, "old.json".into(), &new, &no_tree, 1);
+        assert_eq!(
+            rows(&d.findings),
+            [(
+                "/h/f_exact",
+                Some(20 * M),
+                Some(30 * M),
+                10 * M as i64,
+                false
+            )]
+        );
+
+        let mut findings: Vec<_> = new
+            .findings
+            .iter()
+            .map(|f| finding(&f.id, f.bytes))
+            .collect();
+        assert!(growth::fill_growth(&mut findings, &old, after));
+        assert_eq!(
+            findings[0].growth.as_ref().unwrap().bytes_per_day,
+            10 * M as i64
+        );
+        assert!(findings[1..].iter().all(|f| f.growth.is_none()));
+    }
+}
+
 /// A `watch` end: every directory recorded (no threshold).
 fn sample(created_at: &str, list: &[(&str, u64)], used: u64) -> Snapshot {
     let mut s = snap(created_at, &["/h"], &[]);

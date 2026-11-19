@@ -4,7 +4,7 @@
 //! items by id, and decides each one.
 //!
 //! An item is
-//! - skipped (exit 2) when its path or action, in the plan or detected
+//! - skipped (exit 2) when its path or argv, in the plan or detected
 //!   now, holds U+FFFD (a path that is not valid UTF-8, checked again right
 //!   before it runs), it is no longer detected, a detector or guard blocks
 //!   it now, its tier or action differs from the plan's, or its fingerprint
@@ -26,12 +26,12 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::detect::{DetectContext, PATH_NOT_UTF8, is_lossy, lossy_detail};
+use crate::detect::{DetectContext, PATH_NOT_UTF8, add_lossy_guard, lossy_argv, lossy_detail};
 use crate::guard::{self, Processes};
 use crate::mounts::MountTable;
 use crate::report::{
-    ActionKind, ApplyItem, ApplyOutcome, ApplyReport, AuditEvent, AuditRecord, Finding,
-    GuardResult, GuardStatus, Plan, PlanItem, SCHEMA, Tier, Tool,
+    Action, ActionKind, ApplyItem, ApplyOutcome, ApplyReport, AuditEvent, AuditRecord, Finding,
+    GuardStatus, Plan, PlanItem, SCHEMA, Tier, Tool,
 };
 use crate::tree::ScanTree;
 
@@ -184,17 +184,18 @@ fn decide(
     };
     // Backstop for `detect::block_lossy`: never act on a path or command
     // spelled with U+FFFD, whether the plan file or the fresh finding has it.
-    if let Some(detail) = lossy(planned).or_else(|| fresh.and_then(lossy)) {
+    if let Some(detail) = lossy(&planned.path, &planned.action)
+        .or_else(|| fresh.and_then(|f| lossy(&f.path, &f.action)))
+    {
         let mut c = base(
             fresh.unwrap_or(planned),
             ApplyOutcome::Skipped,
             format!("blocked by {PATH_NOT_UTF8}: {detail}"),
         );
-        c.item.guards = vec![GuardResult {
-            name: PATH_NOT_UTF8.into(),
-            status: GuardStatus::Block,
-            detail,
-        }];
+        if let Some(f) = fresh {
+            c.item.guards.clone_from(&f.guards);
+        }
+        add_lossy_guard(&mut c.item.guards, detail);
         return c;
     }
     let Some(f) = fresh else {
@@ -239,13 +240,8 @@ fn decide(
     base(f, ApplyOutcome::WouldRemove, "ready".into())
 }
 
-/// Why `f`'s path or action cannot be acted on exactly, when either holds
-/// U+FFFD.
-fn lossy(f: &Finding) -> Option<String> {
-    let path = is_lossy(&f.path);
-    let action = f.action.argv.iter().flatten().any(|a| is_lossy(a)) || is_lossy(&f.action.text);
-    (path || action)
-        .then(|| lossy_detail(f).unwrap_or_else(|| "a path it names is not valid UTF-8".into()))
+fn lossy(path: &str, action: &Action) -> Option<String> {
+    lossy_detail(path, lossy_argv(action), false)
 }
 
 /// The blocking guards of `f`, as "name: detail; …".
@@ -403,16 +399,12 @@ pub fn execute(
     }
 }
 
-fn run(c: &Check, mounts: &MountTable) -> (ApplyOutcome, String) {
-    let item = &c.item;
-    if is_lossy(&item.path)
-        || item.action.argv.iter().flatten().any(|a| is_lossy(a))
-        || is_lossy(&item.action.text)
-    {
-        return (
-            ApplyOutcome::Skipped,
-            format!("blocked by {PATH_NOT_UTF8}: a path it names is not valid UTF-8; not run"),
-        );
+fn run(c: &mut Check, mounts: &MountTable) -> (ApplyOutcome, String) {
+    let item = &mut c.item;
+    if let Some(detail) = lossy(&item.path, &item.action) {
+        let outcome = format!("blocked by {PATH_NOT_UTF8}: {detail}; not run");
+        add_lossy_guard(&mut item.guards, detail);
+        return (ApplyOutcome::Skipped, outcome);
     }
     if item.path.starts_with('/') && std::fs::symlink_metadata(&item.path).is_err() {
         return (

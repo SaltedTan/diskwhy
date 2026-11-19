@@ -178,7 +178,31 @@ pub trait Detector: Send + Sync {
     /// Must match a [`CATALOG`] entry.
     fn name(&self) -> &'static str;
     /// An `Err` is reported in the run's `error` and yields no findings.
-    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String>;
+    fn detect_candidates(
+        &self,
+        tree: &ScanTree,
+        ctx: &DetectContext,
+    ) -> Result<Vec<Candidate>, String>;
+
+    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
+        self.detect_candidates(tree, ctx)
+            .map(|found| found.into_iter().map(|c| c.finding).collect())
+    }
+}
+
+pub struct Candidate {
+    path: PathBuf,
+    pub finding: Finding,
+}
+
+impl Candidate {
+    pub fn new(path: PathBuf, finding: Finding) -> Self {
+        Self { path, finding }
+    }
+
+    pub(crate) fn reported(finding: Finding) -> Self {
+        Self::new(PathBuf::from(&finding.path), finding)
+    }
 }
 
 /// Stable across runs and machines: `f_` + 12 hex digits of FNV-1a over
@@ -215,19 +239,22 @@ pub const PATH_NOT_UTF8: &str = "path-not-utf8";
 pub const PATH_NOT_UTF8_ADVICE: &str =
     "rename the path that is not valid UTF-8 to valid UTF-8 and scan again, or remove it by hand";
 
+pub const PATH_NOT_UTF8_RECOVERY_NOTE: &str =
+    "by hand: the command names a path that is not valid UTF-8, so it is not shown";
+
 /// Whether `s` holds U+FFFD, the stand-in `to_string_lossy` puts in place
 /// of bytes that are not valid UTF-8.
 pub fn is_lossy(s: &str) -> bool {
     s.contains(char::REPLACEMENT_CHARACTER)
 }
 
-/// Why diskwhy cannot act on `f` exactly: which of its path, action
-/// (argv or text) and recovery (command or cost) hold U+FFFD, as the
-/// `path-not-utf8` guard's detail. `None` when none does.
-pub fn lossy_detail(f: &Finding) -> Option<String> {
-    let action = f.action.argv.iter().flatten().any(|a| is_lossy(a)) || is_lossy(&f.action.text);
-    let recovery = f.recovery.how.as_deref().is_some_and(is_lossy) || is_lossy(&f.recovery.cost);
-    let what = if is_lossy(&f.path) {
+pub(crate) fn lossy_argv(action: &Action) -> bool {
+    action.argv.iter().flatten().any(|arg| is_lossy(arg))
+}
+
+/// Why diskwhy cannot act on a path, action or recovery that holds U+FFFD.
+pub(crate) fn lossy_detail(path: &str, action: bool, recovery: bool) -> Option<String> {
+    let what = if is_lossy(path) {
         "the path is not valid UTF-8 (shown with U+FFFD)"
     } else {
         match (action, recovery) {
@@ -244,44 +271,42 @@ pub fn lossy_detail(f: &Finding) -> Option<String> {
     Some(format!("{what}; diskwhy cannot act on it exactly"))
 }
 
+pub(crate) fn add_lossy_guard(guards: &mut Vec<GuardResult>, detail: impl Into<String>) {
+    if !guards.iter().any(|g| g.name == PATH_NOT_UTF8) {
+        guards.push(GuardResult {
+            name: PATH_NOT_UTF8.into(),
+            status: GuardStatus::Block,
+            detail: detail.into(),
+        });
+    }
+}
+
 /// Blocks every finding whose path, action or recovery holds U+FFFD: a
 /// command or path built from a lossy spelling can name a different, real
 /// path. The finding keeps its id, path, bytes and detector, so the space
 /// is still accounted for; its tier becomes `blocked`, it gets a
 /// `path-not-utf8` guard, its action becomes advice with no argv, and a
-/// recovery command or cost that holds U+FFFD is replaced by a note. A
+/// recovery command that holds U+FFFD is replaced by a note. A
 /// real name that holds U+FFFD is blocked too: diskwhy cannot tell it from
 /// a lossy one. Idempotent. Run on every detection result, before the
 /// nesting rule, so a blocked finding keeps the findings inside it.
 pub fn block_lossy(findings: &mut [Finding]) {
     for f in findings {
-        let Some(detail) = lossy_detail(f) else {
+        let action = lossy_argv(&f.action) || is_lossy(&f.action.text);
+        let recovery_command = f.recovery.how.as_deref().is_some_and(is_lossy);
+        let recovery = recovery_command || is_lossy(&f.recovery.cost);
+        let Some(detail) = lossy_detail(&f.path, action, recovery) else {
             continue;
         };
         f.tier = Tier::Blocked;
-        f.guards.retain(|g| g.name != PATH_NOT_UTF8);
-        f.guards.push(GuardResult {
-            name: PATH_NOT_UTF8.into(),
-            status: GuardStatus::Block,
-            detail,
-        });
+        add_lossy_guard(&mut f.guards, detail);
         f.action = Action {
             kind: ActionKind::Advice,
             text: PATH_NOT_UTF8_ADVICE.into(),
             argv: None,
         };
-        if f.recovery.how.as_deref().is_some_and(is_lossy) {
-            f.recovery.how = Some(
-                "by hand: the command names a path that is not valid UTF-8, so it is not shown"
-                    .into(),
-            );
-        }
-        if is_lossy(&f.recovery.cost) {
-            f.recovery.cost = "not shown: it names a path that is not valid UTF-8".into();
-        }
-        const NOTE: &str = "; a path it names is not valid UTF-8, so not offered";
-        if !f.reason.ends_with(NOTE) {
-            f.reason.push_str(NOTE);
+        if recovery_command {
+            f.recovery.how = Some(PATH_NOT_UTF8_RECOVERY_NOTE.into());
         }
     }
 }
@@ -294,31 +319,34 @@ pub fn block_lossy(findings: &mut [Finding]) {
 /// findings at the same path the cheaper tier is the outer one.
 /// Pseudo-paths such as `docker://...` never nest. Returns the survivors,
 /// largest first.
-pub fn outermost(mut findings: Vec<Finding>) -> Vec<Finding> {
+pub(crate) fn outermost(findings: Vec<Finding>) -> Vec<Finding> {
+    outermost_candidates(findings.into_iter().map(Candidate::reported).collect())
+}
+
+fn outermost_candidates(mut findings: Vec<Candidate>) -> Vec<Finding> {
     findings.sort_by(|a, b| {
-        Path::new(&a.path)
-            .cmp(Path::new(&b.path))
-            .then_with(|| a.tier.cmp(&b.tier))
-            .then_with(|| a.detector.cmp(&b.detector))
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.finding.tier.cmp(&b.finding.tier))
+            .then_with(|| a.finding.detector.cmp(&b.finding.detector))
     });
-    let mut kept: Vec<Finding> = Vec::new();
+    let mut kept: Vec<Candidate> = Vec::new();
     let mut nested: Vec<(u64, usize)> = Vec::new();
     let mut chain: Vec<usize> = Vec::new();
     for f in findings {
-        if f.path.starts_with('/') {
-            let p = Path::new(&f.path);
+        if f.path.is_absolute() {
             while chain
                 .last()
-                .is_some_and(|&i| !p.starts_with(Path::new(&kept[i].path)))
+                .is_some_and(|&i| !f.path.starts_with(&kept[i].path))
             {
                 chain.pop();
             }
             if let Some(&outer) = chain.last() {
-                let t = kept[outer].tier;
-                if f.tier >= t && t != Tier::Blocked {
+                let t = kept[outer].finding.tier;
+                if f.finding.tier >= t && t != Tier::Blocked {
                     continue;
                 }
-                nested[outer].0 += f.bytes;
+                nested[outer].0 += f.finding.bytes;
                 nested[outer].1 += 1;
             }
             chain.push(kept.len());
@@ -326,16 +354,17 @@ pub fn outermost(mut findings: Vec<Finding>) -> Vec<Finding> {
         kept.push(f);
         nested.push((0, 0));
     }
-    for (f, (bytes, n)) in kept.iter_mut().zip(nested) {
+    for (c, (bytes, n)) in kept.iter_mut().zip(nested) {
         if n > 0 {
-            f.nested_bytes = Some(bytes);
-            f.reason.push_str(&format!(
+            c.finding.nested_bytes = Some(bytes);
+            c.finding.reason.push_str(&format!(
                 "; {} of it is in {n} finding{} inside it, reported separately",
                 crate::units::human(bytes),
                 if n == 1 { "" } else { "s" }
             ));
         }
     }
+    let mut kept: Vec<_> = kept.into_iter().map(|c| c.finding).collect();
     kept.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.id.cmp(&b.id)));
     kept
 }
@@ -404,7 +433,7 @@ pub fn run_with(
     only: Option<&[String]>,
 ) -> (Vec<Finding>, Vec<DetectorRun>) {
     let (findings, runs) = run_candidates(tree, ctx, built, only);
-    (outermost(findings), runs)
+    (outermost_candidates(findings), runs)
 }
 
 /// Runs the detectors (all, or `only`) and returns every finding, before
@@ -415,7 +444,7 @@ pub fn run_candidates(
     ctx: &DetectContext,
     built: &[Box<dyn Detector>],
     only: Option<&[String]>,
-) -> (Vec<Finding>, Vec<DetectorRun>) {
+) -> (Vec<Candidate>, Vec<DetectorRun>) {
     let mut all = Vec::new();
     let mut runs = Vec::new();
     for info in CATALOG {
@@ -442,7 +471,7 @@ pub fn run_candidates(
             Some(_) if status == DetectorAvailability::Unavailable => {}
             Some(d) => {
                 let start = Instant::now();
-                let result = d.detect(tree, ctx);
+                let result = d.detect_candidates(tree, ctx);
                 run.ran = true;
                 run.elapsed_ms = start.elapsed().as_millis() as u64;
                 match result {
@@ -456,7 +485,9 @@ pub fn run_candidates(
         }
         runs.push(run);
     }
-    block_lossy(&mut all);
+    for c in &mut all {
+        block_lossy(std::slice::from_mut(&mut c.finding));
+    }
     (all, runs)
 }
 
@@ -732,6 +763,17 @@ mod tests {
                 f.recovery.how = Some("cd /w/v\u{FFFD} && uv sync".into());
                 f
             },
+            {
+                let mut f = ft("venv", "/w/cost/.venv", 5, Tier::Regenerable);
+                f.recovery.cost = "choose the lockfile under /w/v\u{FFFD}".into();
+                f
+            },
+            {
+                let mut f = ft("venv", "/w/text/.venv", 5, Tier::Regenerable);
+                f.recovery.cost = "choose the lockfile under /w/v\u{FFFD}".into();
+                f.action.text = "remove /w/v\u{FFFD}".into();
+                f
+            },
             // Valid UTF-8 that is not ASCII stays actionable.
             cmd(
                 "cargo-target",
@@ -743,7 +785,7 @@ mod tests {
         ];
         let before = found.clone();
         block_lossy(&mut found);
-        for (f, was) in found.iter().zip(&before).take(3) {
+        for (f, was) in found.iter().zip(&before).take(5) {
             assert_eq!(f.tier, Tier::Blocked, "{f:?}");
             assert_eq!((&f.id, &f.path, f.bytes), (&was.id, &was.path, was.bytes));
             assert_eq!(f.detector, was.detector);
@@ -758,7 +800,8 @@ mod tests {
                 .map(|g| (g.name.as_str(), g.status))
                 .collect();
             assert_eq!(g, [(PATH_NOT_UTF8, GuardStatus::Block)]);
-            assert!(f.reason.ends_with("so not offered"), "{}", f.reason);
+            assert_eq!(f.reason, was.reason);
+            assert_eq!(f.recovery.cost, was.recovery.cost);
         }
         assert_eq!(
             found[0].guards[0].detail,
@@ -770,7 +813,13 @@ mod tests {
              diskwhy cannot act on it exactly"
         );
         assert!(found[2].guards[0].detail.starts_with("the recovery names"));
-        assert_eq!(found[3], before[3], "café is valid UTF-8");
+        assert!(found[3].guards[0].detail.starts_with("the recovery names"));
+        assert!(
+            found[4].guards[0]
+                .detail
+                .starts_with("the action and recovery name")
+        );
+        assert_eq!(found[5], before[5], "café is valid UTF-8");
 
         // Running it again changes nothing.
         let once = found.clone();
