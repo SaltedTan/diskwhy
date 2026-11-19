@@ -62,7 +62,7 @@ pub enum View {
     Tree,
     /// The findings list.
     Findings,
-    /// One finding, what `dwhy explain` shows for it.
+    /// One finding from the scan, in `dwhy explain` field order.
     Detail,
 }
 

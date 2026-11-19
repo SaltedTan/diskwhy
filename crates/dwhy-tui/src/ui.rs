@@ -306,8 +306,7 @@ const GROWTH_W: usize = 9;
 /// Width of the tier column: `rebuildable`.
 const TIER_W: usize = 11;
 
-/// One row per finding shown: tier, size, growth, detector, path. The path
-/// is shortened to fit; the figures never are.
+/// Reserves room for the path before adding the detector and growth columns.
 fn draw_findings(
     f: &mut Frame,
     l: &mut FindingList,
@@ -552,9 +551,8 @@ fn command_lines(
     lines.into_iter().map(Line::raw)
 }
 
-/// What `dwhy explain` shows for a finding, in the same order, wrapped to
-/// `width`. Guards are the ones the scan recorded; growth comes from the
-/// scan's base snapshot (`base`, its `created_at`).
+/// Wraps a scan finding in `dwhy explain` field order. `base` is the
+/// scan's growth snapshot timestamp, when available.
 fn detail_lines(f: &Finding, lossy: bool, base: Option<&str>, width: usize) -> Vec<Line<'static>> {
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let mut out: Vec<Line<'static>> = Vec::new();

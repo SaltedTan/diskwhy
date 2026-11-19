@@ -632,8 +632,9 @@ pub fn deepest(dirs: Vec<Change>) -> Vec<Change> {
         .collect()
 }
 
-/// Sets `growth` on each finding `old` also has (matched by id), measured
-/// from `old` to `now` (RFC 3339). Returns whether the interval is valid.
+/// Sets `growth` on each finding `old` also has (matched by id). Returns
+/// whether the RFC 3339 timestamps define a positive interval, even when no
+/// findings match.
 pub fn fill_growth(findings: &mut [Finding], old: &Snapshot, now: &str) -> bool {
     let (Some(t_now), Some(t_old)) = (parse_time(now), parse_time(&old.created_at)) else {
         return false;
@@ -658,12 +659,11 @@ pub fn fill_growth(findings: &mut [Finding], old: &Snapshot, now: &str) -> bool 
     true
 }
 
-/// Puts growth on a scan report's findings, as `dwhy scan` and the TUI do:
-/// from the newest snapshot in `dir` of the same roots (and the same
-/// one-filesystem setting) that is at least [`MIN_AGE_SECS`] old at `now`
-/// (seconds since the epoch). Best effort and read-only: without such a
-/// snapshot, findings have no growth. Returns the `created_at` of the
-/// snapshot used.
+/// Uses [`snapshot::find`] to select the growth baseline for a scan report,
+/// matching its host, uid, roots and one-filesystem setting. The baseline
+/// must be at least [`MIN_AGE_SECS`] old at `now` (seconds since the epoch).
+/// Returns the baseline's `created_at` when the interval is usable. This
+/// lookup is read-only and leaves the report alone when no baseline is usable.
 pub fn fill_scan_growth(report: &mut ScanReport, dir: &Path, now: i64) -> Option<String> {
     if report.findings.is_empty() {
         return None;
