@@ -5,8 +5,11 @@
 //! The UI is a state machine ([`app::App`]) fed key events and scan messages; [`ui::draw`]
 //! renders it, so tests use ratatui's `TestBackend` and no terminal.
 //!
-//! M4a: the tree browser. M4b: the findings list and detail view. Nothing
-//! is written or removed.
+//! M4a: the tree browser. M4b: the findings list and detail view. M4c:
+//! marking findings, the plan preview (built with core `plan::build` on a
+//! worker thread, as `dwhy plan` builds it) and plan files: `w` writes one,
+//! [`run_plan`] opens one. A plan file the person asks for is the only
+//! thing the TUI writes; nothing is removed.
 
 pub mod app;
 pub mod job;
@@ -14,6 +17,7 @@ pub mod ui;
 
 use std::io::{self, IsTerminal};
 use std::panic;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -22,7 +26,10 @@ use std::time::Duration;
 use crossterm::event::{self, Event};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
+use dwhy_core::guard::Processes;
+use dwhy_core::report::Plan;
 use dwhy_core::scan::Progress;
+use dwhy_core::system;
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use signal_hook::SigId;
@@ -41,21 +48,55 @@ enum Msg {
     Done(Result<Box<Scanned>, String>),
 }
 
+/// A finished plan build: its number, the host it was built for, the plan.
+type Built = (u64, String, Result<Plan, String>);
+
 /// Opens the TUI: checks there is a terminal, scans `opts` in a background
 /// thread, and browses the result until the person quits.
 pub fn run(opts: Options) -> Result<u8, Error> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Err(
-            "the TUI needs a terminal (stdin and stdout); use `dwhy scan` (or `dwhy scan --json`) instead"
-                .into(),
-        );
-    }
+    need_terminal()?;
     let signal = Termination::register()?;
     let result = run_terminal(opts, &signal);
     match signal.exit_code() {
         Some(code) => Ok(code),
         None => result.map(|()| 0),
     }
+}
+
+/// `dwhy tui --plan FILE`: reads and parses the plan (failing before the
+/// terminal is touched), then previews it with no scan.
+pub fn run_plan(file: &Path) -> Result<u8, Error> {
+    let plan = job::read_plan(file)?;
+    need_terminal()?;
+    let signal = Termination::register()?;
+    let mut app = App::open_plan(
+        plan,
+        file.to_path_buf(),
+        &system::hostname(),
+        system::euid(),
+        job::now(),
+    );
+    let result = (|| -> Result<(), Error> {
+        let _guard = TerminalGuard::enter()?;
+        let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        term.clear()?;
+        let (_tx, rx) = mpsc::channel();
+        event_loop(&mut term, &mut app, &rx, &signal, event::poll, event::read)
+    })();
+    match signal.exit_code() {
+        Some(code) => Ok(code),
+        None => result.map(|()| 0),
+    }
+}
+
+fn need_terminal() -> Result<(), Error> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(
+            "the TUI needs a terminal (stdin and stdout); use `dwhy scan` (or `dwhy scan --json`) instead"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn run_terminal(opts: Options, signal: &Termination) -> Result<(), Error> {
@@ -99,6 +140,7 @@ fn event_loop<B: Backend>(
 where
     B::Error: 'static,
 {
+    let (built_tx, built_rx) = mpsc::channel::<Built>();
     while signal.exit_code().is_none() {
         term.draw(|f| ui::draw(f, app))?;
         let ready = poll(TICK)?;
@@ -111,6 +153,20 @@ where
         {
             return Ok(());
         }
+        if let Some(req) = app.take_request() {
+            let tx = built_tx.clone();
+            // Guards read /proc and run git. Not joined, like the scan.
+            std::thread::Builder::new()
+                .name("dwhy-tui-plan".into())
+                .spawn(move || {
+                    let host = system::hostname();
+                    let plan = req.job.build(&Processes::read(), host.clone());
+                    let _ = tx.send((req.build, host, plan));
+                })?;
+        }
+        while let Ok((build, host, plan)) = built_rx.try_recv() {
+            app.plan_built(build, plan, &host, job::now());
+        }
         loop {
             match rx.try_recv() {
                 Ok(Msg::Stage(s)) => app.set_stage(s),
@@ -118,7 +174,7 @@ where
                 Ok(Msg::Done(Err(e))) => return Err(format!("scan failed: {e}").into()),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    if app.browser().is_none() {
+                    if matches!(app.state, app::State::Scanning { .. }) {
                         return Err("the scan stopped unexpectedly".into());
                     }
                     break;

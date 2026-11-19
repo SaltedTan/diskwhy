@@ -1,25 +1,26 @@
 //! Drawing the app. Laid out to stay legible at 80×24: one title line, a
 //! line per filesystem (at most three, tree view only), the list, a status
-//! line, key help.
+//! line, key help. A status message replaces the status line, or the key
+//! help while the `w` prompt is open.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::Ordering;
 
 use dwhy_core::apply::{action_kind_name, guard_status_name, tier_name};
 use dwhy_core::probes::postgres_wal;
-use dwhy_core::report::{ActionKind, Finding, FsReport};
+use dwhy_core::report::{ActionKind, Finding, FsReport, GuardStatus};
 use dwhy_core::units::{human, signed, thousands};
 use ratatui::Frame;
 use ratatui::buffer::CellWidth;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Browser, FindingList, SizeMode, State, View, sanitize};
+use crate::app::{App, Browser, FindingList, PlanState, PlanView, SizeMode, State, View, sanitize};
 use crate::job::{Mark, PermissionMark, Scanned, Stage};
 
 /// Filesystem lines shown before "… N more".
@@ -31,6 +32,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let fs_lines = match &app.state {
         State::Scanning { .. } => 1,
+        State::Plan(_) => 0,
         State::Browsing(b) if b.view != View::Tree || b.fs_offset.is_some() => 0,
         State::Browsing(b) => b.data.report.fs.len().clamp(1, MAX_FS_LINES),
     };
@@ -54,6 +56,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let width = area.width as usize;
     let dim = Style::new().add_modifier(Modifier::DIM);
     let bold = Style::new().add_modifier(Modifier::BOLD);
+    let prompt_open = app.plan_view().is_some_and(|v| v.prompt.is_some());
+    let areas = PlanAreas {
+        title,
+        list,
+        status,
+        keys,
+    };
 
     match &mut app.state {
         State::Scanning { progress, stage } => {
@@ -83,13 +92,50 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(Span::styled(msg, bold)), status);
             f.render_widget(Paragraph::new(Span::styled(" q quit", dim)), keys);
         }
+        State::Plan(view) => {
+            app.viewport = draw_plan(f, view, &areas, " ↑↓ PgUp PgDn scroll · q quit");
+        }
+        State::Browsing(b) if b.view == View::Plan => match &mut b.plan {
+            PlanState::Ready(view) => {
+                let help =
+                    " ↑↓ PgUp PgDn scroll · w write plan file · Esc back · Tab tree · q quit";
+                app.viewport = draw_plan(f, view, &areas, help);
+            }
+            PlanState::Building(_) | PlanState::None => {
+                f.render_widget(title_line("plan", "", width), title);
+                let n = b.marked.len();
+                let lines = vec![
+                    Line::raw(""),
+                    Line::raw(format!(
+                        "  Building the plan from {n} marked finding{}: running the guards…",
+                        if n == 1 { "" } else { "s" }
+                    )),
+                    Line::raw(""),
+                    Line::styled("  Nothing is written or removed.", dim),
+                ];
+                f.render_widget(Paragraph::new(lines), list);
+                f.render_widget(
+                    Paragraph::new(Span::styled(" checking guards…", bold)),
+                    status,
+                );
+                let help = " Esc back to findings · q quit";
+                f.render_widget(Paragraph::new(Span::styled(help, dim)), keys);
+            }
+        },
         State::Browsing(b) if b.view == View::Findings => {
             let filter = b.findings.filter.map_or("all tiers", tier_name);
-            let count = format!(
+            let mut count = format!(
                 "{filter} · {}/{}",
                 b.findings.shown.len(),
                 b.data.report.findings.len()
             );
+            if !b.marked.is_empty() {
+                count.push_str(&format!(
+                    " · {} marked {}",
+                    b.marked.len(),
+                    human(b.marked_bytes())
+                ));
+            }
             let failed: Vec<_> = b
                 .data
                 .report
@@ -98,10 +144,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 .filter_map(|d| d.error.as_deref().map(|e| (d.name.as_str(), e)))
                 .collect();
             f.render_widget(title_line("findings", &count, width), title);
-            app.viewport =
-                draw_findings(f, &mut b.findings, &b.data, list, &failed, &b.lossy_paths);
+            let marks = Marks {
+                lossy: &b.lossy_paths,
+                marked: &b.marked,
+            };
+            app.viewport = draw_findings(f, &mut b.findings, &b.data, list, &failed, marks);
             f.render_widget(Paragraph::new(findings_status(b, &failed, width)), status);
-            let help = " ↑↓ PgUp PgDn · Enter details · t tier filter · Tab tree · q quit";
+            let help =
+                " ↑↓ · Enter details · Space mark · p plan · t tier filter · Tab tree · q quit";
             f.render_widget(Paragraph::new(Span::styled(help, dim)), keys);
         }
         State::Browsing(b) if b.view == View::Detail => {
@@ -180,6 +230,229 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(Span::styled(help, dim)), keys);
         }
     }
+    if let Some(msg) = &app.message {
+        let at = if prompt_open { keys } else { status };
+        let text = middle_units(display_units(&format!(" {msg}")), width);
+        f.render_widget(Clear, at);
+        f.render_widget(Paragraph::new(Span::styled(text, bold)), at);
+    }
+}
+
+struct PlanAreas {
+    title: Rect,
+    list: Rect,
+    status: Rect,
+    keys: Rect,
+}
+
+/// The plan preview: a banner when `dwhy apply` would refuse the plan, the
+/// plan's lines (scrollable), and the status line or the `w` prompt.
+/// Returns the lines on screen.
+fn draw_plan(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, help: &str) -> usize {
+    let width = a.title.width as usize;
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let p = &v.plan;
+    let right = format!(
+        "{} item{} · {}",
+        p.items.len(),
+        if p.items.len() == 1 { "" } else { "s" },
+        human(p.bytes)
+    );
+    let place = match &v.file {
+        Some(file) => format!("plan {}", file.to_string_lossy()),
+        None => "plan preview".into(),
+    };
+    f.render_widget(
+        title_with(&right, width, |room| {
+            middle_units(display_units(&place), room)
+        }),
+        a.title,
+    );
+    let banner: Vec<Line> = match &v.unusable {
+        Some(why) => wrap(&format!(" NOT USABLE: {why}"), width)
+            .into_iter()
+            .map(|l| {
+                let pad = width.saturating_sub(grapheme_width(&l));
+                Line::raw(format!("{l}{}", " ".repeat(pad)))
+                    .style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD))
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let banner_h = banner.len().min((a.list.height as usize).saturating_sub(1)) as u16;
+    let [banner_area, body] =
+        Layout::vertical([Constraint::Length(banner_h), Constraint::Min(0)]).areas(a.list);
+    f.render_widget(Paragraph::new(banner), banner_area);
+
+    let lines = plan_lines(v, width);
+    let height = body.height as usize;
+    v.scroll = v.scroll.min(lines.len().saturating_sub(height.max(1)));
+    let end = (v.scroll + height).min(lines.len());
+    let status = format!(" lines {}–{end} of {}", v.scroll + 1, lines.len());
+    let shown: Vec<Line> = lines.into_iter().skip(v.scroll).take(height).collect();
+    f.render_widget(Paragraph::new(shown), body);
+
+    match &v.prompt {
+        Some(prompt) if prompt.confirm => {
+            let path = middle_units(display_units(&prompt.path), width.saturating_sub(30));
+            f.render_widget(
+                Paragraph::new(format!(" {path} exists; overwrite? y/n")),
+                a.status,
+            );
+            let keys = " y overwrite · n choose another name";
+            f.render_widget(Paragraph::new(Span::styled(keys, dim)), a.keys);
+        }
+        Some(prompt) => {
+            const LABEL: &str = " write plan to: ";
+            let room = width.saturating_sub(LABEL.len() + 1);
+            // Keep the end in sight: it is where the typing goes.
+            let units: Vec<_> = display_units(&prompt.path).collect();
+            let mut used = 0;
+            let start = units
+                .iter()
+                .rposition(|u| {
+                    used += grapheme_width(u);
+                    used > room
+                })
+                .map_or(0, |i| i + 1);
+            let path: String = units[start..].concat();
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(LABEL),
+                    Span::raw(path),
+                    Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
+                ])),
+                a.status,
+            );
+            let keys = " Enter write · Esc cancel · Backspace delete · Ctrl-U clear";
+            f.render_widget(Paragraph::new(Span::styled(keys, dim)), a.keys);
+        }
+        None => {
+            f.render_widget(Paragraph::new(status), a.status);
+            f.render_widget(Paragraph::new(Span::styled(help, dim)), a.keys);
+        }
+    }
+    height
+}
+
+/// The plan in `dwhy plan`'s order: a summary, the items by size with
+/// their actions and every guard result, then the blocked findings with
+/// what blocked them.
+fn plan_lines(v: &PlanView, width: usize) -> Vec<Line<'static>> {
+    let p = &v.plan;
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let push = |out: &mut Vec<Line<'static>>, s: &str| {
+        out.extend(wrap(s, width).into_iter().map(Line::raw));
+    };
+    let blocked = match p.blocked.len() {
+        0 => String::new(),
+        n => format!(", {n} blocked"),
+    };
+    let summary = if p.items.is_empty() {
+        format!("nothing to remove{blocked}")
+    } else {
+        format!(
+            "{} item{}, frees {}{blocked}",
+            p.items.len(),
+            if p.items.len() == 1 { "" } else { "s" },
+            human(p.bytes)
+        )
+    };
+    out.push(Line::styled(
+        middle(&summary, width),
+        Style::new().add_modifier(Modifier::BOLD),
+    ));
+    push(
+        &mut out,
+        &format!("  created {} · expires {}", p.created_at, p.expires_at),
+    );
+    push(&mut out, &format!("  host {} · uid {}", p.host, p.uid));
+    for root in &p.scan.roots {
+        push(&mut out, &format!("  root {root}"));
+    }
+    let detectors = p
+        .scan
+        .detectors
+        .as_ref()
+        .map_or("all".into(), |d| d.join(", "));
+    push(&mut out, &format!("  detectors: {detectors}"));
+
+    for item in &p.items {
+        let f = &item.finding;
+        let lossy = v.lossy_paths.contains(&f.path);
+        push(&mut out, "");
+        let header = format!(
+            "{:<TIER_W$} {:>8}  {}",
+            tier_name(f.tier),
+            human(f.bytes),
+            f.path
+        );
+        let first = out.len();
+        push(&mut out, &header);
+        for line in &mut out[first..] {
+            *line = std::mem::take(line).style(Style::new().add_modifier(Modifier::BOLD));
+        }
+        push(&mut out, &format!("  {} · {}", f.id, f.detector));
+        if lossy {
+            push(
+                &mut out,
+                "  path is not valid UTF-8; shown approximately — do not copy",
+            );
+        }
+        push(
+            &mut out,
+            &format!("  action ({}):", action_kind_name(f.action.kind)),
+        );
+        out.extend(command_lines(
+            "    ",
+            &f.action.text,
+            lossy,
+            f.action.kind != ActionKind::Advice,
+            width,
+        ));
+        push(&mut out, "  guards:");
+        for g in &f.guards {
+            push(
+                &mut out,
+                &format!(
+                    "    {:<5}  {:<20} {}",
+                    guard_status_name(g.status),
+                    g.name,
+                    g.detail
+                ),
+            );
+        }
+    }
+
+    if !p.blocked.is_empty() {
+        push(&mut out, "");
+        push(
+            &mut out,
+            &format!("blocked, not in the plan ({}):", p.blocked.len()),
+        );
+        for f in &p.blocked {
+            push(
+                &mut out,
+                &format!("  {:>8}  {}  {}", human(f.bytes), f.detector, f.path),
+            );
+            push(&mut out, &format!("            {}", f.id));
+            let mut blocks = f
+                .guards
+                .iter()
+                .filter(|g| g.status == GuardStatus::Block)
+                .peekable();
+            if blocks.peek().is_none() {
+                push(&mut out, &format!("            {}", f.reason));
+            }
+            for g in blocks {
+                push(
+                    &mut out,
+                    &format!("            blocked by {}: {}", g.name, g.detail),
+                );
+            }
+        }
+    }
+    out
 }
 
 /// ` dwhy  <place>` on the left, `<right>` on the right.
@@ -303,8 +576,18 @@ fn draw_list(f: &mut Frame, b: &mut Browser, area: Rect) {
 
 /// Width of the growth column: `+999.9M/d`.
 const GROWTH_W: usize = 9;
+/// Per-row marks in the findings list.
+struct Marks<'a> {
+    /// Paths that may have been converted from invalid UTF-8.
+    lossy: &'a HashSet<String>,
+    /// Marked findings, as indices into the report's findings.
+    marked: &'a BTreeSet<usize>,
+}
+
 /// Width of the tier column: `rebuildable`.
 const TIER_W: usize = 11;
+/// Width of the row marker: selected `>`, marked `*`, approximate path `!`.
+const MARKER_W: usize = 3;
 
 /// Reserves room for the path before adding the detector and growth columns.
 fn draw_findings(
@@ -313,9 +596,13 @@ fn draw_findings(
     data: &Scanned,
     area: Rect,
     failed: &[(&str, &str)],
-    lossy_paths: &HashSet<String>,
+    marks: Marks,
 ) -> usize {
     const MIN_PATH_W: usize = 12;
+    let Marks {
+        lossy: lossy_paths,
+        marked,
+    } = marks;
     let width = area.width as usize;
     let height = area.height as usize;
     let all = &data.report.findings;
@@ -355,7 +642,7 @@ fn draw_findings(
     } else {
         ("  ", TIER_W, 7)
     };
-    let required_w = 2 + tier_w + size_w + 2 * gap.len();
+    let required_w = MARKER_W + tier_w + size_w + 2 * gap.len();
     if width < required_w + "path".len() {
         let msg = middle("  Widen to view findings", width);
         f.render_widget(Paragraph::new(msg), area);
@@ -381,7 +668,7 @@ fn draw_findings(
         }
         cols
     };
-    let header = columns("  ", "tier", "size", "growth", "detector");
+    let header = columns("   ", "tier", "size", "growth", "detector");
     let path_w = width - header.width();
     let mut lines = vec![Line::styled(
         format!("{header}path"),
@@ -401,15 +688,20 @@ fn draw_findings(
             Some(g) => format!("{}/d", signed(g.bytes_per_day)),
             None => "–".into(),
         };
-        let marker = match (sel, lossy_paths.contains(&finding.path)) {
-            (true, true) => ">!",
-            (true, false) => "> ",
-            (false, true) => " !",
-            (false, false) => "  ",
-        };
+        let marker: String = [
+            if sel { '>' } else { ' ' },
+            if marked.contains(&i) { '*' } else { ' ' },
+            if lossy_paths.contains(&finding.path) {
+                '!'
+            } else {
+                ' '
+            },
+        ]
+        .into_iter()
+        .collect();
         let mut line = Line::from(vec![
             Span::raw(columns(
-                marker,
+                &marker,
                 tier_name(finding.tier),
                 &human(finding.bytes),
                 &growth,

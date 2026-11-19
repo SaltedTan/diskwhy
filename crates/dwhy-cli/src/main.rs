@@ -61,7 +61,8 @@ enum Command {
     Watch(WatchArgs),
     /// Explain one finding, by id or path: evidence, guards, growth, action and recovery cost.
     Explain(ExplainArgs),
-    /// Open the TUI (what bare `dwhy` does on the current directory): browse sizes; writes nothing.
+    /// Open the TUI (what bare `dwhy` does on the current directory): browse sizes and findings,
+    /// mark findings and preview their plan; writes only a plan file you ask for.
     Tui(TuiArgs),
     /// Show permissions, optional tools on PATH, and which detectors they enable.
     Doctor {
@@ -123,6 +124,13 @@ struct TuiArgs {
     /// Descend into other filesystems mounted below the roots (never into proc, sysfs, ...).
     #[arg(long, conflicts_with = "one_file_system")]
     cross_filesystems: bool,
+    /// Preview a plan file written by `dwhy plan -o` instead of scanning (it names its own roots).
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["paths", "one_file_system", "cross_filesystems"]
+    )]
+    plan: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -324,6 +332,7 @@ fn main() -> ExitCode {
             paths: Vec::new(),
             one_file_system: false,
             cross_filesystems: false,
+            plan: None,
         }),
     };
     match res {
@@ -338,13 +347,16 @@ fn main() -> ExitCode {
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn run_tui(args: TuiArgs) -> Result<u8> {
-    dwhy_tui::run(dwhy_tui::Options {
-        paths: args.paths,
-        cross_filesystems: args.cross_filesystems,
-        detectors: None,
-        threads: 0,
-        snapshot_dir: snapshot::default_dir(),
-    })
+    match &args.plan {
+        Some(file) => dwhy_tui::run_plan(file),
+        None => dwhy_tui::run(dwhy_tui::Options {
+            paths: args.paths,
+            cross_filesystems: args.cross_filesystems,
+            detectors: None,
+            threads: 0,
+            snapshot_dir: snapshot::default_dir(),
+        }),
+    }
     .map_err(|e| {
         let mut message = String::new();
         for c in e.to_string().chars() {
@@ -934,8 +946,7 @@ fn run_plan(args: PlanArgs) -> Result<u8> {
     drop(status);
     let plan = plan?;
     if let Some(path) = &args.output {
-        let mut text = serde_json::to_string_pretty(&plan)?;
-        text.push('\n');
+        let text = plan::to_json(&plan)?;
         std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     }
     let mut out = std::io::stdout().lock();

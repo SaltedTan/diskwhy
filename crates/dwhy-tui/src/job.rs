@@ -1,16 +1,24 @@
 //! The scan the TUI runs: the same pipeline as `dwhy scan` (roots, walk,
 //! filesystems and unaccounted space, detectors, probes, growth on
-//! findings), with no snapshot saved.
+//! findings), with no snapshot saved. Also the plan work: building a plan
+//! from marked findings as `dwhy plan --select` does, reading a plan file,
+//! and writing one.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dwhy_core::account;
-use dwhy_core::detect;
+use dwhy_core::detect::{self, DetectContext};
 use dwhy_core::growth;
+use dwhy_core::guard::Processes;
 use dwhy_core::mounts::MountTable;
-use dwhy_core::report::{ScanReport, UnreadableReason};
+use dwhy_core::plan::{self, Selection};
+use dwhy_core::probes;
+use dwhy_core::report::{Finding, Plan, PlanScan, ScanReport, UnreadableReason};
 use dwhy_core::scan::{self, Progress, ScanOptions, ScanResult};
 use dwhy_core::tree::{NodeId, ScanTree};
 
@@ -77,12 +85,25 @@ pub struct Mark {
 #[derive(Debug, Clone)]
 pub struct Scanned {
     pub report: ScanReport,
-    pub tree: ScanTree,
+    /// Shared with a plan build on its worker thread.
+    pub tree: Arc<ScanTree>,
     /// Directories whose contents are not fully counted.
     pub marks: HashMap<NodeId, Mark>,
     /// `created_at` of the snapshot the findings' growth was measured from;
     /// `None` when there was none to measure from.
     pub growth_base: Option<String>,
+    /// What a plan is built from, as `dwhy plan` would on the same scan.
+    pub plan: PlanSource,
+}
+
+/// What `plan::build` needs from the scan: the findings as `dwhy plan`
+/// sees them (from the detectors, before probes and growth), the detector
+/// context (its `now` is the plan's creation time), and the roots.
+#[derive(Debug, Clone)]
+pub struct PlanSource {
+    pub findings: Vec<Finding>,
+    pub ctx: DetectContext,
+    pub scan: PlanScan,
 }
 
 /// Runs the whole scan on this thread, reporting each stage to `stage`.
@@ -108,21 +129,137 @@ pub fn scan(
     let mut report = account::system_scan_report(&result, &mounts);
 
     stage(Stage::Detecting);
-    detect::detect_into(&mut report, &result.tree, opts.detectors.as_deref(), true);
-    let growth_base = opts.snapshot_dir.as_deref().and_then(|dir| {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
-        growth::fill_scan_growth(&mut report, dir, now)
-    });
+    let ctx = DetectContext::from_system();
+    let only = opts.detectors.as_deref();
+    detect::detect_into_with(&mut report, &result.tree, &ctx, only, false);
+    // `dwhy plan` runs no probes and measures no growth.
+    let plan = PlanSource {
+        findings: report.findings.clone(),
+        scan: PlanScan {
+            roots: result
+                .roots
+                .iter()
+                .map(|r| r.path.to_string_lossy().into_owned())
+                .collect(),
+            one_filesystem: one_fs,
+            detectors: opts.detectors.clone(),
+        },
+        ctx,
+    };
+    probes::run(&mut report.findings, &plan.ctx);
+    let growth_base = opts
+        .snapshot_dir
+        .as_deref()
+        .and_then(|dir| growth::fill_scan_growth(&mut report, dir, now()));
 
     let marks = coverage_marks(&result);
     Ok(Scanned {
         report,
-        tree: result.tree,
+        tree: Arc::new(result.tree),
         marks,
         growth_base,
+        plan,
     })
+}
+
+/// A plan to build off the UI thread.
+#[derive(Debug, Clone)]
+pub struct PlanJob {
+    pub source: PlanSource,
+    pub tree: Arc<ScanTree>,
+    /// The marked findings' ids.
+    pub select: Vec<String>,
+}
+
+impl PlanJob {
+    /// Builds the plan as `dwhy plan --select <ids>` does: no tier ceiling,
+    /// guards run on the selection with `procs`, fingerprints and expiry.
+    pub fn build(&self, procs: &Processes, host: String) -> Result<Plan, String> {
+        let sel = Selection {
+            tier: None,
+            select: self.select.clone(),
+        };
+        plan::build(
+            self.source.findings.clone(),
+            &sel,
+            &self.tree,
+            &self.source.ctx,
+            procs,
+            host,
+            self.source.scan.clone(),
+        )
+    }
+}
+
+/// Reads and parses a plan file, as `dwhy apply` does.
+pub fn read_plan(path: &Path) -> Result<Plan, String> {
+    let text =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    plan::parse(&text)
+}
+
+/// What is at the path a plan is about to be written to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// Nothing: the plan can be written.
+    Free,
+    /// A regular file: ask before overwriting it.
+    File,
+    /// A symlink or something else that is not a regular file.
+    Refused(String),
+}
+
+pub fn target(path: &Path) -> io::Result<Target> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Target::Free),
+        Err(e) => Err(e),
+        Ok(md) if md.file_type().is_symlink() => Ok(Target::Refused("it is a symlink".into())),
+        Ok(md) if !md.is_file() => Ok(Target::Refused("it is not a regular file".into())),
+        Ok(_) => Ok(Target::File),
+    }
+}
+
+/// Writes `plan` to `path` exactly as `dwhy plan -o` does, never through a
+/// symlink. Without `overwrite` the file must not exist (`O_CREAT|O_EXCL`,
+/// which does not follow a symlink either). With it, the plan goes to a new
+/// file in the same directory that is then renamed over `path`: the rename
+/// replaces the directory entry, so a symlink put there meanwhile is
+/// replaced, not followed.
+pub fn write_plan(path: &Path, plan: &Plan, overwrite: bool) -> io::Result<()> {
+    let text = plan::to_json(plan)?;
+    if !overwrite {
+        return write_new(path, &text);
+    }
+    if let Target::Refused(why) = target(path)? {
+        return Err(io::Error::other(why));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("no file name"))?;
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(name);
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    write_new(&tmp, &text)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
+fn write_new(path: &Path, text: &str) -> io::Result<()> {
+    let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
+    f.write_all(text.as_bytes())
+        .and_then(|()| f.sync_all())
+        .inspect_err(|_| {
+            let _ = fs::remove_file(path);
+        })
+}
+
+/// Seconds since the epoch.
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 fn coverage_marks(result: &ScanResult) -> HashMap<NodeId, Mark> {
@@ -214,8 +351,17 @@ mod tests {
         app.finish(Scanned {
             report: account::system_scan_report(&result, &mounts),
             marks: coverage_marks(&result),
-            tree: result.tree,
+            tree: Arc::new(result.tree),
             growth_base: None,
+            plan: PlanSource {
+                findings: Vec::new(),
+                ctx: DetectContext::from_system(),
+                scan: PlanScan {
+                    roots: Vec::new(),
+                    one_filesystem: true,
+                    detectors: None,
+                },
+            },
         });
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let mut screen = |app: &mut App| {
