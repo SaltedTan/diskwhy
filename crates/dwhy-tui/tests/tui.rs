@@ -1244,9 +1244,7 @@ fn finding_paths_and_commands_escape_controls() {
         "{detail}"
     );
     assert_eq!(
-        detail
-            .matches("(contains control characters, shown escaped)")
-            .count(),
+        detail.matches("preview — do not copy").count(),
         2,
         "{detail}"
     );
@@ -1260,10 +1258,80 @@ fn finding_paths_and_commands_escape_controls() {
         detail.contains(r"cd '/p/repo\\nx' && cargo build"),
         "{detail}"
     );
-    assert!(
-        detail.contains("(contains backslashes, shown escaped)"),
+    assert_eq!(
+        detail.matches("preview — do not copy").count(),
+        2,
         "{detail}"
     );
+}
+
+#[test]
+fn wrapped_action_and_recovery_are_previews() {
+    let path = format!("/p/{}", "project".repeat(9));
+    let mut finding = hand_finding("cargo-target", "/p/target", GIB, Tier::Rebuildable);
+    let action = format!("cargo clean --target-dir {path}");
+    let recovery = format!("cargo build --manifest-path {path}/Cargo.toml");
+    finding.action.kind = ActionKind::Command;
+    finding.action.text = action.clone();
+    finding.recovery.how = Some(recovery.clone());
+    let (_f, mut app) = findings_app(vec![finding], None);
+    press(&mut app, &[KeyCode::Tab, KeyCode::Enter]);
+    let wrapped = render(&mut app, 80, 24, None);
+    assert_eq!(
+        wrapped.matches("preview — do not copy").count(),
+        2,
+        "{wrapped}"
+    );
+    assert!(
+        wrapped.contains("│  cargo clean") && wrapped.contains("│  how:  cargo build"),
+        "{wrapped}"
+    );
+    assert!(
+        !wrapped.contains(&action) && !wrapped.contains(&recovery),
+        "{wrapped}"
+    );
+
+    let exact = render(&mut app, 120, 24, None);
+    assert!(
+        exact.contains(&action) && exact.contains(&recovery),
+        "{exact}"
+    );
+    assert!(!exact.contains("preview — do not copy"), "{exact}");
+}
+
+#[test]
+fn lossy_repository_argument_is_withheld_for_an_exact_worktree() {
+    for lossy_action in [false, true] {
+        let path = "/work/feature";
+        let mut finding = hand_finding("git-worktree", path, GIB, Tier::Review);
+        let (action_repo, recovery_repo) = if lossy_action {
+            ("/repo�", "/repo")
+        } else {
+            ("/repo", "/repo�")
+        };
+        finding.action.kind = ActionKind::Command;
+        finding.action.text = format!("git -C {action_repo} worktree remove {path}");
+        finding.recovery.how = Some(format!(
+            "git -C {recovery_repo} worktree add {path} feature"
+        ));
+        let (_f, mut app) = findings_app(vec![finding], None);
+        press(&mut app, &[KeyCode::Tab, KeyCode::Enter]);
+        let detail = render(&mut app, 120, 24, None);
+        assert!(detail.lines().next().unwrap().contains(path), "{detail}");
+        assert!(!detail.contains("/repo�"), "{detail}");
+        assert_eq!(
+            detail.matches("command withheld: it names a path that is not valid UTF-8 and cannot be shown exactly").count(),
+            1,
+            "{detail}"
+        );
+        let exact = if lossy_action {
+            "git -C /repo worktree add /work/feature feature"
+        } else {
+            "git -C /repo worktree remove /work/feature"
+        };
+        assert!(detail.contains(exact), "{detail}");
+        assert!(!detail.contains("preview — do not copy"), "{detail}");
+    }
 }
 
 #[test]
@@ -1329,7 +1397,7 @@ fn lossy_cargo_path_is_marked_and_commands_are_withheld() {
     let finding = &mut data.report.findings[0];
     assert!(finding.path.ends_with("/app�/target"));
     let action = finding.action.text.clone();
-    finding.recovery.how = Some("cargo build --manifest-path app�/Cargo.toml".into());
+    finding.recovery.how = Some("cargo build --manifest-path /app/Cargo.toml".into());
     let mut app = app_with(data);
     press(&mut app, &[KeyCode::Tab]);
     let list = render(&mut app, 80, 24, None);
@@ -1345,7 +1413,11 @@ fn lossy_cargo_path_is_marked_and_commands_are_withheld() {
         detail
             .matches("command withheld because the path cannot be shown exactly")
             .count(),
-        2,
+        1,
+        "{detail}"
+    );
+    assert!(
+        detail.contains("command withheld: it names a path that is not valid UTF-8"),
         "{detail}"
     );
     assert!(

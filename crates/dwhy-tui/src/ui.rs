@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 
 use dwhy_core::apply::{action_kind_name, guard_status_name, tier_name};
 use dwhy_core::probes::postgres_wal;
-use dwhy_core::report::{Finding, FsReport};
+use dwhy_core::report::{ActionKind, Finding, FsReport};
 use dwhy_core::units::{human, signed, thousands};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -492,28 +492,43 @@ fn display_units(s: &str) -> impl DoubleEndedIterator<Item = Cow<'_, str>> + Clo
     })
 }
 
-fn command_note(s: &str) -> &'static str {
-    if s.contains(char::is_control) {
-        " (contains control characters, shown escaped)"
-    } else if s.contains('\\') {
-        " (contains backslashes, shown escaped)"
+fn command_lines(
+    prefix: &str,
+    text: &str,
+    lossy: bool,
+    is_command: bool,
+    width: usize,
+) -> impl Iterator<Item = Line<'static>> {
+    let withheld = if text.contains(char::REPLACEMENT_CHARACTER) {
+        Some(
+            "command withheld: it names a path that is not valid UTF-8 and cannot be shown exactly",
+        )
+    } else if lossy {
+        Some("command withheld because the path cannot be shown exactly")
     } else {
-        ""
+        None
+    };
+    let original = format!("{prefix}{}", withheld.unwrap_or(text));
+    let mut lines = wrap(&original, width);
+    if withheld.is_none() && is_command && lines.as_slice() != [original.as_str()] {
+        lines = wrap("  preview — do not copy", width);
+        lines.extend(
+            wrap(&original, width.saturating_sub(1))
+                .into_iter()
+                .map(|line| format!("│{line}")),
+        );
     }
+    lines.into_iter().map(Line::raw)
 }
 
 /// What `dwhy explain` shows for a finding, in the same order, wrapped to
 /// `width`. Guards are the ones the scan recorded; growth comes from the
 /// scan's base snapshot (`base`, its `created_at`).
 fn detail_lines(f: &Finding, lossy: bool, base: Option<&str>, width: usize) -> Vec<Line<'static>> {
-    const WITHHELD: &str = "command withheld because the path cannot be shown exactly";
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let mut out: Vec<Line<'static>> = Vec::new();
-    let mut text = |s: String| {
-        for l in wrap(&s, width) {
-            out.push(Line::raw(l));
-        }
-    };
+    let render = |s: &str| wrap(s, width).into_iter().map(Line::raw);
+    let mut text = |s: String| out.extend(render(&s));
     text(format!(
         "finding {} · {} · {}",
         f.id,
@@ -561,33 +576,20 @@ fn detail_lines(f: &Finding, lossy: bool, base: Option<&str>, width: usize) -> V
     });
 
     text(String::new());
-    text(format!(
-        "action ({}):{}",
-        action_kind_name(f.action.kind),
-        if lossy {
-            ""
-        } else {
-            command_note(&f.action.text)
-        }
-    ));
-    text(format!(
-        "  {}",
-        if lossy { WITHHELD } else { &f.action.text }
+    text(format!("action ({}):", action_kind_name(f.action.kind)));
+    out.extend(command_lines(
+        "  ",
+        &f.action.text,
+        lossy,
+        f.action.kind != ActionKind::Advice,
+        width,
     ));
 
-    text(String::new());
-    text("recovery:".into());
-    text(format!("  cost: {}", f.recovery.cost));
+    out.extend(render(""));
+    out.extend(render("recovery:"));
+    out.extend(render(&format!("  cost: {}", f.recovery.cost)));
     if let Some(how) = &f.recovery.how {
-        if lossy {
-            text(format!("  how:  {WITHHELD}"));
-        } else {
-            let note = command_note(how);
-            if !note.is_empty() {
-                text(format!(" {note}"));
-            }
-            text(format!("  how:  {how}"));
-        }
+        out.extend(command_lines("  how:  ", how, lossy, true, width));
     }
     if let Some(first) = out.first_mut() {
         *first = std::mem::take(first).style(bold);
