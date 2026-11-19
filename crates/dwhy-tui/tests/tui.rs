@@ -555,6 +555,7 @@ const BASE: &str = "2026-11-17T09:00:00Z";
 
 fn hand_finding(detector: &str, path: &str, bytes: u64, tier: Tier) -> Finding {
     Finding {
+        file_identity: None,
         id: dwhy_core::detect::finding_id(detector, path),
         detector: detector.into(),
         probe: None,

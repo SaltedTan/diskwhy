@@ -65,6 +65,7 @@ fn ctx() -> DetectContext {
 
 fn finding(path: &str, tier: Tier) -> Finding {
     Finding {
+        file_identity: None,
         id: "f_test".into(),
         detector: "stale-tree".into(),
         probe: None,

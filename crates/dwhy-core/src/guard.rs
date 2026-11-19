@@ -161,7 +161,18 @@ fn strip_deleted(s: &str) -> &str {
 /// finding with a blocking result to `blocked`. `tree` must hold the
 /// scanned paths (git repositories are found through it).
 pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, procs: &Processes) {
+    check_excluding(findings, tree, ctx, procs, &[]);
+}
+
+pub(crate) fn check_excluding(
+    findings: &mut [Finding],
+    tree: &ScanTree,
+    ctx: &DetectContext,
+    procs: &Processes,
+    changed_roots: &[PathBuf],
+) {
     use rayon::prelude::*;
+    let changed = |path: &Path| changed_roots.iter().any(|root| path.starts_with(root));
     let mut repos = repositories(tree);
     let git = ctx.tool_command("git");
     if let Some(git) = git.as_deref() {
@@ -174,6 +185,7 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
             .par_iter()
             .filter(|r| {
                 matches!(r, Repo::GitDir(_))
+                    && !changed(r.path())
                     && roots.iter().any(|root| r.path().starts_with(root))
                     && tracked_by_work_tree(git, r.path(), &repos)
             })
@@ -186,6 +198,7 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
     let mut users: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
     for r in &repos {
         if let Repo::WorkTree(dir) = r
+            && !changed(dir)
             && let Ok(common) = common_dir(&dir.join(".git"))
         {
             users.entry(common).or_default().push(dir.clone());
@@ -215,7 +228,14 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
     }
     let states: HashMap<&Repo, RepoState> = needed
         .par_iter()
-        .map(|(r, outer)| (*r, RepoState::read(git.as_deref(), r, outer)))
+        .map(|(r, outer)| {
+            let state = if changed(r.path()) {
+                RepoState::Failed("root changed since the scan".into())
+            } else {
+                RepoState::read(git.as_deref(), r, outer)
+            };
+            (*r, state)
+        })
         .collect();
     for f in findings.iter_mut() {
         let mut results = Vec::new();

@@ -269,6 +269,7 @@ impl GitWorktree {
                 None => Tier::Review,
             };
             let finding = Finding {
+                file_identity: None,
                 id: finding_id(self.name(), &path_s),
                 detector: self.name().into(),
                 probe: None,
@@ -308,6 +309,7 @@ impl GitWorktree {
                 .map(|e| e.path.display().to_string())
                 .collect();
             let finding = Finding {
+                file_identity: None,
                 id: finding_id(self.name(), &path_s),
                 detector: self.name().into(),
                 probe: None,

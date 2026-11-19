@@ -66,6 +66,7 @@ fn ctx() -> DetectContext {
 fn finding(detector: &str, path: &Path, bytes: u64, tier: Tier) -> Finding {
     let path = path.to_string_lossy().into_owned();
     Finding {
+        file_identity: None,
         id: finding_id(detector, &path),
         detector: detector.into(),
         probe: None,

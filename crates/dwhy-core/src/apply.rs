@@ -126,6 +126,7 @@ pub fn evaluate(
     procs: &Processes,
     policy: &Policy,
 ) -> Vec<Check> {
+    let mut changed_roots = Vec::new();
     let mut checks: Vec<Check> = plan
         .items
         .iter()
@@ -136,6 +137,7 @@ pub fn evaluate(
                 tree,
                 ctx,
                 policy,
+                &mut changed_roots,
             )
         })
         .collect();
@@ -145,11 +147,11 @@ pub fn evaluate(
         .iter()
         .filter_map(|&i| checks[i].fresh.clone())
         .collect();
-    guard::check(&mut guarded, tree, ctx, procs);
+    guard::check_excluding(&mut guarded, tree, ctx, procs, &changed_roots);
     for (i, f) in ready.into_iter().zip(guarded) {
         let c = &mut checks[i];
         c.item.guards.clone_from(&f.guards);
-        if let Some(detail) = changed_since_scan(&f, tree) {
+        if let Some(detail) = changed_root(&f.path, c.inode) {
             c.item.outcome = ApplyOutcome::Skipped;
             c.item.detail = format!("changed since the scan: {detail}");
             add_changed_guard(&mut c.item.guards, detail);
@@ -168,6 +170,7 @@ fn decide(
     tree: &ScanTree,
     ctx: &DetectContext,
     policy: &Policy,
+    changed_roots: &mut Vec<PathBuf>,
 ) -> Check {
     let planned = &item.finding;
     let base = |f: &Finding, outcome, detail: String| Check {
@@ -234,6 +237,12 @@ fn decide(
     }
     if let Err(why) = policy.allows(f) {
         return base(f, ApplyOutcome::Refused, why);
+    }
+    if let Some(detail) = changed_since_scan(f, tree) {
+        changed_roots.push(PathBuf::from(&f.path));
+        let mut c = skip(format!("changed since the scan: {detail}"));
+        add_changed_guard(&mut c.item.guards, detail);
+        return c;
     }
     let now = plan::fingerprint(f, tree, ctx);
     let diff = plan::differences(&item.fingerprint, &now);
@@ -412,7 +421,7 @@ fn run(c: &mut Check, mounts: &MountTable) -> (ApplyOutcome, String) {
         add_lossy_guard(&mut item.guards, detail);
         return (ApplyOutcome::Skipped, outcome);
     }
-    if let Some(detail) = changed_root(&item.path, c.inode, None) {
+    if let Some(detail) = changed_root(&item.path, c.inode) {
         let outcome = format!("changed since the scan: {detail}");
         add_changed_guard(&mut item.guards, detail);
         return (ApplyOutcome::Skipped, outcome);

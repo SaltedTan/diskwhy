@@ -535,6 +535,7 @@ fn docker_is_compared_only_when_both_sides_have_it() {
 
 fn finding(id: &str, bytes: u64) -> Finding {
     Finding {
+        file_identity: None,
         id: id.into(),
         detector: "cargo-target".into(),
         probe: None,

@@ -935,6 +935,7 @@ mod tests {
 
     fn finding(detector: &str, path: &str, bytes: u64, tier: Tier, kind: ActionKind) -> Finding {
         Finding {
+            file_identity: None,
             id: format!("f_{path}"),
             detector: detector.into(),
             probe: None,

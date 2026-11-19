@@ -62,6 +62,7 @@ fn report_of(res: &ScanResult, mounts: &MountTable) -> ScanReport {
 
 fn finding(path: &str, bytes: u64) -> Finding {
     Finding {
+        file_identity: None,
         id: dwhy_core::detect::finding_id("cargo-target", path),
         detector: "cargo-target".into(),
         probe: None,

@@ -11,9 +11,9 @@
 //! device and inode, the newest mtime under it, its size in quarter-doubling
 //! buckets, HEAD and a hash of `git status` when the root is a git work
 //! tree, and the object id of a Docker finding. The device, inode, mtime and
-//! size all come from the walk, so they describe one directory. A root whose
-//! live device and inode are no longer the walked ones (replaced, gone, or a
-//! symlink now) is blocked with a `changed-since-scan` guard instead.
+//! size come from the walk or one detector stat of a file. A missing root,
+//! a symlink, or a live identity mismatch blocks the finding with a
+//! `changed-since-scan` guard.
 //!
 //! `apply` does not trust a plan's actions or tiers: it re-detects and acts
 //! on the fresh finding with the same id. A plan is a selection plus the
@@ -26,13 +26,12 @@ use std::path::Path;
 use crate::detect::{DetectContext, is_lossy, rfc3339};
 use crate::guard::{self, Processes};
 use crate::report::{
-    ActionKind, Finding, Fingerprint, GitFingerprint, GuardResult, GuardStatus, Plan, PlanItem,
-    PlanScan, PlanSelection, SCHEMA, Tier, Tool, check_schema,
+    ActionKind, FileIdentity, Finding, Fingerprint, GitFingerprint, GuardResult, GuardStatus, Plan,
+    PlanItem, PlanScan, PlanSelection, SCHEMA, Tier, Tool, check_schema,
 };
-use crate::tree::{Markers, ScanTree};
+use crate::tree::{Markers, ScanTree, TreeNode};
 
-/// The guard that blocks a finding whose root is no longer the directory the
-/// scan walked.
+/// The guard that blocks a finding whose live root differs from the measured root.
 const CHANGED_SINCE_SCAN: &str = "changed-since-scan";
 
 /// A plan expires this long after it is made.
@@ -128,8 +127,8 @@ pub fn select(
 }
 
 /// Builds a plan from the findings of a scan: selects, runs the guards on
-/// the selection, fingerprints eligible findings from the walk, and blocks
-/// selected roots that fail the live identity check (`changed-since-scan`).
+/// the selection, fingerprints eligible findings from their measurements,
+/// and blocks selected roots that fail the live identity check (`changed-since-scan`).
 /// `tree` is the scan the findings came from; `ctx.now` is the
 /// creation time.
 pub fn build(
@@ -147,7 +146,9 @@ pub fn build(
     let mut blocked = Vec::new();
     for mut f in already_blocked.into_iter().chain(picked) {
         let fingerprint = (f.tier != Tier::Blocked).then(|| fingerprint(&f, tree, ctx));
-        if let Some(detail) = changed_since_scan(&f, tree) {
+        let changed = changed_since_scan(&f, tree);
+        f.file_identity = None;
+        if let Some(detail) = changed {
             add_changed_guard(&mut f.guards, detail);
             f.tier = Tier::Blocked;
         } else if let Some(fingerprint) = fingerprint {
@@ -207,27 +208,26 @@ pub fn distinct_bytes<'a>(items: impl IntoIterator<Item = (&'a str, u64)>) -> u6
         .sum()
 }
 
-/// Why the root of filesystem finding `f` is not the one `tree` walked, if
-/// it is not: it is not in the walk, it is gone, it is a symlink now, or its
-/// live device and inode (`lstat`, never followed) differ from the walked
-/// ones. `None` for pseudo-paths (`docker://…`), which have no tree node.
+/// Why a finding's live root differs from the measured root.
 pub(crate) fn changed_since_scan(f: &Finding, tree: &ScanTree) -> Option<String> {
     if !f.path.starts_with('/') {
         return None;
     }
     let node = tree.find(Path::new(&f.path)).map(|id| tree.node(id));
-    changed_root(
-        &f.path,
-        node.map(|n| (n.dev, n.ino)),
-        node.map(|n| n.is_dir),
-    )
+    changed_root(&f.path, root_identity(f, node).map(|id| (id.dev, id.ino)))
 }
 
-pub(crate) fn changed_root(
-    path: &str,
-    inode: Option<(u64, u64)>,
-    is_dir: Option<bool>,
-) -> Option<String> {
+fn root_identity(f: &Finding, node: Option<&TreeNode>) -> Option<FileIdentity> {
+    f.file_identity.or_else(|| {
+        node.map(|n| FileIdentity {
+            dev: n.dev,
+            ino: n.ino,
+            mtime: n.newest_mtime,
+        })
+    })
+}
+
+pub(crate) fn changed_root(path: &str, inode: Option<(u64, u64)>) -> Option<String> {
     if !path.starts_with('/') {
         return None;
     }
@@ -242,11 +242,9 @@ pub(crate) fn changed_root(
         }
         Err(e) => Some(format!("{path} cannot be checked against the scan: {e}")),
         Ok(md) if md.file_type().is_symlink() => Some(format!("{path} is a symlink now")),
-        Ok(md) if (md.dev(), md.ino()) != inode || is_dir.is_some_and(|dir| md.is_dir() != dir) => {
-            Some(format!(
-                "{path} was replaced after the scan (device/inode differ)"
-            ))
-        }
+        Ok(md) if (md.dev(), md.ino()) != inode => Some(format!(
+            "{path} was replaced after the scan (device/inode differ)"
+        )),
         Ok(_) => None,
     }
 }
@@ -261,11 +259,8 @@ pub(crate) fn add_changed_guard(guards: &mut Vec<GuardResult>, detail: String) {
     });
 }
 
-/// The fingerprint of `f` as the scan `tree` measured it: the device, inode
-/// and newest mtime of its tree node, never a live stat (a directory swapped
-/// in after the walk must not lend its identity to the walked one's size and
-/// mtime). Only git and Docker state are read now. `tree` must be a scan
-/// covering its path; a path with no node gets no device, inode or mtime.
+/// The fingerprint of `f` from the scan tree or the detector's file measurement.
+/// Only Git and Docker state are read live.
 pub fn fingerprint(f: &Finding, tree: &ScanTree, ctx: &DetectContext) -> Fingerprint {
     let mut fp = Fingerprint {
         dev: None,
@@ -277,24 +272,22 @@ pub fn fingerprint(f: &Finding, tree: &ScanTree, ctx: &DetectContext) -> Fingerp
     };
     if f.path.starts_with('/') {
         let p = Path::new(&f.path);
-        if let Some(id) = tree.find(p) {
-            let n = tree.node(id);
-            fp.dev = Some(n.dev);
-            fp.inode = Some(n.ino);
-            fp.newest_mtime = Some(n.newest_mtime);
-            if n.is_dir
-                && n.markers.contains(Markers::DOT_GIT)
-                && guard::git_guarded(f)
-                && let Some(git) = ctx.tool_command("git")
-            {
-                fp.git =
-                    guard::work_tree_state(&git, p)
-                        .ok()
-                        .map(|(head, status)| GitFingerprint {
-                            head,
-                            status_hash: format!("{:016x}", fnv1a(status.as_bytes())),
-                        });
-            }
+        let node = tree.find(p).map(|id| tree.node(id));
+        if let Some(id) = root_identity(f, node) {
+            fp.dev = Some(id.dev);
+            fp.inode = Some(id.ino);
+            fp.newest_mtime = Some(id.mtime);
+        }
+        if node.is_some_and(|n| n.is_dir && n.markers.contains(Markers::DOT_GIT))
+            && guard::git_guarded(f)
+            && let Some(git) = ctx.tool_command("git")
+        {
+            fp.git = guard::work_tree_state(&git, p)
+                .ok()
+                .map(|(head, status)| GitFingerprint {
+                    head,
+                    status_hash: format!("{:016x}", fnv1a(status.as_bytes())),
+                });
         }
     } else if f.path.starts_with("docker://") {
         fp.docker_id = ctx

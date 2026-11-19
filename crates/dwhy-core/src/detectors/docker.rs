@@ -61,6 +61,7 @@ fn finding(
     recovery: Recovery,
 ) -> Finding {
     Finding {
+        file_identity: None,
         id: finding_id(detector, &path),
         detector: detector.into(),
         probe: None,

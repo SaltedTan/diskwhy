@@ -116,6 +116,7 @@ impl Docker for Fake {
 fn volume_finding(name: &str) -> Finding {
     let path = format!("docker://volume/{name}");
     Finding {
+        file_identity: None,
         id: finding_id("docker-volume", &path),
         detector: "docker-volume".into(),
         probe: None,

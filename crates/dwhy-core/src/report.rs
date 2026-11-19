@@ -321,6 +321,8 @@ pub struct DeletedOpen {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Finding {
+    #[serde(skip)]
+    pub file_identity: Option<FileIdentity>,
     pub id: String,
     pub detector: String,
     /// The probe that added evidence to this finding, when one did.
@@ -349,6 +351,13 @@ pub struct Finding {
     /// Evidence from the probe named in `probe`, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Evidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub dev: u64,
+    pub ino: u64,
+    pub mtime: i64,
 }
 
 /// Evidence probes gathered about a finding, one member per probe.

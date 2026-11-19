@@ -116,6 +116,7 @@ fn sample() -> ScanReport {
             rerun: Some("sudo /usr/local/bin/dwhy scan /".into()),
         }],
         findings: vec![Finding {
+            file_identity: None,
             id: "f_7c1e".into(),
             detector: "docker-volume".into(),
             probe: Some("postgres-wal".into()),
@@ -243,6 +244,7 @@ fn command_action_shape() {
 
 fn plan_finding(id: &str, detector: &str, path: &str, tier: Tier, action: Action) -> Finding {
     Finding {
+        file_identity: None,
         id: id.into(),
         detector: detector.into(),
         probe: None,
@@ -734,6 +736,7 @@ fn watch_report_shape() {
 
 fn probed_finding() -> Finding {
     Finding {
+        file_identity: None,
         id: "f_7c1e00000000".into(),
         detector: "docker-volume".into(),
         probe: Some("postgres-wal".into()),

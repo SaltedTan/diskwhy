@@ -4,6 +4,7 @@
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dwhy_core::apply::{self, Audit, Check, Env, Policy};
@@ -227,6 +228,7 @@ fn ctx() -> DetectContext {
 fn finding(detector: &str, path: &Path, tier: Tier) -> Finding {
     let path = path.to_string_lossy().into_owned();
     Finding {
+        file_identity: None,
         id: finding_id(detector, &path),
         detector: detector.into(),
         probe: None,
@@ -475,6 +477,84 @@ fn a_root_replaced_after_applys_own_scan_is_skipped() {
     assert!(cache.join("file").exists());
     let r = apply::report(&plan, &checks, &Policy::default(), true, &env());
     assert_eq!(apply::exit_code(&r), 2);
+}
+
+#[test]
+fn survey_skips_a_symlink_replacement_without_reporting_its_git_worktrees() {
+    let (_t, b) = base();
+    let (_other, other) = base();
+    let mut found = fixture(&b);
+    found.retain(|f| f.detector != "cargo-target");
+    let scratch = b.join("scratch");
+    let original = scratch.join("repo");
+    let replacement = other.join("tree/repo");
+    let linked = other.join("linked");
+    let git = |repo: &Path, args: &[&str]| {
+        let out = Command::new("git")
+            .args([
+                "--no-optional-locks",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    for repo in [&original, &replacement] {
+        fs::create_dir_all(repo).unwrap();
+        git(repo, &["init", "-q"]);
+    }
+    git(&replacement, &["commit", "--allow-empty", "-qm", "fixture"]);
+    git(
+        &replacement,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let plan = make_plan(&b, found.clone());
+    assert_eq!(plan.items.len(), 2);
+    let tree = scan_tree(&b);
+    fs::rename(&scratch, scratch.with_extension("old")).unwrap();
+    symlink(other.join("tree"), &scratch).unwrap();
+
+    let pol = policy(Tier::Regenerable, &[&found[1].id]);
+    let checks = apply::evaluate(&plan, found, &tree, &ctx(), &Processes::default(), &pol);
+    let report = apply::report(&plan, &checks, &pol, true, &env());
+    assert_eq!(apply::exit_code(&report), 2);
+    let skipped = report
+        .items
+        .iter()
+        .find(|i| i.detector == "stale-tree")
+        .unwrap();
+    assert_eq!(skipped.outcome, ApplyOutcome::Skipped);
+    assert_eq!(skipped.guards.len(), 1, "{:?}", skipped.guards);
+    assert_eq!(skipped.guards[0].name, "changed-since-scan");
+    assert_eq!(skipped.guards[0].status, GuardStatus::Block);
+    assert!(
+        !serde_json::to_string(&report)
+            .unwrap()
+            .contains(other.to_str().unwrap())
+    );
+    assert!(checks.iter().any(Check::ready));
 }
 
 #[test]
