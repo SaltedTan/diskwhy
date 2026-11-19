@@ -7,13 +7,8 @@
 //! they block, or one a detector already marked `blocked` that `--select`
 //! names, goes to the plan's `blocked` list instead of its items.
 //!
-//! The fingerprint records what must not change before `apply`: the root's
-//! device and inode, the newest mtime under it, its size in quarter-doubling
-//! buckets, HEAD and a hash of `git status` when the root is a git work
-//! tree, and the object id of a Docker finding. The device, inode, mtime and
-//! size come from the walk or one detector stat of a file. A missing root,
-//! a symlink, or a live identity mismatch blocks the finding with a
-//! `changed-since-scan` guard.
+//! See [`Fingerprint`] for the saved fields and the safety rules in
+//! `docs/DESIGN.md` for the live identity checks.
 //!
 //! `apply` does not trust a plan's actions or tiers: it re-detects and acts
 //! on the fresh finding with the same id. A plan is a selection plus the
@@ -130,7 +125,7 @@ pub fn select(
 
 /// Builds a plan from the findings of a scan: selects, runs the guards on
 /// the selection, fingerprints eligible findings from their measurements,
-/// and blocks selected roots that fail the live identity check (`changed-since-scan`).
+/// and blocks findings that fail the live identity check (`changed-since-scan`).
 /// `tree` is the scan the findings came from; `ctx.now` is the
 /// creation time.
 pub fn build(

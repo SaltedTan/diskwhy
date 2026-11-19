@@ -321,6 +321,8 @@ pub struct DeletedOpen {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Finding {
+    /// Identity captured by a detector when it measures a standalone file.
+    /// Omitted from serialized findings.
     #[serde(skip)]
     pub file_identity: Option<FileIdentity>,
     pub id: String,
@@ -561,20 +563,21 @@ pub struct PlanItem {
 /// What must not have changed between `plan` and `apply`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fingerprint {
-    /// `st_dev` of the finding's root (not following a symlink), for a
-    /// filesystem finding whose root exists.
+    /// `st_dev` recorded for the finding's root during the walk or the
+    /// detector's standalone-file measurement. `None` without a filesystem identity.
     pub dev: Option<u64>,
-    /// `st_ino` of the finding's root.
+    /// Recorded `st_ino` of the same root.
     pub inode: Option<u64>,
-    /// Newest mtime under the root, seconds since the epoch.
+    /// Newest measured mtime under the root, or the measured file's mtime,
+    /// in seconds since the epoch.
     pub newest_mtime: Option<i64>,
     /// `bytes` in buckets of a quarter of a doubling (4 per power of two):
     /// small changes in size do not count, large ones do.
     pub size_bucket: u32,
-    /// For a finding whose root is a git work tree.
+    /// Git state when available for a guarded Git worktree at the finding's root.
     pub git: Option<GitFingerprint>,
     /// For a Docker finding: the image or container id, or the volume name
-    /// and creation time.
+    /// and creation time. Docker build cache has no object ID for fingerprinting.
     pub docker_id: Option<String>,
 }
 

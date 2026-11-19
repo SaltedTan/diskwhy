@@ -1289,8 +1289,8 @@ fn cli_files(root: &Path) -> Vec<Install> {
     })
 }
 
-/// Regular files with a single link directly in `dir` that `group`
-/// accepts, sized from lstat (the scan tree holds directories only).
+/// Regular files with a single link directly in `dir` that `group` accepts.
+/// The stat used for sizing also supplies the identity and mtime for planning.
 fn files_in(dir: &Path, group: impl Fn(&str) -> Option<(String, Vec<u64>)>) -> Vec<Install> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();

@@ -6,8 +6,8 @@
 //! An item is
 //! - skipped (exit 2) when the path encoding check blocks it, it is no
 //!   longer detected, a detector or guard blocks it now, its tier or action
-//!   differs from the plan's, its fingerprint changed, or its root is no
-//!   longer the one apply's own scan walked (`changed-since-scan`);
+//!   differs from the plan's, its fingerprint changed, or a live identity
+//!   check failed (`changed-since-scan`, see the safety rules in `docs/DESIGN.md`);
 //! - refused (exit 3) when its tier is above `--max-tier`, or it is a
 //!   `review` item whose id `--confirm` did not name (`--confirm` alone lets
 //!   a review item through; it never lifts a rebuildable one);

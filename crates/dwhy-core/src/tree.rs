@@ -125,9 +125,8 @@ pub struct TreeNode {
     /// free them.
     pub shared: u64,
     /// `st_dev` and `st_ino` of the directory (or non-directory root) the
-    /// walk measured, from the same `lstat`/`fstatat` that sized it. A plan
-    /// fingerprints these, so its identity and its size and mtime come from
-    /// one moment.
+    /// walk measured. Roots use the initial `lstat`. Subdirectories use
+    /// the parent's `fstatat` result, also used to size the directory itself.
     pub dev: u64,
     pub ino: u64,
 }
