@@ -15,8 +15,7 @@ use dwhy_core::tree::NodeId;
 use ratatui::text::Line;
 
 use crate::job::{
-    self, BuiltPlan, Mark, OverwriteTarget, PlanJob, PlanMark, Scanned, Stage, Target,
-    UnplannedMark, WriteError,
+    self, BuiltPlan, Mark, PlanJob, PlanMark, Scanned, Stage, UnplannedMark, WriteError,
 };
 
 /// Where `w` offers to write a plan, relative to the working directory.
@@ -146,16 +145,8 @@ pub struct PlanView {
     pub(crate) lines: Option<(usize, Vec<Line<'static>>)>,
     /// First line on screen.
     pub scroll: usize,
-    /// The `w` prompt, while it is open.
-    pub prompt: Option<Prompt>,
-}
-
-/// The `w` prompt: a path to write the plan to.
-#[derive(Debug)]
-pub struct Prompt {
-    pub path: String,
-    /// The path names an existing file; waiting for y or n.
-    pub confirm: Option<OverwriteTarget>,
+    /// The path being edited in the `w` prompt.
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug)]
@@ -677,10 +668,7 @@ impl PlanView {
                     return Some(format!("this plan is already a file: {}", file.display()));
                 }
                 None => {
-                    self.prompt = Some(Prompt {
-                        path: DEFAULT_PLAN_FILE.into(),
-                        confirm: None,
-                    });
+                    self.prompt = Some(DEFAULT_PLAN_FILE.into());
                 }
             },
             _ => scroll_lines(&mut self.scroll, code, page),
@@ -690,51 +678,33 @@ impl PlanView {
 
     /// A key while the `w` prompt is open; returns the status message.
     fn on_prompt_key(&mut self, key: KeyEvent) -> Option<String> {
-        let prompt = self.prompt.as_mut()?;
+        let path = self.prompt.as_mut()?;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if prompt.confirm.is_some() {
-            match key.code {
-                KeyCode::Char('y' | 'Y') if (key.modifiers - KeyModifiers::SHIFT).is_empty() => {
-                    return self.write();
-                }
-                // Back to the path, to choose another.
-                KeyCode::Char('n' | 'N') | KeyCode::Esc => prompt.confirm = None,
-                _ => {}
-            }
-            return None;
-        }
         match key.code {
             KeyCode::Esc => {
                 self.prompt = None;
                 return Some("no plan file written".into());
             }
-            KeyCode::Enter if prompt.path.is_empty() => {
+            KeyCode::Enter if path.is_empty() => {
                 return Some("type a file name, or Esc to cancel".into());
             }
-            KeyCode::Enter => match job::target(Path::new(&prompt.path)) {
-                Ok(Target::Free) => return self.write(),
-                Ok(Target::File(file)) => prompt.confirm = Some(file),
-                Ok(Target::Refused(why)) => {
-                    return Some(format!("not writing {}: {why}", prompt.path));
-                }
-                Err(e) => return Some(format!("cannot write {}: {e}", prompt.path)),
-            },
+            KeyCode::Enter => return self.write(),
             KeyCode::Backspace => {
-                prompt.path.pop();
+                path.pop();
             }
-            KeyCode::Char('u') if ctrl => prompt.path.clear(),
-            KeyCode::Char(c) if !ctrl => prompt.path.push(c),
+            KeyCode::Char('u') if ctrl => path.clear(),
+            KeyCode::Char(c) if !ctrl => path.push(c),
             _ => {}
         }
         None
     }
 
     fn write(&mut self) -> Option<String> {
-        let prompt = self.prompt.as_mut()?;
-        let path = Path::new(&prompt.path);
-        let message = match job::write_plan(path, &self.plan, prompt.confirm.as_ref()) {
+        let name = self.prompt.as_deref()?;
+        let path = Path::new(name);
+        let message = match job::write_plan(path, &self.plan) {
             Ok(()) => {
-                let message = format!("wrote {}", prompt.path);
+                let message = format!("wrote {name}");
                 self.prompt = None;
                 message
             }
@@ -745,14 +715,14 @@ impl PlanView {
                 )
             }
             Err(WriteError::BeforeWrite(e)) => {
-                prompt.confirm = if e.kind() == ErrorKind::AlreadyExists
-                    && let Ok(Target::File(file)) = job::target(path)
+                if e.kind() == ErrorKind::AlreadyExists
+                    || (e.kind() == ErrorKind::IsADirectory
+                        && std::fs::symlink_metadata(path).is_ok())
                 {
-                    Some(file)
+                    format!("{name} exists; choose another name")
                 } else {
-                    None
-                };
-                format!("cannot write {}: {e}", prompt.path)
+                    format!("cannot write {name}: {e}")
+                }
             }
         };
         Some(message)

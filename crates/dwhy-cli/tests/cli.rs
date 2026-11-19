@@ -339,7 +339,7 @@ fn tui_and_cli_plans_round_trip() {
     .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let tui_file = dir.path().join("tui.json");
-    job::write_plan(&tui_file, &built.plan, None).unwrap();
+    job::write_plan(&tui_file, &built.plan).unwrap();
     let tui_text = fs::read_to_string(&tui_file).unwrap();
     let tui_plan = plan::parse(&tui_text).unwrap();
     let mut expected = serde_json::to_string_pretty(&tui_plan).unwrap();

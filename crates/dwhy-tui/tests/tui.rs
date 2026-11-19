@@ -2287,8 +2287,8 @@ fn write_prompt_80x24() {
     let (_f, mut app) = preview_app();
     press(&mut app, &[KeyCode::Char('w')]);
     assert_eq!(
-        app.plan_view().unwrap().prompt.as_ref().unwrap().path,
-        DEFAULT_PLAN_FILE
+        app.plan_view().unwrap().prompt.as_deref(),
+        Some(DEFAULT_PLAN_FILE)
     );
     insta::assert_snapshot!(render_at(&mut app, 80, 24, None, PLAN_AT));
 }
@@ -2311,8 +2311,8 @@ fn w_writes_the_plan_file_as_dwhy_plan_does() {
     press(&mut app, &[KeyCode::Char('w')]);
     press(&mut app, &[KeyCode::Backspace]);
     assert_eq!(
-        app.plan_view().unwrap().prompt.as_ref().unwrap().path,
-        "./dwhy-plan.jso"
+        app.plan_view().unwrap().prompt.as_deref(),
+        Some("./dwhy-plan.jso")
     );
     assert!(!app.on_key(ctrl('u')));
     type_text(&mut app, path);
@@ -2331,84 +2331,10 @@ fn w_writes_the_plan_file_as_dwhy_plan_does() {
     let saved = fs::read_to_string(&file).unwrap();
     assert!(saved.ends_with('\n'));
     assert_eq!(&plan::parse(&saved).unwrap(), plan_of(&app));
-
-    // An existing file: n goes back to the path, y overwrites.
-    let old = "old".repeat(saved.len());
-    fs::write(&file, &old).unwrap();
-    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
-    let original = fs::metadata(&file).unwrap();
-    press(&mut app, &[KeyCode::Char('w')]);
-    assert!(!app.on_key(ctrl('u')));
-    type_text(&mut app, path);
-    press(&mut app, &[KeyCode::Enter]);
-    assert!(
-        app.plan_view()
-            .unwrap()
-            .prompt
-            .as_ref()
-            .unwrap()
-            .confirm
-            .is_some()
-    );
-    let screen = render(&mut app, 200, 24, None);
-    assert!(screen.contains("exists; overwrite? y/n"), "{screen}");
-    for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
-        assert!(!app.on_key(KeyEvent::new(KeyCode::Char('y'), modifiers)));
-        assert_eq!(fs::read_to_string(&file).unwrap(), old);
-        assert!(
-            app.plan_view()
-                .unwrap()
-                .prompt
-                .as_ref()
-                .unwrap()
-                .confirm
-                .is_some()
-        );
-    }
-    press(&mut app, &[KeyCode::Char('n')]);
-    let prompt = app.plan_view().unwrap().prompt.as_ref().unwrap();
-    assert!(prompt.confirm.is_none() && prompt.path == path);
-    assert_eq!(fs::read_to_string(&file).unwrap(), old);
-    press(&mut app, &[KeyCode::Enter]);
-    assert!(!app.on_key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT)));
-    assert_eq!(fs::read_to_string(&file).unwrap(), saved);
-    let updated = fs::metadata(&file).unwrap();
-    let metadata = |m: &fs::Metadata| (m.dev(), m.ino(), m.uid(), m.gid(), m.mode());
-    assert_eq!(metadata(&updated), metadata(&original));
-    assert!(app.plan_view().unwrap().prompt.is_none());
-    assert_eq!(fs::read_dir(out.path()).unwrap().count(), 1);
 }
 
 #[test]
-fn w_asks_again_when_the_overwrite_target_changes() {
-    let (_f, mut app) = preview_app();
-    let out = tempfile::tempdir().unwrap();
-    let file = out.path().join("plan.json");
-    fs::write(&file, "first file").unwrap();
-    press(&mut app, &[KeyCode::Char('w')]);
-    assert!(!app.on_key(ctrl('u')));
-    type_text(&mut app, file.to_str().unwrap());
-    press(&mut app, &[KeyCode::Enter]);
-    for replacement in ["second file", "third file"] {
-        let original_inode = fs::metadata(&file).unwrap().ino();
-        fs::remove_file(&file).unwrap();
-        fs::write(&file, replacement).unwrap();
-        assert_ne!(fs::metadata(&file).unwrap().ino(), original_inode);
-        press(&mut app, &[KeyCode::Char('y')]);
-        assert_eq!(fs::read_to_string(&file).unwrap(), replacement);
-        assert!(app.message.as_deref().unwrap().contains("target changed"));
-        let screen = render_at(&mut app, 200, 24, None, PLAN_AT);
-        assert!(screen.contains("exists; overwrite? y/n"), "{screen}");
-    }
-    assert_eq!(fs::read_dir(out.path()).unwrap().count(), 1);
-    press(&mut app, &[KeyCode::Char('y')]);
-    let saved = fs::read_to_string(&file).unwrap();
-    assert_eq!(&plan::parse(&saved).unwrap(), plan_of(&app));
-    assert!(app.plan_view().unwrap().prompt.is_none());
-}
-
-#[test]
-fn w_overwrites_a_long_basename_through_a_parent_symlink() {
+fn w_creates_a_long_basename_through_a_parent_symlink() {
     let (_f, mut app) = preview_app();
     let out = tempfile::tempdir().unwrap();
     let parent = out.path().join("parent");
@@ -2417,57 +2343,65 @@ fn w_overwrites_a_long_basename_through_a_parent_symlink() {
     std::os::unix::fs::symlink(&parent, &alias).unwrap();
     let name = "p".repeat(255);
     let file = parent.join(&name);
-    fs::write(&file, "old").unwrap();
-    fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
 
     press(&mut app, &[KeyCode::Char('w')]);
     assert!(!app.on_key(ctrl('u')));
     type_text(&mut app, alias.join(&name).to_str().unwrap());
-    press(&mut app, &[KeyCode::Enter, KeyCode::Char('y')]);
+    press(&mut app, &[KeyCode::Enter]);
     let saved = fs::read_to_string(&file).unwrap();
     assert_eq!(&plan::parse(&saved).unwrap(), plan_of(&app));
-    assert_eq!(
-        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
-        0o640
-    );
     assert_eq!(fs::read_dir(parent).unwrap().count(), 1);
 }
 
 #[test]
-fn w_refuses_symlinks_and_non_files() {
+fn w_requires_an_unused_path() {
     let (_f, mut app) = preview_app();
     let out = tempfile::tempdir().unwrap();
     let real = out.path().join("real.json");
-    fs::write(&real, "keep").unwrap();
+    let original = b"keep this file";
+    fs::write(&real, original).unwrap();
+    let inode = fs::metadata(&real).unwrap().ino();
+    let hardlink = out.path().join("baseline.json");
+    fs::hard_link(&real, &hardlink).unwrap();
     let link = out.path().join("link.json");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let dangling = out.path().join("dangling.json");
     std::os::unix::fs::symlink(out.path().join("nowhere.json"), &dangling).unwrap();
-    for target in [&link, &dangling, &out.path().to_path_buf()] {
-        press(&mut app, &[KeyCode::Char('w')]);
+    let dir = out.path().to_str().unwrap();
+    let dir_slash = format!("{dir}/");
+    press(&mut app, &[KeyCode::Char('w')]);
+    for path in [
+        real.to_str().unwrap(),
+        hardlink.to_str().unwrap(),
+        link.to_str().unwrap(),
+        dangling.to_str().unwrap(),
+        dir,
+        &dir_slash,
+    ] {
         assert!(!app.on_key(ctrl('u')));
-        type_text(&mut app, target.to_str().unwrap());
+        type_text(&mut app, path);
         press(&mut app, &[KeyCode::Enter]);
-        let msg = app.message.clone().unwrap();
-        assert!(msg.starts_with("not writing "), "{msg}");
-        // The prompt stays open to choose another path.
-        assert!(app.plan_view().unwrap().prompt.is_some());
+        let message = format!("{path} exists; choose another name");
+        assert_eq!(app.message.as_deref(), Some(message.as_str()));
+        assert_eq!(app.plan_view().unwrap().prompt.as_deref(), Some(path));
         let screen = render(&mut app, 200, 24, None);
-        assert!(screen.contains("not writing"), "{screen}");
+        assert!(screen.contains("exists; choose another name"), "{screen}");
         assert!(screen.contains(" write plan to: "), "{screen}");
-        press(&mut app, &[KeyCode::Esc]);
+        assert_eq!(fs::read(&real).unwrap(), original);
+        assert_eq!(fs::metadata(&real).unwrap().ino(), inode);
     }
-    assert_eq!(fs::read_to_string(&real).unwrap(), "keep");
+    assert_eq!(fs::read(&hardlink).unwrap(), original);
+    assert_eq!(fs::metadata(&hardlink).unwrap().ino(), inode);
+    assert_eq!(fs::read_link(&link).unwrap(), real);
     assert!(!out.path().join("nowhere.json").exists());
-    // Overwriting never follows a symlink either.
-    let plan = hand_plan();
-    let job::Target::File(held) = job::target(&real).unwrap() else {
-        panic!("regular plan file");
-    };
-    assert!(job::write_plan(&link, &plan, Some(&held)).is_err());
-    assert!(job::write_plan(&dangling, &plan, None).is_err());
-    assert_eq!(fs::read_to_string(&real).unwrap(), "keep");
-    assert!(!out.path().join("nowhere.json").exists());
+
+    let unused = out.path().join("new.json");
+    assert!(!app.on_key(ctrl('u')));
+    type_text(&mut app, unused.to_str().unwrap());
+    press(&mut app, &[KeyCode::Enter]);
+    assert!(app.plan_view().unwrap().prompt.is_none());
+    let saved = fs::read_to_string(unused).unwrap();
+    assert_eq!(&plan::parse(&saved).unwrap(), plan_of(&app));
 }
 
 #[test]

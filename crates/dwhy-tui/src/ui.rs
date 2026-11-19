@@ -308,20 +308,11 @@ fn draw_plan(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, help: &str, now: i6
     f.render_widget(Paragraph::new(shown), body);
 
     match &v.prompt {
-        Some(prompt) if prompt.confirm.is_some() => {
-            let path = middle_units(display_units(&prompt.path), width.saturating_sub(30));
-            f.render_widget(
-                Paragraph::new(format!(" {path} exists; overwrite? y/n")),
-                a.status,
-            );
-            let keys = " y overwrite · n choose another name";
-            f.render_widget(Paragraph::new(Span::styled(keys, dim)), a.keys);
-        }
-        Some(prompt) => {
+        Some(path) => {
             const LABEL: &str = " write plan to: ";
             let room = width.saturating_sub(LABEL.len() + 1);
             // Keep the end in sight: it is where the typing goes.
-            let units: Vec<_> = display_units(&prompt.path).collect();
+            let units: Vec<_> = display_units(path).collect();
             let mut used = 0;
             let start = units
                 .iter()
@@ -339,7 +330,7 @@ fn draw_plan(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, help: &str, now: i6
                 ])),
                 a.status,
             );
-            let keys = " Enter write · Esc cancel · Backspace delete · Ctrl-U clear";
+            let keys = " Enter create · Esc cancel · Backspace delete · Ctrl-U clear";
             f.render_widget(Paragraph::new(Span::styled(keys, dim)), a.keys);
         }
         None => {

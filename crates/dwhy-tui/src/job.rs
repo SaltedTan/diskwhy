@@ -8,7 +8,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -280,36 +279,6 @@ pub fn read_plan(path: &Path) -> Result<Plan, String> {
     plan::parse(&text)
 }
 
-/// What is at the path a plan is about to be written to.
-#[derive(Debug)]
-pub enum Target {
-    /// Nothing: the plan can be written.
-    Free,
-    /// A regular file: ask before overwriting it.
-    File(OverwriteTarget),
-    /// A symlink or something else that is not a regular file.
-    Refused(String),
-}
-
-#[derive(Debug)]
-pub struct OverwriteTarget(fs::File);
-
-pub fn target(path: &Path) -> io::Result<Target> {
-    match fs::symlink_metadata(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Target::Free),
-        Err(e) => Err(e),
-        Ok(md) if md.file_type().is_symlink() => Ok(Target::Refused("it is a symlink".into())),
-        Ok(md) if !md.is_file() => Ok(Target::Refused("it is not a regular file".into())),
-        Ok(_) => {
-            let file = system::open_for_read_nofollow(path)?;
-            if !file.metadata()?.is_file() {
-                return Ok(Target::Refused("it is not a regular file".into()));
-            }
-            Ok(Target::File(OverwriteTarget(file)))
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum WriteError {
     BeforeWrite(io::Error),
@@ -322,47 +291,13 @@ impl From<io::Error> for WriteError {
     }
 }
 
-/// Writes the same JSON as `dwhy plan -o`. An existing regular file can be
-/// overwritten only after confirmation of its identity.
-pub fn write_plan(
-    path: &Path,
-    plan: &Plan,
-    overwrite: Option<&OverwriteTarget>,
-) -> Result<(), WriteError> {
+/// Creates a new file with the same JSON as `dwhy plan -o`.
+pub fn write_plan(path: &Path, plan: &Plan) -> Result<(), WriteError> {
     let text = plan::to_json(plan).map_err(io::Error::from)?;
-    let confirmed = overwrite.map(|held| held.0.metadata()).transpose()?;
-    let mut file = system::open_for_write_nofollow(path, confirmed.is_none()).map_err(|e| {
-        if let Some(confirmed) = &confirmed
-            && match fs::symlink_metadata(path) {
-                Ok(current) => !matches_confirmed_file(&current, confirmed),
-                Err(e) => e.kind() == io::ErrorKind::NotFound,
-            }
-        {
-            changed_target()
-        } else {
-            e
-        }
-    })?;
-    if let Some(confirmed) = &confirmed {
-        if !matches_confirmed_file(&file.metadata()?, confirmed) {
-            return Err(changed_target().into());
-        }
-        file.set_len(0)?;
-    }
+    let mut file = system::create_new_file_nofollow(path)?;
     file.write_all(text.as_bytes())
         .and_then(|()| file.sync_all())
         .map_err(WriteError::Incomplete)
-}
-
-fn matches_confirmed_file(current: &fs::Metadata, confirmed: &fs::Metadata) -> bool {
-    current.is_file() && current.dev() == confirmed.dev() && current.ino() == confirmed.ino()
-}
-
-fn changed_target() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "the target changed since the overwrite prompt",
-    )
 }
 
 /// Seconds since the epoch.
