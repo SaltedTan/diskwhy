@@ -497,6 +497,7 @@ fn display_units(s: &str) -> impl DoubleEndedIterator<Item = Cow<'_, str>> + Clo
                         | '\u{070f}'
                         | '\u{0890}'..='\u{0891}'
                         | '\u{08e2}'
+                        | '\u{17b4}'..='\u{17b5}'
                         | '\u{200c}'
                         | '\u{e0020}'..='\u{e007f}'
                 )
@@ -538,7 +539,9 @@ fn command_lines(
     };
     let original = format!("{prefix}{}", withheld.unwrap_or(text));
     let mut lines = wrap(&original, width);
-    if withheld.is_none() && is_command && lines.as_slice() != [original.as_str()] {
+    let copyable =
+        text.bytes().all(|b| (b' '..=b'~').contains(&b)) && lines.as_slice() == [original.as_str()];
+    if withheld.is_none() && is_command && !copyable {
         lines = wrap("  preview — do not copy", width);
         lines.extend(
             wrap(&original, width.saturating_sub(1))

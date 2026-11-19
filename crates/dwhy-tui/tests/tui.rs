@@ -1268,6 +1268,8 @@ fn finding_paths_and_commands_escape_controls() {
 #[test]
 fn invisible_cargo_path_characters_are_visible_in_paths_and_previews() {
     for (character, escape) in [
+        ('\u{17b4}', r"\u{17b4}"),
+        ('\u{17b5}', r"\u{17b5}"),
         ('\u{200b}', r"\u{200b}"),
         ('\u{200c}', r"\u{200c}"),
         ('\u{200d}', r"\u{200d}"),
@@ -1308,6 +1310,31 @@ fn invisible_cargo_path_characters_are_visible_in_paths_and_previews() {
         assert_eq!(
             detail.matches("preview — do not copy").count(),
             2,
+            "{detail}"
+        );
+    }
+}
+
+#[test]
+fn only_printable_ascii_commands_are_unlabelled_on_one_line() {
+    for (project, expected_previews) in [("café", 2), ("cafe", 0)] {
+        let path = format!("/p/{project}/target");
+        let action = format!("cargo clean --target-dir '{path}'");
+        let recovery = format!("cd '/p/{project}' && cargo build");
+        let mut finding = hand_finding("cargo-target", &path, GIB, Tier::Rebuildable);
+        finding.action.kind = ActionKind::Command;
+        finding.action.text = action.clone();
+        finding.recovery.how = Some(recovery.clone());
+        let (_f, mut app) = findings_app(vec![finding], None);
+        press(&mut app, &[KeyCode::Tab, KeyCode::Enter]);
+        let detail = render(&mut app, 80, 24, None);
+        assert!(
+            detail.contains(&action) && detail.contains(&recovery),
+            "{detail}"
+        );
+        assert_eq!(
+            detail.matches("preview — do not copy").count(),
+            expected_previews,
             "{detail}"
         );
     }
