@@ -27,7 +27,6 @@ use crossterm::event::{self, Event};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use dwhy_core::guard::Processes;
-use dwhy_core::report::Plan;
 use dwhy_core::scan::Progress;
 use dwhy_core::system;
 use ratatui::Terminal;
@@ -49,7 +48,7 @@ enum Msg {
 }
 
 /// A finished plan build: its number, the host it was built for, the plan.
-type Built = (u64, String, Result<Plan, String>);
+type Built = (u64, String, Result<job::BuiltPlan, String>);
 
 /// Opens the TUI: checks there is a terminal, scans `opts` in a background
 /// thread, and browses the result until the person quits.
@@ -74,7 +73,6 @@ pub fn run_plan(file: &Path) -> Result<u8, Error> {
         file.to_path_buf(),
         &system::hostname(),
         system::euid(),
-        job::now(),
     );
     let result = (|| -> Result<(), Error> {
         let _guard = TerminalGuard::enter()?;
@@ -160,12 +158,12 @@ where
                 .name("dwhy-tui-plan".into())
                 .spawn(move || {
                     let host = system::hostname();
-                    let plan = req.job.build(&Processes::read(), host.clone());
+                    let plan = req.job.build(Processes::read, host.clone());
                     let _ = tx.send((req.build, host, plan));
                 })?;
         }
         while let Ok((build, host, plan)) = built_rx.try_recv() {
-            app.plan_built(build, plan, &host, job::now());
+            app.plan_built(build, plan, &host, system::euid());
         }
         loop {
             match rx.try_recv() {

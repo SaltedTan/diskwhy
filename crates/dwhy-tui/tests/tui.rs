@@ -22,7 +22,7 @@ use dwhy_core::report::{
 use dwhy_core::scan::Progress;
 use dwhy_core::{growth, snapshot, system};
 use dwhy_tui::app::{App, DEFAULT_PLAN_FILE, PlanState, RowKind, SizeMode, State, View};
-use dwhy_tui::job::{self, Options, PermissionMark, Scanned};
+use dwhy_tui::job::{self, BuiltPlan, Options, PermissionMark, Scanned};
 use dwhy_tui::ui;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -147,8 +147,12 @@ fn press(app: &mut App, codes: &[KeyCode]) {
 }
 
 fn render(app: &mut App, w: u16, h: u16, root: Option<&Path>) -> String {
+    render_at(app, w, h, root, job::now())
+}
+
+fn render_at(app: &mut App, w: u16, h: u16, root: Option<&Path>, now: i64) -> String {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| ui::draw(f, app)).unwrap();
+    term.draw(|f| ui::draw_at(f, app, now)).unwrap();
     let s = term.backend().to_string();
     match root {
         Some(r) => {
@@ -1587,8 +1591,13 @@ fn scan_takes_growth_from_the_snapshot_dir_it_is_given() {
     let g = data.report.findings[0].growth.as_ref().unwrap();
     assert!(g.bytes_per_day > 0, "{g:?}");
     assert_eq!(g.since, old.generated_at);
-    // Plans are built from the findings as `dwhy plan` sees them: no growth.
-    assert!(data.plan.findings[0].growth.is_none());
+    let mut app = app_with(data);
+    press(
+        &mut app,
+        &[KeyCode::Tab, KeyCode::Char(' '), KeyCode::Char('p')],
+    );
+    run_build(&mut app, &Processes::default());
+    assert!(plan_of(&app).items[0].finding.growth.is_none());
     // Read only: nothing saved or pruned.
     assert_eq!(fs::read_dir(&dir).unwrap().count(), listed);
 }
@@ -1640,13 +1649,12 @@ fn type_text(app: &mut App, text: &str) {
 /// the given processes for the guards.
 fn run_build(app: &mut App, procs: &Processes) {
     let req = app.take_request().expect("a plan build was requested");
-    let result = req.job.build(procs, HOST.into());
-    let now = req.job.source.ctx.now + 60;
-    app.plan_built(req.build, result, HOST, now);
+    let result = req.job.build(|| procs.clone(), HOST.into());
+    app.plan_built(req.build, result, HOST, system::euid());
 }
 
 fn plan_of(app: &App) -> &Plan {
-    &app.plan_view().expect("the plan preview is shown").plan
+    app.plan_view().expect("the plan preview is shown").plan()
 }
 
 fn guard(name: &str, status: GuardStatus, detail: &str) -> GuardResult {
@@ -1747,13 +1755,17 @@ fn hand_plan() -> Plan {
     }
 }
 
-/// The mixed findings with the given paths marked, the uid pinned.
+fn hand_build() -> BuiltPlan {
+    BuiltPlan {
+        plan: hand_plan(),
+        gone: Vec::new(),
+        lossy_paths: Default::default(),
+    }
+}
+
+/// The mixed findings with the given paths marked.
 fn marked_app(paths: &[&str]) -> (Fixture, App) {
     let (f, mut app) = findings_app(mixed_findings(), Some(BASE));
-    let State::Browsing(b) = &mut app.state else {
-        unreachable!();
-    };
-    b.data.plan.ctx.uid = UID;
     press(&mut app, &[KeyCode::Tab]);
     for p in paths {
         press(&mut app, &[KeyCode::Home]);
@@ -1770,7 +1782,7 @@ fn preview_app() -> (Fixture, App) {
     let (f, mut app) = marked_app(&["/home/me/projects/diskwhy/target"]);
     press(&mut app, &[KeyCode::Char('p')]);
     let req = app.take_request().unwrap();
-    app.plan_built(req.build, Ok(hand_plan()), HOST, PLAN_AT + 60);
+    app.plan_built(req.build, Ok(hand_build()), HOST, UID);
     (f, app)
 }
 
@@ -1910,11 +1922,12 @@ fn p_builds_the_plan_of_the_marks_and_esc_keeps_them() {
     assert_eq!(view(&app), View::Plan);
     assert!(matches!(
         app.browser().unwrap().plan,
-        PlanState::Building(_)
+        PlanState::Building(..)
     ));
     let building = render(&mut app, 80, 24, Some(&root));
     assert!(building.contains("from 2 marked findings"), "{building}");
     assert!(building.contains("checking guards"), "{building}");
+    assert!(building.contains("rescanned 0 entries"), "{building}");
 
     run_build(&mut app, &Processes::default());
     let p = plan_of(&app);
@@ -1939,7 +1952,7 @@ fn p_builds_the_plan_of_the_marks_and_esc_keeps_them() {
             .any(|g| g.name == "in-use-cwd")
     );
     assert!(p.items[0].fingerprint.inode.is_some());
-    assert_eq!(app.plan_view().unwrap().unusable, None);
+    assert_eq!(app.plan_view().unwrap().unusable(job::now()), None);
     let screen = render(&mut app, 80, 24, Some(&root));
     assert!(screen.contains("2 items, frees 4.0M"), "{screen}");
     assert!(screen.contains("pass   in-use-cwd"), "{screen}");
@@ -1951,6 +1964,67 @@ fn p_builds_the_plan_of_the_marks_and_esc_keeps_them() {
     assert_eq!(view(&app), View::Findings);
     assert!(matches!(app.browser().unwrap().plan, PlanState::None));
     assert_eq!(marked(&app).len(), 2);
+}
+
+#[test]
+fn p_rescans_and_reports_marks_that_are_gone() {
+    let f = crates_fixture();
+    let root = f.root();
+    let mut app = app_with(scan(&[&root]));
+    press(
+        &mut app,
+        &[
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+        ],
+    );
+    let paths = marked(&app);
+    let app_target = root.join("app/target");
+    let lib_target = root.join("lib/target");
+    fs::remove_file(lib_target.join("CACHEDIR.TAG")).unwrap();
+    let original_bytes = app
+        .browser()
+        .unwrap()
+        .marked_findings()
+        .find(|f| Path::new(&f.path) == app_target)
+        .unwrap()
+        .bytes;
+    fs::write(app_target.join("extra"), vec![7u8; 2 * MIB]).unwrap();
+    let before = job::now();
+    press(&mut app, &[KeyCode::Char('p')]);
+    run_build(&mut app, &Processes::default());
+    let plan = plan_of(&app);
+    let (created, _) = plan::validity_window(plan).unwrap();
+    assert!((before..=job::now()).contains(&created));
+    let [item] = plan.items.as_slice() else {
+        panic!("expected one item, got {:?}", plan.items);
+    };
+    assert_eq!(Path::new(&item.finding.path), app_target);
+    assert!(item.finding.bytes > original_bytes);
+    assert_eq!(plan.selection.select, [item.finding.id.clone()]);
+    let screen = render(&mut app, 120, 40, Some(&root));
+    assert!(screen.contains("gone since the scan:"), "{screen}");
+    assert!(
+        screen.contains(&format!("{ROOT_PLACEHOLDER}/lib/target")),
+        "{screen}"
+    );
+
+    press(&mut app, &[KeyCode::Esc]);
+    assert_eq!(marked(&app), paths);
+    assert_eq!(shown_paths(&app).len(), 2);
+    fs::remove_file(app_target.join("CACHEDIR.TAG")).unwrap();
+    press(&mut app, &[KeyCode::Char('p')]);
+    run_build(&mut app, &Processes::default());
+    assert_eq!(view(&app), View::Findings);
+    assert!(app.plan_view().is_none());
+    assert!(
+        app.message
+            .as_deref()
+            .unwrap()
+            .contains("all marked findings are gone")
+    );
 }
 
 #[test]
@@ -1998,21 +2072,21 @@ fn q_quits_and_esc_leaves_while_the_plan_builds() {
     // Esc leaves; a result that arrives afterwards is dropped.
     press(&mut app, &[KeyCode::Esc]);
     assert_eq!(view(&app), View::Findings);
-    app.plan_built(first.build, Ok(hand_plan()), HOST, PLAN_AT);
+    app.plan_built(first.build, Ok(hand_build()), HOST, UID);
     assert!(matches!(app.browser().unwrap().plan, PlanState::None));
     // Only the latest build counts.
     press(&mut app, &[KeyCode::Char('p')]);
     let second = app.take_request().unwrap();
-    app.plan_built(first.build, Ok(hand_plan()), HOST, PLAN_AT);
+    app.plan_built(first.build, Ok(hand_build()), HOST, UID);
     assert!(matches!(
         app.browser().unwrap().plan,
-        PlanState::Building(_)
+        PlanState::Building(..)
     ));
     // Other keys wait; q quits.
     press(&mut app, &[KeyCode::Down, KeyCode::Char('w')]);
     assert!(matches!(
         app.browser().unwrap().plan,
-        PlanState::Building(_)
+        PlanState::Building(..)
     ));
     assert!(app.on_key(key(KeyCode::Char('q'))));
     // A build error goes back to the list and says why.
@@ -2020,7 +2094,7 @@ fn q_quits_and_esc_leaves_while_the_plan_builds() {
         second.build,
         Err("--select x: no finding".into()),
         HOST,
-        PLAN_AT,
+        UID,
     );
     assert_eq!(view(&app), View::Findings);
     assert!(app.message.as_deref().unwrap().contains("--select x"));
@@ -2029,13 +2103,14 @@ fn q_quits_and_esc_leaves_while_the_plan_builds() {
 #[test]
 fn plan_preview_80x24() {
     let (_f, mut app) = preview_app();
-    insta::assert_snapshot!(render(&mut app, 80, 24, None));
+    insta::assert_snapshot!(render_at(&mut app, 80, 24, None, PLAN_AT));
 }
 
 #[test]
 fn plan_preview_120x40() {
     let (_f, mut app) = preview_app();
-    let screen = render(&mut app, 120, 40, None);
+    render_at(&mut app, 80, 24, None, PLAN_AT);
+    let screen = render_at(&mut app, 120, 40, None, PLAN_AT);
     assert!(screen.contains("warn   git-unpublished"), "{screen}");
     assert!(
         screen.contains("blocked by in-use-cwd: working directory of node (pid 4242)"),
@@ -2052,7 +2127,7 @@ fn write_prompt_80x24() {
         app.plan_view().unwrap().prompt.as_ref().unwrap().path,
         DEFAULT_PLAN_FILE
     );
-    insta::assert_snapshot!(render(&mut app, 80, 24, None));
+    insta::assert_snapshot!(render_at(&mut app, 80, 24, None, PLAN_AT));
 }
 
 #[test]
@@ -2065,7 +2140,6 @@ fn w_writes_the_plan_file_as_dwhy_plan_does() {
         &[KeyCode::Tab, KeyCode::Char(' '), KeyCode::Char('p')],
     );
     run_build(&mut app, &Processes::default());
-    let expected = plan::to_json(plan_of(&app)).unwrap();
     let out = tempfile::tempdir().unwrap();
     let file = out.path().join("quick-plan.json");
     let path = file.to_str().unwrap();
@@ -2090,29 +2164,93 @@ fn w_writes_the_plan_file_as_dwhy_plan_does() {
     type_text(&mut app, path);
     press(&mut app, &[KeyCode::Enter]);
     assert!(app.plan_view().unwrap().prompt.is_none());
-    assert!(app.message.as_deref().unwrap().starts_with("wrote "));
-    assert_eq!(fs::read_to_string(&file).unwrap(), expected);
-    let back = plan::parse(&fs::read_to_string(&file).unwrap()).unwrap();
-    assert_eq!(&back, plan_of(&app));
+    assert_eq!(app.message, Some(format!("wrote {path}")));
+    let saved = fs::read_to_string(&file).unwrap();
+    assert!(saved.ends_with('\n'));
+    assert_eq!(&plan::parse(&saved).unwrap(), plan_of(&app));
 
     // An existing file: n goes back to the path, y overwrites.
     fs::write(&file, "old").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
     press(&mut app, &[KeyCode::Char('w')]);
     assert!(!app.on_key(ctrl('u')));
     type_text(&mut app, path);
     press(&mut app, &[KeyCode::Enter]);
-    assert!(app.plan_view().unwrap().prompt.as_ref().unwrap().confirm);
+    assert!(
+        app.plan_view()
+            .unwrap()
+            .prompt
+            .as_ref()
+            .unwrap()
+            .confirm
+            .is_some()
+    );
     let screen = render(&mut app, 200, 24, None);
     assert!(screen.contains("exists; overwrite? y/n"), "{screen}");
     press(&mut app, &[KeyCode::Char('n')]);
     let prompt = app.plan_view().unwrap().prompt.clone().unwrap();
-    assert!(!prompt.confirm && prompt.path == path);
+    assert!(prompt.confirm.is_none() && prompt.path == path);
     assert_eq!(fs::read_to_string(&file).unwrap(), "old");
     press(&mut app, &[KeyCode::Enter, KeyCode::Char('y')]);
-    assert_eq!(fs::read_to_string(&file).unwrap(), expected);
+    assert_eq!(fs::read_to_string(&file).unwrap(), saved);
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     assert!(app.plan_view().unwrap().prompt.is_none());
     // No temp file is left next to it.
     assert_eq!(fs::read_dir(out.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn w_asks_again_when_the_overwrite_target_changes() {
+    let (_f, mut app) = preview_app();
+    let out = tempfile::tempdir().unwrap();
+    let file = out.path().join("plan.json");
+    fs::write(&file, "first file").unwrap();
+    press(&mut app, &[KeyCode::Char('w')]);
+    assert!(!app.on_key(ctrl('u')));
+    type_text(&mut app, file.to_str().unwrap());
+    press(&mut app, &[KeyCode::Enter]);
+    let replacement = out.path().join("replacement.json");
+    fs::write(&replacement, "second file").unwrap();
+    fs::rename(replacement, &file).unwrap();
+    press(&mut app, &[KeyCode::Char('y')]);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "second file");
+    assert!(app.message.as_deref().unwrap().contains("target changed"));
+    let screen = render_at(&mut app, 200, 24, None, PLAN_AT);
+    assert!(screen.contains("exists; overwrite? y/n"), "{screen}");
+    assert_eq!(fs::read_dir(out.path()).unwrap().count(), 1);
+    press(&mut app, &[KeyCode::Char('y')]);
+    let saved = fs::read_to_string(&file).unwrap();
+    assert_eq!(&plan::parse(&saved).unwrap(), plan_of(&app));
+    assert!(app.plan_view().unwrap().prompt.is_none());
+}
+
+#[test]
+fn w_overwrites_a_long_basename_through_a_parent_symlink() {
+    let (_f, mut app) = preview_app();
+    let out = tempfile::tempdir().unwrap();
+    let parent = out.path().join("parent");
+    fs::create_dir(&parent).unwrap();
+    let alias = out.path().join("alias");
+    std::os::unix::fs::symlink(&parent, &alias).unwrap();
+    let name = "p".repeat(255);
+    let file = parent.join(&name);
+    fs::write(&file, "old").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+
+    press(&mut app, &[KeyCode::Char('w')]);
+    assert!(!app.on_key(ctrl('u')));
+    type_text(&mut app, alias.join(&name).to_str().unwrap());
+    press(&mut app, &[KeyCode::Enter, KeyCode::Char('y')]);
+    let saved = fs::read_to_string(&file).unwrap();
+    assert_eq!(&plan::parse(&saved).unwrap(), plan_of(&app));
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert_eq!(fs::read_dir(parent).unwrap().count(), 1);
 }
 
 #[test]
@@ -2143,8 +2281,11 @@ fn w_refuses_symlinks_and_non_files() {
     assert!(!out.path().join("nowhere.json").exists());
     // Overwriting never follows a symlink either.
     let plan = hand_plan();
-    assert!(job::write_plan(&link, &plan, true).is_err());
-    assert!(job::write_plan(&dangling, &plan, false).is_err());
+    let job::Target::File { identity, .. } = job::target(&real).unwrap() else {
+        panic!("regular plan file");
+    };
+    assert!(job::write_plan(&link, &plan, Some(identity)).is_err());
+    assert!(job::write_plan(&dangling, &plan, None).is_err());
     assert_eq!(fs::read_to_string(&real).unwrap(), "keep");
     assert!(!out.path().join("nowhere.json").exists());
 }
@@ -2153,11 +2294,11 @@ fn w_refuses_symlinks_and_non_files() {
 fn plan_file_opens_in_the_preview() {
     let plan = hand_plan();
     let file = PathBuf::from("/tmp/plans/dwhy-plan.json");
-    let mut app = App::open_plan(plan.clone(), file.clone(), HOST, UID, PLAN_AT + 60);
+    let mut app = App::open_plan(plan.clone(), file.clone(), HOST, UID);
     let view = app.plan_view().unwrap();
-    assert_eq!(view.unusable, None);
+    assert_eq!(view.unusable(PLAN_AT + 60), None);
     assert_eq!(view.file.as_deref(), Some(file.as_path()));
-    let screen = render(&mut app, 80, 24, None);
+    let screen = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
     assert!(
         screen.contains("plan /tmp/plans/dwhy-plan.json"),
         "{screen}"
@@ -2177,15 +2318,39 @@ fn plan_file_opens_in_the_preview() {
         (HOST, UID + 1, PLAN_AT, "made by uid 1000, not 1001"),
         (HOST, UID, PLAN_AT + plan::TTL_SECS, "expired at"),
     ] {
-        let app = App::open_plan(plan.clone(), file.clone(), host, uid, now);
-        let got = app.plan_view().unwrap().unusable.clone().unwrap();
+        let app = App::open_plan(plan.clone(), file.clone(), host, uid);
+        let got = app.plan_view().unwrap().unusable(now).unwrap().to_string();
         assert!(got.contains(why), "{got}");
     }
 }
 
 #[test]
+fn an_open_preview_shows_the_capped_deadline_and_expires_at_it() {
+    let mut plan = hand_plan();
+    plan.expires_at = dwhy_core::detect::rfc3339(PLAN_AT + 86_400);
+    let mut app = App::open_plan(plan, "edited.json".into(), HOST, UID);
+    let deadline = PLAN_AT + 3600;
+    let expiry = format!("expires {}", dwhy_core::detect::rfc3339(deadline));
+    let before = render_at(&mut app, 80, 24, None, deadline - 1);
+    assert!(before.contains(&expiry), "{before}");
+    assert!(!before.contains("NOT USABLE"), "{before}");
+    let expired = render_at(&mut app, 80, 24, None, deadline);
+    assert!(
+        expired.contains("NOT USABLE: the plan expired at"),
+        "{expired}"
+    );
+    assert!(expired.contains(&expiry), "{expired}");
+}
+
+#[test]
 fn unusable_plan_banner_80x24() {
     let file = PathBuf::from("/tmp/plans/dwhy-plan.json");
-    let mut app = App::open_plan(hand_plan(), file, HOST, UID, PLAN_AT + plan::TTL_SECS + 600);
-    insta::assert_snapshot!(render(&mut app, 80, 24, None));
+    let mut app = App::open_plan(hand_plan(), file, HOST, UID);
+    insta::assert_snapshot!(render_at(
+        &mut app,
+        80,
+        24,
+        None,
+        PLAN_AT + plan::TTL_SECS + 600
+    ));
 }

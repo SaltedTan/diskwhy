@@ -294,8 +294,7 @@ pub fn detect_into(
     detect_into_with(report, tree, &DetectContext::from_system(), only, probe)
 }
 
-/// [`detect_into`] with the caller's context, for a caller that needs it
-/// again afterwards (the TUI builds plans from the same context).
+/// [`detect_into`] with the caller's context.
 pub fn detect_into_with(
     report: &mut crate::report::ScanReport,
     tree: &ScanTree,

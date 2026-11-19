@@ -8,6 +8,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::Ordering;
 
 use dwhy_core::apply::{action_kind_name, guard_status_name, tier_name};
+use dwhy_core::detect::rfc3339;
+use dwhy_core::plan;
 use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{ActionKind, Finding, FsReport, GuardStatus};
 use dwhy_core::units::{human, signed, thousands};
@@ -21,7 +23,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Browser, FindingList, PlanState, PlanView, SizeMode, State, View, sanitize};
-use crate::job::{Mark, PermissionMark, Scanned, Stage};
+use crate::job::{self, Mark, PermissionMark, Scanned, Stage};
 
 /// Filesystem lines shown before "… N more".
 const MAX_FS_LINES: usize = 3;
@@ -29,6 +31,10 @@ const MAX_FS_LINES: usize = 3;
 const BAR: usize = 10;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    draw_at(f, app, job::now());
+}
+
+pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
     let area = f.area();
     let fs_lines = match &app.state {
         State::Scanning { .. } => 1,
@@ -93,34 +99,41 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(Span::styled(" q quit", dim)), keys);
         }
         State::Plan(view) => {
-            app.viewport = draw_plan(f, view, &areas, " ↑↓ PgUp PgDn scroll · q quit");
+            app.viewport = draw_plan(f, view, &areas, " ↑↓ PgUp PgDn scroll · q quit", now);
         }
         State::Browsing(b) if b.view == View::Plan => match &mut b.plan {
             PlanState::Ready(view) => {
                 let help =
                     " ↑↓ PgUp PgDn scroll · w write plan file · Esc back · Tab tree · q quit";
-                app.viewport = draw_plan(f, view, &areas, help);
+                app.viewport = draw_plan(f, view, &areas, help, now);
             }
-            PlanState::Building(_) | PlanState::None => {
+            PlanState::Building(_, progress) => {
                 f.render_widget(title_line("plan", "", width), title);
                 let n = b.marked.len();
                 let lines = vec![
                     Line::raw(""),
                     Line::raw(format!(
-                        "  Building the plan from {n} marked finding{}: running the guards…",
+                        "  Building the plan from {n} marked finding{}",
                         if n == 1 { "" } else { "s" }
                     )),
-                    Line::raw(""),
-                    Line::styled("  Nothing is written or removed.", dim),
+                    Line::raw("  Rescanning, then checking guards…"),
                 ];
                 f.render_widget(Paragraph::new(lines), list);
                 f.render_widget(
-                    Paragraph::new(Span::styled(" checking guards…", bold)),
+                    Paragraph::new(Span::styled(
+                        format!(
+                            " rescanned {} entries, {}",
+                            thousands(progress.entries.load(Ordering::Relaxed)),
+                            human(progress.allocated.load(Ordering::Relaxed))
+                        ),
+                        bold,
+                    )),
                     status,
                 );
                 let help = " Esc back to findings · q quit";
                 f.render_widget(Paragraph::new(Span::styled(help, dim)), keys);
             }
+            PlanState::None => {}
         },
         State::Browsing(b) if b.view == View::Findings => {
             let filter = b.findings.filter.map_or("all tiers", tier_name);
@@ -248,10 +261,10 @@ struct PlanAreas {
 /// The plan preview: a banner when `dwhy apply` would refuse the plan, the
 /// plan's lines (scrollable), and the status line or the `w` prompt.
 /// Returns the lines on screen.
-fn draw_plan(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, help: &str) -> usize {
+fn draw_plan(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, help: &str, now: i64) -> usize {
     let width = a.title.width as usize;
     let dim = Style::new().add_modifier(Modifier::DIM);
-    let p = &v.plan;
+    let p = v.plan();
     let right = format!(
         "{} item{} · {}",
         p.items.len(),
@@ -268,7 +281,7 @@ fn draw_plan(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, help: &str) -> usiz
         }),
         a.title,
     );
-    let banner: Vec<Line> = match &v.unusable {
+    let banner: Vec<Line> = match v.unusable(now) {
         Some(why) => wrap(&format!(" NOT USABLE: {why}"), width)
             .into_iter()
             .map(|l| {
@@ -284,16 +297,19 @@ fn draw_plan(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, help: &str) -> usiz
         Layout::vertical([Constraint::Length(banner_h), Constraint::Min(0)]).areas(a.list);
     f.render_widget(Paragraph::new(banner), banner_area);
 
-    let lines = plan_lines(v, width);
+    if v.lines.as_ref().is_none_or(|(cached, _)| *cached != width) {
+        v.lines = Some((width, plan_lines(v, width)));
+    }
+    let (_, lines) = v.lines.as_ref().unwrap();
     let height = body.height as usize;
     v.scroll = v.scroll.min(lines.len().saturating_sub(height.max(1)));
     let end = (v.scroll + height).min(lines.len());
     let status = format!(" lines {}–{end} of {}", v.scroll + 1, lines.len());
-    let shown: Vec<Line> = lines.into_iter().skip(v.scroll).take(height).collect();
+    let shown = lines[v.scroll..end].to_vec();
     f.render_widget(Paragraph::new(shown), body);
 
     match &v.prompt {
-        Some(prompt) if prompt.confirm => {
+        Some(prompt) if prompt.confirm.is_some() => {
             let path = middle_units(display_units(&prompt.path), width.saturating_sub(30));
             f.render_widget(
                 Paragraph::new(format!(" {path} exists; overwrite? y/n")),
@@ -339,7 +355,7 @@ fn draw_plan(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, help: &str) -> usiz
 /// their actions and every guard result, then the blocked findings with
 /// what blocked them.
 fn plan_lines(v: &PlanView, width: usize) -> Vec<Line<'static>> {
-    let p = &v.plan;
+    let p = v.plan();
     let mut out: Vec<Line<'static>> = Vec::new();
     let push = |out: &mut Vec<Line<'static>>, s: &str| {
         out.extend(wrap(s, width).into_iter().map(Line::raw));
@@ -362,9 +378,11 @@ fn plan_lines(v: &PlanView, width: usize) -> Vec<Line<'static>> {
         middle(&summary, width),
         Style::new().add_modifier(Modifier::BOLD),
     ));
+    let expires =
+        plan::validity_window(p).map_or_else(|_| "unavailable".into(), |(_, t)| rfc3339(t));
     push(
         &mut out,
-        &format!("  created {} · expires {}", p.created_at, p.expires_at),
+        &format!("  created {} · expires {expires}", p.created_at),
     );
     push(&mut out, &format!("  host {} · uid {}", p.host, p.uid));
     for root in &p.scan.roots {
@@ -376,6 +394,14 @@ fn plan_lines(v: &PlanView, width: usize) -> Vec<Line<'static>> {
         .as_ref()
         .map_or("all".into(), |d| d.join(", "));
     push(&mut out, &format!("  detectors: {detectors}"));
+
+    if !v.gone_paths.is_empty() {
+        push(&mut out, "");
+        push(&mut out, "gone since the scan:");
+        for path in &v.gone_paths {
+            push(&mut out, &format!("  {path}"));
+        }
+    }
 
     for item in &p.items {
         let f = &item.finding;

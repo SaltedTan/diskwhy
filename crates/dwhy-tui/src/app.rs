@@ -2,6 +2,7 @@
 //! Nothing here touches the terminal, so tests drive it directly.
 
 use std::collections::{BTreeSet, HashSet};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -11,8 +12,9 @@ use dwhy_core::plan;
 use dwhy_core::report::{ActionKind, Finding, Plan, Tier};
 use dwhy_core::scan::Progress;
 use dwhy_core::tree::NodeId;
+use ratatui::text::Line;
 
-use crate::job::{self, Mark, PlanJob, Scanned, Stage, Target};
+use crate::job::{self, BuiltPlan, FileIdentity, Mark, PlanJob, Scanned, Stage, Target};
 
 /// Where `w` offers to write a plan, relative to the working directory.
 pub const DEFAULT_PLAN_FILE: &str = "./dwhy-plan.json";
@@ -111,7 +113,8 @@ pub struct Browser {
     pub(crate) fs_offset: Option<usize>,
     pub findings: FindingList,
     /// Marked findings, as indices into the report's findings.
-    pub marked: BTreeSet<usize>,
+    pub(crate) marked: BTreeSet<usize>,
+    marked_bytes: u64,
     pub plan: PlanState,
     /// Numbers plan builds, so a result that arrives after Esc is dropped.
     plan_builds: u64,
@@ -123,19 +126,21 @@ pub enum PlanState {
     #[default]
     None,
     /// Build number `n` is running on a worker thread.
-    Building(u64),
+    Building(u64, Arc<Progress>),
     Ready(Box<PlanView>),
 }
 
 /// A plan in the preview.
 #[derive(Debug)]
 pub struct PlanView {
-    pub plan: Plan,
-    /// Why `dwhy apply` would refuse this plan here and now (`plan::usable`).
-    pub unusable: Option<String>,
+    plan: Plan,
+    host: String,
+    uid: u32,
     /// The file it was opened from (`dwhy tui --plan`); `None` when built here.
     pub file: Option<PathBuf>,
     pub(crate) lossy_paths: HashSet<String>,
+    pub(crate) gone_paths: Vec<String>,
+    pub(crate) lines: Option<(usize, Vec<Line<'static>>)>,
     /// First line on screen.
     pub scroll: usize,
     /// The `w` prompt, while it is open.
@@ -147,11 +152,11 @@ pub struct PlanView {
 pub struct Prompt {
     pub path: String,
     /// The path names an existing file; waiting for y or n.
-    pub confirm: bool,
+    pub confirm: Option<FileIdentity>,
 }
 
 /// A plan build for the event loop to run off the UI thread.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PlanRequest {
     pub build: u64,
     pub job: PlanJob,
@@ -197,10 +202,9 @@ impl App {
         }
     }
 
-    /// `dwhy tui --plan FILE`: previews `plan`, read from `file`, checked
-    /// with `plan::usable` against this `host`, `uid` and `now`.
-    pub fn open_plan(plan: Plan, file: PathBuf, host: &str, uid: u32, now: i64) -> App {
-        let mut view = PlanView::new(plan, host, uid, now, HashSet::new());
+    /// `dwhy tui --plan FILE`: previews `plan`, read from `file`.
+    pub fn open_plan(plan: Plan, file: PathBuf, host: &str, uid: u32) -> App {
+        let mut view = PlanView::new(plan, host, uid, HashSet::new(), Vec::new());
         view.file = Some(file);
         App {
             roots: Vec::new(),
@@ -217,20 +221,33 @@ impl App {
         self.request.take()
     }
 
-    /// Plan build `build` finished; `host` is the one it was built for and
-    /// `now` the time, to check the plan with `plan::usable`. A result for
-    /// a build that was left with Esc is dropped.
-    pub fn plan_built(&mut self, build: u64, result: Result<Plan, String>, host: &str, now: i64) {
+    /// Plan build `build` finished. A result for a build left with Esc is dropped.
+    pub fn plan_built(
+        &mut self,
+        build: u64,
+        result: Result<BuiltPlan, String>,
+        host: &str,
+        uid: u32,
+    ) {
         let State::Browsing(b) = &mut self.state else {
             return;
         };
-        if !matches!(b.plan, PlanState::Building(n) if n == build) {
+        if !matches!(b.plan, PlanState::Building(n, _) if n == build) {
             return;
         }
         match result {
-            Ok(plan) => {
-                let lossy = b.lossy_paths.clone();
-                let view = PlanView::new(plan, host, b.data.plan.ctx.uid, now, lossy);
+            Ok(BuiltPlan {
+                plan,
+                gone,
+                lossy_paths,
+            }) => {
+                let gone: HashSet<_> = gone.into_iter().collect();
+                let gone_paths = b
+                    .marked_findings()
+                    .filter(|f| gone.contains(&f.id))
+                    .map(|f| f.path.clone())
+                    .collect();
+                let view = PlanView::new(plan, host, uid, lossy_paths, gone_paths);
                 b.plan = PlanState::Ready(Box::new(view));
             }
             Err(e) => {
@@ -288,6 +305,7 @@ impl App {
             fs_offset: None,
             findings: FindingList::default(),
             marked: BTreeSet::new(),
+            marked_bytes: 0,
             plan: PlanState::None,
             plan_builds: 0,
         };
@@ -449,7 +467,7 @@ impl Browser {
 
     /// The marked findings' bytes, leaving out findings inside other marked ones.
     pub fn marked_bytes(&self) -> u64 {
-        plan::distinct_bytes(self.marked_findings().map(|f| (f.path.as_str(), f.bytes)))
+        self.marked_bytes
     }
 
     fn on_findings_key(&mut self, code: KeyCode, viewport: usize) -> Effect {
@@ -473,6 +491,9 @@ impl Browser {
                     if !self.marked.remove(&i) {
                         self.marked.insert(i);
                     }
+                    self.marked_bytes = plan::distinct_bytes(
+                        self.marked_findings().map(|f| (f.path.as_str(), f.bytes)),
+                    );
                 }
             }
             code if l.shown.is_empty() => scroll_lines(&mut l.offset, code, page),
@@ -498,13 +519,14 @@ impl Browser {
             return Effect::Message("nothing marked: Space marks a finding for the plan".into());
         }
         self.plan_builds += 1;
-        self.plan = PlanState::Building(self.plan_builds);
+        let progress = Arc::new(Progress::default());
+        self.plan = PlanState::Building(self.plan_builds, progress.clone());
         self.view = View::Plan;
         Effect::Build(PlanRequest {
             build: self.plan_builds,
             job: PlanJob {
-                source: self.data.plan.clone(),
-                tree: self.data.tree.clone(),
+                options: self.data.plan_options.clone(),
+                progress,
                 select: self.marked_findings().map(|f| f.id.clone()).collect(),
             },
         })
@@ -519,7 +541,7 @@ impl Browser {
             }
             _ => match &mut self.plan {
                 PlanState::Ready(view) => view.on_key(code, page),
-                PlanState::None | PlanState::Building(_) => None,
+                PlanState::None | PlanState::Building(..) => None,
             },
         }
     }
@@ -618,17 +640,32 @@ enum Effect {
 }
 
 impl PlanView {
-    fn new(plan: Plan, host: &str, uid: u32, now: i64, lossy_paths: HashSet<String>) -> PlanView {
+    fn new(
+        plan: Plan,
+        host: &str,
+        uid: u32,
+        lossy_paths: HashSet<String>,
+        gone_paths: Vec<String>,
+    ) -> PlanView {
         PlanView {
-            unusable: plan::usable(&plan, host, uid, now)
-                .err()
-                .map(|e| e.to_string()),
             plan,
+            host: host.into(),
+            uid,
             file: None,
             lossy_paths,
+            gone_paths,
+            lines: None,
             scroll: 0,
             prompt: None,
         }
+    }
+
+    pub fn plan(&self) -> &Plan {
+        &self.plan
+    }
+
+    pub fn unusable(&self, now: i64) -> Option<plan::Unusable> {
+        plan::usable(&self.plan, &self.host, self.uid, now).err()
     }
 
     fn on_key(&mut self, code: KeyCode, page: usize) -> Option<String> {
@@ -640,7 +677,7 @@ impl PlanView {
                 None => {
                     self.prompt = Some(Prompt {
                         path: DEFAULT_PLAN_FILE.into(),
-                        confirm: false,
+                        confirm: None,
                     });
                 }
             },
@@ -652,15 +689,13 @@ impl PlanView {
     /// A key while the `w` prompt is open; returns the status message.
     fn on_prompt_key(&mut self, code: KeyCode, ctrl: bool) -> Option<String> {
         let prompt = self.prompt.as_mut()?;
-        if prompt.confirm {
+        if let Some(confirmed) = prompt.confirm {
             match code {
                 KeyCode::Char('y' | 'Y') => {
-                    let path = std::mem::take(&mut prompt.path);
-                    self.prompt = None;
-                    return Some(self.write(&path, true));
+                    return self.write(Some(confirmed));
                 }
                 // Back to the path, to choose another.
-                KeyCode::Char('n' | 'N') | KeyCode::Esc => prompt.confirm = false,
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => prompt.confirm = None,
                 _ => {}
             }
             return None;
@@ -674,12 +709,8 @@ impl PlanView {
                 return Some("type a file name, or Esc to cancel".into());
             }
             KeyCode::Enter => match job::target(Path::new(&prompt.path)) {
-                Ok(Target::Free) => {
-                    let path = std::mem::take(&mut prompt.path);
-                    self.prompt = None;
-                    return Some(self.write(&path, false));
-                }
-                Ok(Target::File) => prompt.confirm = true,
+                Ok(Target::Free) => return self.write(None),
+                Ok(Target::File { identity, .. }) => prompt.confirm = Some(identity),
                 Ok(Target::Refused(why)) => {
                     return Some(format!("not writing {}: {why}", prompt.path));
                 }
@@ -695,14 +726,27 @@ impl PlanView {
         None
     }
 
-    fn write(&self, path: &str, overwrite: bool) -> String {
-        match job::write_plan(Path::new(path), &self.plan, overwrite) {
-            Ok(()) => format!(
-                "wrote {path}; dwhy apply accepts it until {}",
-                self.plan.expires_at
-            ),
-            Err(e) => format!("cannot write {path}: {e}"),
-        }
+    fn write(&mut self, overwrite: Option<FileIdentity>) -> Option<String> {
+        let prompt = self.prompt.as_mut()?;
+        let path = Path::new(&prompt.path);
+        let message = match job::write_plan(path, &self.plan, overwrite) {
+            Ok(()) => {
+                let message = format!("wrote {}", prompt.path);
+                self.prompt = None;
+                message
+            }
+            Err(e) => {
+                prompt.confirm = if e.kind() == ErrorKind::AlreadyExists
+                    && let Ok(Target::File { identity, .. }) = job::target(path)
+                {
+                    Some(identity)
+                } else {
+                    None
+                };
+                format!("cannot write {}: {e}", prompt.path)
+            }
+        };
+        Some(message)
     }
 }
 

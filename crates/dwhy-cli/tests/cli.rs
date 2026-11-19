@@ -331,16 +331,18 @@ fn tui_and_cli_plans_round_trip() {
         .collect();
     assert_eq!(ids.len(), 2);
     let built = PlanJob {
-        source: scanned.plan.clone(),
-        tree: scanned.tree.clone(),
+        options: scanned.plan_options,
+        progress: Default::default(),
         select: ids.clone(),
     }
-    .build(&Processes::read(), dwhy_core::system::hostname())
+    .build(Processes::read, dwhy_core::system::hostname())
     .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let tui_file = dir.path().join("tui.json");
-    job::write_plan(&tui_file, &built, false).unwrap();
-    let tui_plan = plan::parse(&fs::read_to_string(&tui_file).unwrap()).unwrap();
+    job::write_plan(&tui_file, &built.plan, None).unwrap();
+    let tui_text = fs::read_to_string(&tui_file).unwrap();
+    assert!(tui_text.ends_with('\n'));
+    let tui_plan = plan::parse(&tui_text).unwrap();
     let env = dwhy_core::apply::Env::from_system();
     let now = job::now();
     plan::usable(&tui_plan, &env.host, env.uid, now).unwrap();
@@ -350,6 +352,7 @@ fn tui_and_cli_plans_round_trip() {
         "plan",
         &root,
         "-q",
+        "--json",
         "--detectors",
         "cargo-target",
         "--select",
@@ -359,9 +362,8 @@ fn tui_and_cli_plans_round_trip() {
     ]);
     assert_eq!(out.status.code(), Some(0));
     let cli_text = fs::read_to_string(&cli_file).unwrap();
+    assert_eq!(cli_text.as_bytes(), out.stdout.as_slice());
     let cli_plan = plan::parse(&cli_text).unwrap();
-    // The shared serialization reproduces the CLI's file byte for byte.
-    assert_eq!(plan::to_json(&cli_plan).unwrap(), cli_text);
 
     let summary = |p: &dwhy_core::report::Plan| {
         let items: Vec<_> = p
@@ -417,10 +419,10 @@ fn tui_and_cli_plans_round_trip() {
     );
 
     // The CLI's file opens in the TUI's preview, usable here.
-    let app = dwhy_tui::App::open_plan(cli_plan, cli_file, &env.host, env.uid, now);
+    let app = dwhy_tui::App::open_plan(cli_plan, cli_file, &env.host, env.uid);
     let view = app.plan_view().unwrap();
-    assert_eq!(view.unusable, None);
-    assert_eq!(view.plan.items.len(), 2);
+    assert_eq!(view.unusable(job::now()), None);
+    assert_eq!(view.plan().items.len(), 2);
 }
 
 #[test]
