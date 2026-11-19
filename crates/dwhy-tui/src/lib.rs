@@ -47,8 +47,7 @@ enum Msg {
     Done(Result<Box<Scanned>, String>),
 }
 
-/// A finished plan build: its number, the host it was built for, the plan.
-type Built = (u64, String, Result<job::BuiltPlan, String>);
+type Built = (String, Result<job::BuiltPlan, String>);
 
 /// Opens the TUI: checks there is a terminal, scans `opts` in a background
 /// thread, and browses the result until the person quits.
@@ -145,25 +144,25 @@ where
         if signal.exit_code().is_some() {
             return Ok(());
         }
+        while let Ok((host, plan)) = built_rx.try_recv() {
+            app.plan_built(plan, &host, system::euid());
+        }
         if ready
             && let Event::Key(key) = read()?
             && app.on_key(key)
         {
             return Ok(());
         }
-        if let Some(req) = app.take_request() {
+        if let Some(job) = app.take_request() {
             let tx = built_tx.clone();
             // Guards read /proc and run git. Not joined, like the scan.
             std::thread::Builder::new()
                 .name("dwhy-tui-plan".into())
                 .spawn(move || {
                     let host = system::hostname();
-                    let plan = req.job.build(Processes::read, host.clone());
-                    let _ = tx.send((req.build, host, plan));
+                    let plan = job.build(Processes::read, host.clone());
+                    let _ = tx.send((host, plan));
                 })?;
-        }
-        while let Ok((build, host, plan)) = built_rx.try_recv() {
-            app.plan_built(build, plan, &host, system::euid());
         }
         loop {
             match rx.try_recv() {

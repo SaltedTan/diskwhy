@@ -14,7 +14,10 @@ use dwhy_core::scan::Progress;
 use dwhy_core::tree::NodeId;
 use ratatui::text::Line;
 
-use crate::job::{self, BuiltPlan, FileIdentity, Mark, PlanJob, Scanned, Stage, Target};
+use crate::job::{
+    self, BuiltPlan, FileIdentity, Mark, PlanJob, PlanMark, Scanned, Stage, Target, UnplannedMark,
+    WriteError,
+};
 
 /// Where `w` offers to write a plan, relative to the working directory.
 pub const DEFAULT_PLAN_FILE: &str = "./dwhy-plan.json";
@@ -116,8 +119,6 @@ pub struct Browser {
     pub(crate) marked: BTreeSet<usize>,
     marked_bytes: u64,
     pub plan: PlanState,
-    /// Numbers plan builds, so a result that arrives after Esc is dropped.
-    plan_builds: u64,
 }
 
 /// The plan made from the marks.
@@ -125,8 +126,10 @@ pub struct Browser {
 pub enum PlanState {
     #[default]
     None,
-    /// Build number `n` is running on a worker thread.
-    Building(u64, Arc<Progress>),
+    Building {
+        progress: Arc<Progress>,
+        marks: usize,
+    },
     Ready(Box<PlanView>),
 }
 
@@ -139,7 +142,7 @@ pub struct PlanView {
     /// The file it was opened from (`dwhy tui --plan`); `None` when built here.
     pub file: Option<PathBuf>,
     pub(crate) lossy_paths: HashSet<String>,
-    pub(crate) gone_paths: Vec<String>,
+    pub(crate) unplanned: Vec<UnplannedMark>,
     pub(crate) lines: Option<(usize, Vec<Line<'static>>)>,
     /// First line on screen.
     pub scroll: usize,
@@ -153,13 +156,6 @@ pub struct Prompt {
     pub path: String,
     /// The path names an existing file; waiting for y or n.
     pub confirm: Option<FileIdentity>,
-}
-
-/// A plan build for the event loop to run off the UI thread.
-#[derive(Debug)]
-pub struct PlanRequest {
-    pub build: u64,
-    pub job: PlanJob,
 }
 
 #[derive(Debug)]
@@ -183,7 +179,7 @@ pub struct App {
     pub viewport: usize,
     /// A one-off status message, cleared by the next key.
     pub message: Option<String>,
-    request: Option<PlanRequest>,
+    request: Option<PlanJob>,
 }
 
 impl App {
@@ -217,41 +213,31 @@ impl App {
     }
 
     /// The plan build the last key asked for, for the caller to run.
-    pub fn take_request(&mut self) -> Option<PlanRequest> {
+    pub fn take_request(&mut self) -> Option<PlanJob> {
         self.request.take()
     }
 
-    /// Plan build `build` finished. A result for a build left with Esc is dropped.
-    pub fn plan_built(
-        &mut self,
-        build: u64,
-        result: Result<BuiltPlan, String>,
-        host: &str,
-        uid: u32,
-    ) {
+    pub fn plan_built(&mut self, result: Result<BuiltPlan, String>, host: &str, uid: u32) {
         let State::Browsing(b) = &mut self.state else {
             return;
         };
-        if !matches!(b.plan, PlanState::Building(n, _) if n == build) {
+        if !matches!(b.plan, PlanState::Building { .. }) {
+            return;
+        }
+        b.plan = PlanState::None;
+        if b.view != View::Plan {
             return;
         }
         match result {
             Ok(BuiltPlan {
                 plan,
-                gone,
+                unplanned,
                 lossy_paths,
             }) => {
-                let gone: HashSet<_> = gone.into_iter().collect();
-                let gone_paths = b
-                    .marked_findings()
-                    .filter(|f| gone.contains(&f.id))
-                    .map(|f| f.path.clone())
-                    .collect();
-                let view = PlanView::new(plan, host, uid, lossy_paths, gone_paths);
+                let view = PlanView::new(plan, host, uid, lossy_paths, unplanned);
                 b.plan = PlanState::Ready(Box::new(view));
             }
             Err(e) => {
-                b.plan = PlanState::None;
                 b.view = View::Findings;
                 self.message = Some(format!("no plan: {e}"));
             }
@@ -307,7 +293,6 @@ impl App {
             marked: BTreeSet::new(),
             marked_bytes: 0,
             plan: PlanState::None,
-            plan_builds: 0,
         };
         b.refresh_rows(self.mode);
         b.refilter(None);
@@ -332,7 +317,7 @@ impl App {
         }
         // The prompt takes every other key, `q` included: it is text.
         if let Some(view) = self.plan_view_mut().filter(|v| v.prompt.is_some()) {
-            self.message = view.on_prompt_key(key.code, ctrl);
+            self.message = view.on_prompt_key(key);
             return false;
         }
         if key.code == KeyCode::Char('q') {
@@ -354,7 +339,7 @@ impl App {
                 View::Tree => View::Findings,
                 View::Findings | View::Detail | View::Plan => View::Tree,
             };
-            b.plan = PlanState::None;
+            b.drop_preview();
             return false;
         }
         match b.view {
@@ -480,7 +465,7 @@ impl Browser {
                 self.refilter(FILTERS[(at + 1) % FILTERS.len()]);
             }
             KeyCode::Char('p') => return self.start_plan(),
-            KeyCode::Char(' ') => {
+            KeyCode::Char(' ') if viewport > 0 => {
                 if let Some(&i) = l.shown.get(l.selected) {
                     let f = &self.data.report.findings[i];
                     if f.action.kind == ActionKind::Advice {
@@ -515,33 +500,42 @@ impl Browser {
     /// `p`: asks for the plan of the marked findings, as
     /// `dwhy plan --select <ids>` would make it.
     fn start_plan(&mut self) -> Effect {
+        if matches!(self.plan, PlanState::Building { .. }) {
+            self.view = View::Plan;
+            return Effect::None;
+        }
         if self.marked.is_empty() {
             return Effect::Message("nothing marked: Space marks a finding for the plan".into());
         }
-        self.plan_builds += 1;
         let progress = Arc::new(Progress::default());
-        self.plan = PlanState::Building(self.plan_builds, progress.clone());
+        self.plan = PlanState::Building {
+            progress: progress.clone(),
+            marks: self.marked.len(),
+        };
         self.view = View::Plan;
-        Effect::Build(PlanRequest {
-            build: self.plan_builds,
-            job: PlanJob {
-                options: self.data.plan_options.clone(),
-                progress,
-                select: self.marked_findings().map(|f| f.id.clone()).collect(),
-            },
+        Effect::Build(PlanJob {
+            options: self.data.plan_options.clone(),
+            progress,
+            marks: self.marked_findings().map(PlanMark::from).collect(),
         })
+    }
+
+    fn drop_preview(&mut self) {
+        if matches!(self.plan, PlanState::Ready(_)) {
+            self.plan = PlanState::None;
+        }
     }
 
     fn on_plan_key(&mut self, code: KeyCode, page: usize) -> Option<String> {
         match code {
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
-                self.plan = PlanState::None;
+                self.drop_preview();
                 self.view = View::Findings;
                 None
             }
             _ => match &mut self.plan {
                 PlanState::Ready(view) => view.on_key(code, page),
-                PlanState::None | PlanState::Building(..) => None,
+                PlanState::None | PlanState::Building { .. } => None,
             },
         }
     }
@@ -636,7 +630,7 @@ impl Browser {
 enum Effect {
     None,
     Message(String),
-    Build(PlanRequest),
+    Build(PlanJob),
 }
 
 impl PlanView {
@@ -645,7 +639,7 @@ impl PlanView {
         host: &str,
         uid: u32,
         lossy_paths: HashSet<String>,
-        gone_paths: Vec<String>,
+        unplanned: Vec<UnplannedMark>,
     ) -> PlanView {
         PlanView {
             plan,
@@ -653,7 +647,7 @@ impl PlanView {
             uid,
             file: None,
             lossy_paths,
-            gone_paths,
+            unplanned,
             lines: None,
             scroll: 0,
             prompt: None,
@@ -687,11 +681,12 @@ impl PlanView {
     }
 
     /// A key while the `w` prompt is open; returns the status message.
-    fn on_prompt_key(&mut self, code: KeyCode, ctrl: bool) -> Option<String> {
+    fn on_prompt_key(&mut self, key: KeyEvent) -> Option<String> {
         let prompt = self.prompt.as_mut()?;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if let Some(confirmed) = prompt.confirm {
-            match code {
-                KeyCode::Char('y' | 'Y') => {
+            match key.code {
+                KeyCode::Char('y' | 'Y') if (key.modifiers - KeyModifiers::SHIFT).is_empty() => {
                     return self.write(Some(confirmed));
                 }
                 // Back to the path, to choose another.
@@ -700,7 +695,7 @@ impl PlanView {
             }
             return None;
         }
-        match code {
+        match key.code {
             KeyCode::Esc => {
                 self.prompt = None;
                 return Some("no plan file written".into());
@@ -710,7 +705,7 @@ impl PlanView {
             }
             KeyCode::Enter => match job::target(Path::new(&prompt.path)) {
                 Ok(Target::Free) => return self.write(None),
-                Ok(Target::File { identity, .. }) => prompt.confirm = Some(identity),
+                Ok(Target::File(identity)) => prompt.confirm = Some(identity),
                 Ok(Target::Refused(why)) => {
                     return Some(format!("not writing {}: {why}", prompt.path));
                 }
@@ -735,9 +730,15 @@ impl PlanView {
                 self.prompt = None;
                 message
             }
-            Err(e) => {
+            Err(WriteError::Incomplete(e)) => {
+                self.prompt = None;
+                format!(
+                    "write failed: {e}. File may be incomplete. dwhy apply refuses incomplete plans."
+                )
+            }
+            Err(WriteError::BeforeWrite(e)) => {
                 prompt.confirm = if e.kind() == ErrorKind::AlreadyExists
-                    && let Ok(Target::File { identity, .. }) = job::target(path)
+                    && let Ok(Target::File(identity)) = job::target(path)
                 {
                     Some(identity)
                 } else {

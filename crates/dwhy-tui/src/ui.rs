@@ -107,9 +107,9 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
                     " ↑↓ PgUp PgDn scroll · w write plan file · Esc back · Tab tree · q quit";
                 app.viewport = draw_plan(f, view, &areas, help, now);
             }
-            PlanState::Building(_, progress) => {
+            PlanState::Building { progress, marks } => {
                 f.render_widget(title_line("plan", "", width), title);
-                let n = b.marked.len();
+                let n = *marks;
                 let lines = vec![
                     Line::raw(""),
                     Line::raw(format!(
@@ -395,11 +395,10 @@ fn plan_lines(v: &PlanView, width: usize) -> Vec<Line<'static>> {
         .map_or("all".into(), |d| d.join(", "));
     push(&mut out, &format!("  detectors: {detectors}"));
 
-    if !v.gone_paths.is_empty() {
+    if !v.unplanned.is_empty() {
         push(&mut out, "");
-        push(&mut out, "gone since the scan:");
-        for path in &v.gone_paths {
-            push(&mut out, &format!("  {path}"));
+        for mark in &v.unplanned {
+            push(&mut out, &format!("  {mark}"));
         }
     }
 

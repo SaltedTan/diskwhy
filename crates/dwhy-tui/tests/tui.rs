@@ -1019,11 +1019,20 @@ fn compact_findings_only_open_when_a_row_fits() {
         press(&mut app, &[key]);
         assert_eq!(view(&app), View::Findings);
     }
+    press(&mut app, &[KeyCode::Char(' ')]);
+    assert!(marked(&app).is_empty());
     for width in [24, 27] {
         let screen = render(&mut app, width, 24, None);
         assert!(screen.contains("rebuildable 1.0G /abc"), "{screen}");
         assert!(!screen.contains("Widen"), "{screen}");
     }
+    press(&mut app, &[KeyCode::Char(' ')]);
+    assert_eq!(marked(&app), ["/abc"]);
+    render(&mut app, 80, 4, None);
+    press(&mut app, &[KeyCode::Char(' '), KeyCode::Enter]);
+    assert_eq!(marked(&app), ["/abc"]);
+    assert_eq!(view(&app), View::Findings);
+    render(&mut app, 80, 24, None);
     press(&mut app, &[KeyCode::Enter]);
     assert_eq!(view(&app), View::Detail);
 }
@@ -1648,9 +1657,9 @@ fn type_text(app: &mut App, text: &str) {
 /// Runs the plan build the app asked for, as the event loop would, with
 /// the given processes for the guards.
 fn run_build(app: &mut App, procs: &Processes) {
-    let req = app.take_request().expect("a plan build was requested");
-    let result = req.job.build(|| procs.clone(), HOST.into());
-    app.plan_built(req.build, result, HOST, system::euid());
+    let job = app.take_request().expect("a plan build was requested");
+    let result = job.build(|| procs.clone(), HOST.into());
+    app.plan_built(result, HOST, system::euid());
 }
 
 fn plan_of(app: &App) -> &Plan {
@@ -1758,7 +1767,7 @@ fn hand_plan() -> Plan {
 fn hand_build() -> BuiltPlan {
     BuiltPlan {
         plan: hand_plan(),
-        gone: Vec::new(),
+        unplanned: Vec::new(),
         lossy_paths: Default::default(),
     }
 }
@@ -1781,8 +1790,8 @@ fn marked_app(paths: &[&str]) -> (Fixture, App) {
 fn preview_app() -> (Fixture, App) {
     let (f, mut app) = marked_app(&["/home/me/projects/diskwhy/target"]);
     press(&mut app, &[KeyCode::Char('p')]);
-    let req = app.take_request().unwrap();
-    app.plan_built(req.build, Ok(hand_build()), HOST, UID);
+    assert!(app.take_request().is_some());
+    app.plan_built(Ok(hand_build()), HOST, UID);
     (f, app)
 }
 
@@ -1922,7 +1931,7 @@ fn p_builds_the_plan_of_the_marks_and_esc_keeps_them() {
     assert_eq!(view(&app), View::Plan);
     assert!(matches!(
         app.browser().unwrap().plan,
-        PlanState::Building(..)
+        PlanState::Building { .. }
     ));
     let building = render(&mut app, 80, 24, Some(&root));
     assert!(building.contains("from 2 marked findings"), "{building}");
@@ -2028,6 +2037,105 @@ fn p_rescans_and_reports_marks_that_are_gone() {
 }
 
 #[test]
+fn p_prepares_the_roots_again_before_detecting() {
+    let f = crates_fixture();
+    let root = f.root();
+    let original_parent = root.join("original");
+    let moved_parent = root.join("moved");
+    let stable = root.join("app");
+    fs::create_dir(&original_parent).unwrap();
+    fs::rename(root.join("lib"), original_parent.join("lib")).unwrap();
+    let mut app = app_with(scan(&[&stable, &original_parent.join("lib")]));
+    press(
+        &mut app,
+        &[
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+        ],
+    );
+    assert_eq!(marked(&app).len(), 2);
+
+    fs::rename(&original_parent, &moved_parent).unwrap();
+    std::os::unix::fs::symlink(&moved_parent, &original_parent).unwrap();
+    press(&mut app, &[KeyCode::Char('p')]);
+    run_build(&mut app, &Processes::default());
+
+    let plan = plan_of(&app);
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(
+        Path::new(&plan.items[0].finding.path),
+        stable.join("target")
+    );
+    let mut roots = plan.scan.roots.iter().map(Path::new).collect::<Vec<_>>();
+    roots.sort();
+    assert_eq!(
+        roots,
+        [stable.as_path(), moved_parent.join("lib").as_path()]
+    );
+    let screen = render(&mut app, 120, 40, Some(&root));
+    assert!(
+        screen.contains(&format!(
+            "gone since the scan: {ROOT_PLACEHOLDER}/original/lib/target"
+        )),
+        "{screen}"
+    );
+}
+
+#[test]
+fn p_reports_a_mark_from_a_detector_that_did_not_run() {
+    let f = crates_fixture();
+    let root = f.root();
+    let mut data = scan(&[&root]);
+    let missed_path = root.join("node_modules");
+    data.report.findings.push(hand_finding(
+        "node-modules",
+        missed_path.to_str().unwrap(),
+        4096,
+        Tier::Rebuildable,
+    ));
+    let mut app = app_with(data);
+    press(
+        &mut app,
+        &[
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+            KeyCode::End,
+            KeyCode::Char(' '),
+            KeyCode::Char('p'),
+        ],
+    );
+    run_build(&mut app, &Processes::default());
+    assert_eq!(plan_of(&app).items.len(), 1);
+    let screen = render(&mut app, 120, 40, Some(&root));
+    assert!(
+        screen.contains("not checked: node-modules did not run"),
+        "{screen}"
+    );
+    assert!(!screen.contains("gone since the scan"), "{screen}");
+
+    press(
+        &mut app,
+        &[
+            KeyCode::Esc,
+            KeyCode::Home,
+            KeyCode::Char(' '),
+            KeyCode::Char('p'),
+        ],
+    );
+    run_build(&mut app, &Processes::default());
+    assert!(app.plan_view().is_none());
+    assert_eq!(view(&app), View::Findings);
+    let message = app.message.as_deref().unwrap();
+    assert!(
+        message.contains("not checked: node-modules did not run"),
+        "{message}"
+    );
+    assert!(message.contains(missed_path.to_str().unwrap()), "{message}");
+}
+
+#[test]
 fn a_guard_blocks_a_marked_finding_in_the_plan() {
     let f = crates_fixture();
     let root = f.root();
@@ -2065,39 +2173,49 @@ fn a_guard_blocks_a_marked_finding_in_the_plan() {
 }
 
 #[test]
-fn q_quits_and_esc_leaves_while_the_plan_builds() {
+fn p_reuses_the_running_plan_worker_after_esc_and_tab() {
     let (_f, mut app) = marked_app(&["/home/me/projects/diskwhy/target"]);
     press(&mut app, &[KeyCode::Char('p')]);
     let first = app.take_request().unwrap();
-    // Esc leaves; a result that arrives afterwards is dropped.
+    first.progress.entries.store(42, Ordering::Relaxed);
     press(&mut app, &[KeyCode::Esc]);
     assert_eq!(view(&app), View::Findings);
-    app.plan_built(first.build, Ok(hand_build()), HOST, UID);
-    assert!(matches!(app.browser().unwrap().plan, PlanState::None));
-    // Only the latest build counts.
-    press(&mut app, &[KeyCode::Char('p')]);
-    let second = app.take_request().unwrap();
-    app.plan_built(first.build, Ok(hand_build()), HOST, UID);
-    assert!(matches!(
-        app.browser().unwrap().plan,
-        PlanState::Building(..)
-    ));
-    // Other keys wait; q quits.
-    press(&mut app, &[KeyCode::Down, KeyCode::Char('w')]);
-    assert!(matches!(
-        app.browser().unwrap().plan,
-        PlanState::Building(..)
-    ));
-    assert!(app.on_key(key(KeyCode::Char('q'))));
-    // A build error goes back to the list and says why.
-    app.plan_built(
-        second.build,
-        Err("--select x: no finding".into()),
-        HOST,
-        UID,
+    press(&mut app, &[KeyCode::Char(' '), KeyCode::Char('p')]);
+    assert!(marked(&app).is_empty());
+    assert_eq!(view(&app), View::Plan);
+    assert!(app.take_request().is_none());
+    let screen = render(&mut app, 80, 24, None);
+    assert!(screen.contains("from 1 marked finding"), "{screen}");
+    assert!(screen.contains("rescanned 42 entries"), "{screen}");
+
+    press(&mut app, &[KeyCode::Tab]);
+    assert_eq!(view(&app), View::Tree);
+    press(
+        &mut app,
+        &[KeyCode::Tab, KeyCode::Char('p'), KeyCode::Char('w')],
     );
+    assert_eq!(view(&app), View::Plan);
+    assert!(app.take_request().is_none());
+    assert!(app.plan_view().is_none());
+    assert!(app.on_key(key(KeyCode::Char('q'))));
+
+    app.plan_built(Ok(hand_build()), HOST, UID);
+    assert_eq!(plan_of(&app), &hand_plan());
+    press(
+        &mut app,
+        &[KeyCode::Esc, KeyCode::Char(' '), KeyCode::Char('p')],
+    );
+    assert!(app.take_request().is_some());
+    press(&mut app, &[KeyCode::Esc]);
+    app.plan_built(Ok(hand_build()), HOST, UID);
     assert_eq!(view(&app), View::Findings);
-    assert!(app.message.as_deref().unwrap().contains("--select x"));
+    assert!(app.plan_view().is_none());
+
+    press(&mut app, &[KeyCode::Char('p')]);
+    assert!(app.take_request().is_some());
+    app.plan_built(Err("scan failed".into()), HOST, UID);
+    assert_eq!(view(&app), View::Findings);
+    assert!(app.message.as_deref().unwrap().contains("scan failed"));
 }
 
 #[test]
@@ -2170,8 +2288,10 @@ fn w_writes_the_plan_file_as_dwhy_plan_does() {
     assert_eq!(&plan::parse(&saved).unwrap(), plan_of(&app));
 
     // An existing file: n goes back to the path, y overwrites.
-    fs::write(&file, "old").unwrap();
+    let old = "old".repeat(saved.len());
+    fs::write(&file, &old).unwrap();
     fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    let original = fs::metadata(&file).unwrap();
     press(&mut app, &[KeyCode::Char('w')]);
     assert!(!app.on_key(ctrl('u')));
     type_text(&mut app, path);
@@ -2187,18 +2307,30 @@ fn w_writes_the_plan_file_as_dwhy_plan_does() {
     );
     let screen = render(&mut app, 200, 24, None);
     assert!(screen.contains("exists; overwrite? y/n"), "{screen}");
+    for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+        assert!(!app.on_key(KeyEvent::new(KeyCode::Char('y'), modifiers)));
+        assert_eq!(fs::read_to_string(&file).unwrap(), old);
+        assert!(
+            app.plan_view()
+                .unwrap()
+                .prompt
+                .as_ref()
+                .unwrap()
+                .confirm
+                .is_some()
+        );
+    }
     press(&mut app, &[KeyCode::Char('n')]);
     let prompt = app.plan_view().unwrap().prompt.clone().unwrap();
     assert!(prompt.confirm.is_none() && prompt.path == path);
-    assert_eq!(fs::read_to_string(&file).unwrap(), "old");
-    press(&mut app, &[KeyCode::Enter, KeyCode::Char('y')]);
+    assert_eq!(fs::read_to_string(&file).unwrap(), old);
+    press(&mut app, &[KeyCode::Enter]);
+    assert!(!app.on_key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT)));
     assert_eq!(fs::read_to_string(&file).unwrap(), saved);
-    assert_eq!(
-        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
+    let updated = fs::metadata(&file).unwrap();
+    let metadata = |m: &fs::Metadata| (m.dev(), m.ino(), m.uid(), m.gid(), m.mode());
+    assert_eq!(metadata(&updated), metadata(&original));
     assert!(app.plan_view().unwrap().prompt.is_none());
-    // No temp file is left next to it.
     assert_eq!(fs::read_dir(out.path()).unwrap().count(), 1);
 }
 
@@ -2281,7 +2413,7 @@ fn w_refuses_symlinks_and_non_files() {
     assert!(!out.path().join("nowhere.json").exists());
     // Overwriting never follows a symlink either.
     let plan = hand_plan();
-    let job::Target::File { identity, .. } = job::target(&real).unwrap() else {
+    let job::Target::File(identity) = job::target(&real).unwrap() else {
         panic!("regular plan file");
     };
     assert!(job::write_plan(&link, &plan, Some(identity)).is_err());

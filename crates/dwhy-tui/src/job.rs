@@ -5,12 +5,12 @@
 //! and writing one.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fmt;
+use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dwhy_core::account;
@@ -20,8 +20,9 @@ use dwhy_core::growth;
 use dwhy_core::guard::Processes;
 use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection};
-use dwhy_core::report::{Plan, PlanScan, ScanReport, UnreadableReason};
+use dwhy_core::report::{DetectorRun, Finding, Plan, PlanScan, ScanReport, UnreadableReason};
 use dwhy_core::scan::{self, Progress, ScanOptions, ScanResult};
+use dwhy_core::system;
 use dwhy_core::tree::{NodeId, ScanTree};
 
 /// What to scan.
@@ -152,15 +153,46 @@ pub fn scan(
 pub struct PlanJob {
     pub options: Options,
     pub progress: Arc<Progress>,
-    /// The marked findings' ids.
-    pub select: Vec<String>,
+    pub marks: Vec<PlanMark>,
+}
+
+#[derive(Debug)]
+pub struct PlanMark {
+    id: String,
+    detector: String,
+    path: String,
+}
+
+impl From<&Finding> for PlanMark {
+    fn from(finding: &Finding) -> Self {
+        Self {
+            id: finding.id.clone(),
+            detector: finding.detector.clone(),
+            path: finding.path.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct BuiltPlan {
     pub plan: Plan,
-    pub gone: Vec<String>,
+    pub unplanned: Vec<UnplannedMark>,
     pub lossy_paths: HashSet<String>,
+}
+
+#[derive(Debug)]
+pub enum UnplannedMark {
+    Gone(String),
+    NotChecked { path: String, reason: String },
+}
+
+impl fmt::Display for UnplannedMark {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Gone(path) => write!(f, "gone since the scan: {path}"),
+            Self::NotChecked { path, reason } => write!(f, "not checked: {reason} ({path})"),
+        }
+    }
 }
 
 impl PlanJob {
@@ -171,22 +203,49 @@ impl PlanJob {
         host: String,
     ) -> Result<BuiltPlan, String> {
         let opts = self.options;
+        let roots = opts.roots()?;
         let mounts = MountTable::read().unwrap_or_default();
-        let result = opts.walk(&opts.paths, &mounts, &self.progress)?;
+        let result = opts.walk(&roots, &mounts, &self.progress)?;
         let ctx = DetectContext::from_system();
-        let (findings, _) = detect::run_with(
+        let (findings, runs) = detect::run_with(
             &result.tree,
             &ctx,
             &dwhy_core::detectors::registry(),
             opts.detectors.as_deref(),
         );
         let ids: HashSet<&str> = findings.iter().map(|f| f.id.as_str()).collect();
-        let (select, gone): (Vec<_>, Vec<_>) = self
-            .select
-            .into_iter()
-            .partition(|id| ids.contains(id.as_str()));
+        let mut select = Vec::new();
+        let mut unplanned = Vec::new();
+        for PlanMark { id, detector, path } in self.marks {
+            if ids.contains(id.as_str()) {
+                select.push(id);
+                continue;
+            }
+            let reason = match runs.iter().find(|run| run.name == detector) {
+                Some(DetectorRun {
+                    error: Some(error), ..
+                }) => format!("{detector} failed: {error}"),
+                Some(run) if run.ran => {
+                    unplanned.push(UnplannedMark::Gone(path));
+                    continue;
+                }
+                Some(run) => format!("{detector} did not run: {}", run.detail),
+                None => format!("{detector} did not run"),
+            };
+            unplanned.push(UnplannedMark::NotChecked { path, reason });
+        }
         if select.is_empty() {
-            return Err("all marked findings are gone since the scan".into());
+            if unplanned
+                .iter()
+                .all(|mark| matches!(mark, UnplannedMark::Gone(_)))
+            {
+                return Err("all marked findings are gone since the scan".into());
+            }
+            return Err(unplanned
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" · "));
         }
         let lossy_paths = lossy_finding_paths(&findings, &result.tree);
         let plan = plan::build(
@@ -208,7 +267,7 @@ impl PlanJob {
         )?;
         Ok(BuiltPlan {
             plan,
-            gone,
+            unplanned,
             lossy_paths,
         })
     }
@@ -227,7 +286,7 @@ pub enum Target {
     /// Nothing: the plan can be written.
     Free,
     /// A regular file: ask before overwriting it.
-    File { identity: FileIdentity, mode: u32 },
+    File(FileIdentity),
     /// A symlink or something else that is not a regular file.
     Refused(String),
 }
@@ -253,73 +312,57 @@ pub fn target(path: &Path) -> io::Result<Target> {
         Err(e) => Err(e),
         Ok(md) if md.file_type().is_symlink() => Ok(Target::Refused("it is a symlink".into())),
         Ok(md) if !md.is_file() => Ok(Target::Refused("it is not a regular file".into())),
-        Ok(md) => Ok(Target::File {
-            identity: FileIdentity::from_metadata(&md),
-            mode: md.mode() & 0o7777,
-        }),
+        Ok(md) => Ok(Target::File(FileIdentity::from_metadata(&md))),
+    }
+}
+
+#[derive(Debug)]
+pub enum WriteError {
+    BeforeWrite(io::Error),
+    Incomplete(io::Error),
+}
+
+impl From<io::Error> for WriteError {
+    fn from(error: io::Error) -> Self {
+        Self::BeforeWrite(error)
     }
 }
 
 /// Writes the same JSON as `dwhy plan -o`. An existing regular file can be
-/// replaced only after confirmation of its identity.
-pub fn write_plan(path: &Path, plan: &Plan, overwrite: Option<FileIdentity>) -> io::Result<()> {
-    let text = plan::to_json(plan)?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    let Some(confirmed) = overwrite else {
-        let mut file = options.open(path)?;
-        return write_contents(&mut file, &text).inspect_err(|_| {
-            remove_created(path, &file);
-        });
-    };
-    confirmed_mode(path, confirmed)?;
-
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    let (tmp, mut file) = loop {
-        let n = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let tmp = path.with_file_name(format!(".dwhy-plan.{}.{n}.tmp", std::process::id()));
-        if tmp == path {
-            continue;
+/// overwritten only after confirmation of its identity.
+pub fn write_plan(
+    path: &Path,
+    plan: &Plan,
+    overwrite: Option<FileIdentity>,
+) -> Result<(), WriteError> {
+    let text = plan::to_json(plan).map_err(io::Error::from)?;
+    let mut file = system::open_for_write_nofollow(path, overwrite.is_none()).map_err(|e| {
+        if let Some(confirmed) = overwrite
+            && let Ok(current) = target(path)
+            && current != Target::File(confirmed)
+        {
+            changed_target()
+        } else {
+            e
         }
-        match options.mode(0o600).open(&tmp) {
-            Ok(file) => break (tmp, file),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
+    })?;
+    if let Some(confirmed) = overwrite {
+        let md = file.metadata()?;
+        if !md.is_file() || FileIdentity::from_metadata(&md) != confirmed {
+            return Err(changed_target().into());
         }
-    };
-    let result = (|| {
-        write_contents(&mut file, &text)?;
-        let mode = confirmed_mode(path, confirmed)?;
-        file.set_permissions(fs::Permissions::from_mode(mode))?;
-        fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        remove_created(&tmp, &file);
+        file.set_len(0)?;
     }
-    result
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(WriteError::Incomplete)
 }
 
-fn confirmed_mode(path: &Path, confirmed: FileIdentity) -> io::Result<u32> {
-    match target(path)? {
-        Target::File { identity, mode } if identity == confirmed => Ok(mode),
-        _ => Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "the target changed since the overwrite prompt",
-        )),
-    }
-}
-
-fn write_contents(file: &mut fs::File, text: &str) -> io::Result<()> {
-    file.write_all(text.as_bytes())?;
-    file.sync_all()
-}
-
-fn remove_created(path: &Path, file: &fs::File) {
-    if let (Ok(md), Ok(Target::File { identity, .. })) = (file.metadata(), target(path))
-        && FileIdentity::from_metadata(&md) == identity
-    {
-        let _ = fs::remove_file(path);
-    }
+fn changed_target() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "the target changed since the overwrite prompt",
+    )
 }
 
 /// Seconds since the epoch.

@@ -333,7 +333,7 @@ fn tui_and_cli_plans_round_trip() {
     let built = PlanJob {
         options: scanned.plan_options,
         progress: Default::default(),
-        select: ids.clone(),
+        marks: scanned.report.findings.iter().map(Into::into).collect(),
     }
     .build(Processes::read, dwhy_core::system::hostname())
     .unwrap();
