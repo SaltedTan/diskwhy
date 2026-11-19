@@ -2180,8 +2180,8 @@ fn p_reuses_the_running_plan_worker_after_esc_and_tab() {
     first.progress.entries.store(42, Ordering::Relaxed);
     press(&mut app, &[KeyCode::Esc]);
     assert_eq!(view(&app), View::Findings);
-    press(&mut app, &[KeyCode::Char(' '), KeyCode::Char('p')]);
-    assert!(marked(&app).is_empty());
+    press(&mut app, &[KeyCode::Char('p')]);
+    assert_eq!(marked(&app), ["/home/me/projects/diskwhy/target"]);
     assert_eq!(view(&app), View::Plan);
     assert!(app.take_request().is_none());
     let screen = render(&mut app, 80, 24, None);
@@ -2201,10 +2201,7 @@ fn p_reuses_the_running_plan_worker_after_esc_and_tab() {
 
     app.plan_built(Ok(hand_build()), HOST, UID);
     assert_eq!(plan_of(&app), &hand_plan());
-    press(
-        &mut app,
-        &[KeyCode::Esc, KeyCode::Char(' '), KeyCode::Char('p')],
-    );
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('p')]);
     assert!(app.take_request().is_some());
     press(&mut app, &[KeyCode::Esc]);
     app.plan_built(Ok(hand_build()), HOST, UID);
@@ -2216,6 +2213,54 @@ fn p_reuses_the_running_plan_worker_after_esc_and_tab() {
     app.plan_built(Err("scan failed".into()), HOST, UID);
     assert_eq!(view(&app), View::Findings);
     assert!(app.message.as_deref().unwrap().contains("scan failed"));
+}
+
+#[test]
+fn p_waits_then_builds_for_the_changed_marks() {
+    let f = crates_fixture();
+    let root = f.root();
+    let mut app = app_with(scan(&[&root]));
+    press(
+        &mut app,
+        &[KeyCode::Tab, KeyCode::Char(' '), KeyCode::Char('p')],
+    );
+    let first = app.take_request().unwrap();
+
+    press(
+        &mut app,
+        &[KeyCode::Esc, KeyCode::Char(' '), KeyCode::Char('p')],
+    );
+    assert_eq!(view(&app), View::Findings);
+    assert!(app.take_request().is_none());
+    assert!(app.message.as_deref().unwrap().contains("nothing marked"));
+
+    press(
+        &mut app,
+        &[KeyCode::Down, KeyCode::Char(' '), KeyCode::Char('p')],
+    );
+    assert_eq!(view(&app), View::Plan);
+    assert!(app.take_request().is_none());
+    let screen = render(&mut app, 80, 24, Some(&root));
+    assert!(
+        screen.contains("waiting for the previous build to finish"),
+        "{screen}"
+    );
+
+    let previous = first.build(Processes::default, HOST.into()).unwrap();
+    assert_eq!(
+        Path::new(&previous.plan.items[0].finding.path),
+        root.join("app/target")
+    );
+    app.plan_built(Ok(previous), HOST, system::euid());
+    press(&mut app, &[KeyCode::Char('w')]);
+    assert!(app.plan_view().is_none());
+    run_build(&mut app, &Processes::default());
+
+    let plan = plan_of(&app);
+    assert_eq!(plan.items.len(), 1);
+    let finding = &plan.items[0].finding;
+    assert_eq!(Path::new(&finding.path), root.join("lib/target"));
+    assert_eq!(plan.selection.select, [finding.id.clone()]);
 }
 
 #[test]
@@ -2321,7 +2366,7 @@ fn w_writes_the_plan_file_as_dwhy_plan_does() {
         );
     }
     press(&mut app, &[KeyCode::Char('n')]);
-    let prompt = app.plan_view().unwrap().prompt.clone().unwrap();
+    let prompt = app.plan_view().unwrap().prompt.as_ref().unwrap();
     assert!(prompt.confirm.is_none() && prompt.path == path);
     assert_eq!(fs::read_to_string(&file).unwrap(), old);
     press(&mut app, &[KeyCode::Enter]);
@@ -2344,14 +2389,17 @@ fn w_asks_again_when_the_overwrite_target_changes() {
     assert!(!app.on_key(ctrl('u')));
     type_text(&mut app, file.to_str().unwrap());
     press(&mut app, &[KeyCode::Enter]);
-    let replacement = out.path().join("replacement.json");
-    fs::write(&replacement, "second file").unwrap();
-    fs::rename(replacement, &file).unwrap();
-    press(&mut app, &[KeyCode::Char('y')]);
-    assert_eq!(fs::read_to_string(&file).unwrap(), "second file");
-    assert!(app.message.as_deref().unwrap().contains("target changed"));
-    let screen = render_at(&mut app, 200, 24, None, PLAN_AT);
-    assert!(screen.contains("exists; overwrite? y/n"), "{screen}");
+    for replacement in ["second file", "third file"] {
+        let original_inode = fs::metadata(&file).unwrap().ino();
+        fs::remove_file(&file).unwrap();
+        fs::write(&file, replacement).unwrap();
+        assert_ne!(fs::metadata(&file).unwrap().ino(), original_inode);
+        press(&mut app, &[KeyCode::Char('y')]);
+        assert_eq!(fs::read_to_string(&file).unwrap(), replacement);
+        assert!(app.message.as_deref().unwrap().contains("target changed"));
+        let screen = render_at(&mut app, 200, 24, None, PLAN_AT);
+        assert!(screen.contains("exists; overwrite? y/n"), "{screen}");
+    }
     assert_eq!(fs::read_dir(out.path()).unwrap().count(), 1);
     press(&mut app, &[KeyCode::Char('y')]);
     let saved = fs::read_to_string(&file).unwrap();
@@ -2413,10 +2461,10 @@ fn w_refuses_symlinks_and_non_files() {
     assert!(!out.path().join("nowhere.json").exists());
     // Overwriting never follows a symlink either.
     let plan = hand_plan();
-    let job::Target::File(identity) = job::target(&real).unwrap() else {
+    let job::Target::File(held) = job::target(&real).unwrap() else {
         panic!("regular plan file");
     };
-    assert!(job::write_plan(&link, &plan, Some(identity)).is_err());
+    assert!(job::write_plan(&link, &plan, Some(&held)).is_err());
     assert!(job::write_plan(&dangling, &plan, None).is_err());
     assert_eq!(fs::read_to_string(&real).unwrap(), "keep");
     assert!(!out.path().join("nowhere.json").exists());

@@ -341,8 +341,13 @@ fn tui_and_cli_plans_round_trip() {
     let tui_file = dir.path().join("tui.json");
     job::write_plan(&tui_file, &built.plan, None).unwrap();
     let tui_text = fs::read_to_string(&tui_file).unwrap();
-    assert!(tui_text.ends_with('\n'));
     let tui_plan = plan::parse(&tui_text).unwrap();
+    let mut expected = serde_json::to_string_pretty(&tui_plan).unwrap();
+    expected.push('\n');
+    assert_eq!(
+        tui_text, expected,
+        "TUI plan files use pretty JSON with a final newline"
+    );
     let env = dwhy_core::apply::Env::from_system();
     let now = job::now();
     plan::usable(&tui_plan, &env.host, env.uid, now).unwrap();

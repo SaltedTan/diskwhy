@@ -24,11 +24,22 @@ pub fn euid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
+const OPEN_NOFOLLOW: OFlags = OFlags::NOFOLLOW
+    .union(OFlags::NONBLOCK)
+    .union(OFlags::NOCTTY);
+
+pub fn open_for_read_nofollow(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(OPEN_NOFOLLOW.bits() as i32)
+        .open(path)
+}
+
 pub fn open_for_write_nofollow(path: &Path, create_new: bool) -> io::Result<fs::File> {
     fs::OpenOptions::new()
         .write(true)
         .create_new(create_new)
-        .custom_flags((OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY).bits() as i32)
+        .custom_flags(OPEN_NOFOLLOW.bits() as i32)
         .open(path)
 }
 

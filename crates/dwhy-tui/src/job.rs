@@ -281,30 +281,18 @@ pub fn read_plan(path: &Path) -> Result<Plan, String> {
 }
 
 /// What is at the path a plan is about to be written to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Target {
     /// Nothing: the plan can be written.
     Free,
     /// A regular file: ask before overwriting it.
-    File(FileIdentity),
+    File(OverwriteTarget),
     /// A symlink or something else that is not a regular file.
     Refused(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileIdentity {
-    dev: u64,
-    ino: u64,
-}
-
-impl FileIdentity {
-    fn from_metadata(md: &fs::Metadata) -> Self {
-        Self {
-            dev: md.dev(),
-            ino: md.ino(),
-        }
-    }
-}
+#[derive(Debug)]
+pub struct OverwriteTarget(fs::File);
 
 pub fn target(path: &Path) -> io::Result<Target> {
     match fs::symlink_metadata(path) {
@@ -312,7 +300,13 @@ pub fn target(path: &Path) -> io::Result<Target> {
         Err(e) => Err(e),
         Ok(md) if md.file_type().is_symlink() => Ok(Target::Refused("it is a symlink".into())),
         Ok(md) if !md.is_file() => Ok(Target::Refused("it is not a regular file".into())),
-        Ok(md) => Ok(Target::File(FileIdentity::from_metadata(&md))),
+        Ok(_) => {
+            let file = system::open_for_read_nofollow(path)?;
+            if !file.metadata()?.is_file() {
+                return Ok(Target::Refused("it is not a regular file".into()));
+            }
+            Ok(Target::File(OverwriteTarget(file)))
+        }
     }
 }
 
@@ -333,22 +327,24 @@ impl From<io::Error> for WriteError {
 pub fn write_plan(
     path: &Path,
     plan: &Plan,
-    overwrite: Option<FileIdentity>,
+    overwrite: Option<&OverwriteTarget>,
 ) -> Result<(), WriteError> {
     let text = plan::to_json(plan).map_err(io::Error::from)?;
-    let mut file = system::open_for_write_nofollow(path, overwrite.is_none()).map_err(|e| {
-        if let Some(confirmed) = overwrite
-            && let Ok(current) = target(path)
-            && current != Target::File(confirmed)
+    let confirmed = overwrite.map(|held| held.0.metadata()).transpose()?;
+    let mut file = system::open_for_write_nofollow(path, confirmed.is_none()).map_err(|e| {
+        if let Some(confirmed) = &confirmed
+            && match fs::symlink_metadata(path) {
+                Ok(current) => !matches_confirmed_file(&current, confirmed),
+                Err(e) => e.kind() == io::ErrorKind::NotFound,
+            }
         {
             changed_target()
         } else {
             e
         }
     })?;
-    if let Some(confirmed) = overwrite {
-        let md = file.metadata()?;
-        if !md.is_file() || FileIdentity::from_metadata(&md) != confirmed {
+    if let Some(confirmed) = &confirmed {
+        if !matches_confirmed_file(&file.metadata()?, confirmed) {
             return Err(changed_target().into());
         }
         file.set_len(0)?;
@@ -356,6 +352,10 @@ pub fn write_plan(
     file.write_all(text.as_bytes())
         .and_then(|()| file.sync_all())
         .map_err(WriteError::Incomplete)
+}
+
+fn matches_confirmed_file(current: &fs::Metadata, confirmed: &fs::Metadata) -> bool {
+    current.is_file() && current.dev() == confirmed.dev() && current.ino() == confirmed.ino()
 }
 
 fn changed_target() -> io::Error {

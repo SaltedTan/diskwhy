@@ -109,27 +109,26 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
             }
             PlanState::Building { progress, marks } => {
                 f.render_widget(title_line("plan", "", width), title);
-                let n = *marks;
-                let lines = vec![
-                    Line::raw(""),
-                    Line::raw(format!(
-                        "  Building the plan from {n} marked finding{}",
-                        if n == 1 { "" } else { "s" }
-                    )),
-                    Line::raw("  Rescanning, then checking guards…"),
-                ];
-                f.render_widget(Paragraph::new(lines), list);
-                f.render_widget(
-                    Paragraph::new(Span::styled(
-                        format!(
-                            " rescanned {} entries, {}",
-                            thousands(progress.entries.load(Ordering::Relaxed)),
-                            human(progress.allocated.load(Ordering::Relaxed))
-                        ),
-                        bold,
-                    )),
-                    status,
-                );
+                let message = if *marks == b.marked {
+                    let n = marks.len();
+                    let lines = vec![
+                        Line::raw(""),
+                        Line::raw(format!(
+                            "  Building the plan from {n} marked finding{}",
+                            if n == 1 { "" } else { "s" }
+                        )),
+                        Line::raw("  Rescanning, then checking guards…"),
+                    ];
+                    f.render_widget(Paragraph::new(lines), list);
+                    format!(
+                        " rescanned {} entries, {}",
+                        thousands(progress.entries.load(Ordering::Relaxed)),
+                        human(progress.allocated.load(Ordering::Relaxed))
+                    )
+                } else {
+                    " waiting for the previous build to finish".into()
+                };
+                f.render_widget(Paragraph::new(Span::styled(message, bold)), status);
                 let help = " Esc back to findings · q quit";
                 f.render_widget(Paragraph::new(Span::styled(help, dim)), keys);
             }

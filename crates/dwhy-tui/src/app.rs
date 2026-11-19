@@ -15,8 +15,8 @@ use dwhy_core::tree::NodeId;
 use ratatui::text::Line;
 
 use crate::job::{
-    self, BuiltPlan, FileIdentity, Mark, PlanJob, PlanMark, Scanned, Stage, Target, UnplannedMark,
-    WriteError,
+    self, BuiltPlan, Mark, OverwriteTarget, PlanJob, PlanMark, Scanned, Stage, Target,
+    UnplannedMark, WriteError,
 };
 
 /// Where `w` offers to write a plan, relative to the working directory.
@@ -128,7 +128,7 @@ pub enum PlanState {
     None,
     Building {
         progress: Arc<Progress>,
-        marks: usize,
+        marks: BTreeSet<usize>,
     },
     Ready(Box<PlanView>),
 }
@@ -151,11 +151,11 @@ pub struct PlanView {
 }
 
 /// The `w` prompt: a path to write the plan to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Prompt {
     pub path: String,
     /// The path names an existing file; waiting for y or n.
-    pub confirm: Option<FileIdentity>,
+    pub confirm: Option<OverwriteTarget>,
 }
 
 #[derive(Debug)]
@@ -221,11 +221,16 @@ impl App {
         let State::Browsing(b) = &mut self.state else {
             return;
         };
-        if !matches!(b.plan, PlanState::Building { .. }) {
+        let PlanState::Building { marks, .. } = &b.plan else {
             return;
-        }
+        };
+        let current = *marks == b.marked;
         b.plan = PlanState::None;
         if b.view != View::Plan {
+            return;
+        }
+        if !current {
+            self.request = Some(b.begin_plan_build());
             return;
         }
         match result {
@@ -500,24 +505,27 @@ impl Browser {
     /// `p`: asks for the plan of the marked findings, as
     /// `dwhy plan --select <ids>` would make it.
     fn start_plan(&mut self) -> Effect {
-        if matches!(self.plan, PlanState::Building { .. }) {
-            self.view = View::Plan;
-            return Effect::None;
-        }
         if self.marked.is_empty() {
             return Effect::Message("nothing marked: Space marks a finding for the plan".into());
         }
+        self.view = View::Plan;
+        if matches!(self.plan, PlanState::Building { .. }) {
+            return Effect::None;
+        }
+        Effect::Build(self.begin_plan_build())
+    }
+
+    fn begin_plan_build(&mut self) -> PlanJob {
         let progress = Arc::new(Progress::default());
         self.plan = PlanState::Building {
             progress: progress.clone(),
-            marks: self.marked.len(),
+            marks: self.marked.clone(),
         };
-        self.view = View::Plan;
-        Effect::Build(PlanJob {
+        PlanJob {
             options: self.data.plan_options.clone(),
             progress,
             marks: self.marked_findings().map(PlanMark::from).collect(),
-        })
+        }
     }
 
     fn drop_preview(&mut self) {
@@ -684,10 +692,10 @@ impl PlanView {
     fn on_prompt_key(&mut self, key: KeyEvent) -> Option<String> {
         let prompt = self.prompt.as_mut()?;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if let Some(confirmed) = prompt.confirm {
+        if prompt.confirm.is_some() {
             match key.code {
                 KeyCode::Char('y' | 'Y') if (key.modifiers - KeyModifiers::SHIFT).is_empty() => {
-                    return self.write(Some(confirmed));
+                    return self.write();
                 }
                 // Back to the path, to choose another.
                 KeyCode::Char('n' | 'N') | KeyCode::Esc => prompt.confirm = None,
@@ -704,8 +712,8 @@ impl PlanView {
                 return Some("type a file name, or Esc to cancel".into());
             }
             KeyCode::Enter => match job::target(Path::new(&prompt.path)) {
-                Ok(Target::Free) => return self.write(None),
-                Ok(Target::File(identity)) => prompt.confirm = Some(identity),
+                Ok(Target::Free) => return self.write(),
+                Ok(Target::File(file)) => prompt.confirm = Some(file),
                 Ok(Target::Refused(why)) => {
                     return Some(format!("not writing {}: {why}", prompt.path));
                 }
@@ -721,10 +729,10 @@ impl PlanView {
         None
     }
 
-    fn write(&mut self, overwrite: Option<FileIdentity>) -> Option<String> {
+    fn write(&mut self) -> Option<String> {
         let prompt = self.prompt.as_mut()?;
         let path = Path::new(&prompt.path);
-        let message = match job::write_plan(path, &self.plan, overwrite) {
+        let message = match job::write_plan(path, &self.plan, prompt.confirm.as_ref()) {
             Ok(()) => {
                 let message = format!("wrote {}", prompt.path);
                 self.prompt = None;
@@ -738,9 +746,9 @@ impl PlanView {
             }
             Err(WriteError::BeforeWrite(e)) => {
                 prompt.confirm = if e.kind() == ErrorKind::AlreadyExists
-                    && let Ok(Target::File(identity)) = job::target(path)
+                    && let Ok(Target::File(file)) = job::target(path)
                 {
-                    Some(identity)
+                    Some(file)
                 } else {
                     None
                 };
