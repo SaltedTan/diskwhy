@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use dwhy_core::detect::finding_id;
+use dwhy_core::detect::{block_lossy, finding_id};
 use dwhy_core::docker::{Api, GetError, demux_logs};
 use dwhy_core::probes::postgres_wal::{self, Docker, LOG_TAIL, Live, PsqlError};
 use dwhy_core::report::*;
@@ -669,6 +669,39 @@ fn other_findings_are_left_alone() {
     let mut found = vec![unused.clone(), img.clone()];
     postgres_wal::probe_all(&mut found, &fake);
     assert_eq!(found, [unused, img]);
+    assert!(fake.asked.borrow().is_empty(), "{:?}", fake.asked.borrow());
+}
+
+#[test]
+fn volume_blocked_by_lossy_socket_path_is_not_probed() {
+    let fake = Fake::recorded("psql-failing.txt");
+    let mut volume = volume_finding(VOLUME);
+    volume.action = Action {
+        kind: ActionKind::Command,
+        text: format!("docker -H unix:///run/docker�.sock volume rm {VOLUME}"),
+        argv: Some(
+            [
+                "docker",
+                "-H",
+                "unix:///run/docker�.sock",
+                "volume",
+                "rm",
+                VOLUME,
+            ]
+            .map(String::from)
+            .to_vec(),
+        ),
+    };
+    let mut findings = [volume];
+    block_lossy(&mut findings);
+    assert_eq!(findings[0].tier, Tier::Blocked);
+    assert_eq!(findings[0].action.kind, ActionKind::Advice);
+    assert!(!postgres_wal::applies_to(&findings[0]));
+    let blocked = findings.clone();
+
+    postgres_wal::probe_all(&mut findings, &fake);
+
+    assert_eq!(findings, blocked);
     assert!(fake.asked.borrow().is_empty(), "{:?}", fake.asked.borrow());
 }
 
