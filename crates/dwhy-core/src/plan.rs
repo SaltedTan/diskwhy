@@ -20,8 +20,10 @@
 //! state to compare against, so editing one can make it stale but cannot
 //! widen what apply may do.
 
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, Stat};
+use rustix::io::Errno;
 
 use crate::detect::{DetectContext, is_lossy, rfc3339};
 use crate::guard::{self, Processes};
@@ -144,10 +146,7 @@ pub fn build(
     guard::check(&mut picked, tree, ctx, procs);
     let roots = measured_roots(
         tree,
-        picked
-            .iter()
-            .chain(&already_blocked)
-            .map(|f| (f.path.as_str(), f.file_identity)),
+        picked.iter().map(|f| (f.path.as_str(), f.file_identity)),
     );
     let mut items = Vec::new();
     let mut blocked = Vec::new();
@@ -157,6 +156,7 @@ pub fn build(
             &f.path,
             measured_inode(&f.path, f.file_identity, tree),
             nested_roots(&roots, &f.path),
+            |_| false,
         );
         f.file_identity = None;
         if let Some(detail) = changed {
@@ -258,10 +258,12 @@ pub(crate) fn changed_removal_root(
     path: &str,
     inode: Option<(u64, u64)>,
     nested: &[MeasuredRoot],
+    expected_absent: impl Fn(&Path) -> bool,
 ) -> Option<String> {
-    changed_root(Path::new(path), inode).or_else(|| {
+    changed_root(Path::new(path), inode, false).or_else(|| {
         nested.iter().find_map(|root| {
-            changed_root(&root.path, root.inode).map(|detail| format!("{detail} (inside {path})"))
+            changed_root(&root.path, root.inode, expected_absent(&root.path))
+                .map(|detail| format!("{detail} (inside {path})"))
         })
     })
 }
@@ -271,6 +273,7 @@ pub(crate) fn changed_since_scan(f: &Finding, tree: &ScanTree) -> Option<String>
     changed_root(
         Path::new(&f.path),
         measured_inode(&f.path, f.file_identity, tree),
+        false,
     )
 }
 
@@ -292,7 +295,7 @@ fn root_identity(file: Option<FileIdentity>, node: Option<&TreeNode>) -> Option<
     })
 }
 
-fn changed_root(path: &Path, inode: Option<(u64, u64)>) -> Option<String> {
+fn changed_root(path: &Path, inode: Option<(u64, u64)>, expected_absent: bool) -> Option<String> {
     if !path.is_absolute() {
         return None;
     }
@@ -302,17 +305,45 @@ fn changed_root(path: &Path, inode: Option<(u64, u64)>) -> Option<String> {
             "{display} is not in the scan, so its device/inode are not known"
         ));
     };
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Some(format!("{display} is gone since the scan"))
+    match stat_nofollow(path) {
+        Err(Errno::NOENT) if expected_absent => None,
+        Err(Errno::NOENT) => Some(format!("{display} is gone since the scan")),
+        Err(Errno::NOTDIR | Errno::LOOP) => {
+            Some(format!("{display} has a symlink or non-directory ancestor"))
         }
         Err(e) => Some(format!("{display} cannot be checked against the scan: {e}")),
-        Ok(md) if md.file_type().is_symlink() => Some(format!("{display} is a symlink now")),
-        Ok(md) if (md.dev(), md.ino()) != inode => Some(format!(
+        Ok(st) if FileType::from_raw_mode(st.st_mode) == FileType::Symlink => {
+            Some(format!("{display} is a symlink now"))
+        }
+        Ok(_) if expected_absent => Some(format!("{display} reappeared after removal")),
+        Ok(st) if (st.st_dev, st.st_ino) != inode => Some(format!(
             "{display} was replaced after the scan (device/inode differ)"
         )),
         Ok(_) => None,
     }
+}
+
+pub(crate) fn removal_path_absent(path: &Path) -> bool {
+    matches!(stat_nofollow(path), Err(Errno::NOENT))
+}
+
+fn stat_nofollow(path: &Path) -> Result<Stat, Errno> {
+    let mut parts = path.components().peekable();
+    if parts.next() != Some(Component::RootDir) {
+        return Err(Errno::INVAL);
+    }
+    let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut dir = fs::open("/", flags, Mode::empty())?;
+    while let Some(part) = parts.next() {
+        let Component::Normal(name) = part else {
+            return Err(Errno::INVAL);
+        };
+        if parts.peek().is_none() {
+            return fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW);
+        }
+        dir = fs::openat(&dir, name, flags, Mode::empty())?;
+    }
+    fs::fstat(&dir)
 }
 
 /// Adds (or replaces) the blocking [`CHANGED_SINCE_SCAN`] guard.

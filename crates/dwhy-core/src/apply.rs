@@ -19,6 +19,7 @@
 //! whose `start` line cannot be written does not run), an `end` line after,
 //! and an `end` line for each skipped or refused item.
 
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -30,7 +31,7 @@ use crate::guard::{self, Processes};
 use crate::mounts::MountTable;
 use crate::plan::{
     self, MeasuredRoot, add_changed_guard, changed_removal_root, changed_since_scan,
-    measured_roots, nested_roots,
+    measured_roots, nested_roots, removal_path_absent,
 };
 use crate::report::{
     Action, ActionKind, ApplyItem, ApplyOutcome, ApplyReport, AuditEvent, AuditRecord, Finding,
@@ -171,7 +172,7 @@ pub fn evaluate(
     );
     for (c, f) in checks.iter_mut().zip(guarded).filter(|(c, _)| c.ready()) {
         let nested = nested_roots(&roots, &f.path);
-        if let Some(detail) = changed_removal_root(&f.path, c.inode, nested) {
+        if let Some(detail) = changed_removal_root(&f.path, c.inode, nested, |_| false) {
             (c.item.outcome, c.item.detail) = c.skip_changed(detail);
             continue;
         }
@@ -418,6 +419,7 @@ pub fn execute(
         let p = Path::new(&checks[i].item.path);
         (!p.is_absolute(), std::cmp::Reverse(p.components().count()))
     });
+    let mut removed_paths = HashSet::new();
     for i in order {
         let c = &mut checks[i];
         progress(&c.item);
@@ -426,7 +428,14 @@ pub fn execute(
             c.item.detail = format!("not run: {e}");
             continue;
         }
-        let (outcome, detail) = run(c, mounts);
+        let (outcome, detail) = run(c, mounts, &removed_paths);
+        let path = Path::new(&c.item.path);
+        if outcome == ApplyOutcome::Removed
+            && path.is_absolute()
+            && (c.item.action.kind == ActionKind::RemovePath || removal_path_absent(path))
+        {
+            removed_paths.insert(path.to_path_buf());
+        }
         c.item.outcome = outcome;
         c.item.detail = detail;
         if let Err(e) = audit.record(&record(env, plan, &c.item, AuditEvent::End, Some(outcome))) {
@@ -435,14 +444,20 @@ pub fn execute(
     }
 }
 
-fn run(c: &mut Check, mounts: &MountTable) -> (ApplyOutcome, String) {
+fn run(
+    c: &mut Check,
+    mounts: &MountTable,
+    removed_paths: &HashSet<PathBuf>,
+) -> (ApplyOutcome, String) {
     let item = &mut c.item;
     if let Some(detail) = lossy(&item.path, &item.action) {
         let outcome = format!("blocked by {PATH_NOT_UTF8}: {detail}; not run");
         add_lossy_guard(&mut item.guards, detail);
         return (ApplyOutcome::Skipped, outcome);
     }
-    if let Some(detail) = changed_removal_root(&item.path, c.inode, &c.nested) {
+    if let Some(detail) = changed_removal_root(&item.path, c.inode, &c.nested, |path| {
+        removed_paths.contains(path)
+    }) {
         return c.skip_changed(detail);
     }
     match item.action.kind {

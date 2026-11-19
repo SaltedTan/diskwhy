@@ -571,7 +571,9 @@ fn a_root_gone_or_turned_symlink_after_the_walk_is_blocked() {
 #[test]
 fn an_already_blocked_selected_root_is_checked_against_the_walk() {
     let (_t, b) = base();
-    let d = dir(&b.join("cache"));
+    let parent = dir(&b.join("venv"));
+    let d = dir(&parent.join("cache"));
+    let outer = finding("venv", &parent, 8192, Tier::Rebuildable);
     let mut f = finding("user-cache", &d, 4096, Tier::Blocked);
     let recent_write = GuardResult {
         name: "recent-write".into(),
@@ -581,13 +583,14 @@ fn an_already_blocked_selected_root_is_checked_against_the_walk() {
     f.guards.push(recent_write.clone());
     let sel = Selection {
         tier: None,
-        select: vec![f.id.clone()],
+        select: vec![outer.id.clone(), f.id.clone()],
     };
     let tree = scan_tree(&b);
     replace_same_contents(&d);
 
-    let p = build_from(&tree, &b, vec![f], &sel);
-    assert!(p.items.is_empty());
+    let p = build_from(&tree, &b, vec![outer.clone(), f], &sel);
+    assert_eq!(p.items.len(), 1, "{:?}", p.blocked);
+    assert_eq!(p.items[0].finding.id, outer.id);
     assert_eq!(p.blocked.len(), 1);
     assert!(p.blocked[0].guards.contains(&recent_write));
     assert!(changed_guard(&p.blocked[0]).is_some_and(|g| g.contains("was replaced")));

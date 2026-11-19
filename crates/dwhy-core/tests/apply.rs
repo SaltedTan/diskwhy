@@ -741,6 +741,72 @@ fn an_unselected_nested_git_root_can_block_the_outer_root() {
 }
 
 #[test]
+fn a_symlink_ancestor_cannot_hide_a_nested_checkout() {
+    let (_temp, b) = base();
+    let (_outside, outside) = base();
+    let scratch = b.join("scratch");
+    let live = scratch.join("live");
+    let checkout = live.join("project");
+    let metadata = scratch.join("repo.git");
+    fs::create_dir_all(&checkout).unwrap();
+    git(
+        &checkout,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            metadata.to_str().unwrap(),
+        ],
+    );
+    let finding = finding("stale-tree", &scratch, Tier::Review);
+    let pol = policy(Tier::Regenerable, &[&finding.id]);
+    let plan = make_plan(&b, vec![finding.clone()]);
+    assert_eq!(plan.items.len(), 1, "{:?}", plan.blocked);
+    let tree = scan_tree(&b);
+    let procs = Processes::default();
+    let mut ready = apply::evaluate(&plan, vec![finding.clone()], &tree, &ctx(), &procs, &pol);
+    assert!(ready[0].ready(), "{:?}", ready[0].item);
+
+    let moved = outside.join("live");
+    fs::rename(&live, &moved).unwrap();
+    symlink(&moved, &live).unwrap();
+    let replanned = make_plan_from_tree(&b, vec![finding.clone()], &tree);
+    assert!(replanned.items.is_empty());
+    assert_eq!(replanned.blocked.len(), 1);
+    let surveyed = apply::evaluate(&plan, vec![finding], &tree, &ctx(), &procs, &pol);
+    assert_eq!(surveyed[0].item.outcome, ApplyOutcome::Skipped);
+
+    let mut audit = Audit::open(&b.join("audit.jsonl")).unwrap();
+    apply::execute(
+        &plan,
+        &mut ready,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |_| {},
+    );
+    let report = apply::report(&plan, &ready, &pol, false, &env());
+    assert_eq!(apply::exit_code(&report), 2);
+    assert_eq!(report.freed, 0);
+    for guards in [
+        &replanned.blocked[0].guards,
+        &surveyed[0].item.guards,
+        &report.items[0].guards,
+    ] {
+        assert!(
+            guards.iter().any(|g| {
+                g.name == "changed-since-scan"
+                    && g.status == GuardStatus::Block
+                    && g.detail.contains(checkout.to_str().unwrap())
+            }),
+            "{guards:?}"
+        );
+    }
+    assert!(metadata.join("HEAD").is_file());
+    git(&moved.join("project"), &["rev-parse", "--git-dir"]);
+}
+
+#[test]
 fn the_plans_action_and_tier_are_not_trusted() {
     let (_t, b) = base();
     let found = fixture(&b);
@@ -1044,13 +1110,70 @@ fn an_item_inside_another_is_counted_once() {
         &env(),
         &mut |_| {},
     );
-    assert!(b.join("scratch/notes").exists());
-    assert!(!b.join("scratch/app/target").exists());
+    assert!(!b.join("scratch").exists());
     let r = apply::report(&plan, &checks, &pol, false, &env());
-    assert_eq!(r.items[0].outcome, ApplyOutcome::Skipped);
-    assert!(r.items[0].detail.contains("target is gone since the scan"));
-    assert_eq!(r.items[1].outcome, ApplyOutcome::Removed);
-    assert_eq!(r.freed, 9_000);
+    assert!(
+        r.items.iter().all(|i| i.outcome == ApplyOutcome::Removed),
+        "{:?}",
+        r.items
+    );
+    assert_eq!(apply::exit_code(&r), 0);
+    assert_eq!(r.freed, 10_000);
+}
+
+#[test]
+fn a_nested_path_that_reappears_after_success_still_blocks_its_parent() {
+    let (_t, b) = base();
+    let scratch = b.join("scratch");
+    let target = scratch.join("target");
+    let saved = b.join("saved");
+    write(&target.join("file"), "keep");
+    let outer = finding("stale-tree", &scratch, Tier::Review);
+    let mut inner = finding("cargo-target", &target, Tier::Rebuildable);
+    inner.action = Action {
+        kind: ActionKind::Command,
+        text: "move target".into(),
+        argv: Some(vec![
+            "mv".into(),
+            "--".into(),
+            target.to_str().unwrap().into(),
+            saved.to_str().unwrap().into(),
+        ]),
+    };
+    let pol = policy(Tier::Rebuildable, &[&outer.id]);
+    let found = vec![outer, inner];
+    let plan = make_plan(&b, found.clone());
+    let mut checks = evaluate(&b, &plan, found, &pol);
+    assert!(checks.iter().all(Check::ready), "{:?}", outcomes(&checks));
+    let mut audit = Audit::open(&b.join("audit.jsonl")).unwrap();
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |item| {
+            if Path::new(&item.path) == scratch {
+                assert!(!target.exists());
+                fs::rename(&saved, &target).unwrap();
+            }
+        },
+    );
+    let r = apply::report(&plan, &checks, &pol, false, &env());
+    assert_eq!(apply::exit_code(&r), 2);
+    let parent = r
+        .items
+        .iter()
+        .find(|i| Path::new(&i.path) == scratch)
+        .unwrap();
+    assert_eq!(parent.outcome, ApplyOutcome::Skipped);
+    assert!(
+        parent
+            .guards
+            .iter()
+            .any(|g| { g.name == "changed-since-scan" && g.status == GuardStatus::Block })
+    );
+    assert!(target.join("file").is_file());
 }
 
 #[test]
