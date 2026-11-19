@@ -11,7 +11,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::detectors;
-use crate::report::{DetectorAvailability, DetectorRun, DockerSocket, Finding, Tier, ToolStatus};
+use crate::report::{
+    Action, ActionKind, DetectorAvailability, DetectorRun, DockerSocket, Finding, GuardResult,
+    GuardStatus, Tier, ToolStatus,
+};
 use crate::tree::ScanTree;
 
 /// What a detector needs from the system.
@@ -205,6 +208,84 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
+/// The guard on a finding that names a path that is not valid UTF-8.
+pub const PATH_NOT_UTF8: &str = "path-not-utf8";
+
+/// The advice that replaces the action of a finding [`block_lossy`] blocks.
+pub const PATH_NOT_UTF8_ADVICE: &str =
+    "rename the path that is not valid UTF-8 to valid UTF-8 and scan again, or remove it by hand";
+
+/// Whether `s` holds U+FFFD, the stand-in `to_string_lossy` puts in place
+/// of bytes that are not valid UTF-8.
+pub fn is_lossy(s: &str) -> bool {
+    s.contains(char::REPLACEMENT_CHARACTER)
+}
+
+/// Why diskwhy cannot act on `f` exactly: which of its path, action
+/// (argv or text) and recovery (command or cost) hold U+FFFD, as the
+/// `path-not-utf8` guard's detail. `None` when none does.
+pub fn lossy_detail(f: &Finding) -> Option<String> {
+    let action = f.action.argv.iter().flatten().any(|a| is_lossy(a)) || is_lossy(&f.action.text);
+    let recovery = f.recovery.how.as_deref().is_some_and(is_lossy) || is_lossy(&f.recovery.cost);
+    let what = if is_lossy(&f.path) {
+        "the path is not valid UTF-8 (shown with U+FFFD)"
+    } else {
+        match (action, recovery) {
+            (true, true) => {
+                "the action and recovery name a path that is not valid UTF-8 (shown with U+FFFD)"
+            }
+            (true, false) => "the action names a path that is not valid UTF-8 (shown with U+FFFD)",
+            (false, true) => {
+                "the recovery names a path that is not valid UTF-8 (shown with U+FFFD)"
+            }
+            (false, false) => return None,
+        }
+    };
+    Some(format!("{what}; diskwhy cannot act on it exactly"))
+}
+
+/// Blocks every finding whose path, action or recovery holds U+FFFD: a
+/// command or path built from a lossy spelling can name a different, real
+/// path. The finding keeps its id, path, bytes and detector, so the space
+/// is still accounted for; its tier becomes `blocked`, it gets a
+/// `path-not-utf8` guard, its action becomes advice with no argv, and a
+/// recovery command or cost that holds U+FFFD is replaced by a note. A
+/// real name that holds U+FFFD is blocked too: diskwhy cannot tell it from
+/// a lossy one. Idempotent. Run on every detection result, before the
+/// nesting rule, so a blocked finding keeps the findings inside it.
+pub fn block_lossy(findings: &mut [Finding]) {
+    for f in findings {
+        let Some(detail) = lossy_detail(f) else {
+            continue;
+        };
+        f.tier = Tier::Blocked;
+        f.guards.retain(|g| g.name != PATH_NOT_UTF8);
+        f.guards.push(GuardResult {
+            name: PATH_NOT_UTF8.into(),
+            status: GuardStatus::Block,
+            detail,
+        });
+        f.action = Action {
+            kind: ActionKind::Advice,
+            text: PATH_NOT_UTF8_ADVICE.into(),
+            argv: None,
+        };
+        if f.recovery.how.as_deref().is_some_and(is_lossy) {
+            f.recovery.how = Some(
+                "by hand: the command names a path that is not valid UTF-8, so it is not shown"
+                    .into(),
+            );
+        }
+        if is_lossy(&f.recovery.cost) {
+            f.recovery.cost = "not shown: it names a path that is not valid UTF-8".into();
+        }
+        const NOTE: &str = "; a path it names is not valid UTF-8, so not offered";
+        if !f.reason.ends_with(NOTE) {
+            f.reason.push_str(NOTE);
+        }
+    }
+}
+
 /// Applies the nesting rule to filesystem findings, so no byte is counted
 /// twice. A finding whose path lies inside another kept finding's path is
 /// dropped, unless its tier is cheaper than that finding's or that finding
@@ -305,6 +386,8 @@ pub fn detect_into_with(
     let (mut findings, runs) = run_with(tree, ctx, &detectors::registry(), only);
     if probe {
         crate::probes::run(&mut findings, ctx);
+        // Probes may rewrite a reason or advice; check what they wrote too.
+        block_lossy(&mut findings);
     }
     report.findings = findings;
     report.detectors = runs;
@@ -324,6 +407,9 @@ pub fn run_with(
     (outermost(findings), runs)
 }
 
+/// Runs the detectors (all, or `only`) and returns every finding, before
+/// the nesting rule, with [`block_lossy`] applied: the detection that
+/// `dwhy scan`, `explain`, `plan`, `apply` and the TUI all go through.
 pub fn run_candidates(
     tree: &ScanTree,
     ctx: &DetectContext,
@@ -370,6 +456,7 @@ pub fn run_candidates(
         }
         runs.push(run);
     }
+    block_lossy(&mut all);
     (all, runs)
 }
 
@@ -601,6 +688,142 @@ mod tests {
             .map(|f| f.bytes - f.nested_bytes.unwrap_or(0))
             .sum();
         assert_eq!(own, 100);
+    }
+
+    fn cmd(det: &str, path: &str, bytes: u64, tier: Tier, argv: &[&str]) -> Finding {
+        let mut f = ft(det, path, bytes, tier);
+        f.action = Action {
+            kind: ActionKind::Command,
+            text: argv.join(" "),
+            argv: Some(argv.iter().map(|a| a.to_string()).collect()),
+        };
+        f
+    }
+
+    #[test]
+    fn findings_naming_a_lossy_path_are_blocked_with_advice() {
+        let mut found = vec![
+            // Its own path is lossy.
+            cmd(
+                "cargo-target",
+                "/w/app\u{FFFD}/target",
+                10,
+                Tier::Rebuildable,
+                &["cargo", "clean", "--target-dir", "/w/app\u{FFFD}/target"],
+            ),
+            // Only its command is (git-worktree's main repository, #61).
+            cmd(
+                "git-worktree",
+                "/w/wt",
+                20,
+                Tier::Review,
+                &[
+                    "git",
+                    "-C",
+                    "/w/repo\u{FFFD}",
+                    "worktree",
+                    "remove",
+                    "/w/wt",
+                ],
+            ),
+            // Only its recovery is.
+            {
+                let mut f = ft("venv", "/w/v/.venv", 5, Tier::Regenerable);
+                f.recovery.how = Some("cd /w/v\u{FFFD} && uv sync".into());
+                f
+            },
+            // Valid UTF-8 that is not ASCII stays actionable.
+            cmd(
+                "cargo-target",
+                "/w/café/target",
+                7,
+                Tier::Rebuildable,
+                &["cargo", "clean", "--target-dir", "/w/café/target"],
+            ),
+        ];
+        let before = found.clone();
+        block_lossy(&mut found);
+        for (f, was) in found.iter().zip(&before).take(3) {
+            assert_eq!(f.tier, Tier::Blocked, "{f:?}");
+            assert_eq!((&f.id, &f.path, f.bytes), (&was.id, &was.path, was.bytes));
+            assert_eq!(f.detector, was.detector);
+            assert_eq!(f.action.kind, ActionKind::Advice);
+            assert_eq!(f.action.argv, None);
+            assert_eq!(f.action.text, PATH_NOT_UTF8_ADVICE);
+            assert!(!is_lossy(&f.action.text));
+            assert!(!f.recovery.how.as_deref().is_some_and(is_lossy));
+            let g: Vec<_> = f
+                .guards
+                .iter()
+                .map(|g| (g.name.as_str(), g.status))
+                .collect();
+            assert_eq!(g, [(PATH_NOT_UTF8, GuardStatus::Block)]);
+            assert!(f.reason.ends_with("so not offered"), "{}", f.reason);
+        }
+        assert_eq!(
+            found[0].guards[0].detail,
+            "the path is not valid UTF-8 (shown with U+FFFD); diskwhy cannot act on it exactly"
+        );
+        assert_eq!(
+            found[1].guards[0].detail,
+            "the action names a path that is not valid UTF-8 (shown with U+FFFD); \
+             diskwhy cannot act on it exactly"
+        );
+        assert!(found[2].guards[0].detail.starts_with("the recovery names"));
+        assert_eq!(found[3], before[3], "café is valid UTF-8");
+
+        // Running it again changes nothing.
+        let once = found.clone();
+        block_lossy(&mut found);
+        assert_eq!(found, once);
+    }
+
+    #[test]
+    fn a_lossy_finding_does_not_hide_cheaper_findings_inside_it() {
+        // The worktree is blocked because its command names a lossy main
+        // repository; the build output inside it is still offered.
+        let mut found = vec![
+            cmd(
+                "git-worktree",
+                "/w/wt",
+                100,
+                Tier::Review,
+                &[
+                    "git",
+                    "-C",
+                    "/w/repo\u{FFFD}",
+                    "worktree",
+                    "remove",
+                    "/w/wt",
+                ],
+            ),
+            ft("stale-tree", "/w/wt/old", 30, Tier::Review),
+            ft("cargo-target", "/w/wt/target", 40, Tier::Rebuildable),
+        ];
+        block_lossy(&mut found);
+        let kept = outermost(found);
+        assert_eq!(
+            by_path(&kept),
+            [
+                ("/w/wt", Some(70)),
+                ("/w/wt/old", None),
+                ("/w/wt/target", None)
+            ]
+        );
+
+        // A lossy finding inside an exact one is covered by it: removing
+        // the outer path, which is exact, frees it.
+        let mut found = vec![
+            ft("stale-tree", "/w/scratch", 100, Tier::Review),
+            ft(
+                "cargo-target",
+                "/w/scratch/app\u{FFFD}/target",
+                40,
+                Tier::Rebuildable,
+            ),
+        ];
+        block_lossy(&mut found);
+        assert_eq!(by_path(&outermost(found)), [("/w/scratch", None)]);
     }
 
     #[test]

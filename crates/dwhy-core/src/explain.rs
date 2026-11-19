@@ -586,6 +586,11 @@ pub fn docker_selection(only: Option<&[String]>) -> Vec<String> {
         .collect()
 }
 
+/// Drops findings whose path is a lossy spelling of a name in `tree`, so a
+/// query for a real path spelled with U+FFFD is never answered with a
+/// different directory's finding. Detection already blocks such findings
+/// (`detect::block_lossy`); this is about which finding a path names, not
+/// about what may run.
 pub fn exclude_lossy_paths(findings: &mut Vec<Finding>, tree: &ScanTree) {
     let lossy = lossy_finding_paths(findings, tree);
     findings.retain(|f| !lossy.contains(&f.path));

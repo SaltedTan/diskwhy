@@ -68,7 +68,7 @@ The idea is to automate what was done by hand on pc-ubuntu on 2026-11-13: 36G fr
 - **Scan.** A parallel, single-filesystem (`-x`) walk. It counts each hardlink once by (dev, inode) and records allocated vs apparent bytes. Unreadable directories are recorded, not skipped silently.
 - **Detector.** Recognises one kind of reclaimable thing and turns it into a **finding**, e.g. `cargo-target`, `node-modules`, `venv`, `user-cache` (go/npm/uv/pip/HF/playwright), `git-worktree`, `stale-tree` (scratch dirs by age), `tool-versions`, `trash`, `docker-image`, `docker-build-cache`, `docker-container`, `docker-volume`, `journald`.
 - **Probe.** Adds evidence that explains why a finding is big or growing. See [Decisions taken](#decisions-taken).
-- **Guard.** A check that runs before removal, ending in pass, warn or block, with evidence: `git-unpublished`, `git-dirty`, `git-linked-worktrees`, `in-use-cwd`, `in-use-open`, `container-mount`, `recent-write`, `git-ignored-only` (not built yet).
+- **Guard.** A check that runs before removal, ending in pass, warn or block, with evidence: `git-unpublished`, `git-dirty`, `git-linked-worktrees`, `in-use-cwd`, `in-use-open`, `container-mount`, `recent-write`, `git-ignored-only` (not built yet). `path-not-utf8` is set at detection, not before removal (see Safety rules).
 - **Risk tier.**
   - `regenerable`: caches, including Docker build cache unused for a week; fine to remove automatically
   - `rebuildable`: costs time to restore, e.g. `target/`, venvs
@@ -137,6 +137,7 @@ The versioned CLI output is the contract for agents and the planned MCP server.
 
 - Scans write nothing except their own state. Git commands run with `--no-optional-locks`.
 - Every removal is either a tool-native command or a path removal limited to the finding's root. Symlinks are never followed out of that root, and nothing crosses a filesystem boundary.
+- diskwhy never acts on a path it cannot spell exactly. `diskwhy/v1` reports paths as UTF-8, so a name that is not valid UTF-8 shows with U+FFFD, and a path or command built from that spelling can name a different, real path. Right after the detectors run (for `scan`, `explain`, `plan`, `apply`'s re-detect and the TUI), any finding whose path, action (argv or text) or recovery holds U+FFFD becomes `blocked` with a `path-not-utf8` guard, and its action becomes advice only (rename the path to valid UTF-8 and scan again, or remove it by hand); a recovery command or cost that holds U+FFFD is replaced by a note. Its id, path, bytes and detector stay the same, so its space is still accounted for. This runs before the nesting rule, so a blocked finding still lets cheaper findings inside it be offered. A real name that holds U+FFFD is treated the same way, since diskwhy cannot tell it from a lossy one. As a backstop, `apply` skips an item whose path or action holds U+FFFD, in the plan file or detected now, and checks again right before running it (decided 2026-11-19, issue #61).
 - `apply` re-runs all guards, compares fingerprints (inode, newest mtime, size bucket, git HEAD plus a status hash) and refuses expired plans.
 - Agents are limited by `--max-tier` (config default `regenerable`). See the [Apply and TUI decisions](#decisions-taken) for the required per-item confirmation for `review` items.
 - Append-only audit log in `~/.local/state/diskwhy/audit.jsonl`.

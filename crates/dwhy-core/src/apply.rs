@@ -4,9 +4,11 @@
 //! items by id, and decides each one.
 //!
 //! An item is
-//! - skipped (exit 2) when it is no longer detected, a detector or guard
-//!   blocks it now, its tier or action differs from the plan's, or its
-//!   fingerprint changed;
+//! - skipped (exit 2) when its path or action, in the plan or detected
+//!   now, holds U+FFFD (a path that is not valid UTF-8, checked again right
+//!   before it runs), it is no longer detected, a detector or guard blocks
+//!   it now, its tier or action differs from the plan's, or its fingerprint
+//!   changed;
 //! - refused (exit 3) when its tier is above `--max-tier`, or it is a
 //!   `review` item whose id `--confirm` did not name (`--confirm` alone lets
 //!   a review item through; it never lifts a rebuildable one);
@@ -24,12 +26,12 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::detect::DetectContext;
+use crate::detect::{DetectContext, PATH_NOT_UTF8, is_lossy, lossy_detail};
 use crate::guard::{self, Processes};
 use crate::mounts::MountTable;
 use crate::report::{
     ActionKind, ApplyItem, ApplyOutcome, ApplyReport, AuditEvent, AuditRecord, Finding,
-    GuardStatus, Plan, PlanItem, SCHEMA, Tier, Tool,
+    GuardResult, GuardStatus, Plan, PlanItem, SCHEMA, Tier, Tool,
 };
 use crate::tree::ScanTree;
 
@@ -180,6 +182,21 @@ fn decide(
         fresh: fresh.cloned(),
         inode: item.fingerprint.dev.zip(item.fingerprint.inode),
     };
+    // Backstop for `detect::block_lossy`: never act on a path or command
+    // spelled with U+FFFD, whether the plan file or the fresh finding has it.
+    if let Some(detail) = lossy(planned).or_else(|| fresh.and_then(lossy)) {
+        let mut c = base(
+            fresh.unwrap_or(planned),
+            ApplyOutcome::Skipped,
+            format!("blocked by {PATH_NOT_UTF8}: {detail}"),
+        );
+        c.item.guards = vec![GuardResult {
+            name: PATH_NOT_UTF8.into(),
+            status: GuardStatus::Block,
+            detail,
+        }];
+        return c;
+    }
     let Some(f) = fresh else {
         return base(
             planned,
@@ -220,6 +237,15 @@ fn decide(
         return skip(format!("changed since the plan: {}", diff.join(", ")));
     }
     base(f, ApplyOutcome::WouldRemove, "ready".into())
+}
+
+/// Why `f`'s path or action cannot be acted on exactly, when either holds
+/// U+FFFD.
+fn lossy(f: &Finding) -> Option<String> {
+    let path = is_lossy(&f.path);
+    let action = f.action.argv.iter().flatten().any(|a| is_lossy(a)) || is_lossy(&f.action.text);
+    (path || action)
+        .then(|| lossy_detail(f).unwrap_or_else(|| "a path it names is not valid UTF-8".into()))
 }
 
 /// The blocking guards of `f`, as "name: detail; …".
@@ -379,6 +405,15 @@ pub fn execute(
 
 fn run(c: &Check, mounts: &MountTable) -> (ApplyOutcome, String) {
     let item = &c.item;
+    if is_lossy(&item.path)
+        || item.action.argv.iter().flatten().any(|a| is_lossy(a))
+        || is_lossy(&item.action.text)
+    {
+        return (
+            ApplyOutcome::Skipped,
+            format!("blocked by {PATH_NOT_UTF8}: a path it names is not valid UTF-8; not run"),
+        );
+    }
     if item.path.starts_with('/') && std::fs::symlink_metadata(&item.path).is_err() {
         return (
             ApplyOutcome::Skipped,

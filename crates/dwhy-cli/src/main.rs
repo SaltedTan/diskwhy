@@ -766,6 +766,7 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
     if let (Some(f), Some(tree)) = (&mut finding, &tree) {
         let one = std::slice::from_mut(f);
         probes::run(one, &ctx);
+        detect::block_lossy(one);
         let status = status_line(args.quiet, "checking guards…");
         let processes = if is_docker {
             Processes::default()

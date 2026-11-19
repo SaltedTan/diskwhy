@@ -1505,6 +1505,16 @@ fn lossy_cargo_path_is_marked_and_commands_are_withheld() {
     assert_eq!(data.report.findings.len(), 1);
     let finding = &mut data.report.findings[0];
     assert!(finding.path.ends_with("/app�/target"));
+    // Core blocks it and drops the lossy command (#61) ...
+    assert_eq!(finding.tier, Tier::Blocked);
+    assert_eq!(finding.action.kind, ActionKind::Advice);
+    assert!(finding.guards.iter().any(|g| g.name == "path-not-utf8"));
+    // ... and the TUI still withholds any command that holds U+FFFD.
+    finding.action = Action {
+        kind: ActionKind::Command,
+        text: format!("cargo clean --target-dir {}", finding.path),
+        argv: None,
+    };
     let action = finding.action.text.clone();
     finding.recovery.how = Some("cargo build --manifest-path /app/Cargo.toml".into());
     let mut app = app_with(data);

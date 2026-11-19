@@ -2080,3 +2080,171 @@ fn explain_refuses_an_id_whose_saved_path_was_lossy() {
         "{err}"
     );
 }
+
+/// `cargo_fixture` with the crate at `app\xff`, a name that is not valid
+/// UTF-8, and a lookalike crate at `café`. `None` when the filesystem
+/// refuses the name.
+fn lossy_cargo_fixture() -> Option<(tempfile::TempDir, String)> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (t, root) = cargo_fixture();
+    let app = Path::new(&root).join("app");
+    let lossy = Path::new(&root).join(OsStr::from_bytes(b"app\xff"));
+    if let Err(e) = fs::rename(&app, &lossy) {
+        eprintln!("skipped: the filesystem refuses {lossy:?}: {e}");
+        return None;
+    }
+    let cafe = Path::new(&root).join("café");
+    fs::create_dir_all(cafe.join("target/debug")).unwrap();
+    fs::write(cafe.join("Cargo.toml"), "[package]\nname = \"cafe\"\n").unwrap();
+    fs::write(cafe.join("target/CACHEDIR.TAG"), CARGO_TAG).unwrap();
+    fs::write(cafe.join("target/debug/cafe"), vec![1u8; 3 << 20]).unwrap();
+    Some((t, root))
+}
+
+#[test]
+fn scan_json_blocks_a_finding_whose_path_is_not_utf8() {
+    let Some((_t, root)) = lossy_cargo_fixture() else {
+        return;
+    };
+    let state = tempfile::tempdir().unwrap();
+    let out = dwhy_in(
+        state.path(),
+        &["scan", &root, "--json", "-q", "--detectors", "cargo-target"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let mut v = json_of(&out);
+    let findings = v["findings"].as_array_mut().unwrap();
+    findings.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+    let lossy = format!("{root}/app\u{FFFD}/target");
+    assert_eq!(findings[0]["path"], lossy.as_str());
+    assert_eq!(findings[0]["tier"], "blocked");
+    assert_eq!(findings[0]["action"]["kind"], "advice");
+    assert_eq!(findings[0]["action"].get("argv"), None);
+    assert_eq!(
+        findings[0]["action"]["text"],
+        dwhy_core::detect::PATH_NOT_UTF8_ADVICE
+    );
+    // The snapshot masks a guard's status and detail.
+    assert_eq!(
+        findings[0]["guards"],
+        serde_json::json!([{
+            "name": "path-not-utf8",
+            "status": "block",
+            "detail": "the path is not valid UTF-8 (shown with U+FFFD); diskwhy cannot act on it exactly",
+        }])
+    );
+    assert_eq!(findings[1]["path"], format!("{root}/café/target"));
+    assert_eq!(findings[1]["tier"], "rebuildable");
+    assert_ne!(findings[1]["action"]["kind"], "advice");
+    let mut v = serde_json::json!({ "findings": v["findings"].take() });
+    normalize(&mut v, &root);
+    insta::assert_json_snapshot!(v);
+
+    // `plan --select` refuses it: it has advice only, nothing to apply.
+    let id = dwhy_core::detect::finding_id("cargo-target", &lossy);
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "plan",
+            &root,
+            "-q",
+            "--detectors",
+            "cargo-target",
+            "--select",
+            &id,
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("has no removal action, only advice"), "{err}");
+    assert!(
+        err.contains(dwhy_core::detect::PATH_NOT_UTF8_ADVICE),
+        "{err}"
+    );
+}
+
+#[test]
+fn apply_never_runs_a_lossy_path_or_command() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (_t, root) = cargo_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_dwhy"))
+            .args(args)
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("PATH", bin.path())
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .unwrap()
+    };
+    let plan = dir.path().join("p.json");
+    let out = run(&[
+        "plan",
+        &root,
+        "-q",
+        "--detectors",
+        "cargo-target",
+        "--tier",
+        "rebuildable",
+        "-o",
+        plan.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let edit = |name: &str, f: &dyn Fn(&mut Value)| -> String {
+        let mut v: Value = serde_json::from_slice(&fs::read(&plan).unwrap()).unwrap();
+        f(&mut v["items"][0]["finding"]);
+        let file = dir.path().join(name);
+        fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
+        file.to_str().unwrap().to_string()
+    };
+    let lossy = format!("{root}/app\u{FFFD}/target");
+    let dry_run = |file: &str| {
+        let out = run(&[
+            "apply",
+            file,
+            "--dry-run",
+            "--max-tier",
+            "rebuildable",
+            "--json",
+            "-q",
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{out:?}");
+        let r = json_of(&out);
+        assert_eq!(r["items"][0]["outcome"], "skipped", "{r}");
+        let detail = r["items"][0]["detail"].as_str().unwrap();
+        assert!(detail.starts_with("blocked by path-not-utf8: "), "{detail}");
+    };
+
+    // A hand-edited plan whose command names a lossy path.
+    dry_run(&edit("argv.json", &|f| {
+        f["action"] = serde_json::json!({
+            "kind": "command",
+            "text": format!("cargo clean --target-dir {lossy}"),
+            "argv": ["cargo", "clean", "--target-dir", lossy],
+        });
+    }));
+
+    // A plan that lists a finding at a path that is not valid UTF-8.
+    let app = Path::new(&root).join("app");
+    let renamed = Path::new(&root).join(OsStr::from_bytes(b"app\xff"));
+    if let Err(e) = fs::rename(&app, &renamed) {
+        eprintln!("skipped: the filesystem refuses {renamed:?}: {e}");
+        return;
+    }
+    dry_run(&edit("path.json", &|f| {
+        f["path"] = lossy.as_str().into();
+        f["id"] = dwhy_core::detect::finding_id("cargo-target", &lossy).into();
+    }));
+    assert!(renamed.join("target/debug/app").exists());
+    assert!(
+        !state.path().join("diskwhy/audit.jsonl").exists(),
+        "dry runs write nothing"
+    );
+}
