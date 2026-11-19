@@ -197,6 +197,31 @@ pub struct ScanJob {
     pub progress: Arc<Progress>,
 }
 
+pub struct ScanOutcome {
+    pub scanned: Option<Scanned>,
+    pub removed: Vec<PathBuf>,
+}
+
+impl ScanJob {
+    pub fn run(mut self, stage: &mut dyn FnMut(Stage)) -> Result<ScanOutcome, String> {
+        let mut removed = Vec::new();
+        self.options.paths.retain(|path| {
+            if fs::symlink_metadata(path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+                removed.push(path.clone());
+                false
+            } else {
+                true
+            }
+        });
+        let scanned = if self.options.paths.is_empty() && !removed.is_empty() {
+            None
+        } else {
+            Some(scan(&self.options, &self.progress, stage)?)
+        };
+        Ok(ScanOutcome { scanned, removed })
+    }
+}
+
 /// A plan to build off the UI thread.
 #[derive(Debug)]
 pub struct PlanJob {
@@ -414,6 +439,7 @@ pub struct Applied {
 pub struct ApplyFailed {
     pub message: String,
     pub exit: u8,
+    pub audit_error: bool,
 }
 
 impl ApplyFailed {
@@ -421,6 +447,14 @@ impl ApplyFailed {
         ApplyFailed {
             message: message.into(),
             exit: 1,
+            audit_error: false,
+        }
+    }
+
+    fn audit(message: impl Into<String>) -> ApplyFailed {
+        ApplyFailed {
+            audit_error: true,
+            ..Self::error(message)
         }
     }
 }
@@ -451,6 +485,7 @@ impl ApplyJob {
             return Err(ApplyFailed {
                 message: format!("refused: {e}"),
                 exit: 3,
+                audit_error: false,
             });
         }
         progress.set(ApplyStep::Rescanning);
@@ -487,11 +522,11 @@ impl ApplyJob {
             });
         }
         let path = opts.audit_log.as_deref().ok_or_else(|| {
-            ApplyFailed::error(
+            ApplyFailed::audit(
                 "cannot place the audit log: neither XDG_STATE_HOME nor HOME is an absolute path",
             )
         })?;
-        let mut audit = Audit::open(path).map_err(ApplyFailed::error)?;
+        let mut audit = Audit::open(path).map_err(ApplyFailed::audit)?;
         let mounts = MountTable::read()
             .map_err(|e| ApplyFailed::error(format!("cannot read the mount table: {e}")))?;
         let total = checks.iter().filter(|c| c.ready()).count();

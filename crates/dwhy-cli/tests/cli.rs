@@ -2784,3 +2784,85 @@ fn tui_takes_dry_run_with_paths_or_a_plan() {
         assert!(err.contains("needs a terminal"), "{args:?}: {err}");
     }
 }
+
+#[test]
+fn apply_and_tui_reject_a_saved_plan_with_a_duplicate_finding_id() {
+    let t = Twin::new();
+    let file = t.cli_plan("duplicate.json");
+    let mut plan = dwhy_tui::job::read_plan(Path::new(&file)).unwrap();
+    let mut decoy = plan
+        .items
+        .iter()
+        .find(|item| item.finding.detector == "stale-tree")
+        .unwrap()
+        .clone();
+    decoy.finding.path = t.work().join("decoy").to_str().unwrap().into();
+    let id = decoy.finding.id.clone();
+    plan.items.push(decoy);
+    fs::write(&file, serde_json::to_vec(&plan).unwrap()).unwrap();
+
+    for args in [&["apply", &file, "--yes"][..], &["tui", "--plan", &file]] {
+        let out = t.dwhy(args);
+        assert_eq!(out.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(&format!("duplicate finding ID in plan items: {id}")),
+            "{stderr}"
+        );
+    }
+    assert!(t.targets().iter().all(|p| p.exists()));
+    assert!(!t.audit().exists());
+}
+
+#[test]
+fn apply_skips_a_confirmed_id_when_the_planned_resource_differs() {
+    let t = Twin::new();
+    let file = t.cli_plan("edited.json");
+    let mut original = dwhy_tui::job::read_plan(Path::new(&file)).unwrap();
+    original
+        .items
+        .retain(|item| item.finding.detector == "stale-tree");
+    assert_eq!(original.items.len(), 1);
+    let id = &original.items[0].finding.id;
+    let decoy = t.work().join("decoy");
+    let scratch = &t.targets()[2];
+    for (detector, path) in [
+        ("stale-tree", decoy.as_path()),
+        ("cargo-target", scratch.as_path()),
+    ] {
+        let mut plan = original.clone();
+        plan.items[0].finding.detector = detector.into();
+        plan.items[0].finding.path = path.to_str().unwrap().into();
+        fs::write(&file, serde_json::to_vec(&plan).unwrap()).unwrap();
+
+        let out = t.dwhy(&[
+            "apply",
+            &file,
+            "--yes",
+            "--max-tier",
+            "review",
+            "--confirm",
+            id,
+            "--json",
+            "-q",
+        ]);
+        let report = report_of(&out);
+        assert_eq!(out.status.code(), Some(2), "{report}");
+        assert_eq!(report["items"][0]["outcome"], "skipped", "{report}");
+        assert_eq!(
+            report["items"][0]["detail"],
+            format!(
+                "changed: planned {detector} {} does not match the live finding",
+                path.display()
+            )
+        );
+        assert!(t.targets().iter().all(|p| p.exists()));
+    }
+    assert_eq!(
+        t.audit_events()
+            .iter()
+            .map(|event| event.0.as_str())
+            .collect::<Vec<_>>(),
+        ["end", "end"]
+    );
+}

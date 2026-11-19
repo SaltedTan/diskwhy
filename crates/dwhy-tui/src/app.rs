@@ -18,7 +18,7 @@ use ratatui::text::Line;
 
 use crate::job::{
     self, Applied, ApplyFailed, ApplyJob, ApplyProgress, BuiltPlan, Mark, Options, PlanJob,
-    PlanMark, ScanJob, Scanned, Stage, UnplannedMark, WriteError,
+    PlanMark, ScanJob, ScanOutcome, Scanned, Stage, UnplannedMark, WriteError,
 };
 
 /// Where `w` offers to write a plan, relative to the working directory.
@@ -163,7 +163,7 @@ pub struct Confirm {
     pub confirmed: BTreeSet<String>,
     /// First line on screen.
     pub scroll: usize,
-    pub(crate) reveal_selection: bool,
+    pub(crate) action_scroll: usize,
     pub(crate) layout: Option<crate::ui::ConfirmLayout>,
 }
 
@@ -202,6 +202,7 @@ pub enum State {
         progress: Arc<Progress>,
         stage: Stage,
     },
+    RootsRemoved,
     Browsing(Box<Browser>),
     /// `dwhy tui --plan FILE`: a plan file and no scan.
     Plan(Box<PlanView>),
@@ -289,8 +290,10 @@ impl App {
 
     /// The apply finished (or failed before deciding items).
     pub fn apply_done(&mut self, mut result: Result<Applied, ApplyFailed>) {
-        if let Ok(done) = &mut result {
-            self.audit_errors.append(&mut done.audit_errors);
+        match &mut result {
+            Ok(done) => self.audit_errors.append(&mut done.audit_errors),
+            Err(failed) if failed.audit_error => self.audit_errors.push(failed.message.clone()),
+            Err(_) => {}
         }
         if let State::Applying(v) = &mut self.state
             && v.result.is_none()
@@ -405,10 +408,24 @@ impl App {
         self.state = State::Browsing(Box::new(b));
     }
 
+    pub fn scan_done(&mut self, outcome: ScanOutcome) {
+        if let Some(data) = outcome.scanned {
+            self.finish(data);
+        } else {
+            self.state = State::RootsRemoved;
+        }
+        if !outcome.removed.is_empty() {
+            self.message = Some(format!(
+                "removed: {}",
+                root_labels(&outcome.removed).join(", ")
+            ));
+        }
+    }
+
     pub fn browser(&self) -> Option<&Browser> {
         match &self.state {
             State::Browsing(b) => Some(b),
-            State::Scanning { .. } | State::Plan(_) | State::Applying(_) => None,
+            _ => None,
         }
     }
 
@@ -430,10 +447,11 @@ impl App {
             return true;
         }
         self.message = None;
-        let page = self.viewport.max(1);
+        let viewport = self.viewport;
+        let page = viewport.max(1);
         let dry_session = self.dry_run();
         if let Some(view) = self.plan_view_mut().filter(|v| v.confirm.is_some()) {
-            match view.on_confirm_key(key, page, dry_session) {
+            match view.on_confirm_key(key, viewport, dry_session) {
                 ConfirmKey::None => {}
                 ConfirmKey::Message(m) => self.message = Some(m),
                 ConfirmKey::Start { dry_run } => self.message = self.start_apply(dry_run),
@@ -452,7 +470,7 @@ impl App {
                 self.message = view.on_key(key, page, now);
                 return false;
             }
-            State::Scanning { .. } | State::Applying(_) => return false,
+            State::Scanning { .. } | State::RootsRemoved | State::Applying(_) => return false,
         };
         if key.code == KeyCode::Tab {
             b.view = match b.view {
@@ -545,7 +563,7 @@ impl App {
         let rescan = match &self.state {
             State::Plan(_) => self.options.for_plan(&plan),
             State::Browsing(b) => b.data.plan_options.clone(),
-            State::Scanning { .. } | State::Applying(_) => unreachable!(),
+            State::Scanning { .. } | State::RootsRemoved | State::Applying(_) => unreachable!(),
         };
         let job = ApplyJob {
             plan,
@@ -919,13 +937,13 @@ impl PlanView {
     }
 
     /// A key while the confirm dialog is open.
-    fn on_confirm_key(&mut self, key: KeyEvent, page: usize, dry_session: bool) -> ConfirmKey {
+    fn on_confirm_key(&mut self, key: KeyEvent, viewport: usize, dry_session: bool) -> ConfirmKey {
         let Some(c) = self.confirm.as_mut() else {
             return ConfirmKey::None;
         };
         let items = &self.plan.items;
         let last = items.len().saturating_sub(1);
-        match key.code {
+        let selected = match key.code {
             KeyCode::Esc => {
                 self.confirm = None;
                 return ConfirmKey::Message("nothing applied".into());
@@ -938,41 +956,36 @@ impl PlanView {
             KeyCode::Char('d') if unmodified_action(key) => {
                 return ConfirmKey::Start { dry_run: true };
             }
-            KeyCode::Char(' ') => match items.get(c.selected).map(|i| &i.finding) {
-                Some(f) if f.tier == Tier::Review => {
-                    if !c.confirmed.remove(&f.id) {
-                        c.confirmed.insert(f.id.clone());
+            KeyCode::Char(' ') if viewport > 0 => {
+                match items.get(c.selected).map(|i| &i.finding) {
+                    Some(f) if f.tier == Tier::Review => {
+                        if !c.confirmed.remove(&f.id) {
+                            c.confirmed.insert(f.id.clone());
+                        }
+                        c.layout = None;
                     }
-                    c.layout = None;
+                    Some(_) => {
+                        return ConfirmKey::Message(
+                            "only review items need a confirmation; this one goes ahead".into(),
+                        );
+                    }
+                    None => {}
                 }
-                Some(_) => {
-                    return ConfirmKey::Message(
-                        "only review items need a confirmation; this one goes ahead".into(),
-                    );
-                }
-                None => {}
-            },
-            KeyCode::Up | KeyCode::Char('k') => {
-                c.selected = c.selected.saturating_sub(1);
-                c.reveal_selection = true;
+                return ConfirmKey::None;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                c.selected = (c.selected + 1).min(last);
-                c.reveal_selection = true;
-            }
+            KeyCode::Up | KeyCode::Char('k') => c.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => (c.selected + 1).min(last),
             KeyCode::PageUp | KeyCode::PageDown => {
-                c.reveal_selection = false;
-                scroll_lines(&mut c.scroll, key.code, page);
+                scroll_lines(&mut c.action_scroll, key.code, viewport.saturating_sub(1));
+                return ConfirmKey::None;
             }
-            KeyCode::Home | KeyCode::Char('g') => {
-                c.selected = 0;
-                c.reveal_selection = true;
-            }
-            KeyCode::End | KeyCode::Char('G') => {
-                c.selected = last;
-                c.reveal_selection = true;
-            }
-            _ => {}
+            KeyCode::Home | KeyCode::Char('g') => 0,
+            KeyCode::End | KeyCode::Char('G') => last,
+            _ => return ConfirmKey::None,
+        };
+        if c.selected != selected {
+            c.action_scroll = 0;
+            c.selected = selected;
         }
         ConfirmKey::None
     }

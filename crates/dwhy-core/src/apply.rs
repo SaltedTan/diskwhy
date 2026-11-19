@@ -240,6 +240,12 @@ fn decide(
         c.item.guards = f.guards.clone();
         c
     };
+    if f.path != planned.path || f.detector != planned.detector {
+        return skip(format!(
+            "changed: planned {} {} does not match the live finding",
+            planned.detector, planned.path
+        ));
+    }
     if f.tier == Tier::Blocked {
         return skip(format!("blocked by {}", blocks(f)));
     }
@@ -469,7 +475,7 @@ pub fn execute_until(
                 c.item.detail = format!("not run: {e}");
                 continue;
             }
-            let (outcome, detail) = run(c, mounts, &removed_paths, options.isolate_commands);
+            let (outcome, detail) = run(c, mounts, &removed_paths, &options);
             let path = Path::new(&c.item.path);
             if outcome == ApplyOutcome::Removed
                 && path.is_absolute()
@@ -491,7 +497,7 @@ fn run(
     c: &mut Check,
     mounts: &MountTable,
     removed_paths: &HashSet<PathBuf>,
-    isolate_commands: bool,
+    options: &ExecuteOptions<'_>,
 ) -> (ApplyOutcome, String) {
     let item = &mut c.item;
     if let Some(detail) = lossy(&item.path, &item.action) {
@@ -503,6 +509,9 @@ fn run(
         removed_paths.contains(path)
     }) {
         return c.skip_changed(detail);
+    }
+    if (options.stop)() {
+        return (ApplyOutcome::Skipped, NOT_RUN_STOPPED.into());
     }
     match item.action.kind {
         ActionKind::RemovePath => {
@@ -526,7 +535,7 @@ fn run(
             };
             let mut command = Command::new(prog);
             command.args(args).current_dir("/").stdin(Stdio::null());
-            if isolate_commands {
+            if options.isolate_commands {
                 command.process_group(0);
             }
             match command.output() {

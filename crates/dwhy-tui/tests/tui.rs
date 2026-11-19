@@ -2830,6 +2830,7 @@ fn a_plan_session_rescans_the_plans_roots_and_esc_returns_after_a_dry_run() {
     app.apply_done(Err(ApplyFailed {
         message: "cannot read the mount table: gone".into(),
         exit: 1,
+        audit_error: false,
     }));
     let screen = render(&mut app, 80, 24, None);
     assert!(screen.contains("dwhy apply would exit 1"), "{screen}");
@@ -2877,6 +2878,106 @@ fn apply_results_allow_escape_after_refusals_and_skips() {
 }
 
 #[test]
+fn apply_rescan_reports_removed_roots_and_stays_open() {
+    use dwhy_core::apply::Env;
+    use std::time::{Duration, SystemTime};
+
+    for saved_plan in [false, true] {
+        for keep_root in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let base = fixture.path().canonicalize().unwrap();
+            let scratch = base.join("scratch");
+            let other = base.join("keep");
+            fs::create_dir(&scratch).unwrap();
+            fs::create_dir(&other).unwrap();
+            fs::write(other.join("keep.txt"), "safe").unwrap();
+            let marker = scratch.join(".dwhy-scratch");
+            let payload = scratch.join("blob");
+            fs::write(&marker, "").unwrap();
+            fs::write(&payload, vec![1u8; 2 * MIB]).unwrap();
+            let old = SystemTime::now() - Duration::from_secs(30 * 86_400);
+            for path in [&marker, &payload, &scratch] {
+                fs::File::open(path).unwrap().set_modified(old).unwrap();
+            }
+            let mut paths = vec![scratch.clone()];
+            if keep_root {
+                paths.push(other.clone());
+            }
+            let options = Options {
+                detectors: Some(vec!["stale-tree".into()]),
+                audit_log: Some(base.join("audit.jsonl")),
+                ..opts(paths)
+            };
+            let data = job::scan(&options, &Progress::default(), &mut |_| {}).unwrap();
+            assert_eq!(data.report.findings.len(), 1);
+            let env = Env::from_system();
+            let mut app = if saved_plan {
+                let plan = job::PlanJob {
+                    options: data.plan_options,
+                    progress: Arc::default(),
+                    marks: data.report.findings.iter().map(Into::into).collect(),
+                }
+                .build(Processes::default, env.host.clone())
+                .unwrap()
+                .plan;
+                App::open_plan(plan, base.join("plan.json"), &env.host, env.uid)
+                    .with_options(options)
+            } else {
+                let mut app = app_with(data).with_options(options);
+                press(
+                    &mut app,
+                    &[KeyCode::Tab, KeyCode::Char(' '), KeyCode::Char('p')],
+                );
+                let plan = app
+                    .take_request()
+                    .unwrap()
+                    .build(Processes::default, env.host.clone());
+                app.plan_built(plan, &env.host, env.uid);
+                app
+            };
+
+            press(
+                &mut app,
+                &[KeyCode::Char('x'), KeyCode::Char(' '), KeyCode::Char('y')],
+            );
+            let result = app
+                .take_apply()
+                .unwrap()
+                .run(Processes::default, &env)
+                .unwrap();
+            assert_eq!(result.report.items[0].outcome, ApplyOutcome::Removed);
+            assert!(!scratch.exists());
+            app.apply_done(Ok(result));
+            press(&mut app, &[KeyCode::Enter]);
+            let outcome = app.take_scan().unwrap().run(&mut |_| {}).unwrap();
+            assert_eq!(outcome.removed, std::slice::from_ref(&scratch));
+            app.scan_done(outcome);
+
+            let screen = render(&mut app, 80, 24, None);
+            assert!(
+                screen.contains(&format!("removed: {}", scratch.display())),
+                "{screen}"
+            );
+            assert_eq!(fs::read_to_string(other.join("keep.txt")).unwrap(), "safe");
+            if keep_root {
+                let browser = app.browser().unwrap();
+                assert_eq!(browser.data.plan_options.paths, [other]);
+                assert_eq!(browser.marked_findings().count(), 0);
+            } else {
+                assert!(
+                    screen.contains("all scanned roots were removed"),
+                    "{screen}"
+                );
+                assert!(screen.contains("q quit"), "{screen}");
+                press(&mut app, &[KeyCode::Enter, KeyCode::Esc]);
+                assert!(app.take_scan().is_none());
+                assert!(app.on_key(key(KeyCode::Char('q'))));
+            }
+        }
+    }
+}
+
+#[test]
 fn confirm_dialog_80x24() {
     let mut app = dialog_app(false);
     press(&mut app, &[KeyCode::Char('x')]);
@@ -2902,21 +3003,40 @@ fn confirm_dialog_long_action_80x24() {
 
     for _ in 0..3 {
         press(&mut app, &[KeyCode::PageDown]);
-        render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+        let page = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+        assert!(page.contains("> [ ] review"), "{page}");
     }
     press(&mut app, &[KeyCode::Char(' ')]);
     let end = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
     assert!(end.contains("target-final"), "{end}");
+    assert!(end.contains("> [x] review"), "{end}");
     assert_eq!(confirmed(&app), [review_id()]);
     insta::assert_snapshot!(end);
 
     for _ in 0..3 {
         press(&mut app, &[KeyCode::PageUp]);
-        render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+        let page = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+        assert!(page.contains("> [x] review"), "{page}");
     }
     let top = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
     assert!(top.contains("[x] review"), "{top}");
     assert!(!top.contains("target-final"), "{top}");
+}
+
+#[test]
+fn apply_confirmation_space_requires_a_visible_checkbox() {
+    let mut app = dialog_app(false);
+    press(&mut app, &[KeyCode::Char('x'), KeyCode::Down]);
+    for (width, height) in [(80, 5), (6, 24)] {
+        let screen = render_at(&mut app, width, height, None, PLAN_AT + 60);
+        assert!(!screen.contains("[ ]"), "{screen}");
+        press(&mut app, &[KeyCode::Char(' ')]);
+        assert!(confirmed(&app).is_empty());
+    }
+    let visible = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(visible.contains("> [ ] review"), "{visible}");
+    press(&mut app, &[KeyCode::Char(' ')]);
+    assert_eq!(confirmed(&app), [review_id()]);
 }
 
 #[test]

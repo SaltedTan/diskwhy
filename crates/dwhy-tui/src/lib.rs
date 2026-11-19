@@ -59,7 +59,7 @@ const TICK: Duration = Duration::from_millis(100);
 
 enum Msg {
     Stage(Stage),
-    Done(Result<Box<Scanned>, String>),
+    Done(Result<Box<job::ScanOutcome>, String>),
 }
 
 type Built = (String, Result<job::BuiltPlan, String>);
@@ -73,7 +73,14 @@ pub fn run(opts: Options) -> Result<u8, Error> {
     let progress = Arc::new(Progress::default());
     let mut app =
         App::new(app::root_labels(&opts.paths), progress.clone()).with_options(opts.clone());
-    run_terminal(&mut app, &signal, || spawn_scan(opts, progress))
+    run_terminal(&mut app, &signal, || {
+        spawn_scan(move |stage| {
+            job::scan(&opts, &progress, stage).map(|data| job::ScanOutcome {
+                scanned: Some(data),
+                removed: Vec::new(),
+            })
+        })
+    })
 }
 
 /// `dwhy tui --plan FILE`: reads and parses the plan (failing before the
@@ -129,12 +136,14 @@ fn run_terminal(
 
 /// Scans in a background thread. Not joined: quitting mid-scan leaves it
 /// to end with the process.
-fn spawn_scan(opts: Options, progress: Arc<Progress>) -> io::Result<mpsc::Receiver<Msg>> {
+fn spawn_scan(
+    scan: impl FnOnce(&mut dyn FnMut(Stage)) -> Result<job::ScanOutcome, String> + Send + 'static,
+) -> io::Result<mpsc::Receiver<Msg>> {
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("dwhy-tui-scan".into())
         .spawn(move || {
-            let res = job::scan(&opts, &progress, &mut |s| {
+            let res = scan(&mut |s| {
                 let _ = tx.send(Msg::Stage(s));
             });
             let _ = tx.send(Msg::Done(res.map(Box::new)));
@@ -222,17 +231,17 @@ where
         if signal.exit_code().is_some() {
             return Ok(());
         }
-        while let Ok((host, plan)) = built_rx.try_recv() {
-            app.plan_built(plan, &host, system::euid());
-        }
-        if worker.as_ref().is_some_and(|w| !w.running()) {
-            worker.take().unwrap().finish(app)?;
-        }
         if ready
             && let Event::Key(key) = read()?
             && app.on_key(key)
         {
             return Ok(());
+        }
+        while let Ok((host, plan)) = built_rx.try_recv() {
+            app.plan_built(plan, &host, system::euid());
+        }
+        if worker.as_ref().is_some_and(|w| !w.running()) {
+            worker.take().unwrap().finish(app)?;
         }
         if let Some(job) = app.take_request() {
             let tx = built_tx.clone();
@@ -259,13 +268,13 @@ where
             });
         }
         if let Some(job) = app.take_scan() {
-            rescan = Some(spawn_scan(job.options, job.progress)?);
+            rescan = Some(spawn_scan(move |stage| job.run(stage))?);
         }
         let rx = rescan.as_ref().unwrap_or(rx);
         loop {
             match rx.try_recv() {
                 Ok(Msg::Stage(s)) => app.set_stage(s),
-                Ok(Msg::Done(Ok(data))) => app.finish(*data),
+                Ok(Msg::Done(Ok(outcome))) => app.scan_done(*outcome),
                 Ok(Msg::Done(Err(e))) => return Err(format!("scan failed: {e}").into()),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -526,6 +535,85 @@ mod tests {
 
     fn key(c: char) -> Event {
         Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn apply_progress_keys_do_not_act_on_unseen_results() {
+        let fixture = Crates::new();
+        for code in [KeyCode::Enter, KeyCode::Esc] {
+            let mut app = fixture.app();
+            for c in ['x', 'd'] {
+                assert!(!app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
+            }
+            let progress = app.take_apply().unwrap().progress;
+            let handle = std::thread::spawn(|| {
+                Err(ApplyFailed {
+                    message: "fixture apply failure".into(),
+                    exit: 1,
+                    audit_error: false,
+                })
+            });
+            while !handle.is_finished() {
+                std::thread::yield_now();
+            }
+            let mut worker = Some(ApplyWorker {
+                progress,
+                handle: Some(handle),
+            });
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let (_tx, rx) = mpsc::channel();
+            let mut keys = [
+                Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                key('q'),
+            ]
+            .into_iter();
+            run_loop(
+                &mut term,
+                &mut app,
+                &rx,
+                &Termination::default(),
+                |_| Ok(true),
+                || Ok(keys.next().unwrap()),
+                &mut worker,
+            )
+            .unwrap();
+            assert!(worker.is_none());
+            assert!(app.take_scan().is_none());
+            let screen = term.backend().to_string();
+            assert!(screen.contains("dry run results"), "{screen}");
+            assert!(screen.contains("fixture apply failure"), "{screen}");
+        }
+    }
+
+    #[test]
+    fn apply_audit_path_and_open_failures_are_retained_on_quit() {
+        let fixture = Crates::new();
+        for (path, expected) in [
+            (None, "cannot place the audit log"),
+            (Some(fixture.base.join("work")), "cannot open the audit log"),
+        ] {
+            let mut app = fixture.app();
+            app.options.audit_log = path;
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let (_tx, rx) = mpsc::channel();
+            let mut keys = [key('x'), key('y'), key('q')].into_iter();
+            event_loop(
+                &mut term,
+                &mut app,
+                &rx,
+                &Termination::default(),
+                |_| Ok(true),
+                || Ok(keys.next().unwrap()),
+            )
+            .unwrap();
+            assert_eq!(app.audit_errors.len(), 1, "{:?}", app.audit_errors);
+            assert!(
+                app.audit_errors[0].contains(expected),
+                "{:?}",
+                app.audit_errors
+            );
+            assert!(!fixture.base.join("started").exists());
+        }
     }
 
     /// `q` while an item is being removed: that item finishes, the other

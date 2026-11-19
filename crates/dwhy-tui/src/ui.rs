@@ -43,7 +43,7 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
     let area = f.area();
     let fs_lines = match &app.state {
         State::Scanning { .. } => 1,
-        State::Plan(_) | State::Applying(_) => 0,
+        State::Plan(_) | State::RootsRemoved | State::Applying(_) => 0,
         State::Browsing(b) if b.view != View::Tree || b.fs_offset.is_some() => 0,
         State::Browsing(b) => b.data.report.fs.len().clamp(1, MAX_FS_LINES),
     };
@@ -90,6 +90,11 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
     };
 
     match &mut app.state {
+        State::RootsRemoved => {
+            f.render_widget(title_line("rescan", "", tw), title);
+            f.render_widget(Paragraph::new("  all scanned roots were removed"), list);
+            f.render_widget(Paragraph::new(Span::styled(" q quit", dim)), keys);
+        }
         State::Scanning { progress, stage } => {
             f.render_widget(title_line("scanning", "", tw), title);
             f.render_widget(Paragraph::new(Span::styled(" measuring…", dim)), fs);
@@ -404,36 +409,48 @@ fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: boo
     let inner = block.inner(a.list);
     f.render_widget(block, a.list);
     let width = inner.width as usize;
+    let available = inner.height as usize;
+    if available == 0 || width < 5 {
+        return 0;
+    }
 
     if c.layout.as_ref().is_none_or(|layout| layout.width != width) {
         c.layout = Some(confirm_layout(p, c, width));
     }
     let layout = c.layout.as_ref().unwrap();
-    let height = (inner.height as usize)
-        .saturating_sub(layout.head.len())
-        .max(1);
-    let row = layout.rows.get(c.selected);
-    if std::mem::take(&mut c.reveal_selection)
-        && let Some(row) = row
-    {
-        c.scroll = c.scroll.max(row.end.saturating_sub(height)).min(row.start);
-    }
-    c.scroll = c.scroll.min(layout.lines.len().saturating_sub(height));
-    let mut shown = layout.head.clone();
-    shown.extend(
-        layout.lines[c.scroll..]
-            .iter()
-            .take(height)
-            .enumerate()
-            .map(|(i, line)| {
-                let mut line = line.clone();
-                if row.is_some_and(|row| row.start == c.scroll + i) {
-                    line.spans[0].content = Cow::Borrowed("> ");
-                    line = line.style(Style::new().add_modifier(Modifier::REVERSED));
-                }
-                line
-            }),
-    );
+    let head = layout.head.len().min(available - 1);
+    let height = available - head;
+    let row = &layout.rows[c.selected];
+    c.scroll = c
+        .scroll
+        .max(row.end.saturating_sub(height))
+        .min(row.start)
+        .min(layout.lines.len().saturating_sub(height));
+
+    let mut shown = layout.head[..head].to_vec();
+    let (selected, viewport) = if row.len() > height {
+        let footer = if c.selected + 1 == items.len() {
+            &layout.lines[row.end..]
+        } else {
+            &[]
+        };
+        let footer = &footer[..footer.len().min(height.saturating_sub(2))];
+        let action_height = height - 1 - footer.len();
+        c.action_scroll = c.action_scroll.min(row.len() - 1 - action_height);
+        let start = row.start + 1 + c.action_scroll;
+        shown.push(layout.lines[row.start].clone());
+        shown.extend_from_slice(&layout.lines[start..start + action_height]);
+        shown.extend_from_slice(footer);
+        (head, action_height + 1)
+    } else {
+        c.action_scroll = 0;
+        let end = (c.scroll + height).min(layout.lines.len());
+        shown.extend_from_slice(&layout.lines[c.scroll..end]);
+        (head + row.start - c.scroll, height)
+    };
+    let header = &mut shown[selected];
+    header.spans[0].content = Cow::Borrowed("> ");
+    *header = std::mem::take(header).style(Style::new().add_modifier(Modifier::REVERSED));
     f.render_widget(Paragraph::new(shown), inner);
     let status = match p.items.get(c.selected).map(|i| &i.finding) {
         Some(f) if f.tier == Tier::Review && c.confirmed.contains(&f.id) => {
@@ -453,7 +470,7 @@ fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: boo
     let y = if dry_session { "y dry run" } else { "y apply" };
     let keys = format!(" ↑↓ · PgUp/PgDn scroll · Space tick · {y} · d dry run · Esc back · q quit");
     f.render_widget(Paragraph::new(Span::styled(keys, dim)), a.keys);
-    height
+    viewport
 }
 
 #[derive(Debug)]

@@ -6,7 +6,7 @@ expression: end
 "┌ Remove these items? ─────────────────────────────────────────────────────────┐"
 "│ 2 items, 1 of 1 review confirmed, frees ≈ 3.3G                               │"
 "│                                                                              │"
-"││        long-directory-component/long-directory-component/long-directory-comp│"
+"│> [x] review         90.0M  /home/me/.local/share/Trash                       │"
 "││        onent/long-directory-component/long-directory-component/long-director│"
 "││        y-component/long-directory-component/long-directory-component/long-di│"
 "││        rectory-component/long-directory-component/long-directory-component/l│"
