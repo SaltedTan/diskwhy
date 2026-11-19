@@ -223,7 +223,7 @@ pub struct App {
     pub message: Option<String>,
     /// The session's options, including the threads, detector context and audit log for apply.
     pub options: Options,
-    /// Seconds since the epoch, for the plan checks `x` and `y` make.
+    /// Seconds since the epoch, for the plan checks `x`, `y` and `d` make.
     pub clock: fn() -> i64,
     pub(crate) apply_stop: Arc<AtomicUsize>,
     pub(crate) audit_errors: Vec<String>,

@@ -464,8 +464,8 @@ impl ApplyJob {
     /// the plan is usable here and now, rescans its roots, re-runs its
     /// detectors and the guards, decides every item with core
     /// `apply::evaluate`, and (unless a dry run) runs the ready ones with
-    /// `apply::execute_until`, writing the audit log. Commands run with
-    /// their output captured by core, never on the terminal.
+    /// `apply::execute_until`, writing the audit log. Cleanup commands have
+    /// no direct access to the terminal's standard streams.
     pub fn run(
         self,
         read_processes: impl FnOnce() -> Processes,

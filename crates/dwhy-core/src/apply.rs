@@ -3,21 +3,9 @@
 //! [`evaluate`] takes the findings detected now, matches them to the plan's
 //! items by id, and decides each one.
 //!
-//! An item is
-//! - skipped (exit 2) when the path encoding check blocks it, it is no
-//!   longer detected, a detector or guard blocks it now, its tier or action
-//!   differs from the plan's, its fingerprint changed, or a live identity
-//!   check failed (`changed-since-scan`, see the safety rules in `docs/DESIGN.md`);
-//! - refused (exit 3) when its tier is above `--max-tier`, or it is a
-//!   `review` item whose id `--confirm` did not name (`--confirm` alone lets
-//!   a review item through; it never lifts a rebuildable one);
-//! - otherwise ready.
-//!
-//! [`execute`] runs the ready items, deepest path first, each with its
-//! tool-native command (argv, no shell) or [`crate::remove::remove_tree`],
-//! and writes the audit log: a `start` line before each removal (a removal
-//! whose `start` line cannot be written does not run), an `end` line after,
-//! and an `end` line for each skipped or refused item.
+//! [`execute`] and [`execute_until`] run the ready items and write
+//! [`AuditRecord`]s. See the Plans and Apply decisions in `docs/DESIGN.md`
+//! for the checks, tier policy and exit codes.
 
 use std::collections::HashSet;
 use std::fs::OpenOptions;
@@ -399,8 +387,8 @@ fn record(
     }
 }
 
-/// Runs the ready checks, deepest path first, and audits every item.
-/// `progress` is called with each item before it runs. Returns audit write errors.
+/// Runs the ready checks, deepest path first, and attempts to audit every item.
+/// Calls `progress` before attempting each ready item. Returns audit write errors.
 pub fn execute(
     plan: &Plan,
     checks: &mut [Check],
@@ -427,14 +415,17 @@ pub fn execute(
 pub const NOT_RUN_STOPPED: &str = "not run: apply was stopped before this item";
 
 pub struct ExecuteOptions<'a> {
+    /// A stop request, checked between items and again just before dispatch.
     pub stop: &'a dyn Fn() -> bool,
+    /// Use a separate process group for each cleanup command so a signal to
+    /// the TUI's foreground group leaves the command running.
     pub isolate_commands: bool,
 }
 
-/// [`execute`], stopping between items: once `stop` returns true (it is
-/// asked before each removal), the item in progress has finished and each
-/// ready item not yet started is skipped with [`NOT_RUN_STOPPED`] and gets
-/// an `end` line. The TUI uses this when the person quits mid-apply.
+/// Like [`execute`], with cancellation between dispatches. A stop request
+/// leaves a running action to finish. Ready items skipped because of the
+/// request get [`NOT_RUN_STOPPED`] as their detail and an attempted `end`
+/// record. Returns audit write errors.
 pub fn execute_until(
     plan: &Plan,
     checks: &mut [Check],

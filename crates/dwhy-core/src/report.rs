@@ -506,10 +506,8 @@ pub struct Recovery {
 // ---------------------------------------------------------------------------
 
 /// A plan: the findings selected for removal, each with a fingerprint, and
-/// an expiry. `dwhy apply` does not take the plan's word for what to run:
-/// it rescans `scan.roots`, re-runs the detectors and guards, and acts only
-/// on the fresh finding with each item's id, skipping it when the fresh
-/// tier, action or fingerprint differs from the plan's.
+/// an expiry. Apply uses [`crate::apply::evaluate`] to match the items
+/// against freshly detected findings before deciding what can run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
     pub schema: String,
@@ -525,6 +523,7 @@ pub struct Plan {
     pub scan: PlanScan,
     pub selection: PlanSelection,
     /// Findings to remove, largest first. None is `blocked`.
+    /// [`crate::plan::parse`] requires a distinct finding ID for each item.
     pub items: Vec<PlanItem>,
     /// Selected findings that a guard or detector blocked: listed so the
     /// reason is visible, never applied.
@@ -641,10 +640,10 @@ pub struct ApplyItem {
 #[serde(rename_all = "snake_case")]
 pub enum ApplyOutcome {
     Removed,
-    /// The action ran and failed (exit 1).
+    /// The action failed or could not be started (exit 1).
     Failed,
-    /// A guard blocked it, its fingerprint, tier or action changed, or it is
-    /// gone (exit 2).
+    /// Apply ruled out the item during its checks or stopped before dispatching
+    /// it (exit 2). See [`crate::apply::evaluate`] and [`crate::apply::execute_until`].
     Skipped,
     /// Above `--max-tier`, or a `review` item without `--confirm` (exit 3).
     Refused,
@@ -652,9 +651,11 @@ pub enum ApplyOutcome {
     WouldRemove,
 }
 
-/// One line of `~/.local/state/diskwhy/audit.jsonl`. A removal writes a
-/// `start` line before it runs and an `end` line with its outcome after; a
-/// skipped or refused item gets one `end` line. Dry runs write nothing.
+/// One line of the audit log shared by the CLI and TUI. See [`crate::apply::Audit::default_path`].
+/// A removal requires a `start` record before dispatch. An `end` record carries
+/// the outcome and can be the only record for an item that was skipped or refused.
+/// A skip during the final dispatch checks can also follow a `start` record.
+/// Dry runs write no records.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub schema: String,
@@ -662,7 +663,7 @@ pub struct AuditRecord {
     pub time: String,
     pub host: String,
     pub uid: u32,
-    /// Process id of the `dwhy apply` that wrote it.
+    /// Process ID of the `dwhy` process that wrote it.
     pub pid: u32,
     pub event: AuditEvent,
     pub plan_created_at: String,

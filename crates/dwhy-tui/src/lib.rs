@@ -8,17 +8,9 @@
 //! M4a: the tree browser. M4b: the findings list and detail view. M4c:
 //! marking findings, the plan preview (built with core `plan::build` on a
 //! worker thread) and plan files: `w` writes one,
-//! [`run_plan`] opens one. M4d: `x` in a preview opens the confirm dialog,
-//! and `y` (or `d`, a dry run) applies the plan on a worker thread through
-//! core `apply`, as `dwhy apply` does, then shows the results; Enter
-//! rescans. The TUI writes a plan file only on `w`, and removes things and
-//! writes the audit log only on `y` in the dialog.
-//!
-//! Commands that apply runs never reach the terminal: core runs them with
-//! stdin from /dev/null and stdout and stderr captured
-//! (`Command::output`). Quitting mid-apply (`q`, Ctrl-C or a signal) lets
-//! the item in progress finish, runs no more items (each gets an audit
-//! `end` line, skipped), and exits without showing the results.
+//! [`run_plan`] opens one. M4d runs apply on a worker thread through
+//! [`job::ApplyJob`]. See “TUI details” in `docs/DESIGN.md` for the confirmation
+//! and results screens, dry runs and quitting during apply.
 
 pub mod app;
 pub mod job;

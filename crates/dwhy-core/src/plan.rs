@@ -443,7 +443,7 @@ pub fn to_json(plan: &Plan) -> serde_json::Result<String> {
     Ok(text)
 }
 
-/// Parses a plan file and checks its schema and item IDs.
+/// Parses a plan file, checking its schema and the [`Plan::items`] ID constraint.
 pub fn parse(text: &str) -> Result<Plan, String> {
     #[derive(serde::Deserialize)]
     struct Head {
@@ -485,8 +485,8 @@ impl std::fmt::Display for Unusable {
     }
 }
 
-/// Checks that `plan` was made here, by this uid, and has not expired at
-/// `now` (seconds since the epoch).
+/// Checks the plan's host, uid, validity window and root path encoding.
+/// `now` is in seconds since the epoch.
 pub fn usable(plan: &Plan, host: &str, uid: u32, now: i64) -> Result<(), Unusable> {
     if plan.host != host {
         return Err(Unusable::Elsewhere(format!(
