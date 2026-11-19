@@ -351,6 +351,7 @@ dependencies = [
  "dwhy-core",
  "dwhy-tui",
  "insta",
+ "ratatui",
  "serde_json",
  "tempfile",
  "time",

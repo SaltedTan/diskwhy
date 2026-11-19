@@ -2430,15 +2430,20 @@ impl Twin {
             w.join("scratch/old"),
         ]
     }
-    /// Runs dwhy with only this fixture's home, state and an empty PATH.
-    fn dwhy(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_dwhy"))
-            .args(args)
+    fn command(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        command
             .env_clear()
             .env("HOME", self.base.join("home"))
             .env("PATH", self.base.join("bin"))
             .env("XDG_STATE_HOME", self.base.join("state"))
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+        command
+    }
+    /// Runs dwhy with only this fixture's home, state and an empty PATH.
+    fn dwhy(&self, args: &[&str]) -> Output {
+        self.command(env!("CARGO_BIN_EXE_dwhy"))
+            .args(args)
             .output()
             .expect("run dwhy")
     }
@@ -2546,7 +2551,9 @@ impl Twin {
 }
 
 fn press(app: &mut dwhy_tui::App, codes: &[dwhy_tui::KeyCode]) {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
     for &c in codes {
+        terminal.draw(|f| dwhy_tui::ui::draw(f, app)).unwrap();
         let key = dwhy_tui::KeyEvent::new(c, dwhy_tui::KeyModifiers::NONE);
         assert!(!app.on_key(key), "{c:?} must not quit");
     }
@@ -2812,6 +2819,43 @@ fn apply_and_tui_reject_a_saved_plan_with_a_duplicate_finding_id() {
     }
     assert!(t.targets().iter().all(|p| p.exists()));
     assert!(!t.audit().exists());
+}
+
+#[test]
+fn apply_reports_an_audit_write_error_and_keeps_the_refused_exit_code() {
+    let t = Twin::new();
+    let file = t.cli_plan("review.json");
+    let mut plan = dwhy_tui::job::read_plan(Path::new(&file)).unwrap();
+    plan.items
+        .retain(|item| item.finding.detector == "stale-tree");
+    assert_eq!(plan.items.len(), 1);
+    fs::write(&file, serde_json::to_vec(&plan).unwrap()).unwrap();
+    let audit = t.audit();
+    fs::create_dir_all(audit.parent().unwrap()).unwrap();
+    fs::write(&audit, "").unwrap();
+
+    let out = t
+        .command("/bin/sh")
+        .args([
+            "-c",
+            r#"trap '' XFSZ && ulimit -f 0 && exec "$@""#,
+            "sh",
+            env!("CARGO_BIN_EXE_dwhy"),
+            "apply",
+            &file,
+            "--yes",
+            "--json",
+            "-q",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert_eq!(report_of(&out)["items"][0]["outcome"], "refused");
+    assert!(stderr.contains("cannot write the audit log"), "{stderr}");
+    assert!(stderr.contains(audit.to_str().unwrap()), "{stderr}");
+    assert_eq!(fs::metadata(&audit).unwrap().len(), 0);
+    assert!(t.targets().iter().all(|path| path.exists()));
 }
 
 #[test]

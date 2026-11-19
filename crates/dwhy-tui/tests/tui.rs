@@ -146,6 +146,11 @@ fn key(code: KeyCode) -> KeyEvent {
 
 fn press(app: &mut App, codes: &[KeyCode]) {
     for &c in codes {
+        if matches!(c, KeyCode::Char(' ' | 'y' | 'd'))
+            && app.plan_view().is_some_and(|view| view.confirm.is_some())
+        {
+            render(app, 80, 24, None);
+        }
         assert!(!app.on_key(key(c)), "{c:?} must not quit");
     }
 }
@@ -2662,6 +2667,7 @@ fn modified_apply_keys_do_not_open_or_submit_the_dialog() {
             assert!(app.plan_view().unwrap().confirm.is_none());
         }
         press(&mut app, &[KeyCode::Char('x')]);
+        render(&mut app, 80, 24, None);
         for code in [KeyCode::Char('y'), KeyCode::Char('d')] {
             for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
                 assert!(!app.on_key(KeyEvent::new(code, modifiers)));
@@ -3024,19 +3030,42 @@ fn confirm_dialog_long_action_80x24() {
 }
 
 #[test]
-fn apply_confirmation_space_requires_a_visible_checkbox() {
+fn apply_keys_require_a_readable_confirmation_frame() {
     let mut app = dialog_app(false);
     press(&mut app, &[KeyCode::Char('x'), KeyCode::Down]);
-    for (width, height) in [(80, 5), (6, 24)] {
+    for code in [' ', 'd', 'y'] {
+        assert!(!app.on_key(key(KeyCode::Char(code))));
+    }
+    assert!(confirmed(&app).is_empty());
+    assert!(app.take_apply().is_none());
+
+    for (width, height) in [(80, 5), (30, 24), (70, 24)] {
         let screen = render_at(&mut app, width, height, None, PLAN_AT + 60);
         assert!(!screen.contains("[ ]"), "{screen}");
-        press(&mut app, &[KeyCode::Char(' ')]);
+        assert!(screen.contains("enlarge the terminal to"), "{screen}");
+        if (width, height) == (80, 5) {
+            insta::assert_snapshot!("confirm_dialog_enlarge_80x5", screen);
+        }
+        for code in [' ', 'd', 'y'] {
+            assert!(!app.on_key(key(KeyCode::Char(code))));
+        }
         assert!(confirmed(&app).is_empty());
+        assert!(app.take_apply().is_none());
     }
+
+    assert!(app.on_key(key(KeyCode::Char('q'))));
+    assert!(!app.on_key(key(KeyCode::Esc)));
+    assert!(app.plan_view().unwrap().confirm.is_none());
+    press(&mut app, &[KeyCode::Char('x'), KeyCode::Down]);
     let visible = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
     assert!(visible.contains("> [ ] review"), "{visible}");
-    press(&mut app, &[KeyCode::Char(' ')]);
+    assert!(!app.on_key(key(KeyCode::Char(' '))));
     assert_eq!(confirmed(&app), [review_id()]);
+    render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(!app.on_key(key(KeyCode::Char('y'))));
+    let job = app.take_apply().unwrap();
+    assert!(!job.dry_run);
+    assert_eq!(job.policy.confirm, [review_id()]);
 }
 
 #[test]

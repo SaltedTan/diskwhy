@@ -1054,16 +1054,12 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
         status = status_line(quiet, &format!("removing {}…", item.path));
     });
     drop(status);
-    for error in &audit_errors {
+    for error in audit_errors {
         eprintln!("dwhy: error: {}", error.escape_debug());
     }
     let r = apply::report(&plan, &checks, &policy, false, &env);
     print_apply(&r, args.json, Some(audit.path()))?;
-    Ok(if audit_errors.is_empty() {
-        apply::exit_code(&r)
-    } else {
-        EXIT_ERROR
-    })
+    Ok(apply::exit_code(&r))
 }
 
 /// Rescans the plan's roots, re-runs its detectors, and decides each item.

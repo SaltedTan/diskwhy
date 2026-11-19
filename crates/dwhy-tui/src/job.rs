@@ -551,11 +551,7 @@ impl ApplyJob {
             },
         );
         let report = apply::report(&plan, &checks, &policy, false, env);
-        let exit = if audit_errors.is_empty() {
-            apply::exit_code(&report)
-        } else {
-            1
-        };
+        let exit = apply::exit_code(&report);
         Ok(Applied {
             report,
             audit: Some(audit.path().to_path_buf()),

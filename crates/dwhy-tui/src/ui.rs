@@ -407,20 +407,34 @@ fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: boo
         " Remove these items? "
     });
     let inner = block.inner(a.list);
-    f.render_widget(block, a.list);
     let width = inner.width as usize;
     let available = inner.height as usize;
-    if available == 0 || width < 5 {
-        return 0;
-    }
-
+    let y = if dry_session { "y dry run" } else { "y apply" };
+    let keys = format!(" ↑↓ · PgUp/PgDn scroll · Space tick · {y} · d dry run · Esc back · q quit");
     if c.layout.as_ref().is_none_or(|layout| layout.width != width) {
         c.layout = Some(confirm_layout(p, c, width));
     }
     let layout = c.layout.as_ref().unwrap();
+    let (row, path_visible) = &layout.rows[c.selected];
+    c.actions_visible = available >= 2
+        && layout.head[0].width() <= width
+        && *path_visible
+        && layout.lines[row.start].width() <= width
+        && a.keys.height > 0
+        && grapheme_width(&keys) <= a.keys.width as usize;
+    if !c.actions_visible {
+        let notice = if a.list.height > 0 { a.list } else { a.status };
+        let warning = wrap(" enlarge the terminal to confirm", notice.width as usize);
+        f.render_widget(Paragraph::new(warning.join("\n")), notice);
+        f.render_widget(
+            Paragraph::new(Span::styled(" Esc back · q quit", dim)),
+            a.keys,
+        );
+        return 0;
+    }
+    f.render_widget(block, a.list);
     let head = layout.head.len().min(available - 1);
     let height = available - head;
-    let row = &layout.rows[c.selected];
     c.scroll = c
         .scroll
         .max(row.end.saturating_sub(height))
@@ -467,8 +481,6 @@ fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: boo
         Paragraph::new(middle(&status, a.status.width as usize)),
         a.status,
     );
-    let y = if dry_session { "y dry run" } else { "y apply" };
-    let keys = format!(" ↑↓ · PgUp/PgDn scroll · Space tick · {y} · d dry run · Esc back · q quit");
     f.render_widget(Paragraph::new(Span::styled(keys, dim)), a.keys);
     viewport
 }
@@ -478,7 +490,7 @@ pub(crate) struct ConfirmLayout {
     width: usize,
     head: Vec<Line<'static>>,
     lines: Vec<Line<'static>>,
-    rows: Vec<Range<usize>>,
+    rows: Vec<(Range<usize>, bool)>,
 }
 
 fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
@@ -507,7 +519,7 @@ fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
     }
     summary.push_str(&format!(", frees ≈ {}", human(going)));
 
-    let mut head = vec![Line::styled(middle(&format!(" {summary}"), width), bold)];
+    let mut head = vec![Line::styled(format!(" {summary}"), bold)];
     if confirmed < reviews {
         head.extend(
             wrap(
@@ -540,6 +552,14 @@ fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
             display_units(&f.path),
             width.saturating_sub(2 + header.width()),
         );
+        const MIN_PATH_TAIL_GRAPHEMES: usize = 8;
+        let name = f.path.trim_end_matches('/').rsplit('/').next().unwrap();
+        let tail: Vec<_> = display_units(name)
+            .rev()
+            .take(MIN_PATH_TAIL_GRAPHEMES)
+            .collect();
+        let tail: String = tail.into_iter().rev().collect();
+        let path_visible = !path.is_empty() && path.trim_end_matches('/').ends_with(&tail);
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::raw(header),
@@ -552,7 +572,7 @@ fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
             f.action.kind != ActionKind::Advice,
             width,
         ));
-        rows.push(start..lines.len());
+        rows.push((start..lines.len(), path_visible));
     }
     if !p.blocked.is_empty() {
         lines.push(Line::raw(""));

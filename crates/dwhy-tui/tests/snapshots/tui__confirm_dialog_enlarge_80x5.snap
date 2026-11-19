@@ -1,0 +1,9 @@
+---
+source: crates/dwhy-tui/tests/tui.rs
+expression: screen
+---
+" dwhy  apply this plan?                                         2 items · 3.3G  "
+" enlarge the terminal to confirm                                                "
+"                                                                                "
+"                                                                                "
+" Esc back · q quit                                                              "

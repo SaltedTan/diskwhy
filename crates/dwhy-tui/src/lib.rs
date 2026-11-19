@@ -542,7 +542,9 @@ mod tests {
         let fixture = Crates::new();
         for code in [KeyCode::Enter, KeyCode::Esc] {
             let mut app = fixture.app();
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
             for c in ['x', 'd'] {
+                term.draw(|f| ui::draw(f, &mut app)).unwrap();
                 assert!(!app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
             }
             let progress = app.take_apply().unwrap().progress;
@@ -560,7 +562,6 @@ mod tests {
                 progress,
                 handle: Some(handle),
             });
-            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
             let (_tx, rx) = mpsc::channel();
             let mut keys = [
                 Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
@@ -768,8 +769,10 @@ mod tests {
         };
         let mut app = fixture.open_plan(&scope, launch, 1);
         let env = apply::Env::from_system();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         for remaining in [1, 0] {
             for c in ['x', 'y'] {
+                term.draw(|f| ui::draw(f, &mut app)).unwrap();
                 assert!(!app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
             }
             let result = app

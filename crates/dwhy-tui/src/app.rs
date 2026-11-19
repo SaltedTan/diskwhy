@@ -164,6 +164,7 @@ pub struct Confirm {
     /// First line on screen.
     pub scroll: usize,
     pub(crate) action_scroll: usize,
+    pub(crate) actions_visible: bool,
     pub(crate) layout: Option<crate::ui::ConfirmLayout>,
 }
 
@@ -948,21 +949,20 @@ impl PlanView {
                 self.confirm = None;
                 return ConfirmKey::Message("nothing applied".into());
             }
-            KeyCode::Char('y') if unmodified_action(key) => {
+            KeyCode::Char(action @ ('y' | 'd')) if c.actions_visible && unmodified_action(key) => {
+                c.actions_visible = false;
                 return ConfirmKey::Start {
-                    dry_run: dry_session,
+                    dry_run: dry_session || action == 'd',
                 };
             }
-            KeyCode::Char('d') if unmodified_action(key) => {
-                return ConfirmKey::Start { dry_run: true };
-            }
-            KeyCode::Char(' ') if viewport > 0 => {
+            KeyCode::Char(' ') if c.actions_visible => {
                 match items.get(c.selected).map(|i| &i.finding) {
                     Some(f) if f.tier == Tier::Review => {
                         if !c.confirmed.remove(&f.id) {
                             c.confirmed.insert(f.id.clone());
                         }
                         c.layout = None;
+                        c.actions_visible = false;
                     }
                     Some(_) => {
                         return ConfirmKey::Message(
@@ -985,6 +985,7 @@ impl PlanView {
         };
         if c.selected != selected {
             c.action_scroll = 0;
+            c.actions_visible = false;
             c.selected = selected;
         }
         ConfirmKey::None
