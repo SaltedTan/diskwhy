@@ -417,6 +417,67 @@ fn a_replaced_root_skips_the_item() {
 }
 
 #[test]
+fn a_root_replaced_after_applys_own_scan_is_skipped() {
+    let (_t, b) = base();
+    let mut found = fixture(&b);
+    found.retain(|f| f.detector == "user-cache");
+    let plan = make_plan(&b, found.clone());
+    // Apply's own walk still sees the planned directory, so its fresh
+    // fingerprint matches the plan...
+    let tree = scan_tree(&b);
+    let cache = b.join("cache");
+    let file_mtime = fs::metadata(cache.join("file"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let dir_mtime = fs::metadata(&cache).unwrap().modified().unwrap();
+    // ...and then the root is swapped for a copy with the same contents and
+    // mtimes. The old one is kept so its inode cannot be reused.
+    fs::rename(&cache, b.join("cache.old")).unwrap();
+    write(&cache.join("file"), "cache");
+    fs::File::open(cache.join("file"))
+        .unwrap()
+        .set_modified(file_mtime)
+        .unwrap();
+    fs::File::open(&cache)
+        .unwrap()
+        .set_modified(dir_mtime)
+        .unwrap();
+    let checks = apply::evaluate(
+        &plan,
+        found,
+        &tree,
+        &ctx(),
+        &Processes::default(),
+        &Policy::default(),
+    );
+    let c = checks
+        .iter()
+        .find(|c| c.item.detector == "user-cache")
+        .unwrap();
+    assert_eq!(c.item.outcome, ApplyOutcome::Skipped);
+    assert_eq!(
+        c.item.detail,
+        format!(
+            "changed since the scan: {} was replaced after the scan (device/inode differ)",
+            cache.display()
+        )
+    );
+    assert!(
+        c.item
+            .guards
+            .iter()
+            .any(|g| g.name == plan::CHANGED_SINCE_SCAN && g.status == GuardStatus::Block),
+        "{:?}",
+        c.item.guards
+    );
+    // A dry run: nothing ran, and the exit code is the skip's.
+    assert!(cache.join("file").exists());
+    let r = apply::report(&plan, &checks, &Policy::default(), true, &env());
+    assert_eq!(apply::exit_code(&r), 2);
+}
+
+#[test]
 fn the_plans_action_and_tier_are_not_trusted() {
     let (_t, b) = base();
     let found = fixture(&b);

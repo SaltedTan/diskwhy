@@ -10,7 +10,10 @@
 //! The fingerprint records what must not change before `apply`: the root's
 //! device and inode, the newest mtime under it, its size in quarter-doubling
 //! buckets, HEAD and a hash of `git status` when the root is a git work
-//! tree, and the object id of a Docker finding.
+//! tree, and the object id of a Docker finding. The device, inode, mtime and
+//! size all come from the walk, so they describe one directory. A root whose
+//! live device and inode are no longer the walked ones (replaced, gone, or a
+//! symlink now) is blocked with a `changed-since-scan` guard instead.
 //!
 //! `apply` does not trust a plan's actions or tiers: it re-detects and acts
 //! on the fresh finding with the same id. A plan is a selection plus the
@@ -23,10 +26,14 @@ use std::path::Path;
 use crate::detect::{DetectContext, is_lossy, rfc3339};
 use crate::guard::{self, Processes};
 use crate::report::{
-    ActionKind, Finding, Fingerprint, GitFingerprint, Plan, PlanItem, PlanScan, PlanSelection,
-    SCHEMA, Tier, Tool, check_schema,
+    ActionKind, Finding, Fingerprint, GitFingerprint, GuardResult, GuardStatus, Plan, PlanItem,
+    PlanScan, PlanSelection, SCHEMA, Tier, Tool, check_schema,
 };
 use crate::tree::{Markers, ScanTree};
+
+/// The guard that blocks a finding whose root is no longer the directory the
+/// scan walked.
+pub const CHANGED_SINCE_SCAN: &str = "changed-since-scan";
 
 /// A plan expires this long after it is made.
 pub const TTL_SECS: i64 = 3600;
@@ -123,8 +130,10 @@ pub fn select(
 }
 
 /// Builds a plan from the findings of a scan: selects, runs the guards on
-/// the selection, fingerprints each item. `tree` is the scan the findings
-/// came from; `ctx.now` is the creation time.
+/// the selection, blocks a selected root that is not the one the scan
+/// walked ([`changed_since_scan`]), and fingerprints each item from the
+/// walk. `tree` is the scan the findings came from; `ctx.now` is the
+/// creation time.
 pub fn build(
     findings: Vec<Finding>,
     sel: &Selection,
@@ -136,6 +145,12 @@ pub fn build(
 ) -> Result<Plan, String> {
     let (mut picked, mut blocked) = select(findings, sel)?;
     guard::check(&mut picked, tree, ctx, procs);
+    for f in &mut picked {
+        if let Some(detail) = changed_since_scan(f, tree) {
+            add_changed_guard(&mut f.guards, detail);
+            f.tier = Tier::Blocked;
+        }
+    }
     let mut items = Vec::new();
     for f in picked {
         if f.tier == Tier::Blocked {
@@ -196,7 +211,59 @@ pub fn distinct_bytes<'a>(items: impl IntoIterator<Item = (&'a str, u64)>) -> u6
         .sum()
 }
 
-/// The fingerprint of `f` now. `tree` must be a scan covering its path.
+/// Why the root of filesystem finding `f` is not the one `tree` walked, if
+/// it is not: it is not in the walk, it is gone, it is a symlink now, or its
+/// live device and inode (`lstat`, never followed) differ from the walked
+/// ones. `None` for pseudo-paths (`docker://…`), which have no tree node.
+pub fn changed_since_scan(f: &Finding, tree: &ScanTree) -> Option<String> {
+    if !f.path.starts_with('/') {
+        return None;
+    }
+    let p = Path::new(&f.path);
+    let Some(id) = tree.find(p) else {
+        return Some(format!(
+            "{} is not in the scan, so its device/inode are not known",
+            f.path
+        ));
+    };
+    let n = tree.node(id);
+    match std::fs::symlink_metadata(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Some(format!("{} is gone since the scan", f.path))
+        }
+        Err(e) => Some(format!(
+            "{} cannot be checked against the scan: {e}",
+            f.path
+        )),
+        Ok(md) if md.file_type().is_symlink() && n.is_dir => Some(format!(
+            "{} is a symlink now, not the directory the scan walked",
+            f.path
+        )),
+        Ok(md) if (md.dev(), md.ino()) != (n.dev, n.ino) || md.is_dir() != n.is_dir => {
+            Some(format!(
+                "{} was replaced after the scan (device/inode differ)",
+                f.path
+            ))
+        }
+        Ok(_) => None,
+    }
+}
+
+/// Adds (or replaces) the blocking [`CHANGED_SINCE_SCAN`] guard.
+pub(crate) fn add_changed_guard(guards: &mut Vec<GuardResult>, detail: String) {
+    guards.retain(|g| g.name != CHANGED_SINCE_SCAN);
+    guards.push(GuardResult {
+        name: CHANGED_SINCE_SCAN.into(),
+        status: GuardStatus::Block,
+        detail,
+    });
+}
+
+/// The fingerprint of `f` as the scan `tree` measured it: the device, inode
+/// and newest mtime of its tree node, never a live stat (a directory swapped
+/// in after the walk must not lend its identity to the walked one's size and
+/// mtime). Only git and Docker state are read now. `tree` must be a scan
+/// covering its path; a path with no node gets no device, inode or mtime.
 pub fn fingerprint(f: &Finding, tree: &ScanTree, ctx: &DetectContext) -> Fingerprint {
     let mut fp = Fingerprint {
         dev: None,
@@ -208,12 +275,10 @@ pub fn fingerprint(f: &Finding, tree: &ScanTree, ctx: &DetectContext) -> Fingerp
     };
     if f.path.starts_with('/') {
         let p = Path::new(&f.path);
-        if let Ok(md) = std::fs::symlink_metadata(p) {
-            fp.dev = Some(md.dev());
-            fp.inode = Some(md.ino());
-        }
         if let Some(id) = tree.find(p) {
             let n = tree.node(id);
+            fp.dev = Some(n.dev);
+            fp.inode = Some(n.ino);
             fp.newest_mtime = Some(n.newest_mtime);
             if n.is_dir
                 && n.markers.contains(Markers::DOT_GIT)

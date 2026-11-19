@@ -425,6 +425,167 @@ fn fingerprint_tracks_inode_mtime_and_size() {
     );
 }
 
+/// Replaces directory `d` (holding only `file`) with a new directory of the
+/// same contents and mtimes, as a build restoring `target` from an archive
+/// would. The old one is renamed to `<d>.old` and kept, so its inode stays
+/// alive and cannot be handed to the new one.
+fn replace_same_contents(d: &Path) -> PathBuf {
+    let file_mtime = fs::metadata(d.join("file")).unwrap().modified().unwrap();
+    let dir_mtime = fs::metadata(d).unwrap().modified().unwrap();
+    let old = d.with_extension("old");
+    fs::rename(d, &old).unwrap();
+    dir(d);
+    fs::File::open(d.join("file"))
+        .unwrap()
+        .set_modified(file_mtime)
+        .unwrap();
+    fs::File::open(d).unwrap().set_modified(dir_mtime).unwrap();
+    old
+}
+
+fn live_inode(p: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(p).unwrap().ino()
+}
+
+fn changed_guard(f: &Finding) -> Option<&str> {
+    f.guards
+        .iter()
+        .find(|g| g.name == plan::CHANGED_SINCE_SCAN)
+        .map(|g| {
+            assert_eq!(g.status, dwhy_core::report::GuardStatus::Block);
+            g.detail.as_str()
+        })
+}
+
+fn build_from(tree: &ScanTree, root: &Path, found: Vec<Finding>, sel: &Selection) -> Plan {
+    plan::build(
+        found,
+        sel,
+        tree,
+        &ctx(),
+        &Processes::default(),
+        "host".into(),
+        scan_meta(root),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_stable_root_is_planned_with_the_walked_identity() {
+    let (_t, b) = base();
+    let d = dir(&b.join("cache"));
+    let f = finding("user-cache", &d, 4096, Tier::Regenerable);
+    let tree = scan_tree(&b);
+    let node = tree.node(tree.find(&d).unwrap());
+    let p = build_from(&tree, &b, vec![f], &Selection::default());
+    assert!(p.blocked.is_empty(), "{:?}", p.blocked);
+    assert_eq!(p.items.len(), 1);
+    let fp = &p.items[0].fingerprint;
+    assert_eq!((fp.dev, fp.inode), (Some(node.dev), Some(node.ino)));
+    assert_eq!(fp.inode, Some(live_inode(&d)));
+    assert_eq!(changed_guard(&p.items[0].finding), None);
+}
+
+#[test]
+fn a_root_replaced_after_the_walk_is_blocked() {
+    let (_t, b) = base();
+    let d = dir(&b.join("target"));
+    age(&d.join("file"), 3600);
+    age(&d, 3600);
+    let f = finding("cargo-target", &d, 4096, Tier::Rebuildable);
+    let tree = scan_tree(&b);
+    let walked = tree.node(tree.find(&d).unwrap()).ino;
+    let _old = replace_same_contents(&d);
+    let now_ino = live_inode(&d);
+    assert_ne!(walked, now_ino);
+
+    // The replacement matches the walk in everything but identity: only the
+    // walked inode tells them apart.
+    let fp = plan::fingerprint(&f, &tree, &ctx());
+    assert_eq!(fp.inode, Some(walked), "from the walk, not a live stat");
+    assert_eq!(
+        plan::differences(&fp, &plan::fingerprint(&f, &scan_tree(&b), &ctx())),
+        ["inode"]
+    );
+
+    // Selected by id, by path and by the tier ceiling: never an item.
+    let by_id = Selection {
+        tier: None,
+        select: vec![f.id.clone()],
+    };
+    let by_tier = Selection {
+        tier: Some(Tier::Rebuildable),
+        select: vec![],
+    };
+    for sel in [&by_id, &by_tier] {
+        let p = build_from(&tree, &b, vec![f.clone()], sel);
+        assert!(p.items.is_empty(), "{:?}", p.items);
+        assert_eq!(p.blocked.len(), 1);
+        let blocked = &p.blocked[0];
+        assert_eq!(blocked.tier, Tier::Blocked);
+        assert_eq!(
+            changed_guard(blocked),
+            Some(
+                format!(
+                    "{} was replaced after the scan (device/inode differ)",
+                    d.display()
+                )
+                .as_str()
+            )
+        );
+        // `dwhy plan` exits 2 when the selection named it, 0 otherwise.
+        assert_eq!(plan::selected_blocked(&p), !sel.select.is_empty());
+        assert_eq!(p.bytes, 0);
+    }
+}
+
+#[test]
+fn a_root_gone_or_turned_symlink_after_the_walk_is_blocked() {
+    let (_t, b) = base();
+    let d = dir(&b.join("cache"));
+    let f = finding("user-cache", &d, 4096, Tier::Regenerable);
+    let tree = scan_tree(&b);
+    let old = b.join("cache.old");
+    fs::rename(&d, &old).unwrap();
+    let p = build_from(&tree, &b, vec![f.clone()], &Selection::default());
+    assert!(p.items.is_empty());
+    assert_eq!(
+        changed_guard(&p.blocked[0]),
+        Some(format!("{} is gone since the scan", d.display()).as_str())
+    );
+
+    // A symlink to the very directory the walk measured is still refused.
+    std::os::unix::fs::symlink(&old, &d).unwrap();
+    let p = build_from(&tree, &b, vec![f], &Selection::default());
+    assert!(p.items.is_empty());
+    assert!(
+        changed_guard(&p.blocked[0]).is_some_and(|g| g.contains("is a symlink now")),
+        "{:?}",
+        p.blocked[0].guards
+    );
+}
+
+#[test]
+fn a_finding_outside_the_walk_is_blocked() {
+    let (_t, b) = base();
+    let scanned = dir(&b.join("scanned"));
+    let elsewhere = dir(&b.join("elsewhere"));
+    let f = finding("user-cache", &elsewhere, 4096, Tier::Regenerable);
+    let p = build_from(
+        &scan_tree(&scanned),
+        &scanned,
+        vec![f],
+        &Selection::default(),
+    );
+    assert!(p.items.is_empty());
+    assert!(
+        changed_guard(&p.blocked[0]).is_some_and(|g| g.contains("is not in the scan")),
+        "{:?}",
+        p.blocked[0].guards
+    );
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let st = Command::new("git")
         .args([

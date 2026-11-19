@@ -410,6 +410,8 @@ pub fn scan(
                 markers: Markers::empty(),
                 newest_mtime: mtime(&st),
                 shared: 0,
+                dev: st.st_dev,
+                ino: st.st_ino,
             });
             if linked {
                 shared.add_link(&st, root.clone(), id);
@@ -683,6 +685,8 @@ fn walk_dir(
         markers,
         newest_mtime,
         shared: 0,
+        dev,
+        ino: st.st_ino,
     });
     for (p, m) in linked {
         sh.add_link(&m, p, id);

@@ -6,7 +6,8 @@
 //! An item is
 //! - skipped (exit 2) when the path encoding check blocks it, it is no
 //!   longer detected, a detector or guard blocks it now, its tier or action
-//!   differs from the plan's, or its fingerprint changed;
+//!   differs from the plan's, its fingerprint changed, or its root is no
+//!   longer the one apply's own scan walked (`changed-since-scan`);
 //! - refused (exit 3) when its tier is above `--max-tier`, or it is a
 //!   `review` item whose id `--confirm` did not name (`--confirm` alone lets
 //!   a review item through; it never lifts a rebuildable one);
@@ -234,6 +235,13 @@ fn decide(
     let diff = crate::plan::differences(&item.fingerprint, &now);
     if !diff.is_empty() {
         return skip(format!("changed since the plan: {}", diff.join(", ")));
+    }
+    // `now` is apply's own walk; a root replaced since that walk would match
+    // the plan there, so check the live root against the walk too.
+    if let Some(detail) = crate::plan::changed_since_scan(f, tree) {
+        let mut c = skip(format!("changed since the scan: {detail}"));
+        crate::plan::add_changed_guard(&mut c.item.guards, detail);
+        return c;
     }
     base(f, ApplyOutcome::WouldRemove, "ready".into())
 }
