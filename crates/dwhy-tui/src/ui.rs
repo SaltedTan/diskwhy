@@ -380,7 +380,7 @@ fn draw_plan(
 }
 
 /// The confirm dialog: a summary, then every item (tier, size, path,
-/// action), with a checkbox on each `review` item. Returns the lines on screen.
+/// action), with a checkbox on each `review` item. Returns the action page size.
 fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: bool) -> usize {
     let dim = Style::new().add_modifier(Modifier::DIM);
     let (p, c) = v.confirmation().unwrap();
@@ -415,11 +415,13 @@ fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: boo
         c.layout = Some(confirm_layout(p, c, width));
     }
     let layout = c.layout.as_ref().unwrap();
-    let (row, path_visible) = &layout.rows[c.selected];
-    c.actions_visible = available >= 2
+    let row = &layout.rows[c.selected];
+    let head = layout.head.len().min(available.saturating_sub(1));
+    let height = available - head;
+    c.actions_visible = height > 1 + row.label_height
         && layout.head[0].width() <= width
-        && *path_visible
-        && layout.lines[row.start].width() <= width
+        && row.path_visible
+        && layout.lines[row.lines.start].width() <= width
         && a.keys.height > 0
         && grapheme_width(&keys) <= a.keys.width as usize;
     if !c.actions_visible {
@@ -433,34 +435,34 @@ fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: boo
         return 0;
     }
     f.render_widget(block, a.list);
-    let head = layout.head.len().min(available - 1);
-    let height = available - head;
+    let action = row.lines.start + 1 + row.label_height..row.lines.end;
     c.scroll = c
         .scroll
-        .max(row.end.saturating_sub(height))
-        .min(row.start)
+        .max(row.lines.end.saturating_sub(height))
+        .min(row.lines.start)
         .min(layout.lines.len().saturating_sub(height));
 
     let mut shown = layout.head[..head].to_vec();
-    let (selected, viewport) = if row.len() > height {
+    let (selected, viewport) = if row.lines.len() > height {
         let footer = if c.selected + 1 == items.len() {
-            &layout.lines[row.end..]
+            &layout.lines[row.lines.end..]
         } else {
             &[]
         };
-        let footer = &footer[..footer.len().min(height.saturating_sub(2))];
-        let action_height = height - 1 - footer.len();
-        c.action_scroll = c.action_scroll.min(row.len() - 1 - action_height);
-        let start = row.start + 1 + c.action_scroll;
-        shown.push(layout.lines[row.start].clone());
+        let action_room = height - 1 - row.label_height;
+        let footer = &footer[..footer.len().min(action_room - 1)];
+        let action_height = action_room - footer.len();
+        c.action_scroll = c.action_scroll.min(action.len() - action_height);
+        let start = action.start + c.action_scroll;
+        shown.extend_from_slice(&layout.lines[row.lines.start..action.start]);
         shown.extend_from_slice(&layout.lines[start..start + action_height]);
         shown.extend_from_slice(footer);
-        (head, action_height + 1)
+        (head, action_height)
     } else {
         c.action_scroll = 0;
         let end = (c.scroll + height).min(layout.lines.len());
         shown.extend_from_slice(&layout.lines[c.scroll..end]);
-        (head + row.start - c.scroll, height)
+        (head + row.lines.start - c.scroll, action.len())
     };
     let header = &mut shown[selected];
     header.spans[0].content = Cow::Borrowed("> ");
@@ -490,7 +492,14 @@ pub(crate) struct ConfirmLayout {
     width: usize,
     head: Vec<Line<'static>>,
     lines: Vec<Line<'static>>,
-    rows: Vec<(Range<usize>, bool)>,
+    rows: Vec<ConfirmRow>,
+}
+
+#[derive(Debug)]
+struct ConfirmRow {
+    lines: Range<usize>,
+    path_visible: bool,
+    label_height: usize,
 }
 
 fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
@@ -565,14 +574,19 @@ fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
             Span::raw(header),
             Span::styled(path, Style::new().add_modifier(Modifier::BOLD)),
         ]));
-        lines.extend(command_lines(
+        let (action, label_height) = wrap_action(
             "      ",
             &f.action.text,
             lossy,
             f.action.kind != ActionKind::Advice,
             width,
-        ));
-        rows.push((start..lines.len(), path_visible));
+        );
+        lines.extend(action.into_iter().map(Line::raw));
+        rows.push(ConfirmRow {
+            lines: start..lines.len(),
+            path_visible,
+            label_height,
+        });
     }
     if !p.blocked.is_empty() {
         lines.push(Line::raw(""));
@@ -1336,6 +1350,19 @@ fn command_lines(
     is_command: bool,
     width: usize,
 ) -> impl Iterator<Item = Line<'static>> {
+    wrap_action(prefix, text, lossy, is_command, width)
+        .0
+        .into_iter()
+        .map(Line::raw)
+}
+
+fn wrap_action(
+    prefix: &str,
+    text: &str,
+    lossy: bool,
+    is_command: bool,
+    width: usize,
+) -> (Vec<String>, usize) {
     let withheld = if !is_command {
         None
     } else if is_lossy(text) {
@@ -1349,17 +1376,23 @@ fn command_lines(
     };
     let original = format!("{prefix}{}", withheld.unwrap_or(text));
     let mut lines = wrap(&original, width);
+    if withheld.is_some() {
+        let label_height = lines.len();
+        return (lines, label_height);
+    }
     let copyable =
         text.bytes().all(|b| (b' '..=b'~').contains(&b)) && lines.as_slice() == [original.as_str()];
-    if withheld.is_none() && is_command && !copyable {
+    if is_command && !copyable {
         lines = wrap("  preview — do not copy", width);
+        let label_height = lines.len();
         lines.extend(
             wrap(&original, width.saturating_sub(1))
                 .into_iter()
                 .map(|line| format!("│{line}")),
         );
+        return (lines, label_height);
     }
-    lines.into_iter().map(Line::raw)
+    (lines, 0)
 }
 
 /// Wraps a scan finding in `dwhy explain` field order. `base` is the

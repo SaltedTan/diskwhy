@@ -975,8 +975,8 @@ impl PlanView {
             }
             KeyCode::Up | KeyCode::Char('k') => c.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => (c.selected + 1).min(last),
-            KeyCode::PageUp | KeyCode::PageDown => {
-                scroll_lines(&mut c.action_scroll, key.code, viewport.saturating_sub(1));
+            KeyCode::PageUp | KeyCode::PageDown if c.actions_visible => {
+                scroll_lines(&mut c.action_scroll, key.code, viewport.max(1));
                 return ConfirmKey::None;
             }
             KeyCode::Home | KeyCode::Char('g') => 0,

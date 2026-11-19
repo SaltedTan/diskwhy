@@ -3003,6 +3003,25 @@ fn confirm_dialog_long_action_80x24() {
     let mut app = App::open_plan(plan, "/tmp/plans/dwhy-plan.json".into(), HOST, UID);
     app.clock = || PLAN_AT + 60;
     press(&mut app, &[KeyCode::Char('x'), KeyCode::Down]);
+    let short = render_at(&mut app, 80, 8, None, PLAN_AT + 60);
+    assert!(short.contains("enlarge the terminal to confirm"), "{short}");
+    for code in [' ', 'd', 'y'] {
+        assert!(!app.on_key(key(KeyCode::Char(code))));
+    }
+    assert!(confirmed(&app).is_empty());
+    assert!(app.take_apply().is_none());
+
+    let first = render_at(&mut app, 80, 11, None, PLAN_AT + 60);
+    assert!(first.contains("preview — do not copy"), "{first}");
+    assert!(first.contains("cargo clean --target-dir"), "{first}");
+    press(&mut app, &[KeyCode::PageDown]);
+    let second = render_at(&mut app, 80, 11, None, PLAN_AT + 60);
+    assert!(second.contains("preview — do not copy"), "{second}");
+    assert!(second.contains("long-directory-component"), "{second}");
+    assert!(!second.contains("cargo clean --target-dir"), "{second}");
+    press(&mut app, &[KeyCode::PageUp]);
+    assert_eq!(render_at(&mut app, 80, 11, None, PLAN_AT + 60), first);
+
     let start = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
     assert!(start.contains("preview — do not copy"), "{start}");
     assert!(!start.contains("target-final"), "{start}");
@@ -3011,11 +3030,13 @@ fn confirm_dialog_long_action_80x24() {
         press(&mut app, &[KeyCode::PageDown]);
         let page = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
         assert!(page.contains("> [ ] review"), "{page}");
+        assert!(page.contains("preview — do not copy"), "{page}");
     }
     press(&mut app, &[KeyCode::Char(' ')]);
     let end = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
     assert!(end.contains("target-final"), "{end}");
     assert!(end.contains("> [x] review"), "{end}");
+    assert!(end.contains("preview — do not copy"), "{end}");
     assert_eq!(confirmed(&app), [review_id()]);
     insta::assert_snapshot!(end);
 
@@ -3023,6 +3044,7 @@ fn confirm_dialog_long_action_80x24() {
         press(&mut app, &[KeyCode::PageUp]);
         let page = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
         assert!(page.contains("> [x] review"), "{page}");
+        assert!(page.contains("preview — do not copy"), "{page}");
     }
     let top = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
     assert!(top.contains("[x] review"), "{top}");
@@ -3039,7 +3061,7 @@ fn apply_keys_require_a_readable_confirmation_frame() {
     assert!(confirmed(&app).is_empty());
     assert!(app.take_apply().is_none());
 
-    for (width, height) in [(80, 5), (30, 24), (70, 24)] {
+    for (width, height) in [(80, 5), (80, 8), (30, 24), (70, 24)] {
         let screen = render_at(&mut app, width, height, None, PLAN_AT + 60);
         assert!(!screen.contains("[ ]"), "{screen}");
         assert!(screen.contains("enlarge the terminal to"), "{screen}");
@@ -3066,6 +3088,25 @@ fn apply_keys_require_a_readable_confirmation_frame() {
     let job = app.take_apply().unwrap();
     assert!(!job.dry_run);
     assert_eq!(job.policy.confirm, [review_id()]);
+}
+
+#[test]
+fn confirm_dialog_keeps_the_withheld_action_notice_when_paging() {
+    let mut plan = review_plan();
+    let finding = &mut plan.items[1].finding;
+    finding.action.kind = ActionKind::Command;
+    finding.action.text = "cargo clean --target-dir /home/me/\u{fffd}".into();
+    let mut app = App::open_plan(plan, "/tmp/plans/dwhy-plan.json".into(), HOST, UID);
+    app.clock = || PLAN_AT + 60;
+    press(&mut app, &[KeyCode::Char('x'), KeyCode::Down]);
+    let before = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(before.contains("command withheld"), "{before}");
+    assert!(before.contains("not valid UTF-8"), "{before}");
+    assert!(before.contains("shown exactly"), "{before}");
+    press(&mut app, &[KeyCode::PageDown]);
+    assert_eq!(render_at(&mut app, 80, 24, None, PLAN_AT + 60), before);
+    press(&mut app, &[KeyCode::PageUp]);
+    assert_eq!(render_at(&mut app, 80, 24, None, PLAN_AT + 60), before);
 }
 
 #[test]
