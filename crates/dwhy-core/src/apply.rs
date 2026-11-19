@@ -28,7 +28,10 @@ use std::process::{Command, Stdio};
 use crate::detect::{DetectContext, PATH_NOT_UTF8, add_lossy_guard, lossy_argv, lossy_detail};
 use crate::guard::{self, Processes};
 use crate::mounts::MountTable;
-use crate::plan::{self, add_changed_guard, changed_root, changed_since_scan};
+use crate::plan::{
+    self, MeasuredRoot, add_changed_guard, changed_removal_root, changed_since_scan,
+    measured_roots, nested_roots,
+};
 use crate::report::{
     Action, ActionKind, ApplyItem, ApplyOutcome, ApplyReport, AuditEvent, AuditRecord, Finding,
     GuardStatus, Plan, PlanItem, SCHEMA, Tier, Tool,
@@ -106,6 +109,7 @@ pub struct Check {
     pub fresh: Option<Finding>,
     /// The apply scan's root identity, `(st_dev, st_ino)`, for ready filesystem items.
     pub inode: Option<(u64, u64)>,
+    nested: Vec<MeasuredRoot>,
 }
 
 impl Check {
@@ -156,14 +160,26 @@ pub fn evaluate(
         .map(|(c, p)| c.fresh.as_ref().unwrap_or(&p.finding).clone())
         .collect();
     guard::check(&mut guarded, tree, ctx, procs);
+    let roots = measured_roots(
+        tree,
+        checks.iter().map(|c| {
+            (
+                c.item.path.as_str(),
+                c.fresh.as_ref().and_then(|f| f.file_identity),
+            )
+        }),
+    );
     for (c, f) in checks.iter_mut().zip(guarded).filter(|(c, _)| c.ready()) {
-        if let Some(detail) = changed_root(&f.path, c.inode) {
+        let nested = nested_roots(&roots, &f.path);
+        if let Some(detail) = changed_removal_root(&f.path, c.inode, nested) {
             (c.item.outcome, c.item.detail) = c.skip_changed(detail);
             continue;
         }
         if f.tier == Tier::Blocked {
             c.item.outcome = ApplyOutcome::Skipped;
             c.item.detail = format!("blocked by {}", blocks(&f));
+        } else {
+            c.nested = nested.to_vec();
         }
         c.item.guards = f.guards;
     }
@@ -192,6 +208,7 @@ fn decide(
         },
         fresh: fresh.cloned(),
         inode: None,
+        nested: Vec::new(),
     };
     // Backstop for `detect::block_lossy`: never act on a path or command
     // spelled with U+FFFD, whether the plan file or the fresh finding has it.
@@ -425,7 +442,7 @@ fn run(c: &mut Check, mounts: &MountTable) -> (ApplyOutcome, String) {
         add_lossy_guard(&mut item.guards, detail);
         return (ApplyOutcome::Skipped, outcome);
     }
-    if let Some(detail) = changed_root(&item.path, c.inode) {
+    if let Some(detail) = changed_removal_root(&item.path, c.inode, &c.nested) {
         return c.skip_changed(detail);
     }
     match item.action.kind {

@@ -21,7 +21,7 @@
 //! widen what apply may do.
 
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::detect::{DetectContext, is_lossy, rfc3339};
 use crate::guard::{self, Processes};
@@ -142,11 +142,22 @@ pub fn build(
 ) -> Result<Plan, String> {
     let (mut picked, already_blocked) = select(findings, sel)?;
     guard::check(&mut picked, tree, ctx, procs);
+    let roots = measured_roots(
+        tree,
+        picked
+            .iter()
+            .chain(&already_blocked)
+            .map(|f| (f.path.as_str(), f.file_identity)),
+    );
     let mut items = Vec::new();
     let mut blocked = Vec::new();
     for mut f in already_blocked.into_iter().chain(picked) {
         let fingerprint = (f.tier != Tier::Blocked).then(|| fingerprint(&f, tree, ctx));
-        let changed = changed_since_scan(&f, tree);
+        let changed = changed_removal_root(
+            &f.path,
+            measured_inode(&f.path, f.file_identity, tree),
+            nested_roots(&roots, &f.path),
+        );
         f.file_identity = None;
         if let Some(detail) = changed {
             add_changed_guard(&mut f.guards, detail);
@@ -208,17 +219,71 @@ pub fn distinct_bytes<'a>(items: impl IntoIterator<Item = (&'a str, u64)>) -> u6
         .sum()
 }
 
-/// Why a finding's live root differs from the measured root.
-pub(crate) fn changed_since_scan(f: &Finding, tree: &ScanTree) -> Option<String> {
-    if !f.path.starts_with('/') {
-        return None;
-    }
-    let node = tree.find(Path::new(&f.path)).map(|id| tree.node(id));
-    changed_root(&f.path, root_identity(f, node).map(|id| (id.dev, id.ino)))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MeasuredRoot {
+    path: PathBuf,
+    inode: Option<(u64, u64)>,
 }
 
-fn root_identity(f: &Finding, node: Option<&TreeNode>) -> Option<FileIdentity> {
-    f.file_identity.or_else(|| {
+pub(crate) fn measured_roots<'a>(
+    tree: &ScanTree,
+    planned: impl Iterator<Item = (&'a str, Option<FileIdentity>)>,
+) -> Vec<MeasuredRoot> {
+    let mut roots: Vec<_> = planned
+        .filter(|(path, _)| path.starts_with('/'))
+        .map(|(path, file)| MeasuredRoot {
+            path: PathBuf::from(path),
+            inode: measured_inode(path, file, tree),
+        })
+        .collect();
+    roots.extend(tree.ids().filter_map(|id| {
+        let node = tree.node(id);
+        (node.is_dir && node.markers.contains(Markers::DOT_GIT)).then(|| MeasuredRoot {
+            path: tree.path(id),
+            inode: Some((node.dev, node.ino)),
+        })
+    }));
+    roots.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.inode.cmp(&b.inode)));
+    roots.dedup();
+    roots
+}
+
+pub(crate) fn nested_roots<'a>(roots: &'a [MeasuredRoot], path: &str) -> &'a [MeasuredRoot] {
+    let path = Path::new(path);
+    let later = &roots[roots.partition_point(|root| root.path.as_path() <= path)..];
+    &later[..later.partition_point(|root| root.path.starts_with(path))]
+}
+
+pub(crate) fn changed_removal_root(
+    path: &str,
+    inode: Option<(u64, u64)>,
+    nested: &[MeasuredRoot],
+) -> Option<String> {
+    changed_root(Path::new(path), inode).or_else(|| {
+        nested.iter().find_map(|root| {
+            changed_root(&root.path, root.inode).map(|detail| format!("{detail} (inside {path})"))
+        })
+    })
+}
+
+/// Why a finding's live root differs from the measured root.
+pub(crate) fn changed_since_scan(f: &Finding, tree: &ScanTree) -> Option<String> {
+    changed_root(
+        Path::new(&f.path),
+        measured_inode(&f.path, f.file_identity, tree),
+    )
+}
+
+fn measured_inode(path: &str, file: Option<FileIdentity>, tree: &ScanTree) -> Option<(u64, u64)> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let node = tree.find(Path::new(path)).map(|id| tree.node(id));
+    root_identity(file, node).map(|id| (id.dev, id.ino))
+}
+
+fn root_identity(file: Option<FileIdentity>, node: Option<&TreeNode>) -> Option<FileIdentity> {
+    file.or_else(|| {
         node.map(|n| FileIdentity {
             dev: n.dev,
             ino: n.ino,
@@ -227,23 +292,24 @@ fn root_identity(f: &Finding, node: Option<&TreeNode>) -> Option<FileIdentity> {
     })
 }
 
-pub(crate) fn changed_root(path: &str, inode: Option<(u64, u64)>) -> Option<String> {
-    if !path.starts_with('/') {
+fn changed_root(path: &Path, inode: Option<(u64, u64)>) -> Option<String> {
+    if !path.is_absolute() {
         return None;
     }
+    let display = path.display();
     let Some(inode) = inode else {
         return Some(format!(
-            "{path} is not in the scan, so its device/inode are not known"
+            "{display} is not in the scan, so its device/inode are not known"
         ));
     };
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Some(format!("{path} is gone since the scan"))
+            Some(format!("{display} is gone since the scan"))
         }
-        Err(e) => Some(format!("{path} cannot be checked against the scan: {e}")),
-        Ok(md) if md.file_type().is_symlink() => Some(format!("{path} is a symlink now")),
+        Err(e) => Some(format!("{display} cannot be checked against the scan: {e}")),
+        Ok(md) if md.file_type().is_symlink() => Some(format!("{display} is a symlink now")),
         Ok(md) if (md.dev(), md.ino()) != inode => Some(format!(
-            "{path} was replaced after the scan (device/inode differ)"
+            "{display} was replaced after the scan (device/inode differ)"
         )),
         Ok(_) => None,
     }
@@ -273,7 +339,7 @@ pub fn fingerprint(f: &Finding, tree: &ScanTree, ctx: &DetectContext) -> Fingerp
     if f.path.starts_with('/') {
         let p = Path::new(&f.path);
         let node = tree.find(p).map(|id| tree.node(id));
-        if let Some(id) = root_identity(f, node) {
+        if let Some(id) = root_identity(f.file_identity, node) {
             fp.dev = Some(id.dev);
             fp.inode = Some(id.ino);
             fp.newest_mtime = Some(id.mtime);

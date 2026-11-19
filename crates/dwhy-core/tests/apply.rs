@@ -266,13 +266,17 @@ fn fixture(b: &Path) -> Vec<Finding> {
 }
 
 fn make_plan(b: &Path, findings: Vec<Finding>) -> Plan {
+    make_plan_from_tree(b, findings, &scan_tree(b))
+}
+
+fn make_plan_from_tree(b: &Path, findings: Vec<Finding>, tree: &ScanTree) -> Plan {
     plan::build(
         findings,
         &Selection {
             tier: Some(Tier::Review),
             select: vec![],
         },
-        &scan_tree(b),
+        tree,
         &ctx(),
         &Processes::default(),
         "host".into(),
@@ -627,6 +631,116 @@ fn a_skipped_replacement_still_blocks_removal_of_its_git_dir() {
 }
 
 #[test]
+fn nested_checkout_swap_protects_the_outer_roots_git_metadata() {
+    let (_temp, b) = base();
+    let (_outside, outside) = base();
+    let scratch = b.join("scratch");
+    let target = scratch.join("target");
+    let checkout = outside.join("checkout");
+    let metadata = scratch.join("checkout.git");
+    for dir in [&target, &checkout] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    git(&target, &["init", "-q"]);
+    git(
+        &checkout,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            metadata.to_str().unwrap(),
+        ],
+    );
+    let outer = finding("stale-tree", &scratch, Tier::Review);
+    let inner = finding("cargo-target", &target, Tier::Rebuildable);
+    let pol = policy(Tier::Rebuildable, &[&outer.id]);
+    let found = vec![outer, inner];
+    let plan = make_plan(&b, found.clone());
+    assert_eq!(plan.items.len(), 2, "{:?}", plan.blocked);
+    let tree = scan_tree(&b);
+    let procs = Processes::default();
+    let mut ready = apply::evaluate(&plan, found.clone(), &tree, &ctx(), &procs, &pol);
+    let preview = apply::report(&plan, &ready, &pol, true, &env());
+    assert_eq!(apply::exit_code(&preview), 0);
+    assert!(ready.iter().all(Check::ready));
+
+    fs::rename(&target, outside.join("original")).unwrap();
+    symlink(&checkout, &target).unwrap();
+    let mut surveyed = apply::evaluate(&plan, found, &tree, &ctx(), &procs, &pol);
+    assert!(
+        surveyed
+            .iter()
+            .all(|c| c.item.outcome == ApplyOutcome::Skipped)
+    );
+    let mut audit = Audit::open(&b.join("audit.jsonl")).unwrap();
+    for checks in [&mut surveyed, &mut ready] {
+        apply::execute(&plan, checks, &mut audit, &no_mounts(), &env(), &mut |_| {});
+        let report = apply::report(&plan, checks, &pol, false, &env());
+        assert_eq!(apply::exit_code(&report), 2);
+        assert_eq!(report.freed, 0);
+        for item in &report.items {
+            assert_eq!(item.outcome, ApplyOutcome::Skipped, "{item:?}");
+            assert!(
+                item.guards.iter().any(|g| {
+                    g.name == "changed-since-scan"
+                        && g.status == GuardStatus::Block
+                        && g.detail.contains(target.to_str().unwrap())
+                }),
+                "{item:?}"
+            );
+        }
+        assert_eq!(fs::read_link(&target).unwrap(), checkout);
+        assert!(metadata.join("HEAD").is_file());
+        git(&checkout, &["rev-parse", "--git-dir"]);
+    }
+}
+
+#[test]
+fn an_unselected_nested_git_root_can_block_the_outer_root() {
+    let (_temp, b) = base();
+    let (_outside, outside) = base();
+    let scratch = b.join("scratch");
+    let worktree = scratch.join("project");
+    let checkout = outside.join("checkout");
+    for dir in [&worktree, &checkout] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    git(
+        &worktree,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            outside.join("original.git").to_str().unwrap(),
+        ],
+    );
+    git(&checkout, &["init", "-q"]);
+    let found = vec![finding("stale-tree", &scratch, Tier::Review)];
+    let plan = make_plan(&b, found.clone());
+    assert_eq!(plan.items.len(), 1);
+    let tree = scan_tree(&b);
+    fs::rename(&worktree, outside.join("original")).unwrap();
+    symlink(&checkout, &worktree).unwrap();
+
+    let rebuilt = make_plan_from_tree(&b, found.clone(), &tree);
+    assert!(rebuilt.items.is_empty());
+    assert_eq!(rebuilt.blocked.len(), 1);
+    let pol = policy(Tier::Regenerable, &[&found[0].id]);
+    let checks = apply::evaluate(&plan, found, &tree, &ctx(), &Processes::default(), &pol);
+    assert_eq!(checks[0].item.outcome, ApplyOutcome::Skipped);
+    for guards in [&rebuilt.blocked[0].guards, &checks[0].item.guards] {
+        assert!(
+            guards.iter().any(|g| {
+                g.name == "changed-since-scan"
+                    && g.status == GuardStatus::Block
+                    && g.detail.contains(worktree.to_str().unwrap())
+            }),
+            "{guards:?}"
+        );
+    }
+}
+
+#[test]
 fn the_plans_action_and_tier_are_not_trusted() {
     let (_t, b) = base();
     let found = fixture(&b);
@@ -930,14 +1044,13 @@ fn an_item_inside_another_is_counted_once() {
         &env(),
         &mut |_| {},
     );
-    assert!(!b.join("scratch").exists());
+    assert!(b.join("scratch/notes").exists());
+    assert!(!b.join("scratch/app/target").exists());
     let r = apply::report(&plan, &checks, &pol, false, &env());
-    assert!(
-        r.items.iter().all(|i| i.outcome == ApplyOutcome::Removed),
-        "{:?}",
-        r.items
-    );
-    assert_eq!(r.freed, 10_000);
+    assert_eq!(r.items[0].outcome, ApplyOutcome::Skipped);
+    assert!(r.items[0].detail.contains("target is gone since the scan"));
+    assert_eq!(r.items[1].outcome, ApplyOutcome::Removed);
+    assert_eq!(r.freed, 9_000);
 }
 
 #[test]
