@@ -376,13 +376,14 @@ fn tui_and_cli_plans_round_trip() {
             .iter()
             .map(|i| {
                 let f = &i.finding;
-                (
-                    f.id.clone(),
-                    f.bytes,
-                    f.tier,
-                    f.action.clone(),
-                    f.guards.clone(),
-                )
+                // Each plan reads /proc separately. The number of other users'
+                // processes in the evidence can change between those reads.
+                let guards: Vec<_> = f
+                    .guards
+                    .iter()
+                    .map(|g| (g.name.clone(), g.status))
+                    .collect();
+                (f.id.clone(), f.bytes, f.tier, f.action.clone(), guards)
             })
             .collect();
         let blocked: Vec<_> = p.blocked.iter().map(|f| f.id.clone()).collect();
