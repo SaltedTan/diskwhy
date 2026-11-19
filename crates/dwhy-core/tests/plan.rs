@@ -12,7 +12,8 @@ use dwhy_core::guard::{Proc, Processes};
 use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection, TTL_SECS, Unusable};
 use dwhy_core::report::{
-    Action, ActionKind, DockerSocket, Finding, Plan, PlanScan, Recovery, Tier, ToolStatus,
+    Action, ActionKind, DockerSocket, Finding, GuardResult, GuardStatus, Plan, PlanScan, Recovery,
+    Tier, ToolStatus,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::tree::ScanTree;
@@ -451,9 +452,9 @@ fn live_inode(p: &Path) -> u64 {
 fn changed_guard(f: &Finding) -> Option<&str> {
     f.guards
         .iter()
-        .find(|g| g.name == plan::CHANGED_SINCE_SCAN)
+        .find(|g| g.name == "changed-since-scan")
         .map(|g| {
-            assert_eq!(g.status, dwhy_core::report::GuardStatus::Block);
+            assert_eq!(g.status, GuardStatus::Block);
             g.detail.as_str()
         })
 }
@@ -564,6 +565,32 @@ fn a_root_gone_or_turned_symlink_after_the_walk_is_blocked() {
         "{:?}",
         p.blocked[0].guards
     );
+}
+
+#[test]
+fn an_already_blocked_selected_root_is_checked_against_the_walk() {
+    let (_t, b) = base();
+    let d = dir(&b.join("cache"));
+    let mut f = finding("user-cache", &d, 4096, Tier::Blocked);
+    let recent_write = GuardResult {
+        name: "recent-write".into(),
+        status: GuardStatus::Block,
+        detail: "written recently".into(),
+    };
+    f.guards.push(recent_write.clone());
+    let sel = Selection {
+        tier: None,
+        select: vec![f.id.clone()],
+    };
+    let tree = scan_tree(&b);
+    replace_same_contents(&d);
+
+    let p = build_from(&tree, &b, vec![f], &sel);
+    assert!(p.items.is_empty());
+    assert_eq!(p.blocked.len(), 1);
+    assert!(p.blocked[0].guards.contains(&recent_write));
+    assert!(changed_guard(&p.blocked[0]).is_some_and(|g| g.contains("was replaced")));
+    assert!(plan::selected_blocked(&p));
 }
 
 #[test]

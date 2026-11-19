@@ -28,6 +28,7 @@ use std::process::{Command, Stdio};
 use crate::detect::{DetectContext, PATH_NOT_UTF8, add_lossy_guard, lossy_argv, lossy_detail};
 use crate::guard::{self, Processes};
 use crate::mounts::MountTable;
+use crate::plan::{self, add_changed_guard, changed_root, changed_since_scan};
 use crate::report::{
     Action, ActionKind, ApplyItem, ApplyOutcome, ApplyReport, AuditEvent, AuditRecord, Finding,
     GuardStatus, Plan, PlanItem, SCHEMA, Tier, Tool,
@@ -103,8 +104,7 @@ pub fn action_kind_name(k: ActionKind) -> &'static str {
 pub struct Check {
     pub item: ApplyItem,
     pub fresh: Option<Finding>,
-    /// The plan's fingerprint of the root, `(st_dev, st_ino)`, checked again
-    /// right before a path removal.
+    /// The apply scan's root identity, `(st_dev, st_ino)`, for ready filesystem items.
     pub inode: Option<(u64, u64)>,
 }
 
@@ -148,8 +148,12 @@ pub fn evaluate(
     guard::check(&mut guarded, tree, ctx, procs);
     for (i, f) in ready.into_iter().zip(guarded) {
         let c = &mut checks[i];
-        c.item.guards = f.guards.clone();
-        if f.tier == Tier::Blocked {
+        c.item.guards.clone_from(&f.guards);
+        if let Some(detail) = changed_since_scan(&f, tree) {
+            c.item.outcome = ApplyOutcome::Skipped;
+            c.item.detail = format!("changed since the scan: {detail}");
+            add_changed_guard(&mut c.item.guards, detail);
+        } else if f.tier == Tier::Blocked {
             c.item.outcome = ApplyOutcome::Skipped;
             c.item.detail = format!("blocked by {}", blocks(&f));
         }
@@ -179,7 +183,7 @@ fn decide(
             guards: Vec::new(),
         },
         fresh: fresh.cloned(),
-        inode: item.fingerprint.dev.zip(item.fingerprint.inode),
+        inode: None,
     };
     // Backstop for `detect::block_lossy`: never act on a path or command
     // spelled with U+FFFD, whether the plan file or the fresh finding has it.
@@ -231,19 +235,15 @@ fn decide(
     if let Err(why) = policy.allows(f) {
         return base(f, ApplyOutcome::Refused, why);
     }
-    let now = crate::plan::fingerprint(f, tree, ctx);
-    let diff = crate::plan::differences(&item.fingerprint, &now);
+    let now = plan::fingerprint(f, tree, ctx);
+    let diff = plan::differences(&item.fingerprint, &now);
     if !diff.is_empty() {
         return skip(format!("changed since the plan: {}", diff.join(", ")));
     }
-    // `now` is apply's own walk; a root replaced since that walk would match
-    // the plan there, so check the live root against the walk too.
-    if let Some(detail) = crate::plan::changed_since_scan(f, tree) {
-        let mut c = skip(format!("changed since the scan: {detail}"));
-        crate::plan::add_changed_guard(&mut c.item.guards, detail);
-        return c;
+    Check {
+        inode: now.dev.zip(now.inode),
+        ..base(f, ApplyOutcome::WouldRemove, "ready".into())
     }
-    base(f, ApplyOutcome::WouldRemove, "ready".into())
 }
 
 fn lossy(path: &str, action: &Action) -> Option<String> {
@@ -412,11 +412,10 @@ fn run(c: &mut Check, mounts: &MountTable) -> (ApplyOutcome, String) {
         add_lossy_guard(&mut item.guards, detail);
         return (ApplyOutcome::Skipped, outcome);
     }
-    if item.path.starts_with('/') && std::fs::symlink_metadata(&item.path).is_err() {
-        return (
-            ApplyOutcome::Skipped,
-            "gone: removed since it was checked (by an item around it?)".into(),
-        );
+    if let Some(detail) = changed_root(&item.path, c.inode, None) {
+        let outcome = format!("changed since the scan: {detail}");
+        add_changed_guard(&mut item.guards, detail);
+        return (ApplyOutcome::Skipped, outcome);
     }
     match item.action.kind {
         ActionKind::RemovePath => {

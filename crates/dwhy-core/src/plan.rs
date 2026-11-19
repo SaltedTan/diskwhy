@@ -33,7 +33,7 @@ use crate::tree::{Markers, ScanTree};
 
 /// The guard that blocks a finding whose root is no longer the directory the
 /// scan walked.
-pub const CHANGED_SINCE_SCAN: &str = "changed-since-scan";
+const CHANGED_SINCE_SCAN: &str = "changed-since-scan";
 
 /// A plan expires this long after it is made.
 pub const TTL_SECS: i64 = 3600;
@@ -78,9 +78,7 @@ fn matches(f: &Finding, entry: &str) -> bool {
 /// Whether a finding that `--select` named ended up in the plan's `blocked`
 /// list. A finding only the tier ceiling picked does not count.
 pub fn selected_blocked(plan: &Plan) -> bool {
-    plan.blocked
-        .iter()
-        .any(|f| plan.selection.select.iter().any(|s| matches(f, s)))
+    !plan.selection.select.is_empty() && !plan.blocked.is_empty()
 }
 
 /// Splits `findings` into the selected ones that may go into a plan and the
@@ -130,9 +128,9 @@ pub fn select(
 }
 
 /// Builds a plan from the findings of a scan: selects, runs the guards on
-/// the selection, blocks a selected root that is not the one the scan
-/// walked ([`changed_since_scan`]), and fingerprints each item from the
-/// walk. `tree` is the scan the findings came from; `ctx.now` is the
+/// the selection, fingerprints eligible findings from the walk, and blocks
+/// selected roots that fail the live identity check (`changed-since-scan`).
+/// `tree` is the scan the findings came from; `ctx.now` is the
 /// creation time.
 pub fn build(
     findings: Vec<Finding>,
@@ -143,25 +141,23 @@ pub fn build(
     host: String,
     scan: PlanScan,
 ) -> Result<Plan, String> {
-    let (mut picked, mut blocked) = select(findings, sel)?;
+    let (mut picked, already_blocked) = select(findings, sel)?;
     guard::check(&mut picked, tree, ctx, procs);
-    for f in &mut picked {
-        if let Some(detail) = changed_since_scan(f, tree) {
+    let mut items = Vec::new();
+    let mut blocked = Vec::new();
+    for mut f in already_blocked.into_iter().chain(picked) {
+        let fingerprint = (f.tier != Tier::Blocked).then(|| fingerprint(&f, tree, ctx));
+        if let Some(detail) = changed_since_scan(&f, tree) {
             add_changed_guard(&mut f.guards, detail);
             f.tier = Tier::Blocked;
-        }
-    }
-    let mut items = Vec::new();
-    for f in picked {
-        if f.tier == Tier::Blocked {
-            blocked.push(f);
-        } else {
-            let fingerprint = fingerprint(&f, tree, ctx);
+        } else if let Some(fingerprint) = fingerprint {
             items.push(PlanItem {
                 finding: f,
                 fingerprint,
             });
+            continue;
         }
+        blocked.push(f);
     }
     let largest = |a: &Finding, b: &Finding| b.bytes.cmp(&a.bytes).then_with(|| a.id.cmp(&b.id));
     items.sort_by(|a, b| largest(&a.finding, &b.finding));
@@ -215,34 +211,40 @@ pub fn distinct_bytes<'a>(items: impl IntoIterator<Item = (&'a str, u64)>) -> u6
 /// it is not: it is not in the walk, it is gone, it is a symlink now, or its
 /// live device and inode (`lstat`, never followed) differ from the walked
 /// ones. `None` for pseudo-paths (`docker://…`), which have no tree node.
-pub fn changed_since_scan(f: &Finding, tree: &ScanTree) -> Option<String> {
+pub(crate) fn changed_since_scan(f: &Finding, tree: &ScanTree) -> Option<String> {
     if !f.path.starts_with('/') {
         return None;
     }
-    let p = Path::new(&f.path);
-    let Some(id) = tree.find(p) else {
+    let node = tree.find(Path::new(&f.path)).map(|id| tree.node(id));
+    changed_root(
+        &f.path,
+        node.map(|n| (n.dev, n.ino)),
+        node.map(|n| n.is_dir),
+    )
+}
+
+pub(crate) fn changed_root(
+    path: &str,
+    inode: Option<(u64, u64)>,
+    is_dir: Option<bool>,
+) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let Some(inode) = inode else {
         return Some(format!(
-            "{} is not in the scan, so its device/inode are not known",
-            f.path
+            "{path} is not in the scan, so its device/inode are not known"
         ));
     };
-    let n = tree.node(id);
-    match std::fs::symlink_metadata(p) {
+    match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Some(format!("{} is gone since the scan", f.path))
+            Some(format!("{path} is gone since the scan"))
         }
-        Err(e) => Some(format!(
-            "{} cannot be checked against the scan: {e}",
-            f.path
-        )),
-        Ok(md) if md.file_type().is_symlink() && n.is_dir => Some(format!(
-            "{} is a symlink now, not the directory the scan walked",
-            f.path
-        )),
-        Ok(md) if (md.dev(), md.ino()) != (n.dev, n.ino) || md.is_dir() != n.is_dir => {
+        Err(e) => Some(format!("{path} cannot be checked against the scan: {e}")),
+        Ok(md) if md.file_type().is_symlink() => Some(format!("{path} is a symlink now")),
+        Ok(md) if (md.dev(), md.ino()) != inode || is_dir.is_some_and(|dir| md.is_dir() != dir) => {
             Some(format!(
-                "{} was replaced after the scan (device/inode differ)",
-                f.path
+                "{path} was replaced after the scan (device/inode differ)"
             ))
         }
         Ok(_) => None,

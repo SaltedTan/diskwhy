@@ -917,6 +917,56 @@ fn plan_exits_2_only_when_a_selected_finding_is_blocked() {
     assert!(file.exists());
 }
 
+#[test]
+fn plan_exits_2_when_a_relative_selection_loses_its_parent_during_guards() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_t, root) = cargo_fixture();
+    let root = Path::new(&root);
+    fs::create_dir(root.join("app/target/.git")).unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let git = bin.path().join("git");
+    fs::write(
+        &git,
+        "#!/bin/sh\n/bin/mv \"$DWHY_TEST_ROOT/app\" \"$DWHY_TEST_ROOT/app.moved\"\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_dwhy"))
+        .args([
+            "plan",
+            ".",
+            "-q",
+            "--detectors",
+            "cargo-target",
+            "--json",
+            "--select",
+            "app/target",
+        ])
+        .current_dir(root)
+        .env_clear()
+        .env("PATH", bin.path())
+        .env("DWHY_TEST_ROOT", root)
+        .output()
+        .unwrap();
+    let plan = json_of(&out);
+    assert!(root.join("app.moved/target").is_dir());
+    assert_eq!(out.status.code(), Some(2), "{plan}");
+    assert!(plan["items"].as_array().unwrap().is_empty());
+    assert_eq!(
+        plan["blocked"][0]["path"],
+        root.join("app/target").to_str().unwrap()
+    );
+    assert!(
+        plan["blocked"][0]["guards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["name"] == "changed-since-scan" && g["status"] == "block")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // apply: real removal happens only inside these temp dirs.
 // ---------------------------------------------------------------------------

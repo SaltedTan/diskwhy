@@ -467,7 +467,7 @@ fn a_root_replaced_after_applys_own_scan_is_skipped() {
         c.item
             .guards
             .iter()
-            .any(|g| g.name == plan::CHANGED_SINCE_SCAN && g.status == GuardStatus::Block),
+            .any(|g| g.name == "changed-since-scan" && g.status == GuardStatus::Block),
         "{:?}",
         c.item.guards
     );
@@ -631,6 +631,67 @@ fn execute_removes_ready_items_and_audits_everything() {
         &mut |_| {},
     );
     assert_eq!(audit_lines(&log).len(), 4);
+}
+
+#[test]
+fn execute_skips_replaced_roots_for_commands_and_path_removal() {
+    let (_t, b) = base();
+    let mut found = fixture(&b);
+    found.truncate(2);
+    let marker = b.join("ran");
+    found[1].action = Action {
+        kind: ActionKind::Command,
+        text: "touch marker".into(),
+        argv: Some(vec!["touch".into(), marker.to_str().unwrap().into()]),
+    };
+    let plan = make_plan(&b, found.clone());
+    let pol = policy(Tier::Rebuildable, &[]);
+    let mut checks = evaluate(&b, &plan, found, &pol);
+    assert_eq!(checks.len(), 2);
+    assert!(checks.iter().all(Check::ready));
+    let log = b.join("audit.jsonl");
+    let mut audit = Audit::open(&log).unwrap();
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |item| {
+            let root = Path::new(&item.path);
+            fs::rename(root, root.with_extension("old")).unwrap();
+            write(&root.join("file"), "replacement");
+        },
+    );
+
+    assert!(!marker.exists());
+    for c in &checks {
+        assert_eq!(c.item.outcome, ApplyOutcome::Skipped);
+        assert!(c.item.detail.starts_with("changed since the scan: "));
+        let changed = c
+            .item
+            .guards
+            .iter()
+            .find(|g| g.name == "changed-since-scan")
+            .unwrap();
+        assert_eq!(changed.status, GuardStatus::Block);
+        let root = Path::new(&c.item.path);
+        assert_eq!(
+            fs::read_to_string(root.join("file")).unwrap(),
+            "replacement"
+        );
+        assert!(root.with_extension("old").join("file").exists());
+    }
+    let report = apply::report(&plan, &checks, &pol, false, &env());
+    assert_eq!(apply::exit_code(&report), 2);
+    let lines = audit_lines(&log);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.event == AuditEvent::End && l.outcome == Some(ApplyOutcome::Skipped))
+            .count(),
+        2
+    );
 }
 
 #[test]
