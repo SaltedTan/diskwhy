@@ -2357,3 +2357,430 @@ fn apply_refuses_a_plan_with_a_lossy_scan_root() {
     assert!(Path::new(&root).join("app/target/debug/app").exists());
     assert!(!state.path().join("diskwhy/audit.jsonl").exists());
 }
+
+// ---------------------------------------------------------------------------
+// Applying from the TUI (M4d): real removal only inside these temp dirs.
+// ---------------------------------------------------------------------------
+
+const APPLY_DETECTORS: &str = "cargo-target,stale-tree";
+
+/// A temp fixture for applying from the TUI and the CLI alike:
+/// `work/app/target` (3 MiB) and `work/lib/target` (1 MiB), cargo targets
+/// cleaned by a fake `cargo` in the home's `~/.cargo/bin` (found off PATH,
+/// so both run it by its absolute path), and `work/scratch/old` (2 MiB,
+/// untouched for 30 days), a `review` stale-tree finding. The fake cargo
+/// prints on stdout and stderr and removes only the target dir it is given
+/// inside this fixture.
+struct Twin {
+    _t: tempfile::TempDir,
+    base: std::path::PathBuf,
+}
+
+impl Twin {
+    fn new() -> Twin {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(t.path()).unwrap();
+        for d in ["home/.cargo/bin", "state", "bin", "plans", "work"] {
+            fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let w = Twin { _t: t, base };
+        let cargo = w.cargo();
+        fs::write(
+            &cargo,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"fake-cargo-stdout $*\"\n\
+                 echo \"fake-cargo-stderr $*\" >&2\n\
+                 [ \"$1\" = clean ] && [ \"$4\" = --target-dir ] || exit 9\n\
+                 case \"$5\" in\n  '{}'/*) /bin/rm -rf -- \"$5\" ;;\n  *) exit 9 ;;\nesac\n",
+                w.work().display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        for (name, size) in [("app", 3 << 20), ("lib", 1 << 20)] {
+            let c = w.work().join(name);
+            fs::create_dir_all(c.join("target/debug")).unwrap();
+            fs::write(c.join("Cargo.toml"), "[package]\n").unwrap();
+            fs::write(c.join("target/CACHEDIR.TAG"), CARGO_TAG).unwrap();
+            fs::write(c.join("target/debug/out"), vec![6u8; size]).unwrap();
+        }
+        let scratch = w.work().join("scratch");
+        fs::create_dir_all(scratch.join("old")).unwrap();
+        fs::write(scratch.join(".dwhy-scratch"), "").unwrap();
+        fs::write(scratch.join("old/blob"), vec![7u8; 2 << 20]).unwrap();
+        age_tree(&scratch.join("old"), 30 * 86_400);
+        w
+    }
+    fn work(&self) -> std::path::PathBuf {
+        self.base.join("work")
+    }
+    fn cargo(&self) -> std::path::PathBuf {
+        self.base.join("home/.cargo/bin/cargo")
+    }
+    fn audit(&self) -> std::path::PathBuf {
+        self.base.join("state/diskwhy/audit.jsonl")
+    }
+    fn targets(&self) -> [std::path::PathBuf; 3] {
+        let w = self.work();
+        [
+            w.join("app/target"),
+            w.join("lib/target"),
+            w.join("scratch/old"),
+        ]
+    }
+    /// Runs dwhy with only this fixture's home, state and an empty PATH.
+    fn dwhy(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_dwhy"))
+            .args(args)
+            .env_clear()
+            .env("HOME", self.base.join("home"))
+            .env("PATH", self.base.join("bin"))
+            .env("XDG_STATE_HOME", self.base.join("state"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run dwhy")
+    }
+    /// `dwhy plan work --tier review` to `plans/<name>`.
+    fn cli_plan(&self, name: &str) -> String {
+        let file = self.base.join("plans").join(name);
+        let file = file.to_str().unwrap().to_string();
+        let out = self.dwhy(&[
+            "plan",
+            self.work().to_str().unwrap(),
+            "-q",
+            "--detectors",
+            APPLY_DETECTORS,
+            "--tier",
+            "review",
+            "-o",
+            &file,
+        ]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        file
+    }
+    /// What the dwhy process above knows: this home, no tool on PATH, the
+    /// fake cargo off it, and no Docker.
+    fn context(&self) -> dwhy_core::detect::DetectContext {
+        dwhy_core::detect::DetectContext {
+            uid: dwhy_core::system::euid(),
+            root: false,
+            home: Some(self.base.join("home")),
+            now: 0,
+            tools: vec![dwhy_core::report::ToolStatus {
+                name: "cargo".into(),
+                path: None,
+                off_path: Some(self.cargo().to_str().unwrap().into()),
+                enables: vec![],
+            }],
+            docker_socket: dwhy_core::report::DockerSocket {
+                path: "/nonexistent".into(),
+                exists: false,
+                accessible: false,
+            },
+            docker: dwhy_core::docker::Source::none(),
+        }
+    }
+    /// The TUI session's options for this fixture.
+    fn options(&self) -> dwhy_tui::Options {
+        dwhy_tui::Options {
+            paths: vec![self.work()],
+            cross_filesystems: false,
+            detectors: Some(APPLY_DETECTORS.split(',').map(Into::into).collect()),
+            threads: 2,
+            snapshot_dir: None,
+            dry_run: false,
+            audit_log: Some(self.audit()),
+            context: Some(self.context()),
+        }
+    }
+    /// `dwhy tui --plan FILE` on this fixture.
+    fn tui_plan(&self, file: &str) -> dwhy_tui::App {
+        let plan = dwhy_tui::job::read_plan(Path::new(file)).unwrap();
+        dwhy_tui::App::open_plan(
+            plan,
+            file.into(),
+            &dwhy_core::system::hostname(),
+            dwhy_core::system::euid(),
+        )
+        .with_options(self.options())
+    }
+    /// An item's outcome, detector, path and detail, with this fixture's
+    /// directory and the item's id (made from its path) replaced.
+    fn outcomes(&self, items: &Value) -> Vec<(String, String, String, String)> {
+        let base = self.base.to_str().unwrap();
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| {
+                let id = i["id"].as_str().unwrap();
+                let s = |k: &str| {
+                    i[k].as_str()
+                        .unwrap()
+                        .replace(base, "<base>")
+                        .replace(id, "<id>")
+                };
+                (s("outcome"), s("detector"), s("path"), s("detail"))
+            })
+            .collect()
+    }
+    /// The audit log's (event, detector, outcome) lines, in order.
+    fn audit_events(&self) -> Vec<(String, String, String)> {
+        fs::read_to_string(self.audit())
+            .unwrap_or_default()
+            .lines()
+            .map(|l| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                let s = |k: &str| v[k].as_str().unwrap_or("-").to_string();
+                (s("event"), s("detector"), s("outcome"))
+            })
+            .collect()
+    }
+}
+
+fn press(app: &mut dwhy_tui::App, codes: &[dwhy_tui::KeyCode]) {
+    for &c in codes {
+        let key = dwhy_tui::KeyEvent::new(c, dwhy_tui::KeyModifiers::NONE);
+        assert!(!app.on_key(key), "{c:?} must not quit");
+    }
+}
+
+/// Runs the apply the last key asked for, as the TUI's worker does, and
+/// shows its result. Returns the report as JSON (with the exit code).
+fn run_tui_apply(app: &mut dwhy_tui::App) -> (Value, u8) {
+    let job = app.take_apply().expect("an apply was asked for");
+    let env = dwhy_core::apply::Env::from_system();
+    let done = job
+        .run(dwhy_core::guard::Processes::read, &env)
+        .expect("the apply ran");
+    let out = (serde_json::to_value(&done.report).unwrap(), done.exit);
+    app.apply_done(Ok(done));
+    out
+}
+
+fn report_of(out: &Output) -> Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{e}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+/// The plan item index and id of the review item.
+fn review_item(file: &str) -> (usize, String) {
+    let plan = dwhy_tui::job::read_plan(Path::new(file)).unwrap();
+    let n = plan
+        .items
+        .iter()
+        .position(|i| i.finding.tier == dwhy_core::report::Tier::Review)
+        .expect("a review item");
+    (n, plan.items[n].finding.id.clone())
+}
+
+/// The TUI and `dwhy apply` decide and remove the same, and audit the
+/// same, for the same plan on twin fixtures: with the review item not
+/// confirmed it is refused and the rebuildable ones are removed; a dry run
+/// before removes nothing and writes no audit line.
+#[test]
+fn tui_apply_matches_dwhy_apply() {
+    use dwhy_tui::KeyCode::*;
+    let (tui, cli) = (Twin::new(), Twin::new());
+    let tui_file = tui.cli_plan("plan.json");
+    let cli_file = cli.cli_plan("plan.json");
+    let tui_plan: Value = serde_json::from_slice(&fs::read(&tui_file).unwrap()).unwrap();
+    assert_eq!(tui_plan["items"].as_array().unwrap().len(), 3, "{tui_plan}");
+
+    // Dry runs: `d` in the dialog and `dwhy apply --dry-run`.
+    let mut app = tui.tui_plan(&tui_file);
+    press(&mut app, &[Char('x'), Char('d')]);
+    let (tui_dry, tui_dry_exit) = run_tui_apply(&mut app);
+    let out = cli.dwhy(&[
+        "apply",
+        &cli_file,
+        "--dry-run",
+        "--max-tier",
+        "review",
+        "--json",
+        "-q",
+    ]);
+    let cli_dry = report_of(&out);
+    assert_eq!(Some(i32::from(tui_dry_exit)), out.status.code());
+    assert_eq!(tui_dry_exit, 3, "the unconfirmed review item is refused");
+    assert_eq!(tui_dry["dry_run"], true);
+    assert_eq!(
+        tui.outcomes(&tui_dry["items"]),
+        cli.outcomes(&cli_dry["items"])
+    );
+    let outcomes: Vec<String> = tui
+        .outcomes(&tui_dry["items"])
+        .into_iter()
+        .map(|o| o.0)
+        .collect();
+    assert_eq!(outcomes, ["would_remove", "refused", "would_remove"]);
+    for t in [&tui, &cli] {
+        assert!(
+            t.targets().iter().all(|p| p.exists()),
+            "a dry run removes nothing"
+        );
+        assert!(!t.audit().exists(), "a dry run writes no audit line");
+    }
+
+    // Real applies: Esc back to the dialog, `y`; `dwhy apply --yes`.
+    press(&mut app, &[Esc, Char('y')]);
+    let (tui_r, tui_exit) = run_tui_apply(&mut app);
+    let out = cli.dwhy(&[
+        "apply",
+        &cli_file,
+        "--yes",
+        "--max-tier",
+        "review",
+        "--json",
+        "-q",
+    ]);
+    let cli_r = report_of(&out);
+    assert_eq!(Some(i32::from(tui_exit)), out.status.code());
+    assert_eq!(tui_exit, 3);
+    assert_eq!(tui.outcomes(&tui_r["items"]), cli.outcomes(&cli_r["items"]));
+    assert_eq!(tui_r["freed"], cli_r["freed"]);
+    assert_eq!(tui_r["confirm"], cli_r["confirm"]);
+    assert_eq!(tui_r["max_tier"], "review");
+    let o = tui.outcomes(&tui_r["items"]);
+    assert_eq!(o[0].0, "removed");
+    assert!(
+        o[0].3.starts_with("ran <base>/home/.cargo/bin/cargo clean"),
+        "{o:?}"
+    );
+    assert_eq!(o[1].0, "refused");
+    assert!(o[1].3.contains("--confirm"), "{o:?}");
+    for t in [&tui, &cli] {
+        let [app_t, lib_t, scratch] = t.targets();
+        assert!(
+            !app_t.exists() && !lib_t.exists(),
+            "the planned targets are removed"
+        );
+        assert!(
+            scratch.join("blob").exists(),
+            "the refused review item stays"
+        );
+        assert!(t.work().join("app/Cargo.toml").exists());
+    }
+    let events = tui.audit_events();
+    assert_eq!(events, cli.audit_events());
+    let ev = |e: &str, d: &str, o: &str| (e.to_string(), d.to_string(), o.to_string());
+    assert_eq!(
+        events,
+        [
+            ev("end", "stale-tree", "refused"),
+            ev("start", "cargo-target", "-"),
+            ev("end", "cargo-target", "removed"),
+            ev("start", "cargo-target", "-"),
+            ev("end", "cargo-target", "removed"),
+        ]
+    );
+}
+
+/// M4 acceptance, one way: a CLI plan (`dwhy plan -o`) opened with `dwhy
+/// tui --plan` and applied in the TUI, with the review item confirmed in
+/// the dialog. Enter on the results rescans the plan's roots.
+#[test]
+fn cli_plan_applies_in_the_tui() {
+    use dwhy_tui::KeyCode::*;
+    let t = Twin::new();
+    let file = t.cli_plan("cli.json");
+    let (review, review_id) = review_item(&file);
+    let mut app = t.tui_plan(&file);
+    press(&mut app, &[Char('x')]);
+    for _ in 0..review {
+        press(&mut app, &[Down]);
+    }
+    press(&mut app, &[Char(' '), Char('y')]);
+    let (r, exit) = run_tui_apply(&mut app);
+    assert_eq!(exit, 0, "{r}");
+    assert_eq!(r["confirm"], serde_json::json!([review_id]));
+    assert!(t.targets().iter().all(|p| !p.exists()));
+    assert_eq!(
+        t.audit_events().len(),
+        6,
+        "a start and an end line per item"
+    );
+
+    press(&mut app, &[Enter]);
+    let job = app.take_scan().expect("Enter rescans");
+    assert_eq!(job.options.paths, [t.work()]);
+    let data = dwhy_tui::job::scan(&job.options, &job.progress, &mut |_| {}).unwrap();
+    app.finish(data);
+    let b = app.browser().unwrap();
+    assert!(b.data.report.findings.is_empty(), "nothing left to find");
+    assert_eq!(b.marked_findings().count(), 0);
+}
+
+/// M4 acceptance, the other way: a plan made in the TUI (marks, `p`,
+/// `plan::build`, the `w` file format) applied by `dwhy apply`.
+#[test]
+fn tui_plan_applies_with_dwhy_apply() {
+    let t = Twin::new();
+    let opts = t.options();
+    let scanned =
+        dwhy_tui::job::scan(&opts, &dwhy_core::scan::Progress::default(), &mut |_| {}).unwrap();
+    assert_eq!(scanned.report.findings.len(), 3);
+    let built = dwhy_tui::job::PlanJob {
+        options: scanned.plan_options,
+        progress: Default::default(),
+        marks: scanned.report.findings.iter().map(Into::into).collect(),
+    }
+    .build(
+        dwhy_core::guard::Processes::read,
+        dwhy_core::system::hostname(),
+    )
+    .unwrap();
+    let file = t.base.join("plans/tui.json");
+    dwhy_tui::job::write_plan(&file, &built.plan).unwrap();
+    let file = file.to_str().unwrap();
+    let (_, review_id) = review_item(file);
+    let out = t.dwhy(&[
+        "apply",
+        file,
+        "--yes",
+        "--max-tier",
+        "review",
+        "--confirm",
+        &review_id,
+        "--json",
+        "-q",
+    ]);
+    let r = report_of(&out);
+    assert_eq!(out.status.code(), Some(0), "{r}");
+    let outcomes: Vec<String> = t.outcomes(&r["items"]).into_iter().map(|o| o.0).collect();
+    assert_eq!(outcomes, ["removed", "removed", "removed"]);
+    assert!(t.targets().iter().all(|p| !p.exists()));
+    assert_eq!(t.audit_events().len(), 6);
+}
+
+#[test]
+fn tui_takes_dry_run_with_paths_or_a_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("plan.json");
+    let t = Twin::new();
+    fs::copy(t.cli_plan("p.json"), &f).unwrap();
+    let f = f.to_str().unwrap();
+    let d = dir.path().to_str().unwrap();
+    for args in [
+        &["tui", "--dry-run"][..],
+        &["tui", d, "-x", "--dry-run"][..],
+        &["tui", "--plan", f, "--dry-run"][..],
+    ] {
+        let out = dwhy(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("needs a terminal"), "{args:?}: {err}");
+    }
+}

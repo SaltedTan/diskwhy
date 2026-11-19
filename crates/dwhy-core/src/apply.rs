@@ -402,6 +402,25 @@ pub fn execute(
     env: &Env,
     progress: &mut dyn FnMut(&ApplyItem),
 ) {
+    execute_until(plan, checks, audit, mounts, env, progress, &|| false);
+}
+
+/// The detail of a ready item that [`execute_until`] did not start.
+pub const NOT_RUN_STOPPED: &str = "not run: apply was stopped before this item";
+
+/// [`execute`], stopping between items: once `stop` returns true (it is
+/// asked before each removal), the item in progress has finished and each
+/// ready item not yet started is skipped with [`NOT_RUN_STOPPED`] and gets
+/// an `end` line. The TUI uses this when the person quits mid-apply.
+pub fn execute_until(
+    plan: &Plan,
+    checks: &mut [Check],
+    audit: &mut Audit,
+    mounts: &MountTable,
+    env: &Env,
+    progress: &mut dyn FnMut(&ApplyItem),
+    stop: &dyn Fn() -> bool,
+) {
     for c in checks.iter().filter(|c| !c.ready()) {
         // A failure to record a skip removes nothing; the report has it.
         let _ = audit.record(&record(
@@ -422,6 +441,18 @@ pub fn execute(
     let mut removed_paths = HashSet::new();
     for i in order {
         let c = &mut checks[i];
+        if stop() {
+            c.item.outcome = ApplyOutcome::Skipped;
+            c.item.detail = NOT_RUN_STOPPED.into();
+            let _ = audit.record(&record(
+                env,
+                plan,
+                &c.item,
+                AuditEvent::End,
+                Some(c.item.outcome),
+            ));
+            continue;
+        }
         progress(&c.item);
         if let Err(e) = audit.record(&record(env, plan, &c.item, AuditEvent::Start, None)) {
             c.item.outcome = ApplyOutcome::Failed;

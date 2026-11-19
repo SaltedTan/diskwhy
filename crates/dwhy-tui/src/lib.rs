@@ -8,8 +8,17 @@
 //! M4a: the tree browser. M4b: the findings list and detail view. M4c:
 //! marking findings, the plan preview (built with core `plan::build` on a
 //! worker thread) and plan files: `w` writes one,
-//! [`run_plan`] opens one. A plan file the person asks for is the only
-//! thing the TUI writes; nothing is removed.
+//! [`run_plan`] opens one. M4d: `x` in a preview opens the confirm dialog,
+//! and `y` (or `d`, a dry run) applies the plan on a worker thread through
+//! core `apply`, as `dwhy apply` does, then shows the results; Enter
+//! rescans. The TUI writes a plan file only on `w`, and removes things and
+//! writes the audit log only on `y` in the dialog.
+//!
+//! Commands that apply runs never reach the terminal: core runs them with
+//! stdin from /dev/null and stdout and stderr captured
+//! (`Command::output`). Quitting mid-apply (`q`, Ctrl-C or a signal) lets
+//! the item in progress finish, runs no more items (each gets an audit
+//! `end` line, skipped), and exits without showing the results.
 
 pub mod app;
 pub mod job;
@@ -21,11 +30,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossterm::event::{self, Event};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
+use dwhy_core::apply;
 use dwhy_core::guard::Processes;
 use dwhy_core::scan::Progress;
 use dwhy_core::system;
@@ -35,7 +46,11 @@ use signal_hook::SigId;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
 pub use app::App;
+/// The key events [`App::on_key`] takes, for driving it without a terminal.
+pub use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub use job::{Options, Scanned, Stage};
+
+use job::{Applied, ApplyFailed, ApplyProgress};
 
 pub type Error = Box<dyn std::error::Error>;
 
@@ -48,6 +63,7 @@ enum Msg {
 }
 
 type Built = (String, Result<job::BuiltPlan, String>);
+type ApplyResult = Result<Applied, ApplyFailed>;
 
 /// Opens the TUI: checks there is a terminal, scans `opts` in a background
 /// thread, and browses the result until the person quits.
@@ -62,8 +78,9 @@ pub fn run(opts: Options) -> Result<u8, Error> {
 }
 
 /// `dwhy tui --plan FILE`: reads and parses the plan (failing before the
-/// terminal is touched), then previews it with no scan.
-pub fn run_plan(file: &Path) -> Result<u8, Error> {
+/// terminal is touched), then previews it with no scan. `opts` gives the
+/// session's settings (its paths are not used: the plan names its roots).
+pub fn run_plan(file: &Path, opts: Options) -> Result<u8, Error> {
     let plan = job::read_plan(file)?;
     need_terminal()?;
     let signal = Termination::register()?;
@@ -72,7 +89,8 @@ pub fn run_plan(file: &Path) -> Result<u8, Error> {
         file.to_path_buf(),
         &system::hostname(),
         system::euid(),
-    );
+    )
+    .with_options(opts);
     let result = (|| -> Result<(), Error> {
         let _guard = TerminalGuard::enter()?;
         let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -97,23 +115,22 @@ fn need_terminal() -> Result<(), Error> {
 }
 
 fn run_terminal(opts: Options, signal: &Termination) -> Result<(), Error> {
-    let labels = if opts.paths.is_empty() {
-        vec![".".into()]
-    } else {
-        opts.paths
-            .iter()
-            .map(|r| app::sanitize(&r.to_string_lossy()))
-            .collect()
-    };
     let progress = Arc::new(Progress::default());
-    let mut app = App::new(labels, progress.clone());
+    let mut app =
+        App::new(app::root_labels(&opts.paths), progress.clone()).with_options(opts.clone());
 
     let _guard = TerminalGuard::enter()?;
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     term.clear()?;
 
+    let rx = spawn_scan(opts, progress)?;
+    event_loop(&mut term, &mut app, &rx, signal, event::poll, event::read)
+}
+
+/// Scans in a background thread. Not joined: quitting mid-scan leaves it
+/// to end with the process.
+fn spawn_scan(opts: Options, progress: Arc<Progress>) -> io::Result<mpsc::Receiver<Msg>> {
     let (tx, rx) = mpsc::channel();
-    // Not joined: quitting mid-scan leaves it to end with the process.
     std::thread::Builder::new()
         .name("dwhy-tui-scan".into())
         .spawn(move || {
@@ -122,8 +139,30 @@ fn run_terminal(opts: Options, signal: &Termination) -> Result<(), Error> {
             });
             let _ = tx.send(Msg::Done(res.map(Box::new)));
         })?;
+    Ok(rx)
+}
 
-    event_loop(&mut term, &mut app, &rx, signal, event::poll, event::read)
+/// The apply worker. Dropping it asks the apply to stop and waits for it:
+/// the item in progress (a removal or a command) finishes, no other runs.
+/// Never left to end with the process, which would cut a removal short.
+struct ApplyWorker {
+    progress: Arc<ApplyProgress>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ApplyWorker {
+    fn running(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+}
+
+impl Drop for ApplyWorker {
+    fn drop(&mut self) {
+        self.progress.stop();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 fn event_loop<B: Backend>(
@@ -131,13 +170,40 @@ fn event_loop<B: Backend>(
     app: &mut App,
     rx: &mpsc::Receiver<Msg>,
     signal: &Termination,
+    poll: impl FnMut(Duration) -> io::Result<bool>,
+    read: impl FnMut() -> io::Result<Event>,
+) -> Result<(), Error>
+where
+    B::Error: 'static,
+{
+    let mut worker = None;
+    let result = run_loop(term, app, rx, signal, poll, read, &mut worker);
+    if let Some(w) = worker.as_ref().filter(|w| w.running()) {
+        // Quitting mid-apply: say so while the item in progress finishes.
+        w.progress.stop();
+        app.stopping();
+        let _ = term.draw(|f| ui::draw(f, app));
+    }
+    drop(worker);
+    result
+}
+
+fn run_loop<B: Backend>(
+    term: &mut Terminal<B>,
+    app: &mut App,
+    rx: &mpsc::Receiver<Msg>,
+    signal: &Termination,
     mut poll: impl FnMut(Duration) -> io::Result<bool>,
     mut read: impl FnMut() -> io::Result<Event>,
+    worker: &mut Option<ApplyWorker>,
 ) -> Result<(), Error>
 where
     B::Error: 'static,
 {
     let (built_tx, built_rx) = mpsc::channel::<Built>();
+    let (applied_tx, applied_rx) = mpsc::channel::<ApplyResult>();
+    // The rescan after an apply, once one started.
+    let mut rescan: Option<mpsc::Receiver<Msg>> = None;
     while signal.exit_code().is_none() {
         term.draw(|f| ui::draw(f, app))?;
         let ready = poll(TICK)?;
@@ -146,6 +212,10 @@ where
         }
         while let Ok((host, plan)) = built_rx.try_recv() {
             app.plan_built(plan, &host, system::euid());
+        }
+        if let Ok(result) = applied_rx.try_recv() {
+            app.apply_done(result);
+            *worker = None;
         }
         if ready
             && let Event::Key(key) = read()?
@@ -164,6 +234,24 @@ where
                     let _ = tx.send((host, plan));
                 })?;
         }
+        if let Some(job) = app.take_apply() {
+            let tx = applied_tx.clone();
+            let progress = job.progress.clone();
+            let handle = std::thread::Builder::new()
+                .name("dwhy-tui-apply".into())
+                .spawn(move || {
+                    let env = apply::Env::from_system();
+                    let _ = tx.send(job.run(Processes::read, &env));
+                })?;
+            *worker = Some(ApplyWorker {
+                progress,
+                handle: Some(handle),
+            });
+        }
+        if let Some(job) = app.take_scan() {
+            rescan = Some(spawn_scan(job.options, job.progress)?);
+        }
+        let rx = rescan.as_ref().unwrap_or(rx);
         loop {
             match rx.try_recv() {
                 Ok(Msg::Stage(s)) => app.set_stage(s),
@@ -262,6 +350,7 @@ fn restore() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
 
     #[test]
@@ -319,6 +408,188 @@ mod tests {
             .unwrap();
             assert!(term.backend().to_string().contains("Scanning"));
             assert!(matches!(rx.try_recv(), Ok(Msg::Done(Err(_)))));
+        }
+    }
+
+    /// Two cargo targets under a temp dir, cleaned by a fake `cargo` that
+    /// prints on stdout and stderr, marks that it started, takes a second,
+    /// and removes only the target dir it is given inside the fixture.
+    struct Crates {
+        _t: tempfile::TempDir,
+        base: std::path::PathBuf,
+    }
+
+    impl Crates {
+        fn new() -> Crates {
+            use std::os::unix::fs::PermissionsExt;
+            let t = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(t.path()).unwrap();
+            let work = base.join("work");
+            for (name, size) in [("app", 3 << 20), ("lib", 1 << 20)] {
+                let c = work.join(name);
+                std::fs::create_dir_all(c.join("target/debug")).unwrap();
+                std::fs::write(c.join("Cargo.toml"), "[package]\n").unwrap();
+                std::fs::write(
+                    c.join("target/CACHEDIR.TAG"),
+                    "Signature: 8a477f597d28d172789f06886806bc55\n# created by cargo.\n",
+                )
+                .unwrap();
+                std::fs::write(c.join("target/debug/out"), vec![6u8; size]).unwrap();
+            }
+            let cargo = base.join("cargo");
+            std::fs::write(
+                &cargo,
+                format!(
+                    "#!/bin/sh\n\
+                     echo \"fake-cargo-stdout $*\"\n\
+                     echo \"fake-cargo-stderr $*\" >&2\n\
+                     : > '{base}/started'\n\
+                     sleep 1\n\
+                     [ \"$1\" = clean ] && [ \"$4\" = --target-dir ] || exit 9\n\
+                     case \"$5\" in\n  '{work}'/*) /bin/rm -rf -- \"$5\" ;;\n  *) exit 9 ;;\nesac\n",
+                    base = base.display(),
+                    work = work.display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Crates { _t: t, base }
+        }
+
+        fn options(&self) -> Options {
+            use dwhy_core::report::{DockerSocket, ToolStatus};
+            Options {
+                paths: vec![self.base.join("work")],
+                detectors: Some(vec!["cargo-target".into()]),
+                threads: 2,
+                audit_log: Some(self.base.join("state/audit.jsonl")),
+                context: Some(dwhy_core::detect::DetectContext {
+                    uid: system::euid(),
+                    root: false,
+                    home: None,
+                    now: 0,
+                    tools: vec![ToolStatus {
+                        name: "cargo".into(),
+                        path: None,
+                        off_path: Some(self.base.join("cargo").to_str().unwrap().into()),
+                        enables: vec![],
+                    }],
+                    docker_socket: DockerSocket {
+                        path: "/nonexistent".into(),
+                        exists: false,
+                        accessible: false,
+                    },
+                    docker: dwhy_core::docker::Source::none(),
+                }),
+                ..Options::default()
+            }
+        }
+
+        /// `dwhy tui --plan` on a plan of both targets.
+        fn app(&self) -> App {
+            let opts = self.options();
+            let scanned = job::scan(&opts, &Progress::default(), &mut |_| {}).unwrap();
+            assert_eq!(scanned.report.findings.len(), 2);
+            let built = job::PlanJob {
+                options: scanned.plan_options,
+                progress: Default::default(),
+                marks: scanned.report.findings.iter().map(Into::into).collect(),
+            }
+            .build(Processes::default, system::hostname())
+            .unwrap();
+            let file = self.base.join("plan.json");
+            App::open_plan(built.plan, file, &system::hostname(), system::euid()).with_options(opts)
+        }
+    }
+
+    fn key(c: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    /// `q` while an item is being removed: that item finishes, the other
+    /// does not run (it is audited as skipped), and the TUI says it is
+    /// stopping. The command's output is captured by core: it is not on
+    /// the screen (see the next test for stdout and stderr).
+    #[test]
+    fn quitting_mid_apply_finishes_the_item_and_runs_no_more() {
+        let c = Crates::new();
+        let mut app = c.app();
+        let signal = Termination::default();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (_tx, rx) = mpsc::channel();
+        let started = c.base.join("started");
+        let mut keys = [key('x'), key('y')].into_iter();
+        event_loop(
+            &mut term,
+            &mut app,
+            &rx,
+            &signal,
+            |_| Ok(true),
+            || {
+                if let Some(k) = keys.next() {
+                    return Ok(k);
+                }
+                // Quit while the first command runs.
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                while !started.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the apply never started"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(key('q'))
+            },
+        )
+        .unwrap();
+        let screen = term.backend().to_string();
+        assert!(
+            screen.contains("stopping: the item in progress finishes"),
+            "{screen}"
+        );
+        assert!(!screen.contains("fake-cargo"), "{screen}");
+        let work = c.base.join("work");
+        let left: Vec<_> = ["app", "lib"]
+            .into_iter()
+            .filter(|n| work.join(n).join("target").exists())
+            .collect();
+        assert_eq!(left.len(), 1, "exactly one target was removed: {left:?}");
+        // One JSON object per line, as core writes them.
+        let audit = std::fs::read_to_string(c.base.join("state/audit.jsonl")).unwrap();
+        let lines: Vec<&str> = audit.lines().collect();
+        assert_eq!(lines.len(), 3, "{audit}");
+        assert!(lines[0].contains(r#""event":"start""#), "{audit}");
+        assert!(lines[1].contains(r#""event":"end""#), "{audit}");
+        assert!(lines[1].contains(r#""outcome":"removed""#), "{audit}");
+        assert!(lines[2].contains(r#""event":"end""#), "{audit}");
+        assert!(lines[2].contains(r#""outcome":"skipped""#), "{audit}");
+        let detail = format!(r#""detail":"{}""#, apply::NOT_RUN_STOPPED);
+        assert!(lines[2].contains(&detail), "{audit}");
+        let path = format!("/work/{}/target", left[0]);
+        assert!(lines[2].contains(&path), "{audit}");
+    }
+
+    /// The previous test, run in a child process with its output captured:
+    /// the fake cargo's stdout and stderr never reach the process's own
+    /// stdout or stderr, the terminal the TUI owns.
+    #[test]
+    fn apply_command_output_never_reaches_the_terminal() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::quitting_mid_apply_finishes_the_item_and_runs_no_more",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}{stderr}");
+        assert!(stdout.contains("1 passed"), "{stdout}");
+        for s in [&stdout, &stderr] {
+            assert!(!s.contains("fake-cargo"), "{stdout}{stderr}");
         }
     }
 }
