@@ -6,7 +6,8 @@
 //! An item is
 //! - skipped (exit 2) when the path encoding check blocks it, it is no
 //!   longer detected, a detector or guard blocks it now, its tier or action
-//!   differs from the plan's, or its fingerprint changed;
+//!   differs from the plan's, its fingerprint changed, or a live identity
+//!   check failed (`changed-since-scan`, see the safety rules in `docs/DESIGN.md`);
 //! - refused (exit 3) when its tier is above `--max-tier`, or it is a
 //!   `review` item whose id `--confirm` did not name (`--confirm` alone lets
 //!   a review item through; it never lifts a rebuildable one);
@@ -18,6 +19,7 @@
 //! whose `start` line cannot be written does not run), an `end` line after,
 //! and an `end` line for each skipped or refused item.
 
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -27,6 +29,10 @@ use std::process::{Command, Stdio};
 use crate::detect::{DetectContext, PATH_NOT_UTF8, add_lossy_guard, lossy_argv, lossy_detail};
 use crate::guard::{self, Processes};
 use crate::mounts::MountTable;
+use crate::plan::{
+    self, MeasuredRoot, add_changed_guard, changed_removal_root, changed_since_scan,
+    measured_roots, nested_roots, removal_path_absent,
+};
 use crate::report::{
     Action, ActionKind, ApplyItem, ApplyOutcome, ApplyReport, AuditEvent, AuditRecord, Finding,
     GuardStatus, Plan, PlanItem, SCHEMA, Tier, Tool,
@@ -102,9 +108,9 @@ pub fn action_kind_name(k: ActionKind) -> &'static str {
 pub struct Check {
     pub item: ApplyItem,
     pub fresh: Option<Finding>,
-    /// The plan's fingerprint of the root, `(st_dev, st_ino)`, checked again
-    /// right before a path removal.
+    /// The apply scan's root identity, `(st_dev, st_ino)`, for ready filesystem items.
     pub inode: Option<(u64, u64)>,
+    nested: Vec<MeasuredRoot>,
 }
 
 impl Check {
@@ -112,11 +118,22 @@ impl Check {
     pub fn ready(&self) -> bool {
         self.item.outcome == ApplyOutcome::WouldRemove
     }
+
+    fn skip_changed(&mut self, detail: String) -> (ApplyOutcome, String) {
+        if let Some(f) = &self.fresh {
+            self.item.guards.clone_from(&f.guards);
+        } else {
+            self.item.guards.clear();
+        }
+        let message = format!("changed since the scan: {detail}");
+        add_changed_guard(&mut self.item.guards, detail);
+        (ApplyOutcome::Skipped, message)
+    }
 }
 
 /// Decides every item of `plan` against `fresh`, the findings detected now
-/// in a scan (`tree`) of the plan's roots. Runs the guards on the items the
-/// policy allows. Returns one check per item, in plan order.
+/// in a scan (`tree`) of the plan's roots. Runs the guards on the planned
+/// roots. Returns one check per item, in plan order.
 pub fn evaluate(
     plan: &Plan,
     fresh: Vec<Finding>,
@@ -138,21 +155,34 @@ pub fn evaluate(
             )
         })
         .collect();
-    // The guards, once, on everything still ready.
-    let ready: Vec<usize> = (0..checks.len()).filter(|&i| checks[i].ready()).collect();
-    let mut guarded: Vec<Finding> = ready
+    let mut guarded: Vec<Finding> = checks
         .iter()
-        .filter_map(|&i| checks[i].fresh.clone())
+        .zip(&plan.items)
+        .map(|(c, p)| c.fresh.as_ref().unwrap_or(&p.finding).clone())
         .collect();
     guard::check(&mut guarded, tree, ctx, procs);
-    for (i, f) in ready.into_iter().zip(guarded) {
-        let c = &mut checks[i];
-        c.item.guards = f.guards.clone();
+    let roots = measured_roots(
+        tree,
+        checks.iter().map(|c| {
+            (
+                c.item.path.as_str(),
+                c.fresh.as_ref().and_then(|f| f.file_identity),
+            )
+        }),
+    );
+    for (c, f) in checks.iter_mut().zip(guarded).filter(|(c, _)| c.ready()) {
+        let nested = nested_roots(&roots, &f.path);
+        if let Some(detail) = changed_removal_root(&f.path, c.inode, nested, |_| false) {
+            (c.item.outcome, c.item.detail) = c.skip_changed(detail);
+            continue;
+        }
         if f.tier == Tier::Blocked {
             c.item.outcome = ApplyOutcome::Skipped;
             c.item.detail = format!("blocked by {}", blocks(&f));
+        } else {
+            c.nested = nested.to_vec();
         }
-        c.fresh = Some(f);
+        c.item.guards = f.guards;
     }
     checks
 }
@@ -178,7 +208,8 @@ fn decide(
             guards: Vec::new(),
         },
         fresh: fresh.cloned(),
-        inode: item.fingerprint.dev.zip(item.fingerprint.inode),
+        inode: None,
+        nested: Vec::new(),
     };
     // Backstop for `detect::block_lossy`: never act on a path or command
     // spelled with U+FFFD, whether the plan file or the fresh finding has it.
@@ -230,12 +261,20 @@ fn decide(
     if let Err(why) = policy.allows(f) {
         return base(f, ApplyOutcome::Refused, why);
     }
-    let now = crate::plan::fingerprint(f, tree, ctx);
-    let diff = crate::plan::differences(&item.fingerprint, &now);
+    if let Some(detail) = changed_since_scan(f, tree) {
+        let mut c = base(f, ApplyOutcome::Skipped, String::new());
+        (c.item.outcome, c.item.detail) = c.skip_changed(detail);
+        return c;
+    }
+    let now = plan::fingerprint(f, tree, ctx);
+    let diff = plan::differences(&item.fingerprint, &now);
     if !diff.is_empty() {
         return skip(format!("changed since the plan: {}", diff.join(", ")));
     }
-    base(f, ApplyOutcome::WouldRemove, "ready".into())
+    Check {
+        inode: now.dev.zip(now.inode),
+        ..base(f, ApplyOutcome::WouldRemove, "ready".into())
+    }
 }
 
 fn lossy(path: &str, action: &Action) -> Option<String> {
@@ -380,6 +419,7 @@ pub fn execute(
         let p = Path::new(&checks[i].item.path);
         (!p.is_absolute(), std::cmp::Reverse(p.components().count()))
     });
+    let mut removed_paths = HashSet::new();
     for i in order {
         let c = &mut checks[i];
         progress(&c.item);
@@ -388,7 +428,14 @@ pub fn execute(
             c.item.detail = format!("not run: {e}");
             continue;
         }
-        let (outcome, detail) = run(c, mounts);
+        let (outcome, detail) = run(c, mounts, &removed_paths);
+        let path = Path::new(&c.item.path);
+        if outcome == ApplyOutcome::Removed
+            && path.is_absolute()
+            && (c.item.action.kind == ActionKind::RemovePath || removal_path_absent(path))
+        {
+            removed_paths.insert(path.to_path_buf());
+        }
         c.item.outcome = outcome;
         c.item.detail = detail;
         if let Err(e) = audit.record(&record(env, plan, &c.item, AuditEvent::End, Some(outcome))) {
@@ -397,18 +444,21 @@ pub fn execute(
     }
 }
 
-fn run(c: &mut Check, mounts: &MountTable) -> (ApplyOutcome, String) {
+fn run(
+    c: &mut Check,
+    mounts: &MountTable,
+    removed_paths: &HashSet<PathBuf>,
+) -> (ApplyOutcome, String) {
     let item = &mut c.item;
     if let Some(detail) = lossy(&item.path, &item.action) {
         let outcome = format!("blocked by {PATH_NOT_UTF8}: {detail}; not run");
         add_lossy_guard(&mut item.guards, detail);
         return (ApplyOutcome::Skipped, outcome);
     }
-    if item.path.starts_with('/') && std::fs::symlink_metadata(&item.path).is_err() {
-        return (
-            ApplyOutcome::Skipped,
-            "gone: removed since it was checked (by an item around it?)".into(),
-        );
+    if let Some(detail) = changed_removal_root(&item.path, c.inode, &c.nested, |path| {
+        removed_paths.contains(path)
+    }) {
+        return c.skip_changed(detail);
     }
     match item.action.kind {
         ActionKind::RemovePath => {

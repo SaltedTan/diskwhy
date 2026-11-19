@@ -4,6 +4,7 @@
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dwhy_core::apply::{self, Audit, Check, Env, Policy};
@@ -227,6 +228,7 @@ fn ctx() -> DetectContext {
 fn finding(detector: &str, path: &Path, tier: Tier) -> Finding {
     let path = path.to_string_lossy().into_owned();
     Finding {
+        file_identity: None,
         id: finding_id(detector, &path),
         detector: detector.into(),
         probe: None,
@@ -264,13 +266,17 @@ fn fixture(b: &Path) -> Vec<Finding> {
 }
 
 fn make_plan(b: &Path, findings: Vec<Finding>) -> Plan {
+    make_plan_from_tree(b, findings, &scan_tree(b))
+}
+
+fn make_plan_from_tree(b: &Path, findings: Vec<Finding>, tree: &ScanTree) -> Plan {
     plan::build(
         findings,
         &Selection {
             tier: Some(Tier::Review),
             select: vec![],
         },
-        &scan_tree(b),
+        tree,
         &ctx(),
         &Processes::default(),
         "host".into(),
@@ -414,6 +420,390 @@ fn a_replaced_root_skips_the_item() {
         .item;
     assert_eq!(c.outcome, ApplyOutcome::Skipped);
     assert!(c.detail.contains("inode"), "{}", c.detail);
+}
+
+#[test]
+fn a_root_replaced_after_applys_own_scan_is_skipped() {
+    let (_t, b) = base();
+    let mut found = fixture(&b);
+    found.retain(|f| f.detector == "user-cache");
+    let plan = make_plan(&b, found.clone());
+    // Apply's own walk still sees the planned directory, so its fresh
+    // fingerprint matches the plan...
+    let tree = scan_tree(&b);
+    let cache = b.join("cache");
+    let file_mtime = fs::metadata(cache.join("file"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let dir_mtime = fs::metadata(&cache).unwrap().modified().unwrap();
+    // ...and then the root is swapped for a copy with the same contents and
+    // mtimes. The old one is kept so its inode cannot be reused.
+    fs::rename(&cache, b.join("cache.old")).unwrap();
+    write(&cache.join("file"), "cache");
+    fs::File::open(cache.join("file"))
+        .unwrap()
+        .set_modified(file_mtime)
+        .unwrap();
+    fs::File::open(&cache)
+        .unwrap()
+        .set_modified(dir_mtime)
+        .unwrap();
+    let checks = apply::evaluate(
+        &plan,
+        found,
+        &tree,
+        &ctx(),
+        &Processes::default(),
+        &Policy::default(),
+    );
+    let c = checks
+        .iter()
+        .find(|c| c.item.detector == "user-cache")
+        .unwrap();
+    assert_eq!(c.item.outcome, ApplyOutcome::Skipped);
+    assert_eq!(
+        c.item.detail,
+        format!(
+            "changed since the scan: {} was replaced after the scan (device/inode differ)",
+            cache.display()
+        )
+    );
+    assert!(
+        c.item
+            .guards
+            .iter()
+            .any(|g| g.name == "changed-since-scan" && g.status == GuardStatus::Block),
+        "{:?}",
+        c.item.guards
+    );
+    // A dry run: nothing ran, and the exit code is the skip's.
+    assert!(cache.join("file").exists());
+    let r = apply::report(&plan, &checks, &Policy::default(), true, &env());
+    assert_eq!(apply::exit_code(&r), 2);
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args([
+            "--no-optional-locks",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn survey_skips_a_symlink_replacement_without_reporting_its_git_worktrees() {
+    let (_t, b) = base();
+    let (_other, other) = base();
+    let mut found = fixture(&b);
+    found.retain(|f| f.detector != "cargo-target");
+    let detector_guard = GuardResult {
+        name: "fixture-detector".into(),
+        status: GuardStatus::Warn,
+        detail: "reported during detection".into(),
+    };
+    found[1].guards.push(detector_guard.clone());
+    let scratch = b.join("scratch");
+    let original = scratch.join("repo");
+    let replacement = other.join("tree/repo");
+    let linked = other.join("linked");
+    for repo in [&original, &replacement] {
+        fs::create_dir_all(repo).unwrap();
+        git(repo, &["init", "-q"]);
+    }
+    git(&replacement, &["commit", "--allow-empty", "-qm", "fixture"]);
+    git(
+        &replacement,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let plan = make_plan(&b, found.clone());
+    assert_eq!(plan.items.len(), 2);
+    let tree = scan_tree(&b);
+    fs::rename(&scratch, scratch.with_extension("old")).unwrap();
+    symlink(other.join("tree"), &scratch).unwrap();
+
+    let pol = policy(Tier::Regenerable, &[&found[1].id]);
+    let checks = apply::evaluate(&plan, found, &tree, &ctx(), &Processes::default(), &pol);
+    let report = apply::report(&plan, &checks, &pol, true, &env());
+    assert_eq!(apply::exit_code(&report), 2);
+    let skipped = report
+        .items
+        .iter()
+        .find(|i| i.detector == "stale-tree")
+        .unwrap();
+    assert_eq!(skipped.outcome, ApplyOutcome::Skipped);
+    assert_eq!(skipped.guards.len(), 2, "{:?}", skipped.guards);
+    assert_eq!(skipped.guards[0], detector_guard);
+    assert_eq!(skipped.guards[1].name, "changed-since-scan");
+    assert_eq!(skipped.guards[1].status, GuardStatus::Block);
+    assert!(
+        !serde_json::to_string(&report)
+            .unwrap()
+            .contains(other.to_str().unwrap())
+    );
+    let ready = checks.iter().find(|c| c.ready()).unwrap();
+    assert!(ready.item.guards.iter().any(|g| g.name == "in-use-cwd"));
+}
+
+#[test]
+fn a_skipped_replacement_still_blocks_removal_of_its_git_dir() {
+    let (_t, b) = base();
+    let (_other, other) = base();
+    let scratch = b.join("scratch");
+    let original = scratch.join("repo");
+    let metadata = b.join("metadata");
+    let git_dir = metadata.join("repo.git");
+    let replacement = other.join("tree/repo");
+    for dir in [&original, &metadata, &replacement] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    git(&original, &["init", "-q"]);
+    git(
+        &replacement,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            git_dir.to_str().unwrap(),
+        ],
+    );
+    let scratch_finding = finding("stale-tree", &scratch, Tier::Review);
+    let metadata_finding = finding("stale-tree", &metadata, Tier::Review);
+    let pol = policy(
+        Tier::Regenerable,
+        &[&scratch_finding.id, &metadata_finding.id],
+    );
+    let found = vec![scratch_finding, metadata_finding];
+    let plan = make_plan(&b, found.clone());
+    assert_eq!(plan.items.len(), 2, "{:?}", plan.blocked);
+    let tree = scan_tree(&b);
+    fs::rename(&scratch, scratch.with_extension("old")).unwrap();
+    symlink(other.join("tree"), &scratch).unwrap();
+
+    let checks = apply::evaluate(&plan, found, &tree, &ctx(), &Processes::default(), &pol);
+    let report = apply::report(&plan, &checks, &pol, true, &env());
+    assert_eq!(apply::exit_code(&report), 2);
+    let item_at = |path: &Path| {
+        report
+            .items
+            .iter()
+            .find(|i| Path::new(&i.path) == path)
+            .unwrap()
+    };
+    let skipped = item_at(&scratch);
+    assert_eq!(skipped.outcome, ApplyOutcome::Skipped);
+    assert_eq!(skipped.guards.len(), 1, "{:?}", skipped.guards);
+    assert_eq!(skipped.guards[0].name, "changed-since-scan");
+    let dependency = item_at(&metadata);
+    assert_eq!(dependency.outcome, ApplyOutcome::Skipped);
+    let guard = dependency
+        .guards
+        .iter()
+        .find(|g| g.name == "git-linked-worktrees")
+        .unwrap();
+    assert_eq!(guard.status, GuardStatus::Block);
+    assert!(guard.detail.contains(original.to_str().unwrap()));
+}
+
+#[test]
+fn nested_checkout_swap_protects_the_outer_roots_git_metadata() {
+    let (_temp, b) = base();
+    let (_outside, outside) = base();
+    let scratch = b.join("scratch");
+    let target = scratch.join("target");
+    let checkout = outside.join("checkout");
+    let metadata = scratch.join("checkout.git");
+    for dir in [&target, &checkout] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    git(&target, &["init", "-q"]);
+    git(
+        &checkout,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            metadata.to_str().unwrap(),
+        ],
+    );
+    let outer = finding("stale-tree", &scratch, Tier::Review);
+    let inner = finding("cargo-target", &target, Tier::Rebuildable);
+    let pol = policy(Tier::Rebuildable, &[&outer.id]);
+    let found = vec![outer, inner];
+    let plan = make_plan(&b, found.clone());
+    assert_eq!(plan.items.len(), 2, "{:?}", plan.blocked);
+    let tree = scan_tree(&b);
+    let procs = Processes::default();
+    let mut ready = apply::evaluate(&plan, found.clone(), &tree, &ctx(), &procs, &pol);
+    let preview = apply::report(&plan, &ready, &pol, true, &env());
+    assert_eq!(apply::exit_code(&preview), 0);
+    assert!(ready.iter().all(Check::ready));
+
+    fs::rename(&target, outside.join("original")).unwrap();
+    symlink(&checkout, &target).unwrap();
+    let mut surveyed = apply::evaluate(&plan, found, &tree, &ctx(), &procs, &pol);
+    assert!(
+        surveyed
+            .iter()
+            .all(|c| c.item.outcome == ApplyOutcome::Skipped)
+    );
+    let mut audit = Audit::open(&b.join("audit.jsonl")).unwrap();
+    for checks in [&mut surveyed, &mut ready] {
+        apply::execute(&plan, checks, &mut audit, &no_mounts(), &env(), &mut |_| {});
+        let report = apply::report(&plan, checks, &pol, false, &env());
+        assert_eq!(apply::exit_code(&report), 2);
+        assert_eq!(report.freed, 0);
+        for item in &report.items {
+            assert_eq!(item.outcome, ApplyOutcome::Skipped, "{item:?}");
+            assert!(
+                item.guards.iter().any(|g| {
+                    g.name == "changed-since-scan"
+                        && g.status == GuardStatus::Block
+                        && g.detail.contains(target.to_str().unwrap())
+                }),
+                "{item:?}"
+            );
+        }
+        assert_eq!(fs::read_link(&target).unwrap(), checkout);
+        assert!(metadata.join("HEAD").is_file());
+        git(&checkout, &["rev-parse", "--git-dir"]);
+    }
+}
+
+#[test]
+fn an_unselected_nested_git_root_can_block_the_outer_root() {
+    let (_temp, b) = base();
+    let (_outside, outside) = base();
+    let scratch = b.join("scratch");
+    let worktree = scratch.join("project");
+    let checkout = outside.join("checkout");
+    for dir in [&worktree, &checkout] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    git(
+        &worktree,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            outside.join("original.git").to_str().unwrap(),
+        ],
+    );
+    git(&checkout, &["init", "-q"]);
+    let found = vec![finding("stale-tree", &scratch, Tier::Review)];
+    let plan = make_plan(&b, found.clone());
+    assert_eq!(plan.items.len(), 1);
+    let tree = scan_tree(&b);
+    fs::rename(&worktree, outside.join("original")).unwrap();
+    symlink(&checkout, &worktree).unwrap();
+
+    let rebuilt = make_plan_from_tree(&b, found.clone(), &tree);
+    assert!(rebuilt.items.is_empty());
+    assert_eq!(rebuilt.blocked.len(), 1);
+    let pol = policy(Tier::Regenerable, &[&found[0].id]);
+    let checks = apply::evaluate(&plan, found, &tree, &ctx(), &Processes::default(), &pol);
+    assert_eq!(checks[0].item.outcome, ApplyOutcome::Skipped);
+    for guards in [&rebuilt.blocked[0].guards, &checks[0].item.guards] {
+        assert!(
+            guards.iter().any(|g| {
+                g.name == "changed-since-scan"
+                    && g.status == GuardStatus::Block
+                    && g.detail.contains(worktree.to_str().unwrap())
+            }),
+            "{guards:?}"
+        );
+    }
+}
+
+#[test]
+fn a_symlink_ancestor_cannot_hide_a_nested_checkout() {
+    let (_temp, b) = base();
+    let (_outside, outside) = base();
+    let scratch = b.join("scratch");
+    let live = scratch.join("live");
+    let checkout = live.join("project");
+    let metadata = scratch.join("repo.git");
+    fs::create_dir_all(&checkout).unwrap();
+    git(
+        &checkout,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            metadata.to_str().unwrap(),
+        ],
+    );
+    let finding = finding("stale-tree", &scratch, Tier::Review);
+    let pol = policy(Tier::Regenerable, &[&finding.id]);
+    let plan = make_plan(&b, vec![finding.clone()]);
+    assert_eq!(plan.items.len(), 1, "{:?}", plan.blocked);
+    let tree = scan_tree(&b);
+    let procs = Processes::default();
+    let mut ready = apply::evaluate(&plan, vec![finding.clone()], &tree, &ctx(), &procs, &pol);
+    assert!(ready[0].ready(), "{:?}", ready[0].item);
+
+    let moved = outside.join("live");
+    fs::rename(&live, &moved).unwrap();
+    symlink(&moved, &live).unwrap();
+    let replanned = make_plan_from_tree(&b, vec![finding.clone()], &tree);
+    assert!(replanned.items.is_empty());
+    assert_eq!(replanned.blocked.len(), 1);
+    let surveyed = apply::evaluate(&plan, vec![finding], &tree, &ctx(), &procs, &pol);
+    assert_eq!(surveyed[0].item.outcome, ApplyOutcome::Skipped);
+
+    let mut audit = Audit::open(&b.join("audit.jsonl")).unwrap();
+    apply::execute(
+        &plan,
+        &mut ready,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |_| {},
+    );
+    let report = apply::report(&plan, &ready, &pol, false, &env());
+    assert_eq!(apply::exit_code(&report), 2);
+    assert_eq!(report.freed, 0);
+    for guards in [
+        &replanned.blocked[0].guards,
+        &surveyed[0].item.guards,
+        &report.items[0].guards,
+    ] {
+        assert!(
+            guards.iter().any(|g| {
+                g.name == "changed-since-scan"
+                    && g.status == GuardStatus::Block
+                    && g.detail.contains(checkout.to_str().unwrap())
+            }),
+            "{guards:?}"
+        );
+    }
+    assert!(metadata.join("HEAD").is_file());
+    git(&moved.join("project"), &["rev-parse", "--git-dir"]);
 }
 
 #[test]
@@ -573,6 +963,68 @@ fn execute_removes_ready_items_and_audits_everything() {
 }
 
 #[test]
+fn execute_skips_replaced_roots_for_commands_and_path_removal() {
+    let (_t, b) = base();
+    let mut found = fixture(&b);
+    found.truncate(2);
+    let marker = b.join("ran");
+    found[1].action = Action {
+        kind: ActionKind::Command,
+        text: "touch marker".into(),
+        argv: Some(vec!["touch".into(), marker.to_str().unwrap().into()]),
+    };
+    let plan = make_plan(&b, found.clone());
+    let pol = policy(Tier::Rebuildable, &[]);
+    let mut checks = evaluate(&b, &plan, found, &pol);
+    assert_eq!(checks.len(), 2);
+    assert!(checks.iter().all(Check::ready));
+    let log = b.join("audit.jsonl");
+    let mut audit = Audit::open(&log).unwrap();
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |item| {
+            let root = Path::new(&item.path);
+            fs::rename(root, root.with_extension("old")).unwrap();
+            write(&root.join("file"), "replacement");
+        },
+    );
+
+    assert!(!marker.exists());
+    for c in &checks {
+        assert_eq!(c.item.outcome, ApplyOutcome::Skipped);
+        assert!(c.item.detail.starts_with("changed since the scan: "));
+        assert_eq!(c.item.guards.len(), 1, "{:?}", c.item.guards);
+        let changed = c
+            .item
+            .guards
+            .iter()
+            .find(|g| g.name == "changed-since-scan")
+            .unwrap();
+        assert_eq!(changed.status, GuardStatus::Block);
+        let root = Path::new(&c.item.path);
+        assert_eq!(
+            fs::read_to_string(root.join("file")).unwrap(),
+            "replacement"
+        );
+        assert!(root.with_extension("old").join("file").exists());
+    }
+    let report = apply::report(&plan, &checks, &pol, false, &env());
+    assert_eq!(apply::exit_code(&report), 2);
+    let lines = audit_lines(&log);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.event == AuditEvent::End && l.outcome == Some(ApplyOutcome::Skipped))
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn deepest_items_run_first_and_commands_report_failure() {
     let (_t, b) = base();
     write(&b.join("scratch/app/target/file"), "t");
@@ -665,7 +1117,63 @@ fn an_item_inside_another_is_counted_once() {
         "{:?}",
         r.items
     );
+    assert_eq!(apply::exit_code(&r), 0);
     assert_eq!(r.freed, 10_000);
+}
+
+#[test]
+fn a_nested_path_that_reappears_after_success_still_blocks_its_parent() {
+    let (_t, b) = base();
+    let scratch = b.join("scratch");
+    let target = scratch.join("target");
+    let saved = b.join("saved");
+    write(&target.join("file"), "keep");
+    let outer = finding("stale-tree", &scratch, Tier::Review);
+    let mut inner = finding("cargo-target", &target, Tier::Rebuildable);
+    inner.action = Action {
+        kind: ActionKind::Command,
+        text: "move target".into(),
+        argv: Some(vec![
+            "mv".into(),
+            "--".into(),
+            target.to_str().unwrap().into(),
+            saved.to_str().unwrap().into(),
+        ]),
+    };
+    let pol = policy(Tier::Rebuildable, &[&outer.id]);
+    let found = vec![outer, inner];
+    let plan = make_plan(&b, found.clone());
+    let mut checks = evaluate(&b, &plan, found, &pol);
+    assert!(checks.iter().all(Check::ready), "{:?}", outcomes(&checks));
+    let mut audit = Audit::open(&b.join("audit.jsonl")).unwrap();
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |item| {
+            if Path::new(&item.path) == scratch {
+                assert!(!target.exists());
+                fs::rename(&saved, &target).unwrap();
+            }
+        },
+    );
+    let r = apply::report(&plan, &checks, &pol, false, &env());
+    assert_eq!(apply::exit_code(&r), 2);
+    let parent = r
+        .items
+        .iter()
+        .find(|i| Path::new(&i.path) == scratch)
+        .unwrap();
+    assert_eq!(parent.outcome, ApplyOutcome::Skipped);
+    assert!(
+        parent
+            .guards
+            .iter()
+            .any(|g| { g.name == "changed-since-scan" && g.status == GuardStatus::Block })
+    );
+    assert!(target.join("file").is_file());
 }
 
 #[test]

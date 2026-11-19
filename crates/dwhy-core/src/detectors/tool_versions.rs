@@ -52,7 +52,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::detect::{Candidate, DetectContext, Detector, finding_id, rfc3339, shell_quote};
-use crate::report::{Action, ActionKind, Finding, Recovery, Tier};
+use crate::report::{Action, ActionKind, FileIdentity, Finding, Recovery, Tier};
 use crate::tree::{Markers, NodeId, ScanTree};
 use crate::units::human;
 
@@ -88,6 +88,7 @@ struct Install {
     bytes: u64,
     shared: u64,
     newest_mtime: i64,
+    file_identity: Option<FileIdentity>,
     /// Versions of the same group are comparable; the newest one is kept.
     group: Option<(String, Vec<u64>)>,
 }
@@ -101,6 +102,7 @@ impl Install {
             bytes: n.freeable(),
             shared: n.shared,
             newest_mtime: n.newest_mtime,
+            file_identity: None,
             group,
         }
     }
@@ -838,6 +840,7 @@ impl ToolVersions {
         }
         reason.push_str(&format!("): {}", plan.why));
         let finding = Finding {
+            file_identity: t.file_identity,
             id: finding_id(self.name(), &path_s),
             detector: self.name().into(),
             probe: None,
@@ -1286,8 +1289,8 @@ fn cli_files(root: &Path) -> Vec<Install> {
     })
 }
 
-/// Regular files with a single link directly in `dir` that `group`
-/// accepts, sized from lstat (the scan tree holds directories only).
+/// Regular files with a single link directly in `dir` that `group` accepts.
+/// The stat used for sizing also supplies the identity and mtime for planning.
 fn files_in(dir: &Path, group: impl Fn(&str) -> Option<(String, Vec<u64>)>) -> Vec<Install> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -1298,18 +1301,25 @@ fn files_in(dir: &Path, group: impl Fn(&str) -> Option<(String, Vec<u64>)>) -> V
         let Some(g) = group(&name) else {
             continue;
         };
-        let Ok(md) = std::fs::symlink_metadata(e.path()) else {
+        let path = e.path();
+        let Ok(md) = std::fs::symlink_metadata(&path) else {
             continue;
         };
         if !md.is_file() || md.nlink() != 1 {
             continue;
         }
+        let mtime = md.mtime();
         out.push(Install {
             name,
-            path: e.path(),
+            path,
             bytes: md.blocks() * 512,
             shared: 0,
-            newest_mtime: md.mtime(),
+            newest_mtime: mtime,
+            file_identity: Some(FileIdentity {
+                dev: md.dev(),
+                ino: md.ino(),
+                mtime,
+            }),
             group: Some(g),
         });
     }

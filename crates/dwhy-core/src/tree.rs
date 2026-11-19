@@ -124,6 +124,11 @@ pub struct TreeNode {
     /// outside this subtree (or outside the scan), so removing it would not
     /// free them.
     pub shared: u64,
+    /// `st_dev` and `st_ino` of the directory (or non-directory root) the
+    /// walk measured. Roots use the initial `lstat`. Subdirectories use
+    /// the parent's `fstatat` result, also used to size the directory itself.
+    pub dev: u64,
+    pub ino: u64,
 }
 
 impl TreeNode {
@@ -304,6 +309,8 @@ mod tests {
             markers: Markers::empty(),
             newest_mtime: 0,
             shared: 0,
+            dev: 0,
+            ino: 0,
         }
     }
 

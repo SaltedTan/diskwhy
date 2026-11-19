@@ -187,6 +187,7 @@ impl Detector for Trash {
             }
 
             let finding = Finding {
+                file_identity: None,
                 id: finding_id(self.name(), &path_s),
                 detector: self.name().into(),
                 probe: None,

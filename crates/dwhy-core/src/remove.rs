@@ -5,7 +5,7 @@
 //! - The parent is reached from `/` one component at a time with
 //!   `O_NOFOLLOW`, so a symlink anywhere in the path stops the removal.
 //! - The root is `lstat`ed through the parent: a symlink root is refused,
-//!   and so is a root whose device and inode differ from the plan's.
+//!   and so is a root whose device and inode differ from the expected pair.
 //! - A root with a mount point at or below it is refused before anything is
 //!   removed (bind mounts of the same filesystem have the same `st_dev`).
 //! - Each directory is opened with `O_NOFOLLOW` relative to its parent's
@@ -38,10 +38,10 @@ pub struct Removed {
 }
 
 /// Removes `path` (a directory and everything in it, or a single file).
-/// `expect` is the root's `(st_dev, st_ino)` from the plan: a root that is
-/// another inode now is refused. `mounts` is the mount table: a root with a
-/// mount point at or below it is refused. On an error part of the tree may
-/// already be gone; the error says where it stopped.
+/// `expect` is the root's expected `(st_dev, st_ino)`, taken from the fresh
+/// measurement when called by `apply`. `mounts` is the mount table. A mount
+/// point at or below the root stops removal. On error, part of the tree may
+/// already be gone. The error says where removal stopped.
 pub fn remove_tree(
     path: &Path,
     expect: Option<(u64, u64)>,

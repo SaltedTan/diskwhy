@@ -393,6 +393,7 @@ impl Detector for UserCache {
                 });
             }
             let finding = Finding {
+                file_identity: None,
                 id: finding_id(self.name(), &path),
                 detector: self.name().into(),
                 probe: None,

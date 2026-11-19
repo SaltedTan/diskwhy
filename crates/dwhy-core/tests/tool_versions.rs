@@ -1,14 +1,19 @@
 //! `tool-versions` on fake home directories.
 
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use dwhy_core::apply::{self, Policy};
 use dwhy_core::detect::{self, DetectContext, Detector, finding_id};
 use dwhy_core::detectors::{ToolVersions, registry};
+use dwhy_core::guard::Processes;
 use dwhy_core::mounts::MountTable;
-use dwhy_core::report::{ActionKind, DockerSocket, Finding, Tier, ToolStatus};
+use dwhy_core::plan::{self, Selection};
+use dwhy_core::report::{
+    ActionKind, DockerSocket, Finding, GuardStatus, PlanScan, Tier, ToolStatus,
+};
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::tree::ScanTree;
 
@@ -830,6 +835,104 @@ fn claude_code_versions_keep_current_and_newest() {
         "{}",
         f.recovery.cost
     );
+}
+
+#[test]
+fn old_claude_and_vscode_files_use_their_measured_identity_for_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = fs::canonicalize(temp.path()).unwrap();
+    let claude = home.join(".local/share/claude/versions");
+    let vscode = home.join(".vscode-server");
+    let old = [claude.join("2.1.9"), vscode.join(format!("code-{C1}"))];
+    for kept in [claude.join("2.1.10"), vscode.join(format!("code-{C2}"))] {
+        file(&kept, 2 * MB);
+    }
+    let mtime = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    let measured = old.each_ref().map(|path| {
+        file(path, 2 * MB);
+        fs::File::open(path).unwrap().set_modified(mtime).unwrap();
+        fs::symlink_metadata(path).unwrap()
+    });
+    let ctx = ctx(&home, &[]);
+    let detectors: Vec<Box<dyn Detector>> = vec![Box::new(
+        ToolVersions::with_env(Vec::<(String, String)>::new()).with_running_exes(Vec::new()),
+    )];
+    let detect = |tree| detect::run_with(tree, &ctx, &detectors, Some(&["tool-versions".into()])).0;
+    let tree = scan_tree(&home);
+    assert!(old.iter().all(|path| tree.find(path).is_none()));
+    let findings = detect(&tree);
+    assert_eq!(paths(&findings), old.each_ref().map(|p| s(p)));
+    let procs = Processes::default();
+    let build = || {
+        plan::build(
+            findings.clone(),
+            &Selection {
+                tier: Some(Tier::Rebuildable),
+                select: vec![],
+            },
+            &tree,
+            &ctx,
+            &procs,
+            "host".into(),
+            PlanScan {
+                roots: vec![s(&home)],
+                one_filesystem: true,
+                detectors: Some(vec!["tool-versions".into()]),
+            },
+        )
+        .unwrap()
+    };
+    let plan = build();
+    assert!(plan.blocked.is_empty());
+    assert_eq!(plan.items.len(), old.len());
+    for (path, md) in old.iter().zip(&measured) {
+        let item = plan
+            .items
+            .iter()
+            .find(|i| i.finding.path == s(path))
+            .unwrap();
+        assert_eq!(item.finding.action.kind, ActionKind::RemovePath);
+        assert_eq!(item.finding.bytes, md.blocks() * 512);
+        assert_eq!(item.fingerprint.dev, Some(md.dev()));
+        assert_eq!(item.fingerprint.inode, Some(md.ino()));
+        assert_eq!(item.fingerprint.newest_mtime, Some(md.mtime()));
+    }
+    let saved = plan::parse(&plan::to_json(&plan).unwrap()).unwrap();
+    assert_eq!(saved, plan);
+    let fresh = scan_tree(&home);
+    let checks = apply::evaluate(
+        &saved,
+        detect(&fresh),
+        &fresh,
+        &ctx,
+        &procs,
+        &Policy {
+            max_tier: Tier::Rebuildable,
+            ..Policy::default()
+        },
+    );
+    assert_eq!(checks.len(), old.len());
+    assert!(checks.iter().all(apply::Check::ready), "{checks:?}");
+
+    for (path, md) in old.iter().zip(&measured) {
+        fs::rename(path, path.with_extension("old")).unwrap();
+        file(path, 2 * MB);
+        fs::File::open(path).unwrap().set_modified(mtime).unwrap();
+        let replacement = fs::symlink_metadata(path).unwrap();
+        assert_eq!(replacement.blocks(), md.blocks());
+        assert_eq!(replacement.modified().unwrap(), md.modified().unwrap());
+        assert_ne!(replacement.ino(), md.ino());
+    }
+    let changed = build();
+    assert!(changed.items.is_empty());
+    assert_eq!(paths(&changed.blocked), old.each_ref().map(|p| s(p)));
+    for f in &changed.blocked {
+        assert!(f.guards.iter().any(|g| {
+            g.name == "changed-since-scan"
+                && g.status == GuardStatus::Block
+                && g.detail.contains("was replaced")
+        }));
+    }
 }
 
 #[test]

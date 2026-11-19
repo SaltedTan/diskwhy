@@ -7,26 +7,29 @@
 //! they block, or one a detector already marked `blocked` that `--select`
 //! names, goes to the plan's `blocked` list instead of its items.
 //!
-//! The fingerprint records what must not change before `apply`: the root's
-//! device and inode, the newest mtime under it, its size in quarter-doubling
-//! buckets, HEAD and a hash of `git status` when the root is a git work
-//! tree, and the object id of a Docker finding.
+//! See [`Fingerprint`] for the saved fields and the safety rules in
+//! `docs/DESIGN.md` for the live identity checks.
 //!
 //! `apply` does not trust a plan's actions or tiers: it re-detects and acts
 //! on the fresh finding with the same id. A plan is a selection plus the
 //! state to compare against, so editing one can make it stale but cannot
 //! widen what apply may do.
 
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+
+use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, Stat};
+use rustix::io::Errno;
 
 use crate::detect::{DetectContext, is_lossy, rfc3339};
 use crate::guard::{self, Processes};
 use crate::report::{
-    ActionKind, Finding, Fingerprint, GitFingerprint, Plan, PlanItem, PlanScan, PlanSelection,
-    SCHEMA, Tier, Tool, check_schema,
+    ActionKind, FileIdentity, Finding, Fingerprint, GitFingerprint, GuardResult, GuardStatus, Plan,
+    PlanItem, PlanScan, PlanSelection, SCHEMA, Tier, Tool, check_schema,
 };
-use crate::tree::{Markers, ScanTree};
+use crate::tree::{Markers, ScanTree, TreeNode};
+
+/// The guard that blocks a finding whose live root differs from the measured root.
+const CHANGED_SINCE_SCAN: &str = "changed-since-scan";
 
 /// A plan expires this long after it is made.
 pub const TTL_SECS: i64 = 3600;
@@ -71,9 +74,7 @@ fn matches(f: &Finding, entry: &str) -> bool {
 /// Whether a finding that `--select` named ended up in the plan's `blocked`
 /// list. A finding only the tier ceiling picked does not count.
 pub fn selected_blocked(plan: &Plan) -> bool {
-    plan.blocked
-        .iter()
-        .any(|f| plan.selection.select.iter().any(|s| matches(f, s)))
+    !plan.selection.select.is_empty() && !plan.blocked.is_empty()
 }
 
 /// Splits `findings` into the selected ones that may go into a plan and the
@@ -123,8 +124,10 @@ pub fn select(
 }
 
 /// Builds a plan from the findings of a scan: selects, runs the guards on
-/// the selection, fingerprints each item. `tree` is the scan the findings
-/// came from; `ctx.now` is the creation time.
+/// the selection, fingerprints eligible findings from their measurements,
+/// and blocks findings that fail the live identity check (`changed-since-scan`).
+/// `tree` is the scan the findings came from; `ctx.now` is the
+/// creation time.
 pub fn build(
     findings: Vec<Finding>,
     sel: &Selection,
@@ -134,19 +137,34 @@ pub fn build(
     host: String,
     scan: PlanScan,
 ) -> Result<Plan, String> {
-    let (mut picked, mut blocked) = select(findings, sel)?;
+    let (mut picked, already_blocked) = select(findings, sel)?;
     guard::check(&mut picked, tree, ctx, procs);
+    let roots = measured_roots(
+        tree,
+        picked.iter().map(|f| (f.path.as_str(), f.file_identity)),
+    );
     let mut items = Vec::new();
-    for f in picked {
-        if f.tier == Tier::Blocked {
-            blocked.push(f);
-        } else {
-            let fingerprint = fingerprint(&f, tree, ctx);
+    let mut blocked = Vec::new();
+    for mut f in already_blocked.into_iter().chain(picked) {
+        let fingerprint = (f.tier != Tier::Blocked).then(|| fingerprint(&f, tree, ctx));
+        let changed = changed_removal_root(
+            &f.path,
+            measured_inode(&f.path, f.file_identity, tree),
+            nested_roots(&roots, &f.path),
+            |_| false,
+        );
+        f.file_identity = None;
+        if let Some(detail) = changed {
+            add_changed_guard(&mut f.guards, detail);
+            f.tier = Tier::Blocked;
+        } else if let Some(fingerprint) = fingerprint {
             items.push(PlanItem {
                 finding: f,
                 fingerprint,
             });
+            continue;
         }
+        blocked.push(f);
     }
     let largest = |a: &Finding, b: &Finding| b.bytes.cmp(&a.bytes).then_with(|| a.id.cmp(&b.id));
     items.sort_by(|a, b| largest(&a.finding, &b.finding));
@@ -196,7 +214,145 @@ pub fn distinct_bytes<'a>(items: impl IntoIterator<Item = (&'a str, u64)>) -> u6
         .sum()
 }
 
-/// The fingerprint of `f` now. `tree` must be a scan covering its path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MeasuredRoot {
+    path: PathBuf,
+    inode: Option<(u64, u64)>,
+}
+
+pub(crate) fn measured_roots<'a>(
+    tree: &ScanTree,
+    planned: impl Iterator<Item = (&'a str, Option<FileIdentity>)>,
+) -> Vec<MeasuredRoot> {
+    let mut roots: Vec<_> = planned
+        .filter(|(path, _)| path.starts_with('/'))
+        .map(|(path, file)| MeasuredRoot {
+            path: PathBuf::from(path),
+            inode: measured_inode(path, file, tree),
+        })
+        .collect();
+    roots.extend(tree.ids().filter_map(|id| {
+        let node = tree.node(id);
+        (node.is_dir && node.markers.contains(Markers::DOT_GIT)).then(|| MeasuredRoot {
+            path: tree.path(id),
+            inode: Some((node.dev, node.ino)),
+        })
+    }));
+    roots.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.inode.cmp(&b.inode)));
+    roots.dedup();
+    roots
+}
+
+pub(crate) fn nested_roots<'a>(roots: &'a [MeasuredRoot], path: &str) -> &'a [MeasuredRoot] {
+    let path = Path::new(path);
+    let later = &roots[roots.partition_point(|root| root.path.as_path() <= path)..];
+    &later[..later.partition_point(|root| root.path.starts_with(path))]
+}
+
+pub(crate) fn changed_removal_root(
+    path: &str,
+    inode: Option<(u64, u64)>,
+    nested: &[MeasuredRoot],
+    expected_absent: impl Fn(&Path) -> bool,
+) -> Option<String> {
+    changed_root(Path::new(path), inode, false).or_else(|| {
+        nested.iter().find_map(|root| {
+            changed_root(&root.path, root.inode, expected_absent(&root.path))
+                .map(|detail| format!("{detail} (inside {path})"))
+        })
+    })
+}
+
+/// Why a finding's live root differs from the measured root.
+pub(crate) fn changed_since_scan(f: &Finding, tree: &ScanTree) -> Option<String> {
+    changed_root(
+        Path::new(&f.path),
+        measured_inode(&f.path, f.file_identity, tree),
+        false,
+    )
+}
+
+fn measured_inode(path: &str, file: Option<FileIdentity>, tree: &ScanTree) -> Option<(u64, u64)> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let node = tree.find(Path::new(path)).map(|id| tree.node(id));
+    root_identity(file, node).map(|id| (id.dev, id.ino))
+}
+
+fn root_identity(file: Option<FileIdentity>, node: Option<&TreeNode>) -> Option<FileIdentity> {
+    file.or_else(|| {
+        node.map(|n| FileIdentity {
+            dev: n.dev,
+            ino: n.ino,
+            mtime: n.newest_mtime,
+        })
+    })
+}
+
+fn changed_root(path: &Path, inode: Option<(u64, u64)>, expected_absent: bool) -> Option<String> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let display = path.display();
+    let Some(inode) = inode else {
+        return Some(format!(
+            "{display} is not in the scan, so its device/inode are not known"
+        ));
+    };
+    match stat_nofollow(path) {
+        Err(Errno::NOENT) if expected_absent => None,
+        Err(Errno::NOENT) => Some(format!("{display} is gone since the scan")),
+        Err(Errno::NOTDIR | Errno::LOOP) => {
+            Some(format!("{display} has a symlink or non-directory ancestor"))
+        }
+        Err(e) => Some(format!("{display} cannot be checked against the scan: {e}")),
+        Ok(st) if FileType::from_raw_mode(st.st_mode) == FileType::Symlink => {
+            Some(format!("{display} is a symlink now"))
+        }
+        Ok(_) if expected_absent => Some(format!("{display} reappeared after removal")),
+        Ok(st) if (st.st_dev, st.st_ino) != inode => Some(format!(
+            "{display} was replaced after the scan (device/inode differ)"
+        )),
+        Ok(_) => None,
+    }
+}
+
+pub(crate) fn removal_path_absent(path: &Path) -> bool {
+    matches!(stat_nofollow(path), Err(Errno::NOENT))
+}
+
+fn stat_nofollow(path: &Path) -> Result<Stat, Errno> {
+    let mut parts = path.components().peekable();
+    if parts.next() != Some(Component::RootDir) {
+        return Err(Errno::INVAL);
+    }
+    let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut dir = fs::open("/", flags, Mode::empty())?;
+    while let Some(part) = parts.next() {
+        let Component::Normal(name) = part else {
+            return Err(Errno::INVAL);
+        };
+        if parts.peek().is_none() {
+            return fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW);
+        }
+        dir = fs::openat(&dir, name, flags, Mode::empty())?;
+    }
+    fs::fstat(&dir)
+}
+
+/// Adds (or replaces) the blocking [`CHANGED_SINCE_SCAN`] guard.
+pub(crate) fn add_changed_guard(guards: &mut Vec<GuardResult>, detail: String) {
+    guards.retain(|g| g.name != CHANGED_SINCE_SCAN);
+    guards.push(GuardResult {
+        name: CHANGED_SINCE_SCAN.into(),
+        status: GuardStatus::Block,
+        detail,
+    });
+}
+
+/// The fingerprint of `f` from the scan tree or the detector's file measurement.
+/// Only Git and Docker state are read live.
 pub fn fingerprint(f: &Finding, tree: &ScanTree, ctx: &DetectContext) -> Fingerprint {
     let mut fp = Fingerprint {
         dev: None,
@@ -208,26 +364,22 @@ pub fn fingerprint(f: &Finding, tree: &ScanTree, ctx: &DetectContext) -> Fingerp
     };
     if f.path.starts_with('/') {
         let p = Path::new(&f.path);
-        if let Ok(md) = std::fs::symlink_metadata(p) {
-            fp.dev = Some(md.dev());
-            fp.inode = Some(md.ino());
+        let node = tree.find(p).map(|id| tree.node(id));
+        if let Some(id) = root_identity(f.file_identity, node) {
+            fp.dev = Some(id.dev);
+            fp.inode = Some(id.ino);
+            fp.newest_mtime = Some(id.mtime);
         }
-        if let Some(id) = tree.find(p) {
-            let n = tree.node(id);
-            fp.newest_mtime = Some(n.newest_mtime);
-            if n.is_dir
-                && n.markers.contains(Markers::DOT_GIT)
-                && guard::git_guarded(f)
-                && let Some(git) = ctx.tool_command("git")
-            {
-                fp.git =
-                    guard::work_tree_state(&git, p)
-                        .ok()
-                        .map(|(head, status)| GitFingerprint {
-                            head,
-                            status_hash: format!("{:016x}", fnv1a(status.as_bytes())),
-                        });
-            }
+        if node.is_some_and(|n| n.is_dir && n.markers.contains(Markers::DOT_GIT))
+            && guard::git_guarded(f)
+            && let Some(git) = ctx.tool_command("git")
+        {
+            fp.git = guard::work_tree_state(&git, p)
+                .ok()
+                .map(|(head, status)| GitFingerprint {
+                    head,
+                    status_hash: format!("{:016x}", fnv1a(status.as_bytes())),
+                });
         }
     } else if f.path.starts_with("docker://") {
         fp.docker_id = ctx

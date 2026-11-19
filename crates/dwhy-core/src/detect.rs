@@ -545,6 +545,7 @@ mod tests {
 
     fn f(det: &str, path: &str, bytes: u64) -> Finding {
         Finding {
+            file_identity: None,
             id: finding_id(det, path),
             detector: det.into(),
             probe: None,
