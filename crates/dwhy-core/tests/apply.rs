@@ -14,8 +14,8 @@ use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection};
 use dwhy_core::remove::remove_tree;
 use dwhy_core::report::{
-    Action, ActionKind, ApplyOutcome, AuditEvent, AuditRecord, DockerSocket, Finding, Plan,
-    PlanScan, Recovery, Tier, ToolStatus,
+    Action, ActionKind, ApplyOutcome, AuditEvent, AuditRecord, DockerSocket, Finding, GuardResult,
+    GuardStatus, Plan, PlanScan, Recovery, Tier, ToolStatus,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::tree::ScanTree;
@@ -707,4 +707,111 @@ fn the_audit_log_is_not_followed_through_a_symlink() {
     write(&b.join("elsewhere"), "");
     symlink(b.join("elsewhere"), b.join("audit.jsonl")).unwrap();
     assert!(Audit::open(&b.join("audit.jsonl")).is_err());
+}
+
+#[test]
+fn a_lossy_path_or_command_is_never_applied() {
+    let (_t, b) = base();
+    let found = fixture(&b);
+    let mut plan = make_plan(&b, found.clone());
+    // A hand-edited plan: the cache's command names a lossy path.
+    let lossy = format!("{}/cache\u{FFFD}", b.display());
+    for item in &mut plan.items {
+        if item.finding.detector == "user-cache" {
+            item.finding.action = Action {
+                kind: ActionKind::Command,
+                text: format!("rm -rf {lossy}"),
+                argv: Some(vec!["rm".into(), "-rf".into(), lossy.clone()]),
+            };
+        }
+    }
+    // A fresh finding that names a lossy path, as if a detector had
+    // slipped past `detect::block_lossy`, matching its plan item.
+    let mut fresh = found.clone();
+    let guard = GuardResult {
+        name: "locked".into(),
+        status: GuardStatus::Block,
+        detail: "locked after planning".into(),
+    };
+    fresh
+        .iter_mut()
+        .find(|f| f.detector == "user-cache")
+        .unwrap()
+        .guards
+        .push(guard.clone());
+    for f in fresh
+        .iter_mut()
+        .chain(plan.items.iter_mut().map(|i| &mut i.finding))
+    {
+        if f.detector == "cargo-target" {
+            f.action = Action {
+                kind: ActionKind::Command,
+                text: format!("cargo clean --target-dir {lossy}"),
+                argv: Some(vec![
+                    "cargo".into(),
+                    "clean".into(),
+                    "--target-dir".into(),
+                    lossy.clone(),
+                ]),
+            };
+        }
+    }
+    let checks = evaluate(&b, &plan, fresh, &policy(Tier::Review, &[&found[2].id]));
+    for d in ["user-cache", "cargo-target"] {
+        let c = checks.iter().find(|c| c.item.detector == d).unwrap();
+        assert_eq!(c.item.outcome, ApplyOutcome::Skipped, "{d}: {:?}", c.item);
+        assert!(
+            c.item.detail.starts_with("blocked by path-not-utf8: "),
+            "{}",
+            c.item.detail
+        );
+        assert_eq!(c.item.guards.last().unwrap().name, "path-not-utf8");
+        if d == "user-cache" {
+            assert!(c.item.guards.contains(&guard));
+        }
+    }
+    let stale = checks
+        .iter()
+        .find(|c| c.item.detector == "stale-tree")
+        .unwrap();
+    assert!(stale.ready(), "{:?}", stale.item);
+
+    // The last check, right before running: a ready item whose command
+    // names a lossy path is not run.
+    let marker = b.join("ran\u{FFFD}");
+    let mut check = stale.clone();
+    check.item.action = Action {
+        kind: ActionKind::Command,
+        text: "touch".into(),
+        argv: Some(vec!["touch".into(), marker.to_string_lossy().into_owned()]),
+    };
+    let mut checks = vec![check];
+    let (_s, state) = base();
+    let mut audit = Audit::open(&state.join("a.jsonl")).unwrap();
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |_| {},
+    );
+    assert_eq!(checks[0].item.outcome, ApplyOutcome::Skipped);
+    assert!(
+        checks[0]
+            .item
+            .detail
+            .starts_with("blocked by path-not-utf8"),
+        "{}",
+        checks[0].item.detail
+    );
+    assert!(!marker.exists());
+    assert!(
+        checks[0]
+            .item
+            .guards
+            .iter()
+            .any(|g| g.name == "path-not-utf8")
+    );
+    assert!(b.join("scratch/file").exists());
 }

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
+use crate::detect::{Candidate, DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
 use crate::report::{Action, ActionKind, Finding, GuardResult, GuardStatus, Recovery, Tier};
 use crate::tree::ScanTree;
 use crate::units::human;
@@ -341,7 +341,11 @@ impl Detector for UserCache {
         "user-cache"
     }
 
-    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
+    fn detect_candidates(
+        &self,
+        tree: &ScanTree,
+        ctx: &DetectContext,
+    ) -> Result<Vec<Candidate>, String> {
         let Some(home) = ctx.home.as_deref().filter(|h| h.is_absolute()) else {
             return Ok(Vec::new());
         };
@@ -388,7 +392,7 @@ impl Detector for UserCache {
                     ),
                 });
             }
-            out.push(Finding {
+            let finding = Finding {
                 id: finding_id(self.name(), &path),
                 detector: self.name().into(),
                 probe: None,
@@ -406,7 +410,8 @@ impl Detector for UserCache {
                     how: cache.how.map(String::from),
                 },
                 path,
-            });
+            };
+            out.push(Candidate::new(dir, finding));
         }
         Ok(out)
     }

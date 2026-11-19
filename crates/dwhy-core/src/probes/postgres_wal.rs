@@ -18,10 +18,11 @@ use serde::Deserialize;
 
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::detect::DetectContext;
+use crate::detect::{DetectContext, PATH_NOT_UTF8};
 use crate::docker::{Api, GetError};
 use crate::report::{
-    ActionKind, ArchiveTarget, DetectorAvailability, EvidenceSource, Finding, PostgresWal,
+    ActionKind, ArchiveTarget, DetectorAvailability, EvidenceSource, Finding, GuardStatus,
+    PostgresWal,
 };
 use crate::units::human;
 
@@ -258,6 +259,10 @@ pub fn applies_to(f: &Finding) -> bool {
     f.detector == "docker-volume"
         && f.path.starts_with("docker://volume/")
         && f.action.kind == ActionKind::Advice
+        && !f
+            .guards
+            .iter()
+            .any(|g| g.name == PATH_NOT_UTF8 && g.status == GuardStatus::Block)
 }
 
 /// For `dwhy doctor`.

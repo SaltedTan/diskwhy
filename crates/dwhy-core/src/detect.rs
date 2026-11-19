@@ -11,7 +11,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::detectors;
-use crate::report::{DetectorAvailability, DetectorRun, DockerSocket, Finding, Tier, ToolStatus};
+use crate::report::{
+    Action, ActionKind, DetectorAvailability, DetectorRun, DockerSocket, Finding, GuardResult,
+    GuardStatus, Tier, ToolStatus,
+};
 use crate::tree::ScanTree;
 
 /// What a detector needs from the system.
@@ -175,7 +178,31 @@ pub trait Detector: Send + Sync {
     /// Must match a [`CATALOG`] entry.
     fn name(&self) -> &'static str;
     /// An `Err` is reported in the run's `error` and yields no findings.
-    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String>;
+    fn detect_candidates(
+        &self,
+        tree: &ScanTree,
+        ctx: &DetectContext,
+    ) -> Result<Vec<Candidate>, String>;
+
+    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
+        self.detect_candidates(tree, ctx)
+            .map(|found| found.into_iter().map(|c| c.finding).collect())
+    }
+}
+
+pub struct Candidate {
+    path: PathBuf,
+    pub finding: Finding,
+}
+
+impl Candidate {
+    pub fn new(path: PathBuf, finding: Finding) -> Self {
+        Self { path, finding }
+    }
+
+    pub(crate) fn reported(finding: Finding) -> Self {
+        Self::new(PathBuf::from(&finding.path), finding)
+    }
 }
 
 /// Stable across runs and machines: `f_` + 12 hex digits of FNV-1a over
@@ -205,6 +232,85 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
+/// The guard on a finding that names a path that is not valid UTF-8.
+pub const PATH_NOT_UTF8: &str = "path-not-utf8";
+
+/// The advice that replaces the action of a finding [`block_lossy`] blocks.
+pub const PATH_NOT_UTF8_ADVICE: &str =
+    "rename the path that is not valid UTF-8 to valid UTF-8 and scan again, or remove it by hand";
+
+pub const PATH_NOT_UTF8_RECOVERY_NOTE: &str =
+    "by hand: the command names a path that is not valid UTF-8, so it is not shown";
+
+/// Whether `s` holds U+FFFD, the stand-in `to_string_lossy` puts in place
+/// of bytes that are not valid UTF-8.
+pub fn is_lossy(s: &str) -> bool {
+    s.contains(char::REPLACEMENT_CHARACTER)
+}
+
+pub(crate) fn lossy_argv(action: &Action) -> bool {
+    action.argv.iter().flatten().any(|arg| is_lossy(arg))
+}
+
+/// Why diskwhy cannot act on a path, action or recovery that holds U+FFFD.
+pub(crate) fn lossy_detail(path: &str, action: bool, recovery: bool) -> Option<String> {
+    let what = if is_lossy(path) {
+        "the path is not valid UTF-8 (shown with U+FFFD)"
+    } else {
+        match (action, recovery) {
+            (true, true) => {
+                "the action and recovery name a path that is not valid UTF-8 (shown with U+FFFD)"
+            }
+            (true, false) => "the action names a path that is not valid UTF-8 (shown with U+FFFD)",
+            (false, true) => {
+                "the recovery names a path that is not valid UTF-8 (shown with U+FFFD)"
+            }
+            (false, false) => return None,
+        }
+    };
+    Some(format!("{what}; diskwhy cannot act on it exactly"))
+}
+
+pub(crate) fn add_lossy_guard(guards: &mut Vec<GuardResult>, detail: impl Into<String>) {
+    if !guards.iter().any(|g| g.name == PATH_NOT_UTF8) {
+        guards.push(GuardResult {
+            name: PATH_NOT_UTF8.into(),
+            status: GuardStatus::Block,
+            detail: detail.into(),
+        });
+    }
+}
+
+/// Blocks every finding whose path, action or recovery holds U+FFFD: a
+/// command or path built from a lossy spelling can name a different, real
+/// path. The finding keeps its id, path, bytes and detector, so the space
+/// is still accounted for; its tier becomes `blocked`, it gets a
+/// `path-not-utf8` guard, its action becomes advice with no argv, and a
+/// recovery command that holds U+FFFD is replaced by a note. A
+/// real name that holds U+FFFD is blocked too: diskwhy cannot tell it from
+/// a lossy one. Idempotent. Run on every detection result, before the
+/// nesting rule, so a blocked finding keeps the findings inside it.
+pub fn block_lossy(findings: &mut [Finding]) {
+    for f in findings {
+        let action = lossy_argv(&f.action) || is_lossy(&f.action.text);
+        let recovery_command = f.recovery.how.as_deref().is_some_and(is_lossy);
+        let recovery = recovery_command || is_lossy(&f.recovery.cost);
+        let Some(detail) = lossy_detail(&f.path, action, recovery) else {
+            continue;
+        };
+        f.tier = Tier::Blocked;
+        add_lossy_guard(&mut f.guards, detail);
+        f.action = Action {
+            kind: ActionKind::Advice,
+            text: PATH_NOT_UTF8_ADVICE.into(),
+            argv: None,
+        };
+        if recovery_command {
+            f.recovery.how = Some(PATH_NOT_UTF8_RECOVERY_NOTE.into());
+        }
+    }
+}
+
 /// Applies the nesting rule to filesystem findings, so no byte is counted
 /// twice. A finding whose path lies inside another kept finding's path is
 /// dropped, unless its tier is cheaper than that finding's or that finding
@@ -213,31 +319,34 @@ pub fn shell_quote(s: &str) -> String {
 /// findings at the same path the cheaper tier is the outer one.
 /// Pseudo-paths such as `docker://...` never nest. Returns the survivors,
 /// largest first.
-pub fn outermost(mut findings: Vec<Finding>) -> Vec<Finding> {
+pub(crate) fn outermost(findings: Vec<Finding>) -> Vec<Finding> {
+    outermost_candidates(findings.into_iter().map(Candidate::reported).collect())
+}
+
+fn outermost_candidates(mut findings: Vec<Candidate>) -> Vec<Finding> {
     findings.sort_by(|a, b| {
-        Path::new(&a.path)
-            .cmp(Path::new(&b.path))
-            .then_with(|| a.tier.cmp(&b.tier))
-            .then_with(|| a.detector.cmp(&b.detector))
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.finding.tier.cmp(&b.finding.tier))
+            .then_with(|| a.finding.detector.cmp(&b.finding.detector))
     });
-    let mut kept: Vec<Finding> = Vec::new();
+    let mut kept: Vec<Candidate> = Vec::new();
     let mut nested: Vec<(u64, usize)> = Vec::new();
     let mut chain: Vec<usize> = Vec::new();
     for f in findings {
-        if f.path.starts_with('/') {
-            let p = Path::new(&f.path);
+        if f.path.is_absolute() {
             while chain
                 .last()
-                .is_some_and(|&i| !p.starts_with(Path::new(&kept[i].path)))
+                .is_some_and(|&i| !f.path.starts_with(&kept[i].path))
             {
                 chain.pop();
             }
             if let Some(&outer) = chain.last() {
-                let t = kept[outer].tier;
-                if f.tier >= t && t != Tier::Blocked {
+                let t = kept[outer].finding.tier;
+                if f.finding.tier >= t && t != Tier::Blocked {
                     continue;
                 }
-                nested[outer].0 += f.bytes;
+                nested[outer].0 += f.finding.bytes;
                 nested[outer].1 += 1;
             }
             chain.push(kept.len());
@@ -245,16 +354,17 @@ pub fn outermost(mut findings: Vec<Finding>) -> Vec<Finding> {
         kept.push(f);
         nested.push((0, 0));
     }
-    for (f, (bytes, n)) in kept.iter_mut().zip(nested) {
+    for (c, (bytes, n)) in kept.iter_mut().zip(nested) {
         if n > 0 {
-            f.nested_bytes = Some(bytes);
-            f.reason.push_str(&format!(
+            c.finding.nested_bytes = Some(bytes);
+            c.finding.reason.push_str(&format!(
                 "; {} of it is in {n} finding{} inside it, reported separately",
                 crate::units::human(bytes),
                 if n == 1 { "" } else { "s" }
             ));
         }
     }
+    let mut kept: Vec<_> = kept.into_iter().map(|c| c.finding).collect();
     kept.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.id.cmp(&b.id)));
     kept
 }
@@ -305,6 +415,8 @@ pub fn detect_into_with(
     let (mut findings, runs) = run_with(tree, ctx, &detectors::registry(), only);
     if probe {
         crate::probes::run(&mut findings, ctx);
+        // Probes may rewrite a reason or advice; check what they wrote too.
+        block_lossy(&mut findings);
     }
     report.findings = findings;
     report.detectors = runs;
@@ -321,15 +433,18 @@ pub fn run_with(
     only: Option<&[String]>,
 ) -> (Vec<Finding>, Vec<DetectorRun>) {
     let (findings, runs) = run_candidates(tree, ctx, built, only);
-    (outermost(findings), runs)
+    (outermost_candidates(findings), runs)
 }
 
+/// Runs the detectors (all, or `only`) and returns every finding, before
+/// the nesting rule, with [`block_lossy`] applied: the detection that
+/// `dwhy scan`, `explain`, `plan`, `apply` and the TUI all go through.
 pub fn run_candidates(
     tree: &ScanTree,
     ctx: &DetectContext,
     built: &[Box<dyn Detector>],
     only: Option<&[String]>,
-) -> (Vec<Finding>, Vec<DetectorRun>) {
+) -> (Vec<Candidate>, Vec<DetectorRun>) {
     let mut all = Vec::new();
     let mut runs = Vec::new();
     for info in CATALOG {
@@ -356,7 +471,7 @@ pub fn run_candidates(
             Some(_) if status == DetectorAvailability::Unavailable => {}
             Some(d) => {
                 let start = Instant::now();
-                let result = d.detect(tree, ctx);
+                let result = d.detect_candidates(tree, ctx);
                 run.ran = true;
                 run.elapsed_ms = start.elapsed().as_millis() as u64;
                 match result {
@@ -369,6 +484,9 @@ pub fn run_candidates(
             }
         }
         runs.push(run);
+    }
+    for c in &mut all {
+        block_lossy(std::slice::from_mut(&mut c.finding));
     }
     (all, runs)
 }
@@ -601,6 +719,160 @@ mod tests {
             .map(|f| f.bytes - f.nested_bytes.unwrap_or(0))
             .sum();
         assert_eq!(own, 100);
+    }
+
+    fn cmd(det: &str, path: &str, bytes: u64, tier: Tier, argv: &[&str]) -> Finding {
+        let mut f = ft(det, path, bytes, tier);
+        f.action = Action {
+            kind: ActionKind::Command,
+            text: argv.join(" "),
+            argv: Some(argv.iter().map(|a| a.to_string()).collect()),
+        };
+        f
+    }
+
+    #[test]
+    fn findings_naming_a_lossy_path_are_blocked_with_advice() {
+        let mut found = vec![
+            // Its own path is lossy.
+            cmd(
+                "cargo-target",
+                "/w/app\u{FFFD}/target",
+                10,
+                Tier::Rebuildable,
+                &["cargo", "clean", "--target-dir", "/w/app\u{FFFD}/target"],
+            ),
+            // Only its command is (git-worktree's main repository, #61).
+            cmd(
+                "git-worktree",
+                "/w/wt",
+                20,
+                Tier::Review,
+                &[
+                    "git",
+                    "-C",
+                    "/w/repo\u{FFFD}",
+                    "worktree",
+                    "remove",
+                    "/w/wt",
+                ],
+            ),
+            // Only its recovery is.
+            {
+                let mut f = ft("venv", "/w/v/.venv", 5, Tier::Regenerable);
+                f.recovery.how = Some("cd /w/v\u{FFFD} && uv sync".into());
+                f
+            },
+            {
+                let mut f = ft("venv", "/w/cost/.venv", 5, Tier::Regenerable);
+                f.recovery.cost = "choose the lockfile under /w/v\u{FFFD}".into();
+                f
+            },
+            {
+                let mut f = ft("venv", "/w/text/.venv", 5, Tier::Regenerable);
+                f.recovery.cost = "choose the lockfile under /w/v\u{FFFD}".into();
+                f.action.text = "remove /w/v\u{FFFD}".into();
+                f
+            },
+            // Valid UTF-8 that is not ASCII stays actionable.
+            cmd(
+                "cargo-target",
+                "/w/café/target",
+                7,
+                Tier::Rebuildable,
+                &["cargo", "clean", "--target-dir", "/w/café/target"],
+            ),
+        ];
+        let before = found.clone();
+        block_lossy(&mut found);
+        for (f, was) in found.iter().zip(&before).take(5) {
+            assert_eq!(f.tier, Tier::Blocked, "{f:?}");
+            assert_eq!((&f.id, &f.path, f.bytes), (&was.id, &was.path, was.bytes));
+            assert_eq!(f.detector, was.detector);
+            assert_eq!(f.action.kind, ActionKind::Advice);
+            assert_eq!(f.action.argv, None);
+            assert_eq!(f.action.text, PATH_NOT_UTF8_ADVICE);
+            assert!(!is_lossy(&f.action.text));
+            assert!(!f.recovery.how.as_deref().is_some_and(is_lossy));
+            let g: Vec<_> = f
+                .guards
+                .iter()
+                .map(|g| (g.name.as_str(), g.status))
+                .collect();
+            assert_eq!(g, [(PATH_NOT_UTF8, GuardStatus::Block)]);
+            assert_eq!(f.reason, was.reason);
+            assert_eq!(f.recovery.cost, was.recovery.cost);
+        }
+        assert_eq!(
+            found[0].guards[0].detail,
+            "the path is not valid UTF-8 (shown with U+FFFD); diskwhy cannot act on it exactly"
+        );
+        assert_eq!(
+            found[1].guards[0].detail,
+            "the action names a path that is not valid UTF-8 (shown with U+FFFD); \
+             diskwhy cannot act on it exactly"
+        );
+        assert!(found[2].guards[0].detail.starts_with("the recovery names"));
+        assert!(found[3].guards[0].detail.starts_with("the recovery names"));
+        assert!(
+            found[4].guards[0]
+                .detail
+                .starts_with("the action and recovery name")
+        );
+        assert_eq!(found[5], before[5], "café is valid UTF-8");
+
+        // Running it again changes nothing.
+        let once = found.clone();
+        block_lossy(&mut found);
+        assert_eq!(found, once);
+    }
+
+    #[test]
+    fn a_lossy_finding_does_not_hide_cheaper_findings_inside_it() {
+        // The worktree is blocked because its command names a lossy main
+        // repository; the build output inside it is still offered.
+        let mut found = vec![
+            cmd(
+                "git-worktree",
+                "/w/wt",
+                100,
+                Tier::Review,
+                &[
+                    "git",
+                    "-C",
+                    "/w/repo\u{FFFD}",
+                    "worktree",
+                    "remove",
+                    "/w/wt",
+                ],
+            ),
+            ft("stale-tree", "/w/wt/old", 30, Tier::Review),
+            ft("cargo-target", "/w/wt/target", 40, Tier::Rebuildable),
+        ];
+        block_lossy(&mut found);
+        let kept = outermost(found);
+        assert_eq!(
+            by_path(&kept),
+            [
+                ("/w/wt", Some(70)),
+                ("/w/wt/old", None),
+                ("/w/wt/target", None)
+            ]
+        );
+
+        // A lossy finding inside an exact one is covered by it: removing
+        // the outer path, which is exact, frees it.
+        let mut found = vec![
+            ft("stale-tree", "/w/scratch", 100, Tier::Review),
+            ft(
+                "cargo-target",
+                "/w/scratch/app\u{FFFD}/target",
+                40,
+                Tier::Rebuildable,
+            ),
+        ];
+        block_lossy(&mut found);
+        assert_eq!(by_path(&outermost(found)), [("/w/scratch", None)]);
     }
 
     #[test]

@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use crate::detect::is_lossy;
 use crate::report::{
     Change, ChangeKind, DiffBase, DiffReport, Finding, Growth, Rate, SCHEMA, ScanReport, Snapshot,
     SnapshotDocker, SnapshotScan, Tool, WatchReport,
@@ -154,7 +155,9 @@ fn compare(
         let p = Path::new(path);
         within(p, &old.scan.roots) && within(p, &new.scan.roots)
     };
-    let both = |path: &str| in_roots(path) && blockers(path).is_empty() && !excluded(path);
+    let both = |path: &str| {
+        !is_lossy(path) && in_roots(path) && blockers(path).is_empty() && !excluded(path)
+    };
     let mut mounts: Vec<&str> = old
         .dirs
         .iter()
@@ -166,7 +169,7 @@ fn compare(
                 .chain(&new.findings)
                 .map(|f| f.path.as_str()),
         )
-        .filter(|p| p.starts_with('/') && in_roots(p))
+        .filter(|p| p.starts_with('/') && !is_lossy(p) && in_roots(p))
         .flat_map(&blockers)
         .collect();
     mounts.sort_unstable();
@@ -253,16 +256,26 @@ fn compare(
     // Findings, by id, where the detector ran on both sides.
     let ran_old: HashSet<&str> = old.scan.detectors.iter().map(String::as_str).collect();
     let ran_new: HashSet<&str> = new.scan.detectors.iter().map(String::as_str).collect();
-    let in_scope = |path: &str| !path.starts_with('/') || both(path);
+    let in_scope = |path: &str| {
+        if path.starts_with('/') {
+            both(path)
+        } else {
+            !is_lossy(path)
+        }
+    };
     let mut findings = Vec::new();
     let mut skipped: Vec<&str> = Vec::new();
+    let ambiguous_old = duplicate_finding_ids(old.findings.iter().map(|f| f.id.as_str()));
+    let ambiguous_new = duplicate_finding_ids(new.findings.iter().map(|f| f.id.as_str()));
+    let ambiguous = |id: &str| ambiguous_old.contains(id) || ambiguous_new.contains(id);
     let old_f: HashMap<&str, _> = old.findings.iter().map(|f| (f.id.as_str(), f)).collect();
     let new_f: HashMap<&str, _> = new.findings.iter().map(|f| (f.id.as_str(), f)).collect();
     for f in &old.findings {
-        if !in_scope(&f.path) {
+        if ambiguous(&f.id) || !in_scope(&f.path) {
             continue;
         }
         let after = match new_f.get(f.id.as_str()) {
+            Some(n) if is_lossy(&n.path) => continue,
             Some(n) => Some(n.bytes),
             None if ran_new.contains(f.detector.as_str()) => None,
             None => {
@@ -276,7 +289,7 @@ fn compare(
         findings.push(c);
     }
     for f in &new.findings {
-        if old_f.contains_key(f.id.as_str()) || !in_scope(&f.path) {
+        if ambiguous(&f.id) || old_f.contains_key(f.id.as_str()) || !in_scope(&f.path) {
             continue;
         }
         if !ran_old.contains(f.detector.as_str()) {
@@ -431,6 +444,7 @@ pub fn watch(
         .dirs
         .iter()
         .chain(&end.dirs)
+        .filter(|d| !is_lossy(&d.path))
         .filter(|d| {
             let path = Path::new(&d.path);
             within(path, &start.scan.roots) && within(path, &end.scan.roots)
@@ -632,7 +646,18 @@ pub fn deepest(dirs: Vec<Change>) -> Vec<Change> {
         .collect()
 }
 
-/// Sets `growth` on each finding `old` also has (matched by id). Returns
+fn duplicate_finding_ids<'a>(ids: impl Iterator<Item = &'a str>) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    let mut duplicates = HashSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            duplicates.insert(id.to_owned());
+        }
+    }
+    duplicates
+}
+
+/// Sets `growth` on each finding with exact paths and a unique id in both scans. Returns
 /// whether the RFC 3339 timestamps define a positive interval, even when no
 /// findings match.
 pub fn fill_growth(findings: &mut [Finding], old: &Snapshot, now: &str) -> bool {
@@ -643,15 +668,20 @@ pub fn fill_growth(findings: &mut [Finding], old: &Snapshot, now: &str) -> bool 
     if elapsed <= 0 {
         return false;
     }
-    let before: HashMap<&str, u64> = old
-        .findings
-        .iter()
-        .map(|f| (f.id.as_str(), f.bytes))
-        .collect();
+    let ambiguous_before = duplicate_finding_ids(old.findings.iter().map(|f| f.id.as_str()));
+    let ambiguous_now = duplicate_finding_ids(findings.iter().map(|f| f.id.as_str()));
+    let before: HashMap<&str, _> = old.findings.iter().map(|f| (f.id.as_str(), f)).collect();
     for f in findings {
-        if let Some(&b) = before.get(f.id.as_str()) {
+        let baseline = before.get(f.id.as_str());
+        if is_lossy(&f.path)
+            || baseline.is_some_and(|b| is_lossy(&b.path))
+            || ambiguous_before.contains(&f.id)
+            || ambiguous_now.contains(&f.id)
+        {
+            f.growth = None;
+        } else if let Some(b) = baseline {
             f.growth = Some(Growth {
-                bytes_per_day: per_day(delta(Some(b), Some(f.bytes)), elapsed),
+                bytes_per_day: per_day(delta(Some(b.bytes), Some(f.bytes)), elapsed),
                 since: old.created_at.clone(),
             });
         }

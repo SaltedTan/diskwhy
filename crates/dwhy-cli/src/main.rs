@@ -718,12 +718,13 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
     };
 
     let (findings, runs) = tree.as_ref().map_or_else(Default::default, |tree| {
-        let (mut candidates, runs) = detect::run_candidates(
+        let (candidates, runs) = detect::run_candidates(
             tree,
             &ctx,
             &dwhy_core::detectors::registry(),
             only.as_deref(),
         );
+        let mut candidates = candidates.into_iter().map(|c| c.finding).collect();
         if !is_docker {
             explain::exclude_lossy_paths(&mut candidates, tree);
         }
@@ -766,6 +767,7 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
     if let (Some(f), Some(tree)) = (&mut finding, &tree) {
         let one = std::slice::from_mut(f);
         probes::run(one, &ctx);
+        detect::block_lossy(one);
         let status = status_line(args.quiet, "checking guards…");
         let processes = if is_docker {
             Processes::default()

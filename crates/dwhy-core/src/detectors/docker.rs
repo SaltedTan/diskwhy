@@ -8,7 +8,7 @@
 //! unused for [`BUILD_CACHE_AGE_HOURS`], which is `regenerable`: it is a cache,
 //! and the prune command is limited to those records.
 
-use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
+use crate::detect::{Candidate, DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
 use crate::docker::{Container, Image, Snapshot};
 use crate::report::{Action, ActionKind, Finding, GuardResult, GuardStatus, Recovery, Tier};
 use crate::tree::ScanTree;
@@ -208,9 +208,16 @@ impl Detector for DockerImage {
         "docker-image"
     }
 
-    fn detect(&self, _: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
+    fn detect_candidates(
+        &self,
+        _: &ScanTree,
+        ctx: &DetectContext,
+    ) -> Result<Vec<Candidate>, String> {
         let snap = ctx.docker.get()?;
-        Ok(images(&snap, ctx))
+        Ok(images(&snap, ctx)
+            .into_iter()
+            .map(Candidate::reported)
+            .collect())
     }
 }
 
@@ -285,9 +292,16 @@ impl Detector for DockerBuildCache {
         "docker-build-cache"
     }
 
-    fn detect(&self, _: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
+    fn detect_candidates(
+        &self,
+        _: &ScanTree,
+        ctx: &DetectContext,
+    ) -> Result<Vec<Candidate>, String> {
         let snap = ctx.docker.get()?;
-        Ok(build_cache(&snap, ctx).into_iter().collect())
+        Ok(build_cache(&snap, ctx)
+            .into_iter()
+            .map(Candidate::reported)
+            .collect())
     }
 }
 
@@ -350,9 +364,16 @@ impl Detector for DockerContainer {
         "docker-container"
     }
 
-    fn detect(&self, _: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
+    fn detect_candidates(
+        &self,
+        _: &ScanTree,
+        ctx: &DetectContext,
+    ) -> Result<Vec<Candidate>, String> {
         let snap = ctx.docker.get()?;
-        Ok(containers(&snap, ctx))
+        Ok(containers(&snap, ctx)
+            .into_iter()
+            .map(Candidate::reported)
+            .collect())
     }
 }
 
@@ -395,9 +416,16 @@ impl Detector for DockerVolume {
         "docker-volume"
     }
 
-    fn detect(&self, _: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
+    fn detect_candidates(
+        &self,
+        _: &ScanTree,
+        ctx: &DetectContext,
+    ) -> Result<Vec<Candidate>, String> {
         let snap = ctx.docker.get()?;
-        Ok(volumes(&snap, ctx))
+        Ok(volumes(&snap, ctx)
+            .into_iter()
+            .map(Candidate::reported)
+            .collect())
     }
 }
 

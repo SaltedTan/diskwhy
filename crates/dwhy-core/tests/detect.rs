@@ -230,7 +230,7 @@ fn nested_target_dirs_yield_only_the_outermost() {
     let tree = scan_tree(&root);
     let raw = CargoTarget.detect(&tree, &ctx(Some("cargo"))).unwrap();
     assert_eq!(raw.len(), 2);
-    let kept = detect::outermost(raw);
+    let (kept, _) = detect::run_with(&tree, &ctx(Some("cargo")), &[Box::new(CargoTarget)], None);
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].path, outer.to_str().unwrap());
 }
@@ -365,5 +365,103 @@ fn bytes_leave_out_files_hardlinked_outside_the_target_dir() {
         found[0].reason.contains("hardlinked elsewhere"),
         "{}",
         found[0].reason
+    );
+}
+
+/// Creates `dir`, or returns false (with a message) when the filesystem
+/// refuses a name that is not valid UTF-8.
+fn create_non_utf8(dir: &Path) -> bool {
+    match fs::create_dir(dir) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("skipped: the filesystem refuses {dir:?}: {e}");
+            false
+        }
+    }
+}
+
+#[test]
+fn a_cargo_project_under_a_non_utf8_name_is_blocked() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let t = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    let lossy = root.join(OsStr::from_bytes(b"app\xff"));
+    if !create_non_utf8(&lossy) {
+        return;
+    }
+    cargo_crate(&lossy, "target", 2, Some(CARGO_TAG));
+    // A lookalike: valid UTF-8 that is not ASCII.
+    let cafe = cargo_crate(&root.join("café"), "target", 2, Some(CARGO_TAG));
+    let only = vec!["cargo-target".to_string()];
+    for cargo in [Some("cargo"), None] {
+        let (mut found, _) = detect::run_with(
+            &scan_tree(&root),
+            &ctx(cargo),
+            &dwhy_core::detectors::registry(),
+            Some(&only),
+        );
+        found.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(found.len(), 2, "{found:?}");
+        let (bad, good) = (&found[0], &found[1]);
+        let bad_path = format!("{}/app\u{FFFD}/target", root.to_str().unwrap());
+        assert_eq!(bad.path, bad_path);
+        assert_eq!(bad.id, detect::finding_id("cargo-target", &bad_path));
+        assert_eq!(bad.tier, Tier::Blocked);
+        assert!(bad.bytes >= 2 << 20, "the space is still accounted for");
+        assert_eq!(bad.action.kind, ActionKind::Advice);
+        assert_eq!(bad.action.argv, None);
+        assert!(!detect::is_lossy(&bad.action.text));
+        let guard = bad
+            .guards
+            .iter()
+            .find(|g| g.name == "path-not-utf8")
+            .unwrap();
+        assert_eq!(guard.status, dwhy_core::report::GuardStatus::Block);
+
+        assert_eq!(good.path, cafe.to_str().unwrap());
+        assert_eq!(good.tier, Tier::Rebuildable);
+        assert!(good.guards.is_empty());
+        let kind = if cargo.is_some() {
+            ActionKind::Command
+        } else {
+            ActionKind::RemovePath
+        };
+        assert_eq!(good.action.kind, kind);
+    }
+}
+
+#[test]
+fn lossy_path_aliases_do_not_nest() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let t = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    let lossy = root.join(OsStr::from_bytes(b"app\xff"));
+    if !create_non_utf8(&lossy) {
+        return;
+    }
+    let outer = cargo_crate(&lossy, "target", 20, Some(CARGO_TAG));
+    let sibling = cargo_crate(&root.join("app�"), "target", 40, Some(CARGO_TAG));
+    let child = cargo_crate(&outer.join("pkg"), "target", 2, Some(CARGO_TAG));
+    let tree = scan_tree(&root);
+    let bytes = |path: &Path| tree.node(tree.find(path).unwrap()).freeable();
+    let (found, _) = detect::run_with(&tree, &ctx(Some("cargo")), &[Box::new(CargoTarget)], None);
+    assert_eq!(found.len(), 3, "{found:?}");
+    assert_eq!(found[0].id, found[1].id);
+    assert_eq!(found[0].path, found[1].path);
+    assert_eq!(
+        (found[0].bytes, found[0].nested_bytes),
+        (bytes(&sibling), None)
+    );
+    assert_eq!(
+        (found[1].bytes, found[1].nested_bytes),
+        (bytes(&outer), Some(bytes(&child)))
+    );
+    assert_eq!(
+        (found[2].bytes, found[2].nested_bytes),
+        (bytes(&child), None)
     );
 }

@@ -24,7 +24,7 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
-use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
+use crate::detect::{Candidate, DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
 use crate::report::{Action, ActionKind, Finding, GuardResult, GuardStatus, Recovery, Tier};
 use crate::tree::{Markers, NodeId, ScanTree};
 use crate::units::human;
@@ -94,7 +94,11 @@ impl Detector for GitWorktree {
         "git-worktree"
     }
 
-    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
+    fn detect_candidates(
+        &self,
+        tree: &ScanTree,
+        ctx: &DetectContext,
+    ) -> Result<Vec<Candidate>, String> {
         let Some(git) = ctx.tool_command("git") else {
             return Ok(Vec::new());
         };
@@ -213,7 +217,7 @@ impl GitWorktree {
         git: &str,
         repo: &Path,
         entries: &[WorktreeEntry],
-    ) -> Vec<Finding> {
+    ) -> Vec<Candidate> {
         let mut out = Vec::new();
         let mut prunable = Vec::new();
         for e in entries.iter().skip(1).filter(|e| !e.bare) {
@@ -264,7 +268,7 @@ impl GitWorktree {
                 }
                 None => Tier::Review,
             };
-            out.push(Finding {
+            let finding = Finding {
                 id: finding_id(self.name(), &path_s),
                 detector: self.name().into(),
                 probe: None,
@@ -290,7 +294,8 @@ impl GitWorktree {
                         )),
                 },
                 path: path_s,
-            });
+            };
+            out.push(Candidate::new(tree.path(id), finding));
         }
         let admin = repo.join(".git/worktrees");
         let admin_id = tree.find(&admin).filter(|_| !prunable.is_empty());
@@ -302,7 +307,7 @@ impl GitWorktree {
                 .iter()
                 .map(|e| e.path.display().to_string())
                 .collect();
-            out.push(Finding {
+            let finding = Finding {
                 id: finding_id(self.name(), &path_s),
                 detector: self.name().into(),
                 probe: None,
@@ -327,7 +332,8 @@ impl GitWorktree {
                     how: None,
                 },
                 path: path_s,
-            });
+            };
+            out.push(Candidate::new(tree.path(admin_id), finding));
         }
         out
     }

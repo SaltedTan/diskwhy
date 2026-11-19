@@ -621,7 +621,7 @@ pub struct ApplyItem {
     pub outcome: ApplyOutcome,
     /// Why it was skipped or refused, what failed, or what was removed.
     pub detail: String,
-    /// Guard results at apply time (empty when the guards did not run).
+    /// Guard results recorded at apply time, including any path encoding block.
     pub guards: Vec<GuardResult>,
 }
 

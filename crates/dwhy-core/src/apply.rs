@@ -4,9 +4,9 @@
 //! items by id, and decides each one.
 //!
 //! An item is
-//! - skipped (exit 2) when it is no longer detected, a detector or guard
-//!   blocks it now, its tier or action differs from the plan's, or its
-//!   fingerprint changed;
+//! - skipped (exit 2) when the path encoding check blocks it, it is no
+//!   longer detected, a detector or guard blocks it now, its tier or action
+//!   differs from the plan's, or its fingerprint changed;
 //! - refused (exit 3) when its tier is above `--max-tier`, or it is a
 //!   `review` item whose id `--confirm` did not name (`--confirm` alone lets
 //!   a review item through; it never lifts a rebuildable one);
@@ -24,11 +24,11 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::detect::DetectContext;
+use crate::detect::{DetectContext, PATH_NOT_UTF8, add_lossy_guard, lossy_argv, lossy_detail};
 use crate::guard::{self, Processes};
 use crate::mounts::MountTable;
 use crate::report::{
-    ActionKind, ApplyItem, ApplyOutcome, ApplyReport, AuditEvent, AuditRecord, Finding,
+    Action, ActionKind, ApplyItem, ApplyOutcome, ApplyReport, AuditEvent, AuditRecord, Finding,
     GuardStatus, Plan, PlanItem, SCHEMA, Tier, Tool,
 };
 use crate::tree::ScanTree;
@@ -180,6 +180,22 @@ fn decide(
         fresh: fresh.cloned(),
         inode: item.fingerprint.dev.zip(item.fingerprint.inode),
     };
+    // Backstop for `detect::block_lossy`: never act on a path or command
+    // spelled with U+FFFD, whether the plan file or the fresh finding has it.
+    if let Some(detail) = lossy(&planned.path, &planned.action)
+        .or_else(|| fresh.and_then(|f| lossy(&f.path, &f.action)))
+    {
+        let mut c = base(
+            fresh.unwrap_or(planned),
+            ApplyOutcome::Skipped,
+            format!("blocked by {PATH_NOT_UTF8}: {detail}"),
+        );
+        if let Some(f) = fresh {
+            c.item.guards.clone_from(&f.guards);
+        }
+        add_lossy_guard(&mut c.item.guards, detail);
+        return c;
+    }
     let Some(f) = fresh else {
         return base(
             planned,
@@ -220,6 +236,10 @@ fn decide(
         return skip(format!("changed since the plan: {}", diff.join(", ")));
     }
     base(f, ApplyOutcome::WouldRemove, "ready".into())
+}
+
+fn lossy(path: &str, action: &Action) -> Option<String> {
+    lossy_detail(path, lossy_argv(action), false)
 }
 
 /// The blocking guards of `f`, as "name: detail; …".
@@ -377,8 +397,13 @@ pub fn execute(
     }
 }
 
-fn run(c: &Check, mounts: &MountTable) -> (ApplyOutcome, String) {
-    let item = &c.item;
+fn run(c: &mut Check, mounts: &MountTable) -> (ApplyOutcome, String) {
+    let item = &mut c.item;
+    if let Some(detail) = lossy(&item.path, &item.action) {
+        let outcome = format!("blocked by {PATH_NOT_UTF8}: {detail}; not run");
+        add_lossy_guard(&mut item.guards, detail);
+        return (ApplyOutcome::Skipped, outcome);
+    }
     if item.path.starts_with('/') && std::fs::symlink_metadata(&item.path).is_err() {
         return (
             ApplyOutcome::Skipped,

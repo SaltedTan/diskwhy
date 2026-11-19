@@ -20,7 +20,7 @@
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use crate::detect::{DetectContext, rfc3339};
+use crate::detect::{DetectContext, is_lossy, rfc3339};
 use crate::guard::{self, Processes};
 use crate::report::{
     ActionKind, Finding, Fingerprint, GitFingerprint, Plan, PlanItem, PlanScan, PlanSelection,
@@ -308,12 +308,16 @@ pub enum Unusable {
     Expired(String),
     /// Made on another host or as another user.
     Elsewhere(String),
+    LossyRoot(String),
 }
 
 impl std::fmt::Display for Unusable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Unusable::Expired(s) | Unusable::Elsewhere(s) => f.write_str(s),
+            Unusable::LossyRoot(root) => {
+                write!(f, "plan root {root} is not valid UTF-8; nothing applied")
+            }
         }
     }
 }
@@ -346,6 +350,9 @@ pub fn usable(plan: &Plan, host: &str, uid: u32, now: i64) -> Result<(), Unusabl
             "the plan was created in the future ({})",
             plan.created_at
         )));
+    }
+    if let Some(root) = plan.scan.roots.iter().find(|root| is_lossy(root)) {
+        return Err(Unusable::LossyRoot(root.clone()));
     }
     Ok(())
 }

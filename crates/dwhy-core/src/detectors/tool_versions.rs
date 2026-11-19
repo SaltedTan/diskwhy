@@ -51,7 +51,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use crate::detect::{DetectContext, Detector, finding_id, rfc3339, shell_quote};
+use crate::detect::{Candidate, DetectContext, Detector, finding_id, rfc3339, shell_quote};
 use crate::report::{Action, ActionKind, Finding, Recovery, Tier};
 use crate::tree::{Markers, NodeId, ScanTree};
 use crate::units::human;
@@ -120,7 +120,11 @@ impl Detector for ToolVersions {
         "tool-versions"
     }
 
-    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
+    fn detect_candidates(
+        &self,
+        tree: &ScanTree,
+        ctx: &DetectContext,
+    ) -> Result<Vec<Candidate>, String> {
         let pins = collect_pins(tree);
         let home_scanned = ctx.home.as_deref().is_some_and(|h| tree.find(h).is_some());
         let mut out = Vec::new();
@@ -221,7 +225,7 @@ impl ToolVersions {
         ctx: &DetectContext,
         pins: &Pins,
         home_scanned: bool,
-        out: &mut Vec<Finding>,
+        out: &mut Vec<Candidate>,
     ) {
         let Some(root) = self.dir(ctx, "RUSTUP_HOME", ".rustup") else {
             return;
@@ -283,7 +287,7 @@ impl ToolVersions {
         ctx: &DetectContext,
         pins: &Pins,
         home_scanned: bool,
-        out: &mut Vec<Finding>,
+        out: &mut Vec<Candidate>,
     ) {
         let Some(root) = self
             .var("UV_PYTHON_INSTALL_DIR")
@@ -421,7 +425,7 @@ impl ToolVersions {
         ctx: &DetectContext,
         pins: &Pins,
         home_scanned: bool,
-        out: &mut Vec<Finding>,
+        out: &mut Vec<Candidate>,
     ) {
         let Some(root) = self.dir(ctx, "PYENV_ROOT", ".pyenv") else {
             return;
@@ -484,7 +488,7 @@ impl ToolVersions {
         ctx: &DetectContext,
         pins: &Pins,
         home_scanned: bool,
-        out: &mut Vec<Finding>,
+        out: &mut Vec<Candidate>,
     ) {
         let Some(root) = self.dir(ctx, "NVM_DIR", ".nvm") else {
             return;
@@ -540,7 +544,7 @@ impl ToolVersions {
         ctx: &DetectContext,
         pins: &Pins,
         home_scanned: bool,
-        out: &mut Vec<Finding>,
+        out: &mut Vec<Candidate>,
     ) {
         let Some(root) = self
             .var("FNM_DIR")
@@ -594,7 +598,7 @@ impl ToolVersions {
         }
     }
 
-    fn go_sdk(&self, tree: &ScanTree, ctx: &DetectContext, out: &mut Vec<Finding>) {
+    fn go_sdk(&self, tree: &ScanTree, ctx: &DetectContext, out: &mut Vec<Candidate>) {
         let Some(root) = ctx.home.as_ref().map(|h| h.join("sdk")) else {
             return;
         };
@@ -645,7 +649,7 @@ impl ToolVersions {
         }
     }
 
-    fn vscode(&self, tree: &ScanTree, ctx: &DetectContext, out: &mut Vec<Finding>) {
+    fn vscode(&self, tree: &ScanTree, ctx: &DetectContext, out: &mut Vec<Candidate>) {
         let roots: Vec<PathBuf> = match self.var("VSCODE_AGENT_FOLDER") {
             Some(p) => vec![p],
             None => match &ctx.home {
@@ -711,7 +715,7 @@ impl ToolVersions {
 
     /// Claude Code, Codex and T3 runtime versions: the one in use, any a
     /// running process executes from, and the newest are kept.
-    fn agent_clis(&self, tree: &ScanTree, ctx: &DetectContext, out: &mut Vec<Finding>) {
+    fn agent_clis(&self, tree: &ScanTree, ctx: &DetectContext, out: &mut Vec<Candidate>) {
         let Some(home) = ctx.home.as_ref() else {
             return;
         };
@@ -771,7 +775,7 @@ impl ToolVersions {
         tool: &str,
         current_desc: &str,
         running: &OnceCell<Vec<PathBuf>>,
-        out: &mut Vec<Finding>,
+        out: &mut Vec<Candidate>,
     ) {
         let mut keep = newest(installs);
         if let Some(i) = current.and_then(|c| installs.iter().position(|t| t.name == c)) {
@@ -803,7 +807,7 @@ impl ToolVersions {
         }
     }
 
-    fn vscode_finding(&self, t: &Install, kind: &str, kept: Option<&String>) -> Option<Finding> {
+    fn vscode_finding(&self, t: &Install, kind: &str, kept: Option<&String>) -> Option<Candidate> {
         let why = match kept {
             Some(k) => format!("not the most recently used one ({k})"),
             None => "not the most recently used one".into(),
@@ -820,7 +824,7 @@ impl ToolVersions {
         )
     }
 
-    fn finding(&self, t: &Install, plan: Plan) -> Option<Finding> {
+    fn finding(&self, t: &Install, plan: Plan) -> Option<Candidate> {
         if t.bytes < MIN_BYTES {
             return None;
         }
@@ -833,7 +837,7 @@ impl ToolVersions {
             ));
         }
         reason.push_str(&format!("): {}", plan.why));
-        Some(Finding {
+        let finding = Finding {
             id: finding_id(self.name(), &path_s),
             detector: self.name().into(),
             probe: None,
@@ -851,7 +855,8 @@ impl ToolVersions {
                 how: plan.how,
             },
             path: path_s,
-        })
+        };
+        Some(Candidate::new(t.path.clone(), finding))
     }
 }
 

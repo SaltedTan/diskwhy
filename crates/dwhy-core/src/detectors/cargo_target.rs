@@ -6,7 +6,7 @@
 //! (a target dir whose tag was removed). Some other `target/`, such as a
 //! downloaded prebuilt binary, matches neither.
 
-use crate::detect::{DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
+use crate::detect::{Candidate, DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
 use crate::report::{Action, ActionKind, Finding, Recovery, Tier};
 use crate::tree::{Markers, ScanTree};
 use crate::units::human;
@@ -26,7 +26,11 @@ impl Detector for CargoTarget {
         "cargo-target"
     }
 
-    fn detect(&self, tree: &ScanTree, ctx: &DetectContext) -> Result<Vec<Finding>, String> {
+    fn detect_candidates(
+        &self,
+        tree: &ScanTree,
+        ctx: &DetectContext,
+    ) -> Result<Vec<Candidate>, String> {
         let mut out = Vec::new();
         for id in tree.ids() {
             let n = tree.node(id);
@@ -80,7 +84,7 @@ impl Detector for CargoTarget {
                     argv: None,
                 },
             };
-            out.push(Finding {
+            let finding = Finding {
                 id: finding_id(self.name(), &path_s),
                 detector: self.name().into(),
                 probe: None,
@@ -111,7 +115,8 @@ impl Detector for CargoTarget {
                     how: Some("cargo build".into()),
                 },
                 path: path_s,
-            });
+            };
+            out.push(Candidate::new(path, finding));
         }
         Ok(out)
     }

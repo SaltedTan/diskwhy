@@ -10,7 +10,7 @@ use dwhy_core::report::{
     SnapshotContainer, SnapshotDir, SnapshotDocker, SnapshotFinding, SnapshotFs, SnapshotImage,
     SnapshotScan, SnapshotVolume, Tier, Tool, UsageLine,
 };
-use dwhy_core::{docker, snapshot};
+use dwhy_core::{docker, explain, snapshot};
 
 const M: u64 = 1 << 20;
 const G: u64 = 1 << 30;
@@ -593,6 +593,129 @@ fn findings_get_growth_from_an_older_snapshot_by_id() {
     let mut findings = vec![finding("f_grew", 400 * M)];
     growth::fill_growth(&mut findings, &old, "2026-11-15T12:00:00Z");
     assert_eq!(findings[0].growth, None);
+}
+
+#[test]
+fn lossy_finding_ids_are_omitted_when_ambiguous_on_either_side() {
+    let alias = "f_alias";
+    let exact = "f_exact";
+    let exact_path = "/h/app/target";
+    let lossy_path = "/h/app�/target";
+    let before = "2026-11-14T00:00:00Z";
+    let after = "2026-11-15T00:00:00Z";
+    for (old_count, new_count, old_path, new_path) in [
+        (2, 2, exact_path, exact_path),
+        (1, 2, exact_path, exact_path),
+        (2, 1, exact_path, exact_path),
+        (2, 0, exact_path, exact_path),
+        (0, 2, exact_path, exact_path),
+        (1, 1, lossy_path, lossy_path),
+        (1, 1, lossy_path, exact_path),
+        (1, 1, exact_path, lossy_path),
+        (1, 0, lossy_path, lossy_path),
+        (0, 1, lossy_path, lossy_path),
+    ] {
+        let mut old = snap(before, &["/h"], &["cargo-target"]);
+        let mut new = snap(after, &["/h"], &["cargo-target"]);
+        for (snapshot, count, path, size) in [
+            (&mut old, old_count, old_path, 20),
+            (&mut new, new_count, new_path, 30),
+        ] {
+            snapshot
+                .findings
+                .push(sfinding(exact, "cargo-target", "/h/f_exact", size * M));
+            for n in 0..count {
+                snapshot
+                    .findings
+                    .push(sfinding(alias, "cargo-target", path, (size + 20 * n) * M));
+            }
+        }
+        let d = growth::diff(&old, None, "old.json".into(), &new, &no_tree, 1);
+        assert_eq!(
+            rows(&d.findings),
+            [(
+                "/h/f_exact",
+                Some(20 * M),
+                Some(30 * M),
+                10 * M as i64,
+                false
+            )]
+        );
+
+        let mut findings: Vec<_> = new
+            .findings
+            .iter()
+            .map(|f| Finding {
+                path: f.path.clone(),
+                ..finding(&f.id, f.bytes)
+            })
+            .collect();
+        assert!(growth::fill_growth(&mut findings, &old, after));
+        assert_eq!(
+            findings[0].growth.as_ref().unwrap().bytes_per_day,
+            10 * M as i64
+        );
+        assert!(findings[1..].iter().all(|f| f.growth.is_none()));
+        if old_count == 1 && new_count == 1 {
+            assert_eq!(
+                explain::fill_growth(&mut findings[1], Some(&old), after, None),
+                None
+            );
+            assert!(findings[1].growth.is_none());
+        }
+    }
+}
+
+#[test]
+fn lossy_directory_paths_are_omitted_from_diff_and_watch() {
+    let old = sample(
+        "2026-11-14T00:00:00Z",
+        &[
+            ("/h/exact", 200 * M),
+            ("/h/app�", 200 * M),
+            ("/h/old�", 200 * M),
+        ],
+        10 * G,
+    );
+    let new = sample(
+        "2026-11-15T00:00:00Z",
+        &[
+            ("/h/exact", 210 * M),
+            ("/h/app�", 250 * M),
+            ("/h/new�", 200 * M),
+        ],
+        10 * G,
+    );
+    let diff = growth::diff(
+        &old,
+        None,
+        "old.json".into(),
+        &new,
+        &|path| panic!("unexpected directory lookup for {path}"),
+        1,
+    );
+    assert_eq!(
+        rows(&diff.dirs),
+        [(
+            "/h/exact",
+            Some(200 * M),
+            Some(210 * M),
+            10 * M as i64,
+            false
+        )]
+    );
+    let watch = growth::watch(&old, &new, 60, 60_000, 1, [&[], &[]]);
+    assert_eq!(
+        rate_rows(&watch.dirs),
+        [(
+            ChangeKind::Dir,
+            "/h/exact",
+            Some(200 * M),
+            Some(210 * M),
+            10 * M as i64,
+            10 * M as i64
+        )]
+    );
 }
 
 /// A `watch` end: every directory recorded (no threshold).

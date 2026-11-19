@@ -20,7 +20,7 @@ use dwhy_core::report::{
     Tool,
 };
 use dwhy_core::scan::Progress;
-use dwhy_core::{growth, snapshot, system};
+use dwhy_core::{detect, growth, snapshot, system};
 use dwhy_tui::app::{App, DEFAULT_PLAN_FILE, PlanState, RowKind, SizeMode, State, View};
 use dwhy_tui::job::{self, BuiltPlan, Options, PermissionMark, Scanned};
 use dwhy_tui::ui;
@@ -1480,7 +1480,7 @@ fn finding_escapes_stay_whole_at_layout_boundaries() {
 }
 
 #[test]
-fn lossy_cargo_path_is_marked_and_commands_are_withheld() {
+fn lossy_cargo_path_shows_advice_and_withholds_commands() {
     let f = fixture(false);
     let root = f.root();
     let project = root.join(OsStr::from_bytes(b"app\xff"));
@@ -1501,13 +1501,14 @@ fn lossy_cargo_path_is_marked_and_commands_are_withheld() {
     fs::write(project.join("Cargo.toml"), b"[package]\n").unwrap();
     fs::write(project.join("target/.rustc_info.json"), b"{}").unwrap();
     fs::write(project.join("target/out"), vec![5u8; 2 * MIB]).unwrap();
-    let mut data = scan(&[&root]);
+    let data = scan(&[&root]);
     assert_eq!(data.report.findings.len(), 1);
-    let finding = &mut data.report.findings[0];
+    let finding = &data.report.findings[0];
     assert!(finding.path.ends_with("/app�/target"));
-    let action = finding.action.text.clone();
-    finding.recovery.how = Some("cargo build --manifest-path /app/Cargo.toml".into());
-    let mut app = app_with(data);
+    assert_eq!(finding.tier, Tier::Blocked);
+    assert_eq!(finding.action.kind, ActionKind::Advice);
+    assert!(finding.guards.iter().any(|g| g.name == "path-not-utf8"));
+    let mut app = app_with(data.clone());
     press(&mut app, &[KeyCode::Tab]);
     let list = render(&mut app, 80, 24, None);
     let row = list.lines().nth(2).unwrap();
@@ -1516,7 +1517,7 @@ fn lossy_cargo_path_is_marked_and_commands_are_withheld() {
         "{list}"
     );
     press(&mut app, &[KeyCode::Enter]);
-    let detail = render(&mut app, 80, 24, None);
+    let detail = render(&mut app, 120, 24, None);
     assert!(
         detail.contains("path is not valid UTF-8; shown approximately — do not copy"),
         "{detail}"
@@ -1529,21 +1530,23 @@ fn lossy_cargo_path_is_marked_and_commands_are_withheld() {
         "{detail}"
     );
     assert!(
-        detail.contains("command withheld: it names a path that is not valid UTF-8"),
+        detail.contains("rename the path that is not valid UTF-8 to valid UTF-8"),
         "{detail}"
     );
+    assert!(!detail.contains("cargo build"), "{detail}");
+
+    let mut data = data;
+    data.report.findings[0].recovery.how =
+        Some("cargo build --manifest-path /app�/Cargo.toml".into());
+    detect::block_lossy(&mut data.report.findings);
+    let mut app = app_with(data);
+    press(&mut app, &[KeyCode::Tab, KeyCode::Enter]);
+    let detail = render(&mut app, 120, 24, None);
     assert!(
-        !detail.contains(
-            action
-                .split_whitespace()
-                .take(2)
-                .collect::<Vec<_>>()
-                .join(" ")
-                .as_str()
-        ),
+        detail.contains("by hand: the command names a path that is not valid UTF-8"),
         "{detail}"
     );
-    assert!(!detail.contains("cargo build --manifest-path"), "{detail}");
+    assert!(!detail.contains("command withheld"), "{detail}");
 }
 
 #[test]
@@ -1768,7 +1771,6 @@ fn hand_build() -> BuiltPlan {
     BuiltPlan {
         plan: hand_plan(),
         unplanned: Vec::new(),
-        lossy_paths: Default::default(),
     }
 }
 
@@ -2438,6 +2440,42 @@ fn plan_file_opens_in_the_preview() {
         let app = App::open_plan(plan.clone(), file.clone(), host, uid);
         let got = app.plan_view().unwrap().unusable(now).unwrap().to_string();
         assert!(got.contains(why), "{got}");
+    }
+}
+
+#[test]
+fn lossy_plan_root_is_refused_and_preview_shows_advice() {
+    let mut plan = hand_plan();
+    plan.scan.roots.push("/home/me/app�".into());
+    plan.items.truncate(1);
+    plan.blocked.clear();
+    let f = &mut plan.items[0].finding;
+    f.path = "/home/me/app�/target".into();
+    f.recovery.how = Some("cargo build --manifest-path /home/me/app�/Cargo.toml".into());
+    detect::block_lossy(std::slice::from_mut(f));
+
+    for blocked in [false, true] {
+        let mut plan = plan.clone();
+        if blocked {
+            plan.blocked.push(plan.items.remove(0).finding);
+        }
+        let mut app = App::open_plan(plan, "edited.json".into(), HOST, UID);
+        let screen = render_at(&mut app, 120, 32, None, PLAN_AT + 60);
+        assert!(
+            screen.contains(
+                "NOT USABLE: plan root /home/me/app� is not valid UTF-8; nothing applied"
+            ),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("rename the path that is not valid UTF-8 to valid UTF-8"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("by hand: the command names a path that is not valid UTF-8"),
+            "{screen}"
+        );
+        assert!(!screen.contains("command withheld"), "{screen}");
     }
 }
 

@@ -412,3 +412,49 @@ fn run_includes_git_worktree() {
     assert!(run.ran, "{run:?}");
     assert_eq!(run.findings, 1);
 }
+
+#[test]
+fn a_worktree_whose_main_repository_is_not_utf8_is_blocked() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (_t, root) = tmp();
+    let r = root.join(OsStr::from_bytes(b"repo\xff"));
+    if let Err(e) = fs::create_dir(&r) {
+        eprintln!("skipped: the filesystem refuses {r:?}: {e}");
+        return;
+    }
+    git(&r, &["init", "-q"]);
+    fs::write(r.join("README"), "hi").unwrap();
+    git(&r, &["add", "README"]);
+    git(&r, &["commit", "-q", "-m", "init"]);
+    // The worktree's own path is ASCII; the command's repository is not.
+    let old = worktree(&r, &root, "wt-old", 2);
+    age_tree(&old, 30);
+    let only = vec!["git-worktree".to_string()];
+    let (found, _) = detect::run_with(
+        &scan_tree(&root),
+        &ctx(Some("/usr/bin/git")),
+        &dwhy_core::detectors::registry(),
+        Some(&only),
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    let f = &found[0];
+    assert_eq!(f.path, s(&old));
+    assert_eq!(f.id, detect::finding_id("git-worktree", s(&old)));
+    assert_eq!(f.tier, Tier::Blocked);
+    assert_eq!(f.action.kind, ActionKind::Advice);
+    assert_eq!(f.action.argv, None);
+    let g = f.guards.iter().find(|g| g.name == "path-not-utf8").unwrap();
+    assert_eq!(g.status, GuardStatus::Block);
+    assert!(
+        g.detail.starts_with("the action and recovery name a path"),
+        "{}",
+        g.detail
+    );
+    assert!(
+        !f.recovery.how.as_deref().is_some_and(detect::is_lossy),
+        "{:?}",
+        f.recovery
+    );
+}
