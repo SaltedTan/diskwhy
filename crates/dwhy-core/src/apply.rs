@@ -4,11 +4,9 @@
 //! items by id, and decides each one.
 //!
 //! An item is
-//! - skipped (exit 2) when its path or argv, in the plan or detected
-//!   now, holds U+FFFD (a path that is not valid UTF-8, checked again right
-//!   before it runs), it is no longer detected, a detector or guard blocks
-//!   it now, its tier or action differs from the plan's, or its fingerprint
-//!   changed;
+//! - skipped (exit 2) when the path encoding check blocks it, it is no
+//!   longer detected, a detector or guard blocks it now, its tier or action
+//!   differs from the plan's, or its fingerprint changed;
 //! - refused (exit 3) when its tier is above `--max-tier`, or it is a
 //!   `review` item whose id `--confirm` did not name (`--confirm` alone lets
 //!   a review item through; it never lifts a rebuildable one);
