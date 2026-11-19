@@ -2012,7 +2012,10 @@ fn p_rescans_and_reports_marks_that_are_gone() {
     };
     assert_eq!(Path::new(&item.finding.path), app_target);
     assert!(item.finding.bytes > original_bytes);
-    assert_eq!(plan.selection.select, [item.finding.id.clone()]);
+    assert_eq!(
+        plan.selection.select,
+        std::slice::from_ref(&item.finding.id)
+    );
     let screen = render(&mut app, 120, 40, Some(&root));
     assert!(screen.contains("gone since the scan:"), "{screen}");
     assert!(
@@ -2260,7 +2263,7 @@ fn p_waits_then_builds_for_the_changed_marks() {
     assert_eq!(plan.items.len(), 1);
     let finding = &plan.items[0].finding;
     assert_eq!(Path::new(&finding.path), root.join("lib/target"));
-    assert_eq!(plan.selection.select, [finding.id.clone()]);
+    assert_eq!(plan.selection.select, std::slice::from_ref(&finding.id));
 }
 
 #[test]
