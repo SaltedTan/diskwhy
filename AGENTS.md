@@ -29,7 +29,7 @@ crates/dwhy-core   engine: scan (walker), tree (the ScanTree detectors read: per
                    deepest-dir attribution; growth on findings)
                    explain (dwhy explain: id vs path, id → path through the snapshots, picking the finding at a path)
 crates/dwhy-cli    clap front end, text rendering (human.rs), exit codes; binary `dwhy`
-crates/dwhy-tui    ratatui + crossterm TUI (`dwhy`, `dwhy tui`): app state machine driven by key events, scan in a background thread, tree browser; calls dwhy-core directly
+crates/dwhy-tui    ratatui + crossterm TUI (`dwhy`, `dwhy tui`): app state machine driven by key events; scan, plan build and apply on worker threads; tree, findings, plan preview and apply; calls dwhy-core directly
 ```
 
 Don't create empty crates for later milestones (`dwhy-mcp`); add them when that work starts.
