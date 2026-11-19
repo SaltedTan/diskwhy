@@ -282,6 +282,14 @@ pub fn differences(planned: &Fingerprint, now: &Fingerprint) -> Vec<&'static str
     out
 }
 
+/// A plan as `dwhy plan -o` writes it: pretty JSON and a final newline.
+/// The TUI's `w` writes the same bytes.
+pub fn to_json(plan: &Plan) -> serde_json::Result<String> {
+    let mut text = serde_json::to_string_pretty(plan)?;
+    text.push('\n');
+    Ok(text)
+}
+
 /// Parses a plan file and checks its schema.
 pub fn parse(text: &str) -> Result<Plan, String> {
     #[derive(serde::Deserialize)]
