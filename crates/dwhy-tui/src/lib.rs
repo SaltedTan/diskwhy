@@ -1,11 +1,12 @@
 //! diskwhy terminal UI (`dwhy`, `dwhy tui`).
 //!
 //! [`run`] scans in a background thread with the same dwhy-core pipeline as
-//! `dwhy scan` ([`job`]), then browses the directory tree. The UI is a state
-//! machine ([`app::App`]) fed key events and scan messages; [`ui::draw`]
+//! `dwhy scan` ([`job`]), then browses the directory tree and the findings.
+//! The UI is a state machine ([`app::App`]) fed key events and scan messages; [`ui::draw`]
 //! renders it, so tests use ratatui's `TestBackend` and no terminal.
 //!
-//! M4a: the tree browser. Nothing is written or removed.
+//! M4a: the tree browser. M4b: the findings list and detail view. Nothing
+//! is written or removed.
 
 pub mod app;
 pub mod job;

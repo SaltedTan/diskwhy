@@ -1,11 +1,14 @@
 //! The scan the TUI runs: the same pipeline as `dwhy scan` (roots, walk,
-//! filesystems and unaccounted space, detectors, probes), with no snapshot.
+//! filesystems and unaccounted space, detectors, probes, growth on
+//! findings), with no snapshot saved.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use dwhy_core::account;
 use dwhy_core::detect;
+use dwhy_core::growth;
 use dwhy_core::mounts::MountTable;
 use dwhy_core::report::{ScanReport, UnreadableReason};
 use dwhy_core::scan::{self, Progress, ScanOptions, ScanResult};
@@ -22,6 +25,10 @@ pub struct Options {
     pub detectors: Option<Vec<String>>,
     /// Worker threads; 0 means one per CPU.
     pub threads: usize,
+    /// Snapshots to read growth from, as `dwhy scan` does
+    /// (`snapshot::default_dir()`); `None`: findings get no growth.
+    /// Only read, never written.
+    pub snapshot_dir: Option<PathBuf>,
 }
 
 impl Options {
@@ -73,6 +80,9 @@ pub struct Scanned {
     pub tree: ScanTree,
     /// Directories whose contents are not fully counted.
     pub marks: HashMap<NodeId, Mark>,
+    /// `created_at` of the snapshot the findings' growth was measured from;
+    /// `None` when there was none to measure from.
+    pub growth_base: Option<String>,
 }
 
 /// Runs the whole scan on this thread, reporting each stage to `stage`.
@@ -99,12 +109,19 @@ pub fn scan(
 
     stage(Stage::Detecting);
     detect::detect_into(&mut report, &result.tree, opts.detectors.as_deref(), true);
+    let growth_base = opts.snapshot_dir.as_deref().and_then(|dir| {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        growth::fill_scan_growth(&mut report, dir, now)
+    });
 
     let marks = coverage_marks(&result);
     Ok(Scanned {
         report,
         tree: result.tree,
         marks,
+        growth_base,
     })
 }
 
@@ -198,6 +215,7 @@ mod tests {
             report: account::system_scan_report(&result, &mounts),
             marks: coverage_marks(&result),
             tree: result.tree,
+            growth_base: None,
         });
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let mut screen = |app: &mut App| {

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
 
-use dwhy_core::apply::{self, tier_name};
+use dwhy_core::apply::{self, action_kind_name, guard_status_name, tier_name};
 use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{
     ActionKind, ApplyOutcome, ApplyReport, Change, ChangeKind, DetectorAvailability, DiffReport,
@@ -367,11 +367,7 @@ pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
     } else {
         writeln!(w, "guards:")?;
         for g in &f.guards {
-            let status = match g.status {
-                GuardStatus::Pass => "pass",
-                GuardStatus::Warn => "warn",
-                GuardStatus::Block => "BLOCK",
-            };
+            let status = guard_status_name(g.status);
             writeln!(w, "  {status:<5}  {:<20} {}", g.name, g.detail)?;
         }
     }
@@ -391,12 +387,7 @@ pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
     }
 
     writeln!(w)?;
-    let kind = match f.action.kind {
-        ActionKind::Advice => "advice, nothing to run",
-        ActionKind::Command => "command",
-        ActionKind::RemovePath => "path removal",
-    };
-    writeln!(w, "action ({kind}):")?;
+    writeln!(w, "action ({}):", action_kind_name(f.action.kind))?;
     writeln!(w, "  {}", f.action.text)?;
 
     writeln!(w)?;

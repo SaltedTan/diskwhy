@@ -343,6 +343,7 @@ fn run_tui(args: TuiArgs) -> Result<u8> {
         cross_filesystems: args.cross_filesystems,
         detectors: None,
         threads: 0,
+        snapshot_dir: snapshot::default_dir(),
     })
     .map_err(|e| {
         let mut message = String::new();
@@ -388,20 +389,8 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
 
     // Growth on findings, from a snapshot of the same roots old enough for
     // a meaningful rate. Best effort: without one, findings have no growth.
-    if !report.findings.is_empty()
-        && let Some(dir) = snapshot::default_dir()
-    {
-        let roots: Vec<String> = report.scan.roots.iter().map(|r| r.path.clone()).collect();
-        if let Ok(found) = snapshot::find(
-            &dir,
-            &snapshot::Since::Age(growth::MIN_AGE_SECS),
-            &report.host,
-            report.uid,
-            Some((&roots, report.scan.one_filesystem)),
-            now_secs(),
-        ) {
-            growth::fill_growth(&mut report.findings, &found.snapshot, &report.generated_at);
-        }
+    if let Some(dir) = snapshot::default_dir() {
+        growth::fill_scan_growth(&mut report, &dir, now_secs());
     }
 
     // The report is still printed when the snapshot cannot be saved.

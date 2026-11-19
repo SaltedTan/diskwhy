@@ -11,10 +11,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::report::{
-    Change, ChangeKind, DiffBase, DiffReport, Finding, Growth, Rate, SCHEMA, Snapshot,
+    Change, ChangeKind, DiffBase, DiffReport, Finding, Growth, Rate, SCHEMA, ScanReport, Snapshot,
     SnapshotDocker, SnapshotScan, Tool, WatchReport,
 };
-use crate::snapshot::parse_time;
+use crate::snapshot::{self, parse_time};
 
 /// `scan` puts growth on findings from the newest snapshot at least this
 /// old: a rate from a shorter window, scaled to a day, is mostly noise.
@@ -632,15 +632,16 @@ pub fn deepest(dirs: Vec<Change>) -> Vec<Change> {
         .collect()
 }
 
-/// Sets `growth` on each finding `old` also has (matched by id), measured
-/// from `old` to `now` (RFC 3339). Nothing is set when `old` is not older.
-pub fn fill_growth(findings: &mut [Finding], old: &Snapshot, now: &str) {
+/// Sets `growth` on each finding `old` also has (matched by id). Returns
+/// whether the RFC 3339 timestamps define a positive interval, even when no
+/// findings match.
+pub fn fill_growth(findings: &mut [Finding], old: &Snapshot, now: &str) -> bool {
     let (Some(t_now), Some(t_old)) = (parse_time(now), parse_time(&old.created_at)) else {
-        return;
+        return false;
     };
     let elapsed = t_now - t_old;
     if elapsed <= 0 {
-        return;
+        return false;
     }
     let before: HashMap<&str, u64> = old
         .findings
@@ -655,6 +656,30 @@ pub fn fill_growth(findings: &mut [Finding], old: &Snapshot, now: &str) {
             });
         }
     }
+    true
+}
+
+/// Uses [`snapshot::find`] to select the growth baseline for a scan report,
+/// matching its host, uid, roots and one-filesystem setting. The baseline
+/// must be at least [`MIN_AGE_SECS`] old at `now` (seconds since the epoch).
+/// Returns the baseline's `created_at` when the interval is usable. This
+/// lookup is read-only and leaves the report alone when no baseline is usable.
+pub fn fill_scan_growth(report: &mut ScanReport, dir: &Path, now: i64) -> Option<String> {
+    if report.findings.is_empty() {
+        return None;
+    }
+    let roots: Vec<String> = report.scan.roots.iter().map(|r| r.path.clone()).collect();
+    let found = snapshot::find(
+        dir,
+        &snapshot::Since::Age(MIN_AGE_SECS),
+        &report.host,
+        report.uid,
+        Some((&roots, report.scan.one_filesystem)),
+        now,
+    )
+    .ok()?;
+    fill_growth(&mut report.findings, &found.snapshot, &report.generated_at)
+        .then_some(found.snapshot.created_at)
 }
 
 #[cfg(test)]

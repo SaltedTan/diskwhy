@@ -78,6 +78,24 @@ pub fn tier_name(t: Tier) -> &'static str {
     }
 }
 
+/// A guard result's status as `dwhy explain` and the TUI show it.
+pub fn guard_status_name(s: GuardStatus) -> &'static str {
+    match s {
+        GuardStatus::Pass => "pass",
+        GuardStatus::Warn => "warn",
+        GuardStatus::Block => "BLOCK",
+    }
+}
+
+/// What kind of action a finding has, as `dwhy explain` and the TUI show it.
+pub fn action_kind_name(k: ActionKind) -> &'static str {
+    match k {
+        ActionKind::Advice => "advice, nothing to run",
+        ActionKind::Command => "command",
+        ActionKind::RemovePath => "path removal",
+    }
+}
+
 /// One plan item and what apply decided for it. `fresh` is the finding as
 /// detected now; it is what runs.
 #[derive(Debug, Clone)]
