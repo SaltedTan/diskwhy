@@ -50,7 +50,7 @@ pub use app::App;
 pub use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub use job::{Options, Scanned, Stage};
 
-use job::{Applied, ApplyFailed, ApplyProgress};
+use job::{APPLY_STOP_REQUESTED, Applied, ApplyFailed, ApplyProgress};
 
 pub type Error = Box<dyn std::error::Error>;
 
@@ -70,11 +70,10 @@ type ApplyResult = Result<Applied, ApplyFailed>;
 pub fn run(opts: Options) -> Result<u8, Error> {
     need_terminal()?;
     let signal = Termination::register()?;
-    let result = run_terminal(opts, &signal);
-    match signal.exit_code() {
-        Some(code) => Ok(code),
-        None => result.map(|()| 0),
-    }
+    let progress = Arc::new(Progress::default());
+    let mut app =
+        App::new(app::root_labels(&opts.paths), progress.clone()).with_options(opts.clone());
+    run_terminal(&mut app, &signal, || spawn_scan(opts, progress))
 }
 
 /// `dwhy tui --plan FILE`: reads and parses the plan (failing before the
@@ -91,17 +90,7 @@ pub fn run_plan(file: &Path, opts: Options) -> Result<u8, Error> {
         system::euid(),
     )
     .with_options(opts);
-    let result = (|| -> Result<(), Error> {
-        let _guard = TerminalGuard::enter()?;
-        let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        term.clear()?;
-        let (_tx, rx) = mpsc::channel();
-        event_loop(&mut term, &mut app, &rx, &signal, event::poll, event::read)
-    })();
-    match signal.exit_code() {
-        Some(code) => Ok(code),
-        None => result.map(|()| 0),
-    }
+    run_terminal(&mut app, &signal, || Ok(mpsc::channel().1))
 }
 
 fn need_terminal() -> Result<(), Error> {
@@ -114,17 +103,28 @@ fn need_terminal() -> Result<(), Error> {
     Ok(())
 }
 
-fn run_terminal(opts: Options, signal: &Termination) -> Result<(), Error> {
-    let progress = Arc::new(Progress::default());
-    let mut app =
-        App::new(app::root_labels(&opts.paths), progress.clone()).with_options(opts.clone());
-
-    let _guard = TerminalGuard::enter()?;
-    let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    term.clear()?;
-
-    let rx = spawn_scan(opts, progress)?;
-    event_loop(&mut term, &mut app, &rx, signal, event::poll, event::read)
+fn run_terminal(
+    app: &mut App,
+    signal: &Termination,
+    start_scan: impl FnOnce() -> io::Result<mpsc::Receiver<Msg>>,
+) -> Result<u8, Error> {
+    let result = (|| -> Result<(), Error> {
+        let _guard = TerminalGuard::enter()?;
+        let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        term.clear()?;
+        let rx = start_scan()?;
+        event_loop(&mut term, app, &rx, signal, event::poll, event::read)
+    })();
+    for error in &app.audit_errors {
+        eprintln!("dwhy: error: {}", error.escape_debug());
+    }
+    if !app.audit_errors.is_empty() {
+        return result.map(|()| 1);
+    }
+    match signal.exit_code() {
+        Some(code) => Ok(code),
+        None => result.map(|()| 0),
+    }
 }
 
 /// Scans in a background thread. Not joined: quitting mid-scan leaves it
@@ -147,19 +147,30 @@ fn spawn_scan(opts: Options, progress: Arc<Progress>) -> io::Result<mpsc::Receiv
 /// Never left to end with the process, which would cut a removal short.
 struct ApplyWorker {
     progress: Arc<ApplyProgress>,
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<ApplyResult>>,
 }
 
 impl ApplyWorker {
     fn running(&self) -> bool {
         self.handle.as_ref().is_some_and(|h| !h.is_finished())
     }
+
+    fn finish(mut self, app: &mut App) -> Result<(), Error> {
+        let result = self
+            .handle
+            .take()
+            .unwrap()
+            .join()
+            .map_err(|_| "the apply worker panicked")?;
+        app.apply_done(result);
+        Ok(())
+    }
 }
 
 impl Drop for ApplyWorker {
     fn drop(&mut self) {
-        self.progress.stop();
         if let Some(h) = self.handle.take() {
+            self.progress.stop();
             let _ = h.join();
         }
     }
@@ -176,15 +187,17 @@ fn event_loop<B: Backend>(
 where
     B::Error: 'static,
 {
+    app.apply_stop = signal.flag.clone();
     let mut worker = None;
     let result = run_loop(term, app, rx, signal, poll, read, &mut worker);
-    if let Some(w) = worker.as_ref().filter(|w| w.running()) {
-        // Quitting mid-apply: say so while the item in progress finishes.
-        w.progress.stop();
-        app.stopping();
-        let _ = term.draw(|f| ui::draw(f, app));
+    if let Some(w) = worker {
+        if w.running() {
+            w.progress.stop();
+            app.stopping();
+            let _ = term.draw(|f| ui::draw(f, app));
+        }
+        w.finish(app)?;
     }
-    drop(worker);
     result
 }
 
@@ -201,7 +214,6 @@ where
     B::Error: 'static,
 {
     let (built_tx, built_rx) = mpsc::channel::<Built>();
-    let (applied_tx, applied_rx) = mpsc::channel::<ApplyResult>();
     // The rescan after an apply, once one started.
     let mut rescan: Option<mpsc::Receiver<Msg>> = None;
     while signal.exit_code().is_none() {
@@ -213,9 +225,8 @@ where
         while let Ok((host, plan)) = built_rx.try_recv() {
             app.plan_built(plan, &host, system::euid());
         }
-        if let Ok(result) = applied_rx.try_recv() {
-            app.apply_done(result);
-            *worker = None;
+        if worker.as_ref().is_some_and(|w| !w.running()) {
+            worker.take().unwrap().finish(app)?;
         }
         if ready
             && let Event::Key(key) = read()?
@@ -235,13 +246,12 @@ where
                 })?;
         }
         if let Some(job) = app.take_apply() {
-            let tx = applied_tx.clone();
             let progress = job.progress.clone();
             let handle = std::thread::Builder::new()
                 .name("dwhy-tui-apply".into())
                 .spawn(move || {
                     let env = apply::Env::from_system();
-                    let _ = tx.send(job.run(Processes::read, &env));
+                    job.run(Processes::read, &env)
                 })?;
             *worker = Some(ApplyWorker {
                 progress,
@@ -291,7 +301,7 @@ impl Termination {
 
     fn exit_code(&self) -> Option<u8> {
         match self.flag.load(Ordering::Relaxed) {
-            0 => None,
+            0 | APPLY_STOP_REQUESTED => None,
             num => Some(128 + num as u8),
         }
     }
@@ -444,6 +454,7 @@ mod tests {
                      echo \"fake-cargo-stdout $*\"\n\
                      echo \"fake-cargo-stderr $*\" >&2\n\
                      : > '{base}/started'\n\
+                     while [ -e '{base}/hold' ]; do sleep 0.01; done\n\
                      sleep 1\n\
                      [ \"$1\" = clean ] && [ \"$4\" = --target-dir ] || exit 9\n\
                      case \"$5\" in\n  '{work}'/*) /bin/rm -rf -- \"$5\" ;;\n  *) exit 9 ;;\nesac\n",
@@ -488,17 +499,28 @@ mod tests {
         /// `dwhy tui --plan` on a plan of both targets.
         fn app(&self) -> App {
             let opts = self.options();
-            let scanned = job::scan(&opts, &Progress::default(), &mut |_| {}).unwrap();
+            self.open_plan(&opts, opts.clone(), 2)
+        }
+
+        fn open_plan(&self, scope: &Options, launch: Options, items: usize) -> App {
+            let scanned = job::scan(scope, &Progress::default(), &mut |_| {}).unwrap();
             assert_eq!(scanned.report.findings.len(), 2);
             let built = job::PlanJob {
                 options: scanned.plan_options,
                 progress: Default::default(),
-                marks: scanned.report.findings.iter().map(Into::into).collect(),
+                marks: scanned
+                    .report
+                    .findings
+                    .iter()
+                    .take(items)
+                    .map(Into::into)
+                    .collect(),
             }
             .build(Processes::default, system::hostname())
             .unwrap();
             let file = self.base.join("plan.json");
-            App::open_plan(built.plan, file, &system::hostname(), system::euid()).with_options(opts)
+            App::open_plan(built.plan, file, &system::hostname(), system::euid())
+                .with_options(launch)
         }
     }
 
@@ -567,6 +589,128 @@ mod tests {
         assert!(lines[2].contains(&detail), "{audit}");
         let path = format!("/work/{}/target", left[0]);
         assert!(lines[2].contains(&path), "{audit}");
+    }
+
+    #[test]
+    fn termination_stops_apply_before_the_event_loop_wakes() {
+        let fixture = Crates::new();
+        let mut app = fixture.app();
+        let signal = Termination::default();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (_tx, rx) = mpsc::channel();
+        let hold = fixture.base.join("hold");
+        std::fs::write(&hold, "").unwrap();
+        let started = fixture.base.join("started");
+        let log = fixture.options().audit_log.unwrap();
+        let mut polls = 0;
+        let mut keys = [key('x'), key('y')].into_iter();
+        let wait = |ready: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !ready() {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            true
+        };
+        event_loop(
+            &mut term,
+            &mut app,
+            &rx,
+            &signal,
+            |_| {
+                polls += 1;
+                if polls <= 2 {
+                    return Ok(true);
+                }
+                let in_progress = wait(&|| started.exists());
+                signal.flag.store(SIGHUP as usize, Ordering::Relaxed);
+                std::fs::remove_file(&hold)?;
+                assert!(in_progress, "the first cleanup never started");
+                assert!(wait(
+                    &|| std::fs::read_to_string(&log).is_ok_and(|audit| audit.lines().count() >= 3)
+                ));
+                Ok(false)
+            },
+            || Ok(keys.next().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(signal.exit_code(), Some(129));
+        let result = app
+            .apply_view()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        use dwhy_core::report::ApplyOutcome::{Removed, Skipped};
+        assert_eq!(
+            result
+                .report
+                .items
+                .iter()
+                .filter(|i| i.outcome == Removed)
+                .count(),
+            1
+        );
+        assert!(
+            result
+                .report
+                .items
+                .iter()
+                .any(|i| i.outcome == Skipped && i.detail == apply::NOT_RUN_STOPPED)
+        );
+        let audit = std::fs::read_to_string(log).unwrap();
+        assert_eq!(audit.matches(r#""event":"start""#).count(), 1, "{audit}");
+    }
+
+    #[test]
+    fn a_saved_plan_session_keeps_its_scan_scope_after_a_second_apply() {
+        let fixture = Crates::new();
+        let scope = Options {
+            cross_filesystems: true,
+            ..fixture.options()
+        };
+        let launch = Options {
+            paths: vec![fixture.base.join("unused")],
+            detectors: None,
+            ..fixture.options()
+        };
+        let mut app = fixture.open_plan(&scope, launch, 1);
+        let env = apply::Env::from_system();
+        for remaining in [1, 0] {
+            for c in ['x', 'y'] {
+                assert!(!app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
+            }
+            let result = app
+                .take_apply()
+                .unwrap()
+                .run(Processes::default, &env)
+                .unwrap();
+            assert_eq!(result.exit, 0, "{:?}", result.report.items);
+            app.apply_done(Ok(result));
+            assert!(!app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+            let scan = app.take_scan().unwrap();
+            assert_eq!(scan.options.paths, scope.paths);
+            assert_eq!(scan.options.cross_filesystems, scope.cross_filesystems);
+            assert_eq!(scan.options.detectors, scope.detectors);
+            let data = job::scan(&scan.options, &scan.progress, &mut |_| {}).unwrap();
+            assert_eq!(data.report.findings.len(), remaining);
+            app.finish(data);
+            assert_eq!(app.browser().unwrap().marked_findings().count(), 0);
+            if remaining > 0 {
+                for code in [KeyCode::Tab, KeyCode::Char(' '), KeyCode::Char('p')] {
+                    assert!(!app.on_key(KeyEvent::new(code, KeyModifiers::NONE)));
+                }
+                let plan = app
+                    .take_request()
+                    .unwrap()
+                    .build(Processes::default, env.host.clone());
+                app.plan_built(plan, &env.host, env.uid);
+            }
+        }
     }
 
     /// The previous test, run in a child process with its output captured:

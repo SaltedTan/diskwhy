@@ -1,0 +1,28 @@
+---
+source: crates/dwhy-tui/tests/tui.rs
+expression: end
+---
+" dwhy  apply this plan?                                         2 items · 3.3G  "
+"┌ Remove these items? ─────────────────────────────────────────────────────────┐"
+"│ 2 items, 1 of 1 review confirmed, frees ≈ 3.3G                               │"
+"│                                                                              │"
+"││        long-directory-component/long-directory-component/long-directory-comp│"
+"││        onent/long-directory-component/long-directory-component/long-director│"
+"││        y-component/long-directory-component/long-directory-component/long-di│"
+"││        rectory-component/long-directory-component/long-directory-component/l│"
+"││        ong-directory-component/long-directory-component/long-directory-compo│"
+"││        nent/long-directory-component/long-directory-component/long-directory│"
+"││        -component/long-directory-component/long-directory-component/long-dir│"
+"││        ectory-component/long-directory-component/long-directory-component/lo│"
+"││        ng-directory-component/long-directory-component/long-directory-compon│"
+"││        ent/long-directory-component/long-directory-component/long-directory-│"
+"││        component/long-directory-component/long-directory-component/long-dire│"
+"││        ctory-component/long-directory-component/long-directory-component/lon│"
+"││        g-directory-component/long-directory-component/long-directory-compone│"
+"││        nt/long-directory-component/long-directory-component/long-directory-c│"
+"││        omponent/long-directory-component//target-final                      │"
+"│                                                                              │"
+"│  1 blocked finding not in the plan: never applied                            │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" item 2/2 · review: confirmed                                                   "
+" ↑↓ · PgUp/PgDn scroll · Space tick · y apply · d dry run · Esc back · q quit   "

@@ -1187,7 +1187,7 @@ fn a_removal_whose_audit_line_cannot_be_written_does_not_run() {
     let mut checks = evaluate(&b, &plan, found, &Policy::default());
     // Every write to /dev/full fails with ENOSPC.
     let mut audit = Audit::open(Path::new("/dev/full")).unwrap();
-    apply::execute(
+    let errors = apply::execute(
         &plan,
         &mut checks,
         &mut audit,
@@ -1195,6 +1195,14 @@ fn a_removal_whose_audit_line_cannot_be_written_does_not_run() {
         &env(),
         &mut |_| {},
     );
+    assert_eq!(errors.len(), 3, "one write error per item: {errors:?}");
+    for name in ["cache", "target", "scratch"] {
+        let path = b.join(name);
+        assert!(
+            errors.iter().any(|e| e.starts_with(path.to_str().unwrap())),
+            "{errors:?}"
+        );
+    }
     assert!(b.join("cache/file").exists(), "nothing removed");
     let c = &checks
         .iter()

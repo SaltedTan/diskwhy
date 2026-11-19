@@ -5,12 +5,13 @@ use std::collections::{BTreeSet, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use dwhy_core::apply::Policy;
 use dwhy_core::explain::lossy_finding_paths;
 use dwhy_core::plan;
-use dwhy_core::report::{ActionKind, Finding, Plan, Tier};
+use dwhy_core::report::{ActionKind, ApplyOutcome, Finding, Plan, Tier};
 use dwhy_core::scan::Progress;
 use dwhy_core::tree::NodeId;
 use ratatui::text::Line;
@@ -154,7 +155,7 @@ pub struct PlanView {
 
 /// The confirm dialog: every plan item, with a checkbox on each `review`
 /// item (the TUI's `--confirm <id>`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct Confirm {
     /// The item the cursor is on, as an index into the plan's items.
     pub selected: usize,
@@ -162,6 +163,8 @@ pub struct Confirm {
     pub confirmed: BTreeSet<String>,
     /// First line on screen.
     pub scroll: usize,
+    pub(crate) reveal_selection: bool,
+    pub(crate) layout: Option<crate::ui::ConfirmLayout>,
 }
 
 /// An apply started from the confirm dialog: running, then its results.
@@ -176,6 +179,8 @@ pub struct ApplyView {
     pub progress: Arc<ApplyProgress>,
     /// `None` while it runs.
     pub result: Option<Result<Applied, ApplyFailed>>,
+    can_go_back: bool,
+    pub(crate) lines: Option<(usize, Vec<Line<'static>>)>,
     /// First line of the results on screen.
     pub scroll: usize,
     /// The person quit while it ran: the item in progress finishes, no
@@ -185,10 +190,9 @@ pub struct ApplyView {
 
 impl ApplyView {
     /// Whether Esc on the results goes back to the dialog: only when
-    /// nothing was removed (a dry run, or an apply that failed before
-    /// running any item).
+    /// every item is known to have been left untouched.
     pub fn can_go_back(&self) -> bool {
-        self.dry_run || matches!(self.result, Some(Err(_)))
+        self.can_go_back
     }
 }
 
@@ -215,11 +219,12 @@ pub struct App {
     pub viewport: usize,
     /// A one-off status message, cleared by the next key.
     pub message: Option<String>,
-    /// The session's options: the rescan after an apply uses them, and the
-    /// apply takes its threads, detector context and audit log from them.
+    /// The session's options, including the threads, detector context and audit log for apply.
     pub options: Options,
     /// Seconds since the epoch, for the plan checks `x` and `y` make.
     pub clock: fn() -> i64,
+    pub(crate) apply_stop: Arc<AtomicUsize>,
+    pub(crate) audit_errors: Vec<String>,
     request: Option<PlanJob>,
     apply_request: Option<ApplyJob>,
     scan_request: Option<ScanJob>,
@@ -239,6 +244,8 @@ impl App {
             message: None,
             options: Options::default(),
             clock: job::now,
+            apply_stop: Arc::default(),
+            audit_errors: Vec::new(),
             request: None,
             apply_request: None,
             scan_request: None,
@@ -281,10 +288,22 @@ impl App {
     }
 
     /// The apply finished (or failed before deciding items).
-    pub fn apply_done(&mut self, result: Result<Applied, ApplyFailed>) {
+    pub fn apply_done(&mut self, mut result: Result<Applied, ApplyFailed>) {
+        if let Ok(done) = &mut result {
+            self.audit_errors.append(&mut done.audit_errors);
+        }
         if let State::Applying(v) = &mut self.state
             && v.result.is_none()
         {
+            v.can_go_back = match &result {
+                Ok(done) => {
+                    v.dry_run
+                        || done.report.items.iter().all(|item| {
+                            matches!(item.outcome, ApplyOutcome::Refused | ApplyOutcome::Skipped)
+                        })
+                }
+                Err(_) => true,
+            };
             v.result = Some(result);
         }
     }
@@ -414,7 +433,7 @@ impl App {
         let page = self.viewport.max(1);
         let dry_session = self.dry_run();
         if let Some(view) = self.plan_view_mut().filter(|v| v.confirm.is_some()) {
-            match view.on_confirm_key(key.code, page, dry_session) {
+            match view.on_confirm_key(key, page, dry_session) {
                 ConfirmKey::None => {}
                 ConfirmKey::Message(m) => self.message = Some(m),
                 ConfirmKey::Start { dry_run } => self.message = self.start_apply(dry_run),
@@ -430,7 +449,7 @@ impl App {
         let b = match &mut self.state {
             State::Browsing(b) => b,
             State::Plan(view) => {
-                self.message = view.on_key(key.code, page, now);
+                self.message = view.on_key(key, page, now);
                 return false;
             }
             State::Scanning { .. } | State::Applying(_) => return false,
@@ -458,7 +477,7 @@ impl App {
                 return false;
             }
             View::Plan => {
-                self.message = b.on_plan_key(key.code, page, now);
+                self.message = b.on_plan_key(key, page, now);
                 return false;
             }
         }
@@ -525,14 +544,15 @@ impl App {
         let plan = view.plan.clone();
         let rescan = match &self.state {
             State::Plan(_) => self.options.for_plan(&plan),
-            _ => self.options.clone(),
+            State::Browsing(b) => b.data.plan_options.clone(),
+            State::Scanning { .. } | State::Applying(_) => unreachable!(),
         };
         let job = ApplyJob {
             plan,
             policy,
             dry_run,
             options: self.options.clone(),
-            progress: Arc::default(),
+            progress: Arc::new(ApplyProgress::with_stop(self.apply_stop.clone())),
         };
         let progress = job.progress.clone();
         let placeholder = State::Scanning {
@@ -546,6 +566,8 @@ impl App {
             dry_run,
             progress,
             result: None,
+            can_go_back: false,
+            lines: None,
             scroll: 0,
             stopping: false,
         }));
@@ -738,15 +760,15 @@ impl Browser {
         }
     }
 
-    fn on_plan_key(&mut self, code: KeyCode, page: usize, now: i64) -> Option<String> {
-        match code {
+    fn on_plan_key(&mut self, key: KeyEvent, page: usize, now: i64) -> Option<String> {
+        match key.code {
             KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
                 self.drop_preview();
                 self.view = View::Findings;
                 None
             }
             _ => match &mut self.plan {
-                PlanState::Ready(view) => view.on_key(code, page, now),
+                PlanState::Ready(view) => view.on_key(key, page, now),
                 PlanState::None | PlanState::Building { .. } => None,
             },
         }
@@ -864,13 +886,17 @@ impl PlanView {
         &self.plan
     }
 
+    pub(crate) fn confirmation(&mut self) -> Option<(&Plan, &mut Confirm)> {
+        Some((&self.plan, self.confirm.as_mut()?))
+    }
+
     pub fn unusable(&self, now: i64) -> Option<plan::Unusable> {
         plan::usable(&self.plan, &self.host, self.uid, now).err()
     }
 
-    fn on_key(&mut self, code: KeyCode, page: usize, now: i64) -> Option<String> {
-        match code {
-            KeyCode::Char('x') => {
+    fn on_key(&mut self, key: KeyEvent, page: usize, now: i64) -> Option<String> {
+        match key.code {
+            KeyCode::Char('x') if unmodified_action(key) => {
                 if let Some(why) = self.unusable(now) {
                     return Some(format!("cannot apply: {why}"));
                 }
@@ -887,36 +913,37 @@ impl PlanView {
                     self.prompt = Some(DEFAULT_PLAN_FILE.into());
                 }
             },
-            _ => scroll_lines(&mut self.scroll, code, page),
+            _ => scroll_lines(&mut self.scroll, key.code, page),
         }
         None
     }
 
     /// A key while the confirm dialog is open.
-    fn on_confirm_key(&mut self, code: KeyCode, page: usize, dry_session: bool) -> ConfirmKey {
+    fn on_confirm_key(&mut self, key: KeyEvent, page: usize, dry_session: bool) -> ConfirmKey {
         let Some(c) = self.confirm.as_mut() else {
             return ConfirmKey::None;
         };
         let items = &self.plan.items;
         let last = items.len().saturating_sub(1);
-        // Items take two lines or more.
-        let page = (page / 2).max(1);
-        match code {
+        match key.code {
             KeyCode::Esc => {
                 self.confirm = None;
                 return ConfirmKey::Message("nothing applied".into());
             }
-            KeyCode::Char('y') => {
+            KeyCode::Char('y') if unmodified_action(key) => {
                 return ConfirmKey::Start {
                     dry_run: dry_session,
                 };
             }
-            KeyCode::Char('d') => return ConfirmKey::Start { dry_run: true },
+            KeyCode::Char('d') if unmodified_action(key) => {
+                return ConfirmKey::Start { dry_run: true };
+            }
             KeyCode::Char(' ') => match items.get(c.selected).map(|i| &i.finding) {
                 Some(f) if f.tier == Tier::Review => {
                     if !c.confirmed.remove(&f.id) {
                         c.confirmed.insert(f.id.clone());
                     }
+                    c.layout = None;
                 }
                 Some(_) => {
                     return ConfirmKey::Message(
@@ -925,12 +952,26 @@ impl PlanView {
                 }
                 None => {}
             },
-            KeyCode::Up | KeyCode::Char('k') => c.selected = c.selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => c.selected = (c.selected + 1).min(last),
-            KeyCode::PageUp => c.selected = c.selected.saturating_sub(page),
-            KeyCode::PageDown => c.selected = (c.selected + page).min(last),
-            KeyCode::Home | KeyCode::Char('g') => c.selected = 0,
-            KeyCode::End | KeyCode::Char('G') => c.selected = last,
+            KeyCode::Up | KeyCode::Char('k') => {
+                c.selected = c.selected.saturating_sub(1);
+                c.reveal_selection = true;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                c.selected = (c.selected + 1).min(last);
+                c.reveal_selection = true;
+            }
+            KeyCode::PageUp | KeyCode::PageDown => {
+                c.reveal_selection = false;
+                scroll_lines(&mut c.scroll, key.code, page);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                c.selected = 0;
+                c.reveal_selection = true;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                c.selected = last;
+                c.reveal_selection = true;
+            }
             _ => {}
         }
         ConfirmKey::None
@@ -987,6 +1028,11 @@ impl PlanView {
         };
         Some(message)
     }
+}
+
+fn unmodified_action(key: KeyEvent) -> bool {
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 fn size(t: &dwhy_core::report::Totals, mode: SizeMode) -> u64 {

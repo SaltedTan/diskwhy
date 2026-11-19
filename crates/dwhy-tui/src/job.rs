@@ -9,7 +9,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -62,6 +62,10 @@ impl Options {
         if let Some(names) = &self.detectors {
             detect::validate_selection(names)?;
         }
+        self.prepare_roots()
+    }
+
+    fn prepare_roots(&self) -> Result<Vec<PathBuf>, String> {
         let paths = if self.paths.is_empty() {
             vec![PathBuf::from(".")]
         } else {
@@ -181,7 +185,6 @@ pub fn scan(
         growth_base,
         plan_options: Options {
             paths: roots,
-            snapshot_dir: None,
             ..opts.clone()
         },
     })
@@ -341,8 +344,10 @@ pub struct ApplyProgress {
     /// The rescan's counters.
     pub scan: Progress,
     step: Mutex<ApplyStep>,
-    stop: AtomicBool,
+    stop: Arc<AtomicUsize>,
 }
+
+pub(crate) const APPLY_STOP_REQUESTED: usize = usize::MAX;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ApplyStep {
@@ -359,6 +364,14 @@ pub enum ApplyStep {
 }
 
 impl ApplyProgress {
+    pub(crate) fn with_stop(stop: Arc<AtomicUsize>) -> Self {
+        Self {
+            scan: Progress::default(),
+            step: Mutex::default(),
+            stop,
+        }
+    }
+
     pub fn step(&self) -> ApplyStep {
         self.step.lock().map(|s| s.clone()).unwrap_or_default()
     }
@@ -371,11 +384,16 @@ impl ApplyProgress {
 
     /// Asks the apply to stop: the item in progress finishes, no other runs.
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.stop.compare_exchange(
+            0,
+            APPLY_STOP_REQUESTED,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
     }
 
     pub fn stopping(&self) -> bool {
-        self.stop.load(Ordering::Relaxed)
+        self.stop.load(Ordering::Relaxed) != 0
     }
 }
 
@@ -387,6 +405,7 @@ pub struct Applied {
     pub audit: Option<PathBuf>,
     /// What `dwhy apply` exits with for this report.
     pub exit: u8,
+    pub audit_errors: Vec<String>,
 }
 
 /// An apply that failed before running any item: what `dwhy apply` prints
@@ -436,7 +455,7 @@ impl ApplyJob {
         }
         progress.set(ApplyStep::Rescanning);
         let opts = options.for_plan(&plan);
-        let roots = opts.roots().map_err(ApplyFailed::error)?;
+        let roots = opts.prepare_roots().map_err(ApplyFailed::error)?;
         let mounts = MountTable::read().unwrap_or_default();
         let result = opts
             .walk(&roots, &mounts, &progress.scan)
@@ -447,7 +466,7 @@ impl ApplyJob {
             &result.tree,
             &ctx,
             &dwhy_core::detectors::registry(),
-            plan.scan.detectors.as_deref(),
+            opts.detectors.as_deref(),
         );
         let mut checks = apply::evaluate(
             &plan,
@@ -464,6 +483,7 @@ impl ApplyJob {
                 report,
                 audit: None,
                 exit,
+                audit_errors: Vec::new(),
             });
         }
         let path = opts.audit_log.as_deref().ok_or_else(|| {
@@ -476,7 +496,7 @@ impl ApplyJob {
             .map_err(|e| ApplyFailed::error(format!("cannot read the mount table: {e}")))?;
         let total = checks.iter().filter(|c| c.ready()).count();
         let mut done = 0;
-        apply::execute_until(
+        let audit_errors = apply::execute_until(
             &plan,
             &mut checks,
             &mut audit,
@@ -490,14 +510,22 @@ impl ApplyJob {
                 });
                 done += 1;
             },
-            &|| progress.stopping(),
+            apply::ExecuteOptions {
+                stop: &|| progress.stopping(),
+                isolate_commands: true,
+            },
         );
         let report = apply::report(&plan, &checks, &policy, false, env);
-        let exit = apply::exit_code(&report);
+        let exit = if audit_errors.is_empty() {
+            apply::exit_code(&report)
+        } else {
+            1
+        };
         Ok(Applied {
             report,
             audit: Some(audit.path().to_path_buf()),
             exit,
+            audit_errors,
         })
     }
 }

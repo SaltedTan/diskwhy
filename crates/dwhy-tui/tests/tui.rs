@@ -2606,6 +2606,7 @@ fn hand_applied() -> Applied {
         },
         audit: Some("/tmp/state/diskwhy/audit.jsonl".into()),
         exit: 3,
+        audit_errors: Vec::new(),
     }
 }
 
@@ -2649,6 +2650,26 @@ fn x_opens_the_dialog_only_for_a_usable_plan() {
     assert!(app.plan_view().unwrap().confirm.is_some());
     press(&mut app, &[KeyCode::Esc]);
     assert_eq!(app.browser().unwrap().view, View::Plan);
+}
+
+#[test]
+fn modified_apply_keys_do_not_open_or_submit_the_dialog() {
+    let (_fixture, mut browser) = preview_app();
+    browser.clock = || PLAN_AT + 60;
+    for mut app in [dialog_app(false), browser, dialog_app(true)] {
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            assert!(!app.on_key(KeyEvent::new(KeyCode::Char('x'), modifiers)));
+            assert!(app.plan_view().unwrap().confirm.is_none());
+        }
+        press(&mut app, &[KeyCode::Char('x')]);
+        for code in [KeyCode::Char('y'), KeyCode::Char('d')] {
+            for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                assert!(!app.on_key(KeyEvent::new(code, modifiers)));
+                assert!(app.take_apply().is_none());
+                assert!(app.plan_view().unwrap().confirm.is_some());
+            }
+        }
+    }
 }
 
 #[test]
@@ -2821,10 +2842,81 @@ fn a_plan_session_rescans_the_plans_roots_and_esc_returns_after_a_dry_run() {
 }
 
 #[test]
+fn apply_results_allow_escape_after_refusals_and_skips() {
+    for (outcome, returns) in [(ApplyOutcome::Skipped, true), (ApplyOutcome::Failed, false)] {
+        let mut app = dialog_app(false);
+        press(
+            &mut app,
+            &[
+                KeyCode::Char('x'),
+                KeyCode::End,
+                KeyCode::Char(' '),
+                KeyCode::Char('y'),
+            ],
+        );
+        assert!(app.take_apply().is_some());
+        let mut result = hand_applied();
+        result.report.freed = 0;
+        result.report.items[0].outcome = outcome;
+        result.exit = dwhy_core::apply::exit_code(&result.report);
+        app.apply_done(Ok(result));
+
+        let screen = render(&mut app, 80, 24, None);
+        assert_eq!(
+            screen.contains("Esc back to the dialog"),
+            returns,
+            "{screen}"
+        );
+        press(&mut app, &[KeyCode::Esc]);
+        if returns {
+            assert_eq!(confirmed(&app), [review_id()]);
+        } else {
+            assert!(app.apply_view().is_some());
+        }
+    }
+}
+
+#[test]
 fn confirm_dialog_80x24() {
     let mut app = dialog_app(false);
     press(&mut app, &[KeyCode::Char('x')]);
     insta::assert_snapshot!(render_at(&mut app, 80, 24, None, PLAN_AT + 60));
+}
+
+#[test]
+fn confirm_dialog_long_action_80x24() {
+    let mut plan = review_plan();
+    let finding = &mut plan.items[1].finding;
+    let cargo_path = format!(
+        "/home/me/{}/target-final",
+        "long-directory-component/".repeat(70)
+    );
+    finding.action.kind = ActionKind::Command;
+    finding.action.text = format!("cargo clean --target-dir {cargo_path}");
+    let mut app = App::open_plan(plan, "/tmp/plans/dwhy-plan.json".into(), HOST, UID);
+    app.clock = || PLAN_AT + 60;
+    press(&mut app, &[KeyCode::Char('x'), KeyCode::Down]);
+    let start = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(start.contains("preview — do not copy"), "{start}");
+    assert!(!start.contains("target-final"), "{start}");
+
+    for _ in 0..3 {
+        press(&mut app, &[KeyCode::PageDown]);
+        render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    }
+    press(&mut app, &[KeyCode::Char(' ')]);
+    let end = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(end.contains("target-final"), "{end}");
+    assert_eq!(confirmed(&app), [review_id()]);
+    insta::assert_snapshot!(end);
+
+    for _ in 0..3 {
+        press(&mut app, &[KeyCode::PageUp]);
+        render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    }
+    let top = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(top.contains("[x] review"), "{top}");
+    assert!(!top.contains("target-final"), "{top}");
 }
 
 #[test]

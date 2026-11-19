@@ -6,13 +6,14 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
+use std::ops::Range;
 use std::sync::atomic::Ordering;
 
 use dwhy_core::apply::{action_kind_name, guard_status_name, tier_name};
 use dwhy_core::detect::{PATH_NOT_UTF8_RECOVERY_NOTE, is_lossy, rfc3339};
 use dwhy_core::plan;
 use dwhy_core::probes::postgres_wal;
-use dwhy_core::report::{ActionKind, ApplyOutcome, Finding, FsReport, GuardStatus, Tier};
+use dwhy_core::report::{ActionKind, ApplyOutcome, Finding, FsReport, GuardStatus, Plan, Tier};
 use dwhy_core::units::{human, signed, thousands};
 use ratatui::Frame;
 use ratatui::buffer::CellWidth;
@@ -24,7 +25,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, ApplyView, Browser, FindingList, PlanState, PlanView, SizeMode, State, View, sanitize,
+    App, ApplyView, Browser, Confirm, FindingList, PlanState, PlanView, SizeMode, State, View,
+    sanitize,
 };
 use crate::job::{self, ApplyStep, Mark, PermissionMark, Scanned, Stage};
 
@@ -376,34 +378,9 @@ fn draw_plan(
 /// action), with a checkbox on each `review` item. Returns the lines on screen.
 fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: bool) -> usize {
     let dim = Style::new().add_modifier(Modifier::DIM);
-    let bold = Style::new().add_modifier(Modifier::BOLD);
-    let p = v.plan();
+    let (p, c) = v.confirmation().unwrap();
     let items = &p.items;
-    let Some(c) = v.confirm.clone() else {
-        return 0;
-    };
     let plural = |n: usize| if n == 1 { "" } else { "s" };
-    let reviews = items
-        .iter()
-        .filter(|i| i.finding.tier == Tier::Review)
-        .count();
-    let confirmed = items
-        .iter()
-        .filter(|i| i.finding.tier == Tier::Review && c.confirmed.contains(&i.finding.id))
-        .count();
-    let going = plan::distinct_bytes(
-        items
-            .iter()
-            .map(|i| &i.finding)
-            .filter(|f| f.tier != Tier::Review || c.confirmed.contains(&f.id))
-            .map(|f| (f.path.as_str(), f.bytes)),
-    );
-    let mut summary = format!("{} item{}", items.len(), plural(items.len()));
-    if reviews > 0 {
-        summary.push_str(&format!(", {confirmed} of {reviews} review confirmed"));
-    }
-    summary.push_str(&format!(", frees ≈ {}", human(going)));
-
     let verb = if dry_session { "dry run" } else { "apply" };
     let right = format!(
         "{} item{} · {}",
@@ -428,91 +405,36 @@ fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: boo
     f.render_widget(block, a.list);
     let width = inner.width as usize;
 
-    let mut head = vec![Line::styled(middle(&format!(" {summary}"), width), bold)];
-    if confirmed < reviews {
-        head.extend(
-            wrap(
-                " Unconfirmed review items are refused, as by dwhy apply without --confirm.",
-                width,
-            )
-            .into_iter()
-            .map(|l| Line::styled(l, dim)),
-        );
+    if c.layout.as_ref().is_none_or(|layout| layout.width != width) {
+        c.layout = Some(confirm_layout(p, c, width));
     }
-    head.push(Line::raw(""));
-
-    // Item lines, each tagged with its item.
-    let mut lines: Vec<(Option<usize>, Line<'static>)> = Vec::new();
-    for (n, item) in items.iter().enumerate() {
-        let f = &item.finding;
-        let lossy = is_lossy(&f.path);
-        let sel = n == c.selected;
-        let check = match f.tier {
-            Tier::Review if c.confirmed.contains(&f.id) => "[x] ",
-            Tier::Review => "[ ] ",
-            _ => "    ",
-        };
-        let header = format!(
-            "{}{check}{:<TIER_W$} {:>8}  ",
-            if sel { "> " } else { "  " },
-            tier_name(f.tier),
-            human(f.bytes),
-        );
-        let path = middle_units(display_units(&f.path), width.saturating_sub(header.width()));
-        let mut line = Line::from(vec![
-            Span::raw(header),
-            Span::styled(path, Style::new().add_modifier(Modifier::BOLD)),
-        ]);
-        if sel {
-            line = line.style(Style::new().add_modifier(Modifier::REVERSED));
-        }
-        lines.push((Some(n), line));
-        for l in command_lines(
-            "      ",
-            &f.action.text,
-            lossy,
-            f.action.kind != ActionKind::Advice,
-            width,
-        ) {
-            lines.push((Some(n), l));
-        }
+    let layout = c.layout.as_ref().unwrap();
+    let height = (inner.height as usize)
+        .saturating_sub(layout.head.len())
+        .max(1);
+    let row = layout.rows.get(c.selected);
+    if std::mem::take(&mut c.reveal_selection)
+        && let Some(row) = row
+    {
+        c.scroll = c.scroll.max(row.end.saturating_sub(height)).min(row.start);
     }
-    if !p.blocked.is_empty() {
-        lines.push((None, Line::raw("")));
-        let n = p.blocked.len();
-        lines.extend(
-            wrap(
-                &format!(
-                    "  {n} blocked finding{} not in the plan: never applied",
-                    plural(n)
-                ),
-                width,
-            )
-            .into_iter()
-            .map(|l| (None, Line::styled(l, dim))),
-        );
-    }
-
-    let height = (inner.height as usize).saturating_sub(head.len()).max(1);
-    let first = lines.iter().position(|(i, _)| *i == Some(c.selected));
-    let last = lines.iter().rposition(|(i, _)| *i == Some(c.selected));
-    let mut scroll = c.scroll;
-    if let (Some(first), Some(last)) = (first, last) {
-        if last >= scroll + height {
-            scroll = last + 1 - height;
-        }
-        if first < scroll {
-            scroll = first;
-        }
-    }
-    scroll = scroll.min(lines.len().saturating_sub(height));
-    if let Some(c) = v.confirm.as_mut() {
-        c.scroll = scroll;
-    }
-    head.extend(lines.into_iter().skip(scroll).take(height).map(|(_, l)| l));
-    f.render_widget(Paragraph::new(head), inner);
-
-    let p = v.plan();
+    c.scroll = c.scroll.min(layout.lines.len().saturating_sub(height));
+    let mut shown = layout.head.clone();
+    shown.extend(
+        layout.lines[c.scroll..]
+            .iter()
+            .take(height)
+            .enumerate()
+            .map(|(i, line)| {
+                let mut line = line.clone();
+                if row.is_some_and(|row| row.start == c.scroll + i) {
+                    line.spans[0].content = Cow::Borrowed("> ");
+                    line = line.style(Style::new().add_modifier(Modifier::REVERSED));
+                }
+                line
+            }),
+    );
+    f.render_widget(Paragraph::new(shown), inner);
     let status = match p.items.get(c.selected).map(|i| &i.finding) {
         Some(f) if f.tier == Tier::Review && c.confirmed.contains(&f.id) => {
             "review: confirmed".to_string()
@@ -529,9 +451,114 @@ fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: boo
         a.status,
     );
     let y = if dry_session { "y dry run" } else { "y apply" };
-    let keys = format!(" ↑↓ · Space confirm review · {y} · d dry run · Esc cancel · q quit");
+    let keys = format!(" ↑↓ · PgUp/PgDn scroll · Space tick · {y} · d dry run · Esc back · q quit");
     f.render_widget(Paragraph::new(Span::styled(keys, dim)), a.keys);
     height
+}
+
+#[derive(Debug)]
+pub(crate) struct ConfirmLayout {
+    width: usize,
+    head: Vec<Line<'static>>,
+    lines: Vec<Line<'static>>,
+    rows: Vec<Range<usize>>,
+}
+
+fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let items = &p.items;
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let reviews = items
+        .iter()
+        .filter(|i| i.finding.tier == Tier::Review)
+        .count();
+    let confirmed = items
+        .iter()
+        .filter(|i| i.finding.tier == Tier::Review && c.confirmed.contains(&i.finding.id))
+        .count();
+    let going = plan::distinct_bytes(
+        items
+            .iter()
+            .map(|i| &i.finding)
+            .filter(|f| f.tier != Tier::Review || c.confirmed.contains(&f.id))
+            .map(|f| (f.path.as_str(), f.bytes)),
+    );
+    let mut summary = format!("{} item{}", items.len(), plural(items.len()));
+    if reviews > 0 {
+        summary.push_str(&format!(", {confirmed} of {reviews} review confirmed"));
+    }
+    summary.push_str(&format!(", frees ≈ {}", human(going)));
+
+    let mut head = vec![Line::styled(middle(&format!(" {summary}"), width), bold)];
+    if confirmed < reviews {
+        head.extend(
+            wrap(
+                " Unconfirmed review items are refused, as by dwhy apply without --confirm.",
+                width,
+            )
+            .into_iter()
+            .map(|l| Line::styled(l, dim)),
+        );
+    }
+    head.push(Line::raw(""));
+
+    let mut rows = Vec::with_capacity(items.len());
+    let mut lines = Vec::new();
+    for item in items {
+        let start = lines.len();
+        let f = &item.finding;
+        let lossy = is_lossy(&f.path);
+        let check = match f.tier {
+            Tier::Review if c.confirmed.contains(&f.id) => "[x] ",
+            Tier::Review => "[ ] ",
+            _ => "    ",
+        };
+        let header = format!(
+            "{check}{:<TIER_W$} {:>8}  ",
+            tier_name(f.tier),
+            human(f.bytes),
+        );
+        let path = middle_units(
+            display_units(&f.path),
+            width.saturating_sub(2 + header.width()),
+        );
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::raw(header),
+            Span::styled(path, Style::new().add_modifier(Modifier::BOLD)),
+        ]));
+        lines.extend(command_lines(
+            "      ",
+            &f.action.text,
+            lossy,
+            f.action.kind != ActionKind::Advice,
+            width,
+        ));
+        rows.push(start..lines.len());
+    }
+    if !p.blocked.is_empty() {
+        lines.push(Line::raw(""));
+        let n = p.blocked.len();
+        lines.extend(
+            wrap(
+                &format!(
+                    "  {n} blocked finding{} not in the plan: never applied",
+                    plural(n)
+                ),
+                width,
+            )
+            .into_iter()
+            .map(|l| Line::styled(l, dim)),
+        );
+    }
+
+    ConfirmLayout {
+        width,
+        head,
+        lines,
+        rows,
+    }
 }
 
 /// What `dwhy apply` prints for an item's outcome.
@@ -600,24 +627,33 @@ fn draw_apply(f: &mut Frame, v: &mut ApplyView, a: &PlanAreas) -> usize {
         return a.list.height as usize;
     };
 
-    let (right, lines) = match result {
-        Ok(done) => (format!("exit {}", done.exit), results_lines(done, width)),
-        Err(e) => {
-            let mut lines = Vec::new();
-            lines.extend(
-                wrap(&e.message, width)
-                    .into_iter()
-                    .map(|l| Line::styled(l, bold)),
-            );
-            lines.push(Line::raw(format!(
-                "  dwhy apply would exit {} ({}) · nothing was removed",
-                e.exit,
-                exit_meaning(e.exit)
-            )));
-            (format!("exit {}", e.exit), lines)
-        }
+    let exit = match result {
+        Ok(done) => done.exit,
+        Err(e) => e.exit,
     };
-    f.render_widget(title_line(&format!("{what} results"), &right, tw), a.title);
+    if v.lines.as_ref().is_none_or(|(cached, _)| *cached != width) {
+        let lines = match result {
+            Ok(done) => results_lines(done, width),
+            Err(e) => {
+                let mut lines: Vec<_> = wrap(&e.message, width)
+                    .into_iter()
+                    .map(|l| Line::styled(l, bold))
+                    .collect();
+                lines.push(Line::raw(format!(
+                    "  dwhy apply would exit {} ({}) · nothing was removed",
+                    e.exit,
+                    exit_meaning(e.exit)
+                )));
+                lines
+            }
+        };
+        v.lines = Some((width, lines));
+    }
+    let (_, lines) = v.lines.as_ref().unwrap();
+    f.render_widget(
+        title_line(&format!("{what} results"), &format!("exit {exit}"), tw),
+        a.title,
+    );
     let height = a.list.height as usize;
     v.scroll = v.scroll.min(lines.len().saturating_sub(height.max(1)));
     let end = (v.scroll + height).min(lines.len());

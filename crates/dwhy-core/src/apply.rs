@@ -23,6 +23,7 @@ use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -393,7 +394,7 @@ fn record(
 }
 
 /// Runs the ready checks, deepest path first, and audits every item.
-/// `progress` is called with each item before it runs.
+/// `progress` is called with each item before it runs. Returns audit write errors.
 pub fn execute(
     plan: &Plan,
     checks: &mut [Check],
@@ -401,12 +402,28 @@ pub fn execute(
     mounts: &MountTable,
     env: &Env,
     progress: &mut dyn FnMut(&ApplyItem),
-) {
-    execute_until(plan, checks, audit, mounts, env, progress, &|| false);
+) -> Vec<String> {
+    execute_until(
+        plan,
+        checks,
+        audit,
+        mounts,
+        env,
+        progress,
+        ExecuteOptions {
+            stop: &|| false,
+            isolate_commands: false,
+        },
+    )
 }
 
 /// The detail of a ready item that [`execute_until`] did not start.
 pub const NOT_RUN_STOPPED: &str = "not run: apply was stopped before this item";
+
+pub struct ExecuteOptions<'a> {
+    pub stop: &'a dyn Fn() -> bool,
+    pub isolate_commands: bool,
+}
 
 /// [`execute`], stopping between items: once `stop` returns true (it is
 /// asked before each removal), the item in progress has finished and each
@@ -419,17 +436,18 @@ pub fn execute_until(
     mounts: &MountTable,
     env: &Env,
     progress: &mut dyn FnMut(&ApplyItem),
-    stop: &dyn Fn() -> bool,
-) {
+    options: ExecuteOptions<'_>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut write_record = |item: &ApplyItem, event, outcome| {
+        audit
+            .record(&record(env, plan, item, event, outcome))
+            .inspect_err(|e| {
+                errors.push(format!("{}: {e}", item.path));
+            })
+    };
     for c in checks.iter().filter(|c| !c.ready()) {
-        // A failure to record a skip removes nothing; the report has it.
-        let _ = audit.record(&record(
-            env,
-            plan,
-            &c.item,
-            AuditEvent::End,
-            Some(c.item.outcome),
-        ));
+        let _ = write_record(&c.item, AuditEvent::End, Some(c.item.outcome));
     }
     let mut order: Vec<usize> = (0..checks.len()).filter(|&i| checks[i].ready()).collect();
     // Deepest first, so a tool-native command inside runs before a path
@@ -441,44 +459,39 @@ pub fn execute_until(
     let mut removed_paths = HashSet::new();
     for i in order {
         let c = &mut checks[i];
-        if stop() {
+        if (options.stop)() {
             c.item.outcome = ApplyOutcome::Skipped;
             c.item.detail = NOT_RUN_STOPPED.into();
-            let _ = audit.record(&record(
-                env,
-                plan,
-                &c.item,
-                AuditEvent::End,
-                Some(c.item.outcome),
-            ));
-            continue;
+        } else {
+            progress(&c.item);
+            if let Err(e) = write_record(&c.item, AuditEvent::Start, None) {
+                c.item.outcome = ApplyOutcome::Failed;
+                c.item.detail = format!("not run: {e}");
+                continue;
+            }
+            let (outcome, detail) = run(c, mounts, &removed_paths, options.isolate_commands);
+            let path = Path::new(&c.item.path);
+            if outcome == ApplyOutcome::Removed
+                && path.is_absolute()
+                && (c.item.action.kind == ActionKind::RemovePath || removal_path_absent(path))
+            {
+                removed_paths.insert(path.to_path_buf());
+            }
+            c.item.outcome = outcome;
+            c.item.detail = detail;
         }
-        progress(&c.item);
-        if let Err(e) = audit.record(&record(env, plan, &c.item, AuditEvent::Start, None)) {
-            c.item.outcome = ApplyOutcome::Failed;
-            c.item.detail = format!("not run: {e}");
-            continue;
-        }
-        let (outcome, detail) = run(c, mounts, &removed_paths);
-        let path = Path::new(&c.item.path);
-        if outcome == ApplyOutcome::Removed
-            && path.is_absolute()
-            && (c.item.action.kind == ActionKind::RemovePath || removal_path_absent(path))
-        {
-            removed_paths.insert(path.to_path_buf());
-        }
-        c.item.outcome = outcome;
-        c.item.detail = detail;
-        if let Err(e) = audit.record(&record(env, plan, &c.item, AuditEvent::End, Some(outcome))) {
+        if let Err(e) = write_record(&c.item, AuditEvent::End, Some(c.item.outcome)) {
             c.item.detail.push_str(&format!(" (and {e})"));
         }
     }
+    errors
 }
 
 fn run(
     c: &mut Check,
     mounts: &MountTable,
     removed_paths: &HashSet<PathBuf>,
+    isolate_commands: bool,
 ) -> (ApplyOutcome, String) {
     let item = &mut c.item;
     if let Some(detail) = lossy(&item.path, &item.action) {
@@ -511,12 +524,12 @@ fn run(
             else {
                 return (ApplyOutcome::Failed, "the command has no argv".into());
             };
-            match Command::new(prog)
-                .args(args)
-                .current_dir("/")
-                .stdin(Stdio::null())
-                .output()
-            {
+            let mut command = Command::new(prog);
+            command.args(args).current_dir("/").stdin(Stdio::null());
+            if isolate_commands {
+                command.process_group(0);
+            }
+            match command.output() {
                 Ok(out) if out.status.success() => {
                     (ApplyOutcome::Removed, format!("ran {}", item.action.text))
                 }

@@ -1049,14 +1049,21 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
     let mounts = MountTable::read().map_err(|e| format!("cannot read the mount table: {e}"))?;
     let quiet = args.quiet;
     let mut status: Option<StatusLine> = None;
-    apply::execute(&plan, &mut checks, &mut audit, &mounts, &env, &mut |item| {
+    let audit_errors = apply::execute(&plan, &mut checks, &mut audit, &mounts, &env, &mut |item| {
         drop(status.take());
         status = status_line(quiet, &format!("removing {}…", item.path));
     });
     drop(status);
+    for error in &audit_errors {
+        eprintln!("dwhy: error: {}", error.escape_debug());
+    }
     let r = apply::report(&plan, &checks, &policy, false, &env);
     print_apply(&r, args.json, Some(audit.path()))?;
-    Ok(apply::exit_code(&r))
+    Ok(if audit_errors.is_empty() {
+        apply::exit_code(&r)
+    } else {
+        EXIT_ERROR
+    })
 }
 
 /// Rescans the plan's roots, re-runs its detectors, and decides each item.
