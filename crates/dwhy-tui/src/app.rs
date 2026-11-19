@@ -1,16 +1,25 @@
 //! The TUI as a state machine: scan messages and key events in, state out.
 //! Nothing here touches the terminal, so tests drive it directly.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use dwhy_core::explain::lossy_finding_paths;
-use dwhy_core::report::{Finding, Tier};
+use dwhy_core::plan;
+use dwhy_core::report::{ActionKind, Finding, Plan, Tier};
 use dwhy_core::scan::Progress;
 use dwhy_core::tree::NodeId;
+use ratatui::text::Line;
 
-use crate::job::{Mark, Scanned, Stage};
+use crate::job::{
+    self, BuiltPlan, Mark, PlanJob, PlanMark, Scanned, Stage, UnplannedMark, WriteError,
+};
+
+/// Where `w` offers to write a plan, relative to the working directory.
+pub const DEFAULT_PLAN_FILE: &str = "./dwhy-plan.json";
 
 /// Which size the tree shows and sorts by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +73,8 @@ pub enum View {
     Findings,
     /// One finding from the scan, in `dwhy explain` field order.
     Detail,
+    /// The plan built from the marked findings.
+    Plan,
 }
 
 /// The tier filter cycle: all, then each tier, then all again.
@@ -103,6 +114,39 @@ pub struct Browser {
     pub offset: usize,
     pub(crate) fs_offset: Option<usize>,
     pub findings: FindingList,
+    /// Marked findings, as indices into the report's findings.
+    pub(crate) marked: BTreeSet<usize>,
+    marked_bytes: u64,
+    pub plan: PlanState,
+}
+
+/// The plan made from the marks.
+#[derive(Debug, Default)]
+pub enum PlanState {
+    #[default]
+    None,
+    Building {
+        progress: Arc<Progress>,
+        marks: BTreeSet<usize>,
+    },
+    Ready(Box<PlanView>),
+}
+
+/// A plan in the preview.
+#[derive(Debug)]
+pub struct PlanView {
+    plan: Plan,
+    host: String,
+    uid: u32,
+    /// The file it was opened from (`dwhy tui --plan`); `None` when built here.
+    pub file: Option<PathBuf>,
+    pub(crate) lossy_paths: HashSet<String>,
+    pub(crate) unplanned: Vec<UnplannedMark>,
+    pub(crate) lines: Option<(usize, Vec<Line<'static>>)>,
+    /// First line on screen.
+    pub scroll: usize,
+    /// The path being edited in the `w` prompt.
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug)]
@@ -112,6 +156,8 @@ pub enum State {
         stage: Stage,
     },
     Browsing(Box<Browser>),
+    /// `dwhy tui --plan FILE`: a plan file and no scan.
+    Plan(Box<PlanView>),
 }
 
 #[derive(Debug)]
@@ -122,6 +168,9 @@ pub struct App {
     pub mode: SizeMode,
     /// Rows the list showed at the last draw (what PgUp/PgDn move by).
     pub viewport: usize,
+    /// A one-off status message, cleared by the next key.
+    pub message: Option<String>,
+    request: Option<PlanJob>,
 }
 
 impl App {
@@ -135,6 +184,82 @@ impl App {
             },
             mode: SizeMode::Allocated,
             viewport: 10,
+            message: None,
+            request: None,
+        }
+    }
+
+    /// `dwhy tui --plan FILE`: previews `plan`, read from `file`.
+    pub fn open_plan(plan: Plan, file: PathBuf, host: &str, uid: u32) -> App {
+        let mut view = PlanView::new(plan, host, uid, HashSet::new(), Vec::new());
+        view.file = Some(file);
+        App {
+            roots: Vec::new(),
+            state: State::Plan(Box::new(view)),
+            mode: SizeMode::Allocated,
+            viewport: 10,
+            message: None,
+            request: None,
+        }
+    }
+
+    /// The plan build the last key asked for, for the caller to run.
+    pub fn take_request(&mut self) -> Option<PlanJob> {
+        self.request.take()
+    }
+
+    pub fn plan_built(&mut self, result: Result<BuiltPlan, String>, host: &str, uid: u32) {
+        let State::Browsing(b) = &mut self.state else {
+            return;
+        };
+        let PlanState::Building { marks, .. } = &b.plan else {
+            return;
+        };
+        let current = *marks == b.marked;
+        b.plan = PlanState::None;
+        if b.view != View::Plan {
+            return;
+        }
+        if !current {
+            self.request = Some(b.begin_plan_build());
+            return;
+        }
+        match result {
+            Ok(BuiltPlan {
+                plan,
+                unplanned,
+                lossy_paths,
+            }) => {
+                let view = PlanView::new(plan, host, uid, lossy_paths, unplanned);
+                b.plan = PlanState::Ready(Box::new(view));
+            }
+            Err(e) => {
+                b.view = View::Findings;
+                self.message = Some(format!("no plan: {e}"));
+            }
+        }
+    }
+
+    /// The plan preview on screen, if any.
+    pub fn plan_view(&self) -> Option<&PlanView> {
+        match &self.state {
+            State::Plan(p) => Some(p),
+            State::Browsing(b) if b.view == View::Plan => match &b.plan {
+                PlanState::Ready(p) => Some(p),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn plan_view_mut(&mut self) -> Option<&mut PlanView> {
+        match &mut self.state {
+            State::Plan(p) => Some(p),
+            State::Browsing(b) if b.view == View::Plan => match &mut b.plan {
+                PlanState::Ready(p) => Some(p),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -161,6 +286,9 @@ impl App {
             offset: 0,
             fs_offset: None,
             findings: FindingList::default(),
+            marked: BTreeSet::new(),
+            marked_bytes: 0,
+            plan: PlanState::None,
         };
         b.refresh_rows(self.mode);
         b.refilter(None);
@@ -170,7 +298,7 @@ impl App {
     pub fn browser(&self) -> Option<&Browser> {
         match &self.state {
             State::Browsing(b) => Some(b),
-            State::Scanning { .. } => None,
+            State::Scanning { .. } | State::Plan(_) => None,
         }
     }
 
@@ -180,31 +308,52 @@ impl App {
             return false;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Char('q') => return true,
-            KeyCode::Char('c') if ctrl => return true,
-            _ => {}
+        if ctrl && key.code == KeyCode::Char('c') {
+            return true;
         }
+        // The prompt takes every other key, `q` included: it is text.
+        if let Some(view) = self.plan_view_mut().filter(|v| v.prompt.is_some()) {
+            self.message = view.on_prompt_key(key);
+            return false;
+        }
+        if key.code == KeyCode::Char('q') {
+            return true;
+        }
+        self.message = None;
         let page = self.viewport.max(1);
         let mode = self.mode;
-        let State::Browsing(b) = &mut self.state else {
-            return false;
+        let b = match &mut self.state {
+            State::Browsing(b) => b,
+            State::Plan(view) => {
+                self.message = view.on_key(key.code, page);
+                return false;
+            }
+            State::Scanning { .. } => return false,
         };
         if key.code == KeyCode::Tab {
             b.view = match b.view {
                 View::Tree => View::Findings,
-                View::Findings | View::Detail => View::Tree,
+                View::Findings | View::Detail | View::Plan => View::Tree,
             };
+            b.drop_preview();
             return false;
         }
         match b.view {
             View::Tree => {}
             View::Findings => {
-                b.on_findings_key(key.code, self.viewport);
+                match b.on_findings_key(key.code, self.viewport) {
+                    Effect::None => {}
+                    Effect::Message(m) => self.message = Some(m),
+                    Effect::Build(r) => self.request = Some(r),
+                }
                 return false;
             }
             View::Detail => {
                 b.on_detail_key(key.code, page);
+                return false;
+            }
+            View::Plan => {
+                self.message = b.on_plan_key(key.code, page);
                 return false;
             }
         }
@@ -292,7 +441,17 @@ impl Browser {
         self.data.report.findings.get(i)
     }
 
-    fn on_findings_key(&mut self, code: KeyCode, viewport: usize) {
+    /// The marked findings, in report order.
+    pub fn marked_findings(&self) -> impl Iterator<Item = &Finding> {
+        self.marked.iter().map(|&i| &self.data.report.findings[i])
+    }
+
+    /// The marked findings' bytes, leaving out findings inside other marked ones.
+    pub fn marked_bytes(&self) -> u64 {
+        self.marked_bytes
+    }
+
+    fn on_findings_key(&mut self, code: KeyCode, viewport: usize) -> Effect {
         let l = &mut self.findings;
         let last = l.shown.len().saturating_sub(1);
         let page = viewport.max(1);
@@ -300,6 +459,23 @@ impl Browser {
             KeyCode::Char('t') => {
                 let at = FILTERS.iter().position(|&f| f == l.filter).unwrap_or(0);
                 self.refilter(FILTERS[(at + 1) % FILTERS.len()]);
+            }
+            KeyCode::Char('p') => return self.start_plan(),
+            KeyCode::Char(' ') if viewport > 0 => {
+                if let Some(&i) = l.shown.get(l.selected) {
+                    let f = &self.data.report.findings[i];
+                    if f.action.kind == ActionKind::Advice {
+                        return Effect::Message(
+                            "advice only: this finding has no removal action to plan".into(),
+                        );
+                    }
+                    if !self.marked.remove(&i) {
+                        self.marked.insert(i);
+                    }
+                    self.marked_bytes = plan::distinct_bytes(
+                        self.marked_findings().map(|f| (f.path.as_str(), f.bytes)),
+                    );
+                }
             }
             code if l.shown.is_empty() => scroll_lines(&mut l.offset, code, page),
             KeyCode::Up | KeyCode::Char('k') => l.selected = l.selected.saturating_sub(1),
@@ -313,6 +489,52 @@ impl Browser {
                 self.view = View::Detail;
             }
             _ => {}
+        }
+        Effect::None
+    }
+
+    /// `p`: requests a plan build for the current marks.
+    fn start_plan(&mut self) -> Effect {
+        if self.marked.is_empty() {
+            return Effect::Message("nothing marked: Space marks a finding for the plan".into());
+        }
+        self.view = View::Plan;
+        if matches!(self.plan, PlanState::Building { .. }) {
+            return Effect::None;
+        }
+        Effect::Build(self.begin_plan_build())
+    }
+
+    fn begin_plan_build(&mut self) -> PlanJob {
+        let progress = Arc::new(Progress::default());
+        self.plan = PlanState::Building {
+            progress: progress.clone(),
+            marks: self.marked.clone(),
+        };
+        PlanJob {
+            options: self.data.plan_options.clone(),
+            progress,
+            marks: self.marked_findings().map(PlanMark::from).collect(),
+        }
+    }
+
+    fn drop_preview(&mut self) {
+        if matches!(self.plan, PlanState::Ready(_)) {
+            self.plan = PlanState::None;
+        }
+    }
+
+    fn on_plan_key(&mut self, code: KeyCode, page: usize) -> Option<String> {
+        match code {
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                self.drop_preview();
+                self.view = View::Findings;
+                None
+            }
+            _ => match &mut self.plan {
+                PlanState::Ready(view) => view.on_key(code, page),
+                PlanState::None | PlanState::Building { .. } => None,
+            },
         }
     }
 
@@ -399,6 +621,110 @@ impl Browser {
             Place::Roots => self.rows.iter().map(|r| r.size).sum(),
             Place::Dir(id) => size(&self.data.tree.node(id).total, mode),
         };
+    }
+}
+
+/// What a findings-list key asks of the app.
+enum Effect {
+    None,
+    Message(String),
+    Build(PlanJob),
+}
+
+impl PlanView {
+    fn new(
+        plan: Plan,
+        host: &str,
+        uid: u32,
+        lossy_paths: HashSet<String>,
+        unplanned: Vec<UnplannedMark>,
+    ) -> PlanView {
+        PlanView {
+            plan,
+            host: host.into(),
+            uid,
+            file: None,
+            lossy_paths,
+            unplanned,
+            lines: None,
+            scroll: 0,
+            prompt: None,
+        }
+    }
+
+    pub fn plan(&self) -> &Plan {
+        &self.plan
+    }
+
+    pub fn unusable(&self, now: i64) -> Option<plan::Unusable> {
+        plan::usable(&self.plan, &self.host, self.uid, now).err()
+    }
+
+    fn on_key(&mut self, code: KeyCode, page: usize) -> Option<String> {
+        match code {
+            KeyCode::Char('w') => match &self.file {
+                Some(file) => {
+                    return Some(format!("this plan is already a file: {}", file.display()));
+                }
+                None => {
+                    self.prompt = Some(DEFAULT_PLAN_FILE.into());
+                }
+            },
+            _ => scroll_lines(&mut self.scroll, code, page),
+        }
+        None
+    }
+
+    /// A key while the `w` prompt is open; returns the status message.
+    fn on_prompt_key(&mut self, key: KeyEvent) -> Option<String> {
+        let path = self.prompt.as_mut()?;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.prompt = None;
+                return Some("no plan file written".into());
+            }
+            KeyCode::Enter if path.is_empty() => {
+                return Some("type a file name, or Esc to cancel".into());
+            }
+            KeyCode::Enter => return self.write(),
+            KeyCode::Backspace => {
+                path.pop();
+            }
+            KeyCode::Char('u') if ctrl => path.clear(),
+            KeyCode::Char(c) if !ctrl => path.push(c),
+            _ => {}
+        }
+        None
+    }
+
+    fn write(&mut self) -> Option<String> {
+        let name = self.prompt.as_deref()?;
+        let path = Path::new(name);
+        let message = match job::write_plan(path, &self.plan) {
+            Ok(()) => {
+                let message = format!("wrote {name}");
+                self.prompt = None;
+                message
+            }
+            Err(WriteError::Incomplete(e)) => {
+                self.prompt = None;
+                format!(
+                    "write failed: {e}. File may be incomplete. dwhy apply refuses incomplete plans."
+                )
+            }
+            Err(WriteError::BeforeWrite(e)) => {
+                if e.kind() == ErrorKind::AlreadyExists
+                    || (e.kind() == ErrorKind::IsADirectory
+                        && std::fs::symlink_metadata(path).is_ok())
+                {
+                    format!("{name} exists; choose another name")
+                } else {
+                    format!("cannot write {name}: {e}")
+                }
+            }
+        };
+        Some(message)
     }
 }
 

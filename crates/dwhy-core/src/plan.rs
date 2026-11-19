@@ -282,6 +282,14 @@ pub fn differences(planned: &Fingerprint, now: &Fingerprint) -> Vec<&'static str
     out
 }
 
+/// A plan as `dwhy plan -o` writes it: pretty JSON and a final newline.
+/// The TUI's `w` writes the same bytes.
+pub fn to_json(plan: &Plan) -> serde_json::Result<String> {
+    let mut text = serde_json::to_string_pretty(plan)?;
+    text.push('\n');
+    Ok(text)
+}
+
 /// Parses a plan file and checks its schema.
 pub fn parse(text: &str) -> Result<Plan, String> {
     #[derive(serde::Deserialize)]
@@ -325,15 +333,11 @@ pub fn usable(plan: &Plan, host: &str, uid: u32, now: i64) -> Result<(), Unusabl
             plan.uid
         )));
     }
-    let expires = parse_time(&plan.expires_at)
-        .ok_or_else(|| Unusable::Expired(format!("bad expires_at {:?}", plan.expires_at)))?;
-    let created = parse_time(&plan.created_at)
-        .ok_or_else(|| Unusable::Expired(format!("bad created_at {:?}", plan.created_at)))?;
-    // An edited plan cannot live longer than TTL_SECS from its creation.
-    if now >= expires.min(created + TTL_SECS) {
+    let (created, expires) = validity_window(plan)?;
+    if now >= expires {
         return Err(Unusable::Expired(format!(
             "the plan expired at {} (plans last {} minutes); make a new one with `dwhy plan`",
-            rfc3339(expires.min(created + TTL_SECS)),
+            rfc3339(expires),
             TTL_SECS / 60
         )));
     }
@@ -344,6 +348,15 @@ pub fn usable(plan: &Plan, host: &str, uid: u32, now: i64) -> Result<(), Unusabl
         )));
     }
     Ok(())
+}
+
+/// The plan's creation time and capped expiry, in seconds since the epoch.
+pub fn validity_window(plan: &Plan) -> Result<(i64, i64), Unusable> {
+    let expires = parse_time(&plan.expires_at)
+        .ok_or_else(|| Unusable::Expired(format!("bad expires_at {:?}", plan.expires_at)))?;
+    let created = parse_time(&plan.created_at)
+        .ok_or_else(|| Unusable::Expired(format!("bad created_at {:?}", plan.created_at)))?;
+    Ok((created, expires.min(created + TTL_SECS)))
 }
 
 fn parse_time(s: &str) -> Option<i64> {

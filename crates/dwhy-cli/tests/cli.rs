@@ -247,6 +247,190 @@ fn tui_needs_a_terminal() {
 }
 
 #[test]
+fn tui_plan_conflicts_and_bad_files() {
+    let (_t, root) = cargo_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("p.json");
+    let out = dwhy(&[
+        "plan",
+        &root,
+        "-q",
+        "--detectors",
+        "cargo-target",
+        "--tier",
+        "rebuildable",
+        "-o",
+        file.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0));
+    let f = file.to_str().unwrap();
+    // The plan names its own roots and -x.
+    for args in [
+        &["tui", "--plan", f, "."][..],
+        &["tui", "--plan", f, "-x"][..],
+        &["tui", "--plan", f, "--cross-filesystems"][..],
+    ] {
+        let out = dwhy(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("cannot be used with"), "{err}");
+    }
+    // A good plan gets as far as needing a terminal.
+    let out = dwhy(&["tui", "--plan", f]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("needs a terminal"));
+
+    // A bad or missing file fails before the terminal check, as apply does,
+    // with control characters escaped.
+    let bad = dir.path().join("bad\nname.json");
+    fs::write(&bad, "{\"schema\": \"diskwhy/v1\"}").unwrap();
+    let missing = dir.path().join("gone\nplan.json");
+    for (path, want) in [(&bad, "not a diskwhy plan"), (&missing, "cannot read")] {
+        let out = dwhy(&["tui", "--plan", path.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(1));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(want), "{err}");
+        assert!(!err.contains("needs a terminal"), "{err}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+    }
+    assert!(
+        String::from_utf8_lossy(&dwhy(&["tui", "--plan", missing.to_str().unwrap()]).stderr)
+            .contains("gone\\nplan.json")
+    );
+}
+
+/// The TUI's plan (marks → `plan::build` → `w`) is the plan `dwhy plan
+/// --select` makes from the same findings, and a CLI plan opens in the TUI.
+#[test]
+fn tui_and_cli_plans_round_trip() {
+    use dwhy_core::guard::Processes;
+    use dwhy_core::plan;
+    use dwhy_tui::job::{self, PlanJob};
+
+    let (_t, root) = cargo_fixture();
+    fs::create_dir_all(format!("{root}/lib/target/debug")).unwrap();
+    fs::write(
+        format!("{root}/lib/Cargo.toml"),
+        "[package]\nname = \"lib\"\n",
+    )
+    .unwrap();
+    fs::write(format!("{root}/lib/target/CACHEDIR.TAG"), CARGO_TAG).unwrap();
+    fs::write(format!("{root}/lib/target/debug/lib"), vec![2u8; 1 << 20]).unwrap();
+    let opts = dwhy_tui::Options {
+        paths: vec![root.clone().into()],
+        detectors: Some(vec!["cargo-target".into()]),
+        threads: 2,
+        ..Default::default()
+    };
+    let scanned = job::scan(&opts, &dwhy_core::scan::Progress::default(), &mut |_| {}).unwrap();
+    let ids: Vec<String> = scanned
+        .report
+        .findings
+        .iter()
+        .map(|f| f.id.clone())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    let built = PlanJob {
+        options: scanned.plan_options,
+        progress: Default::default(),
+        marks: scanned.report.findings.iter().map(Into::into).collect(),
+    }
+    .build(Processes::read, dwhy_core::system::hostname())
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let tui_file = dir.path().join("tui.json");
+    job::write_plan(&tui_file, &built.plan).unwrap();
+    let tui_text = fs::read_to_string(&tui_file).unwrap();
+    let tui_plan = plan::parse(&tui_text).unwrap();
+    let mut expected = serde_json::to_string_pretty(&tui_plan).unwrap();
+    expected.push('\n');
+    assert_eq!(
+        tui_text, expected,
+        "TUI plan files use pretty JSON with a final newline"
+    );
+    let env = dwhy_core::apply::Env::from_system();
+    let now = job::now();
+    plan::usable(&tui_plan, &env.host, env.uid, now).unwrap();
+
+    let cli_file = dir.path().join("cli.json");
+    let out = dwhy(&[
+        "plan",
+        &root,
+        "-q",
+        "--json",
+        "--detectors",
+        "cargo-target",
+        "--select",
+        &ids.join(","),
+        "-o",
+        cli_file.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0));
+    let cli_text = fs::read_to_string(&cli_file).unwrap();
+    assert_eq!(cli_text.as_bytes(), out.stdout.as_slice());
+    let cli_plan = plan::parse(&cli_text).unwrap();
+
+    let summary = |p: &dwhy_core::report::Plan| {
+        let items: Vec<_> = p
+            .items
+            .iter()
+            .map(|i| {
+                let f = &i.finding;
+                (
+                    f.id.clone(),
+                    f.bytes,
+                    f.tier,
+                    f.action.clone(),
+                    f.guards.clone(),
+                )
+            })
+            .collect();
+        let blocked: Vec<_> = p.blocked.iter().map(|f| f.id.clone()).collect();
+        (
+            items,
+            blocked,
+            p.bytes,
+            p.scan.clone(),
+            p.selection.clone(),
+            p.host.clone(),
+            p.uid,
+        )
+    };
+    assert_eq!(summary(&tui_plan), summary(&cli_plan));
+    assert_eq!(tui_plan.items.len(), 2);
+    let fp = |p: &dwhy_core::report::Plan| -> Vec<_> {
+        p.items.iter().map(|i| i.fingerprint.clone()).collect()
+    };
+    assert_eq!(fp(&tui_plan), fp(&cli_plan));
+
+    // `dwhy apply --dry-run` accepts the TUI's file.
+    let out = dwhy(&[
+        "apply",
+        tui_file.to_str().unwrap(),
+        "--dry-run",
+        "-q",
+        "--max-tier",
+        "rebuildable",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        fs::metadata(format!("{root}/app/target")).is_ok(),
+        "dry run removes nothing"
+    );
+
+    // The CLI's file opens in the TUI's preview, usable here.
+    let app = dwhy_tui::App::open_plan(cli_plan, cli_file, &env.host, env.uid);
+    let view = app.plan_view().unwrap();
+    assert_eq!(view.unusable(job::now()), None);
+    assert_eq!(view.plan().items.len(), 2);
+}
+
+#[test]
 fn doctor_json() {
     let out = dwhy(&["doctor", "--json"]);
     assert_eq!(out.status.code(), Some(0));

@@ -291,10 +291,20 @@ pub fn detect_into(
     only: Option<&[String]>,
     probe: bool,
 ) -> Option<Arc<crate::docker::Snapshot>> {
-    let ctx = DetectContext::from_system();
-    let (mut findings, runs) = run_with(tree, &ctx, &detectors::registry(), only);
+    detect_into_with(report, tree, &DetectContext::from_system(), only, probe)
+}
+
+/// [`detect_into`] with the caller's context.
+pub fn detect_into_with(
+    report: &mut crate::report::ScanReport,
+    tree: &ScanTree,
+    ctx: &DetectContext,
+    only: Option<&[String]>,
+    probe: bool,
+) -> Option<Arc<crate::docker::Snapshot>> {
+    let (mut findings, runs) = run_with(tree, ctx, &detectors::registry(), only);
     if probe {
-        crate::probes::run(&mut findings, &ctx);
+        crate::probes::run(&mut findings, ctx);
     }
     report.findings = findings;
     report.detectors = runs;

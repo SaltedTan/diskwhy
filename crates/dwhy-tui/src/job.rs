@@ -1,17 +1,26 @@
 //! The scan the TUI runs: the same pipeline as `dwhy scan` (roots, walk,
 //! filesystems and unaccounted space, detectors, probes, growth on
-//! findings), with no snapshot saved.
+//! findings), with no snapshot saved. Also the plan work: rescanning for
+//! marked findings, building with core `plan::build`, and handling plan files.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dwhy_core::account;
-use dwhy_core::detect;
+use dwhy_core::detect::{self, DetectContext};
+use dwhy_core::explain::lossy_finding_paths;
 use dwhy_core::growth;
+use dwhy_core::guard::Processes;
 use dwhy_core::mounts::MountTable;
-use dwhy_core::report::{ScanReport, UnreadableReason};
+use dwhy_core::plan::{self, Selection};
+use dwhy_core::report::{DetectorRun, Finding, Plan, PlanScan, ScanReport, UnreadableReason};
 use dwhy_core::scan::{self, Progress, ScanOptions, ScanResult};
+use dwhy_core::system;
 use dwhy_core::tree::{NodeId, ScanTree};
 
 /// What to scan.
@@ -45,6 +54,21 @@ impl Options {
             self.paths.clone()
         };
         scan::prepare_roots(&paths, !self.cross_filesystems).map_err(|e| e.to_string())
+    }
+
+    fn walk(
+        &self,
+        roots: &[PathBuf],
+        mounts: &MountTable,
+        progress: &Progress,
+    ) -> Result<ScanResult, String> {
+        let opts = ScanOptions {
+            one_filesystem: !self.cross_filesystems,
+            min_dir_bytes: u64::MAX,
+            threads: self.threads,
+            ..ScanOptions::default()
+        };
+        scan::scan(roots, &opts, mounts, progress).map_err(|e| e.to_string())
     }
 }
 
@@ -83,6 +107,8 @@ pub struct Scanned {
     /// `created_at` of the snapshot the findings' growth was measured from;
     /// `None` when there was none to measure from.
     pub growth_base: Option<String>,
+    /// Prepared roots and options for the plan's rescan.
+    pub plan_options: Options,
 }
 
 /// Runs the whole scan on this thread, reporting each stage to `stage`.
@@ -94,27 +120,17 @@ pub fn scan(
     stage(Stage::Walking);
     let roots = opts.roots()?;
     let mounts = MountTable::read().unwrap_or_default();
-    let one_fs = !opts.cross_filesystems;
-    let scan_opts = ScanOptions {
-        one_filesystem: one_fs,
-        // The tree has every directory; the report's size-filtered list is not shown.
-        min_dir_bytes: u64::MAX,
-        threads: opts.threads,
-        ..ScanOptions::default()
-    };
-    let result = scan::scan(&roots, &scan_opts, &mounts, progress).map_err(|e| e.to_string())?;
+    let result = opts.walk(&roots, &mounts, progress)?;
 
     stage(Stage::Accounting);
     let mut report = account::system_scan_report(&result, &mounts);
 
     stage(Stage::Detecting);
     detect::detect_into(&mut report, &result.tree, opts.detectors.as_deref(), true);
-    let growth_base = opts.snapshot_dir.as_deref().and_then(|dir| {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
-        growth::fill_scan_growth(&mut report, dir, now)
-    });
+    let growth_base = opts
+        .snapshot_dir
+        .as_deref()
+        .and_then(|dir| growth::fill_scan_growth(&mut report, dir, now()));
 
     let marks = coverage_marks(&result);
     Ok(Scanned {
@@ -122,7 +138,173 @@ pub fn scan(
         tree: result.tree,
         marks,
         growth_base,
+        plan_options: Options {
+            paths: roots,
+            snapshot_dir: None,
+            ..opts.clone()
+        },
     })
+}
+
+/// A plan to build off the UI thread.
+#[derive(Debug)]
+pub struct PlanJob {
+    pub options: Options,
+    pub progress: Arc<Progress>,
+    pub marks: Vec<PlanMark>,
+}
+
+#[derive(Debug)]
+pub struct PlanMark {
+    id: String,
+    detector: String,
+    path: String,
+}
+
+impl From<&Finding> for PlanMark {
+    fn from(finding: &Finding) -> Self {
+        Self {
+            id: finding.id.clone(),
+            detector: finding.detector.clone(),
+            path: finding.path.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct BuiltPlan {
+    pub plan: Plan,
+    pub unplanned: Vec<UnplannedMark>,
+    pub lossy_paths: HashSet<String>,
+}
+
+#[derive(Debug)]
+pub enum UnplannedMark {
+    Gone(String),
+    NotChecked { path: String, reason: String },
+}
+
+impl fmt::Display for UnplannedMark {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Gone(path) => write!(f, "gone since the scan: {path}"),
+            Self::NotChecked { path, reason } => write!(f, "not checked: {reason} ({path})"),
+        }
+    }
+}
+
+impl PlanJob {
+    /// Builds a plan for marks found on the rescan and reports missing marks
+    /// separately so the preview can explain why they were left out.
+    pub fn build(
+        self,
+        read_processes: impl FnOnce() -> Processes,
+        host: String,
+    ) -> Result<BuiltPlan, String> {
+        let opts = self.options;
+        let roots = opts.roots()?;
+        let mounts = MountTable::read().unwrap_or_default();
+        let result = opts.walk(&roots, &mounts, &self.progress)?;
+        let ctx = DetectContext::from_system();
+        let (findings, runs) = detect::run_with(
+            &result.tree,
+            &ctx,
+            &dwhy_core::detectors::registry(),
+            opts.detectors.as_deref(),
+        );
+        let ids: HashSet<&str> = findings.iter().map(|f| f.id.as_str()).collect();
+        let mut select = Vec::new();
+        let mut unplanned = Vec::new();
+        for PlanMark { id, detector, path } in self.marks {
+            if ids.contains(id.as_str()) {
+                select.push(id);
+                continue;
+            }
+            let reason = match runs.iter().find(|run| run.name == detector) {
+                Some(DetectorRun {
+                    error: Some(error), ..
+                }) => format!("{detector} failed: {error}"),
+                Some(run) if run.ran => {
+                    unplanned.push(UnplannedMark::Gone(path));
+                    continue;
+                }
+                Some(run) => format!("{detector} did not run: {}", run.detail),
+                None => format!("{detector} did not run"),
+            };
+            unplanned.push(UnplannedMark::NotChecked { path, reason });
+        }
+        if select.is_empty() {
+            if unplanned
+                .iter()
+                .all(|mark| matches!(mark, UnplannedMark::Gone(_)))
+            {
+                return Err("all marked findings are gone since the scan".into());
+            }
+            return Err(unplanned
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" · "));
+        }
+        let lossy_paths = lossy_finding_paths(&findings, &result.tree);
+        let plan = plan::build(
+            findings,
+            &Selection { tier: None, select },
+            &result.tree,
+            &ctx,
+            &read_processes(),
+            host,
+            PlanScan {
+                roots: result
+                    .roots
+                    .iter()
+                    .map(|r| r.path.to_string_lossy().into_owned())
+                    .collect(),
+                one_filesystem: !opts.cross_filesystems,
+                detectors: opts.detectors,
+            },
+        )?;
+        Ok(BuiltPlan {
+            plan,
+            unplanned,
+            lossy_paths,
+        })
+    }
+}
+
+/// Reads and parses a plan file, as `dwhy apply` does.
+pub fn read_plan(path: &Path) -> Result<Plan, String> {
+    let text =
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    plan::parse(&text)
+}
+
+#[derive(Debug)]
+pub enum WriteError {
+    BeforeWrite(io::Error),
+    Incomplete(io::Error),
+}
+
+impl From<io::Error> for WriteError {
+    fn from(error: io::Error) -> Self {
+        Self::BeforeWrite(error)
+    }
+}
+
+/// Creates a new file with the same JSON as `dwhy plan -o`.
+pub fn write_plan(path: &Path, plan: &Plan) -> Result<(), WriteError> {
+    let text = plan::to_json(plan).map_err(io::Error::from)?;
+    let mut file = system::create_new_file_nofollow(path)?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(WriteError::Incomplete)
+}
+
+/// Seconds since the epoch.
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 fn coverage_marks(result: &ScanResult) -> HashMap<NodeId, Mark> {
@@ -216,6 +398,7 @@ mod tests {
             marks: coverage_marks(&result),
             tree: result.tree,
             growth_base: None,
+            plan_options: Options::default(),
         });
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let mut screen = |app: &mut App| {

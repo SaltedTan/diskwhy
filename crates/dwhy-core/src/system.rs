@@ -1,9 +1,11 @@
 //! Facts about the running system: host, uid, users, open-but-deleted files.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::{fs, io};
+
+use rustix::fs::OFlags;
 
 use crate::report::DeletedOpen;
 
@@ -20,6 +22,14 @@ pub fn uid() -> u32 {
 
 pub fn euid() -> u32 {
     rustix::process::geteuid().as_raw()
+}
+
+pub fn create_new_file_nofollow(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(OFlags::NOFOLLOW.bits() as i32)
+        .open(path)
 }
 
 /// diskwhy's own state: `$XDG_STATE_HOME/diskwhy`, else

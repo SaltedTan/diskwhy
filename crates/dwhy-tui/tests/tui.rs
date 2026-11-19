@@ -11,15 +11,18 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use dwhy_core::guard::{Proc, Processes};
+use dwhy_core::plan;
 use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{
-    Action, ActionKind, ArchiveTarget, EvidenceSource, Finding, FsReport, Growth, GuardResult,
-    GuardStatus, PostgresWal, Recovery, Tier,
+    Action, ActionKind, ArchiveTarget, EvidenceSource, Finding, Fingerprint, FsReport, Growth,
+    GuardResult, GuardStatus, Plan, PlanItem, PlanScan, PlanSelection, PostgresWal, Recovery, Tier,
+    Tool,
 };
 use dwhy_core::scan::Progress;
 use dwhy_core::{growth, snapshot, system};
-use dwhy_tui::app::{App, RowKind, SizeMode, State, View};
-use dwhy_tui::job::{self, Options, PermissionMark, Scanned};
+use dwhy_tui::app::{App, DEFAULT_PLAN_FILE, PlanState, RowKind, SizeMode, State, View};
+use dwhy_tui::job::{self, BuiltPlan, Options, PermissionMark, Scanned};
 use dwhy_tui::ui;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -144,8 +147,12 @@ fn press(app: &mut App, codes: &[KeyCode]) {
 }
 
 fn render(app: &mut App, w: u16, h: u16, root: Option<&Path>) -> String {
+    render_at(app, w, h, root, job::now())
+}
+
+fn render_at(app: &mut App, w: u16, h: u16, root: Option<&Path>, now: i64) -> String {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    term.draw(|f| ui::draw(f, app)).unwrap();
+    term.draw(|f| ui::draw_at(f, app, now)).unwrap();
     let s = term.backend().to_string();
     match root {
         Some(r) => {
@@ -1003,7 +1010,7 @@ fn compact_findings_only_open_when_a_row_fits() {
     let finding = hand_finding("cargo-target", "/abc", GIB, Tier::Rebuildable);
     let (_f, mut app) = findings_app(vec![finding], None);
     press(&mut app, &[KeyCode::Tab]);
-    let screen = render(&mut app, 22, 24, None);
+    let screen = render(&mut app, 23, 24, None);
     assert!(
         screen.contains("Widen") && !screen.contains("/abc"),
         "{screen}"
@@ -1012,11 +1019,20 @@ fn compact_findings_only_open_when_a_row_fits() {
         press(&mut app, &[key]);
         assert_eq!(view(&app), View::Findings);
     }
-    for width in [23, 27] {
+    press(&mut app, &[KeyCode::Char(' ')]);
+    assert!(marked(&app).is_empty());
+    for width in [24, 27] {
         let screen = render(&mut app, width, 24, None);
         assert!(screen.contains("rebuildable 1.0G /abc"), "{screen}");
         assert!(!screen.contains("Widen"), "{screen}");
     }
+    press(&mut app, &[KeyCode::Char(' ')]);
+    assert_eq!(marked(&app), ["/abc"]);
+    render(&mut app, 80, 4, None);
+    press(&mut app, &[KeyCode::Char(' '), KeyCode::Enter]);
+    assert_eq!(marked(&app), ["/abc"]);
+    assert_eq!(view(&app), View::Findings);
+    render(&mut app, 80, 24, None);
     press(&mut app, &[KeyCode::Enter]);
     assert_eq!(view(&app), View::Detail);
 }
@@ -1495,7 +1511,10 @@ fn lossy_cargo_path_is_marked_and_commands_are_withheld() {
     press(&mut app, &[KeyCode::Tab]);
     let list = render(&mut app, 80, 24, None);
     let row = list.lines().nth(2).unwrap();
-    assert!(row.contains(">!") && row.contains("/app�/target"), "{list}");
+    assert!(
+        row.contains("> !") && row.contains("/app�/target"),
+        "{list}"
+    );
     press(&mut app, &[KeyCode::Enter]);
     let detail = render(&mut app, 80, 24, None);
     assert!(
@@ -1581,6 +1600,874 @@ fn scan_takes_growth_from_the_snapshot_dir_it_is_given() {
     let g = data.report.findings[0].growth.as_ref().unwrap();
     assert!(g.bytes_per_day > 0, "{g:?}");
     assert_eq!(g.since, old.generated_at);
+    let mut app = app_with(data);
+    press(
+        &mut app,
+        &[KeyCode::Tab, KeyCode::Char(' '), KeyCode::Char('p')],
+    );
+    run_build(&mut app, &Processes::default());
+    assert!(plan_of(&app).items[0].finding.growth.is_none());
     // Read only: nothing saved or pruned.
     assert_eq!(fs::read_dir(&dir).unwrap().count(), listed);
+}
+
+// ---------------------------------------------------------------------------
+// M4c: marks, the plan preview and plan files
+// ---------------------------------------------------------------------------
+
+const CARGO_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n\
+                         # This file is a cache directory tag created by cargo.\n";
+/// 2026-11-19T09:00:00Z, when the hand-made plans are created.
+const PLAN_AT: i64 = 1_795_078_800;
+const HOST: &str = "testhost";
+const UID: u32 = 1000;
+
+/// A fixture with two crates whose `target/` dirs are `cargo-target`
+/// findings: `app` (3 MiB) and `lib` (1 MiB).
+fn crates_fixture() -> Fixture {
+    let f = fixture(false);
+    let r = f.root();
+    for (name, size) in [("app", 3 * MIB), ("lib", MIB)] {
+        fs::create_dir_all(r.join(name).join("target/debug")).unwrap();
+        fs::write(r.join(name).join("Cargo.toml"), b"[package]\n").unwrap();
+        fs::write(r.join(name).join("target/CACHEDIR.TAG"), CARGO_TAG).unwrap();
+        fs::write(r.join(name).join("target/debug/out"), vec![6u8; size]).unwrap();
+    }
+    f
+}
+
+fn marked(app: &App) -> Vec<String> {
+    let b = app.browser().unwrap();
+    b.marked_findings().map(|f| f.path.clone()).collect()
+}
+
+fn ctrl(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+
+fn type_text(app: &mut App, text: &str) {
+    for c in text.chars() {
+        assert!(
+            !app.on_key(key(KeyCode::Char(c))),
+            "{c:?} is text in the prompt"
+        );
+    }
+}
+
+/// Runs the plan build the app asked for, as the event loop would, with
+/// the given processes for the guards.
+fn run_build(app: &mut App, procs: &Processes) {
+    let job = app.take_request().expect("a plan build was requested");
+    let result = job.build(|| procs.clone(), HOST.into());
+    app.plan_built(result, HOST, system::euid());
+}
+
+fn plan_of(app: &App) -> &Plan {
+    app.plan_view().expect("the plan preview is shown").plan()
+}
+
+fn guard(name: &str, status: GuardStatus, detail: &str) -> GuardResult {
+    GuardResult {
+        name: name.into(),
+        status,
+        detail: detail.into(),
+    }
+}
+
+fn fingerprint() -> Fingerprint {
+    Fingerprint {
+        dev: Some(2049),
+        inode: Some(1234),
+        newest_mtime: Some(PLAN_AT - 7 * 86_400),
+        size_bucket: 100,
+        git: None,
+        docker_id: None,
+    }
+}
+
+/// A plan as `plan::build` would make it on another machine: two items (one
+/// with a guard warning) and one finding a guard blocked.
+fn hand_plan() -> Plan {
+    let passes = || {
+        vec![
+            guard(
+                "in-use-cwd",
+                GuardStatus::Pass,
+                "no process has its working directory in it",
+            ),
+            guard(
+                "in-use-open",
+                GuardStatus::Pass,
+                "no process has a file in it open",
+            ),
+        ]
+    };
+    let mut cargo = cargo_finding();
+    cargo.growth = None;
+    cargo.guards = passes();
+    cargo.guards.extend([
+        guard("git-dirty", GuardStatus::Pass, "1 git worktree checked"),
+        guard(
+            "git-unpublished",
+            GuardStatus::Warn,
+            "unpushed commits stay in the repository's branch: diskwhy (main, 2 commits)",
+        ),
+    ]);
+    let mut trash = hand_finding(
+        "trash",
+        "/home/me/.local/share/Trash",
+        90 << 20,
+        Tier::Regenerable,
+    );
+    trash.guards = passes();
+    let mut blocked = hand_finding(
+        "node-modules",
+        "/home/me/projects/web-dashboard/node_modules",
+        812 << 20,
+        Tier::Blocked,
+    );
+    blocked.guards = passes();
+    blocked.guards[0] = guard(
+        "in-use-cwd",
+        GuardStatus::Block,
+        "working directory of node (pid 4242)",
+    );
+    let select = [&cargo, &trash, &blocked]
+        .iter()
+        .map(|f| f.id.clone())
+        .collect();
+    Plan {
+        schema: "diskwhy/v1".into(),
+        tool: Tool::current(),
+        host: HOST.into(),
+        uid: UID,
+        created_at: dwhy_core::detect::rfc3339(PLAN_AT),
+        expires_at: dwhy_core::detect::rfc3339(PLAN_AT + plan::TTL_SECS),
+        scan: PlanScan {
+            roots: vec!["/home/me".into()],
+            one_filesystem: true,
+            detectors: None,
+        },
+        selection: PlanSelection { tier: None, select },
+        bytes: cargo.bytes + trash.bytes,
+        items: vec![
+            PlanItem {
+                finding: cargo,
+                fingerprint: fingerprint(),
+            },
+            PlanItem {
+                finding: trash,
+                fingerprint: fingerprint(),
+            },
+        ],
+        blocked: vec![blocked],
+    }
+}
+
+fn hand_build() -> BuiltPlan {
+    BuiltPlan {
+        plan: hand_plan(),
+        unplanned: Vec::new(),
+        lossy_paths: Default::default(),
+    }
+}
+
+/// The mixed findings with the given paths marked.
+fn marked_app(paths: &[&str]) -> (Fixture, App) {
+    let (f, mut app) = findings_app(mixed_findings(), Some(BASE));
+    press(&mut app, &[KeyCode::Tab]);
+    for p in paths {
+        press(&mut app, &[KeyCode::Home]);
+        while selected_path(&app) != *p {
+            press(&mut app, &[KeyCode::Down]);
+        }
+        press(&mut app, &[KeyCode::Char(' ')]);
+    }
+    (f, app)
+}
+
+/// The hand plan in the preview, as if built from the marks.
+fn preview_app() -> (Fixture, App) {
+    let (f, mut app) = marked_app(&["/home/me/projects/diskwhy/target"]);
+    press(&mut app, &[KeyCode::Char('p')]);
+    assert!(app.take_request().is_some());
+    app.plan_built(Ok(hand_build()), HOST, UID);
+    (f, app)
+}
+
+#[test]
+fn space_marks_and_unmarks_and_marks_survive_filter_and_tab() {
+    let (_f, mut app) = findings_app(mixed_findings(), Some(BASE));
+    press(&mut app, &[KeyCode::Tab, KeyCode::Down, KeyCode::Char(' ')]);
+    assert_eq!(marked(&app), ["/home/me/projects/diskwhy/target"]);
+    let screen = render(&mut app, 80, 24, None);
+    assert!(
+        screen.contains("all tiers · 7/7 · 1 marked 3.2G"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains(">* rebuildable     3.2G"),
+        "the row shows the mark: {screen}"
+    );
+
+    // Marks stay through the tier filter, and the filter's rows mark too.
+    press(&mut app, &[KeyCode::Char('t'), KeyCode::Char(' ')]);
+    assert_eq!(
+        app.browser().unwrap().findings.filter,
+        Some(Tier::Regenerable)
+    );
+    assert_eq!(selected_path(&app), "/home/me/.cache/pip");
+    // Blocked findings can be marked: the plan lists them as blocked.
+    press(
+        &mut app,
+        &[KeyCode::Char('t'), KeyCode::Char('t'), KeyCode::Char('t')],
+    );
+    assert_eq!(app.browser().unwrap().findings.filter, Some(Tier::Blocked));
+    press(&mut app, &[KeyCode::Char(' '), KeyCode::Char('t')]);
+    assert_eq!(app.browser().unwrap().findings.filter, None);
+    press(&mut app, &[KeyCode::Tab, KeyCode::Tab]);
+    assert_eq!(view(&app), View::Findings);
+    assert_eq!(marked(&app).len(), 3);
+    let b = app.browser().unwrap();
+    assert_eq!(
+        b.marked_bytes(),
+        3_435_973_837 + (3 * GIB / 2) + (640 << 20)
+    );
+
+    // Space again unmarks.
+    press(&mut app, &[KeyCode::Home]);
+    while selected_path(&app) != "/home/me/.cache/pip" {
+        press(&mut app, &[KeyCode::Down]);
+    }
+    press(&mut app, &[KeyCode::Char(' ')]);
+    assert_eq!(
+        marked(&app),
+        [
+            "/home/me/projects/diskwhy/target",
+            "/home/me/projects/old-feature"
+        ]
+    );
+}
+
+#[test]
+fn advice_only_findings_cannot_be_marked() {
+    let (_f, mut app) = findings_app(mixed_findings(), Some(BASE));
+    press(&mut app, &[KeyCode::Tab]);
+    assert_eq!(selected_path(&app), "docker://volume/pgdata");
+    press(&mut app, &[KeyCode::Char(' ')]);
+    assert!(marked(&app).is_empty());
+    let msg = app.message.clone().unwrap();
+    assert!(msg.contains("advice only"), "{msg}");
+    let screen = render(&mut app, 80, 24, None);
+    assert!(
+        screen.lines().nth(22).unwrap().contains("advice only"),
+        "{screen}"
+    );
+    // The next key clears it.
+    press(&mut app, &[KeyCode::Down]);
+    assert_eq!(app.message, None);
+}
+
+#[test]
+fn marked_bytes_count_nested_findings_once() {
+    let outer = hand_finding("stale-tree", "/home/me/scratch", 2 * GIB, Tier::Review);
+    let inner = hand_finding(
+        "cargo-target",
+        "/home/me/scratch/app/target",
+        GIB,
+        Tier::Rebuildable,
+    );
+    let (_f, mut app) = findings_app(vec![outer, inner], None);
+    press(
+        &mut app,
+        &[
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+        ],
+    );
+    assert_eq!(marked(&app).len(), 2);
+    assert_eq!(app.browser().unwrap().marked_bytes(), 2 * GIB);
+}
+
+#[test]
+fn findings_list_with_marks_80x24() {
+    let (_f, mut app) = marked_app(&[
+        "/home/me/projects/diskwhy/target",
+        "/home/me/projects/old-feature",
+        "/home/me/.local/share/Trash",
+    ]);
+    press(&mut app, &[KeyCode::Up]);
+    insta::assert_snapshot!(render(&mut app, 80, 24, None));
+}
+
+#[test]
+fn p_with_nothing_marked_says_so() {
+    let (_f, mut app) = findings_app(mixed_findings(), Some(BASE));
+    press(&mut app, &[KeyCode::Tab, KeyCode::Char('p')]);
+    assert_eq!(view(&app), View::Findings);
+    assert!(app.take_request().is_none());
+    assert!(
+        app.message
+            .as_deref()
+            .unwrap()
+            .starts_with("nothing marked")
+    );
+}
+
+#[test]
+fn p_builds_the_plan_of_the_marks_and_esc_keeps_them() {
+    let f = crates_fixture();
+    let root = f.root();
+    let mut app = app_with(scan(&[&root]));
+    press(&mut app, &[KeyCode::Tab]);
+    assert_eq!(shown_paths(&app).len(), 2);
+    press(
+        &mut app,
+        &[KeyCode::Char(' '), KeyCode::Down, KeyCode::Char(' ')],
+    );
+    press(&mut app, &[KeyCode::Char('p')]);
+    assert_eq!(view(&app), View::Plan);
+    assert!(matches!(
+        app.browser().unwrap().plan,
+        PlanState::Building { .. }
+    ));
+    let building = render(&mut app, 80, 24, Some(&root));
+    assert!(building.contains("from 2 marked findings"), "{building}");
+    assert!(building.contains("checking guards"), "{building}");
+    assert!(building.contains("rescanned 0 entries"), "{building}");
+
+    run_build(&mut app, &Processes::default());
+    let p = plan_of(&app);
+    let app_target = root.join("app/target");
+    assert_eq!(
+        p.items
+            .iter()
+            .map(|i| i.finding.path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            app_target.to_str().unwrap(),
+            root.join("lib/target").to_str().unwrap()
+        ]
+    );
+    assert_eq!(p.selection.tier, None, "no tier ceiling, as with --select");
+    assert!(p.blocked.is_empty());
+    assert!(
+        p.items[0]
+            .finding
+            .guards
+            .iter()
+            .any(|g| g.name == "in-use-cwd")
+    );
+    assert!(p.items[0].fingerprint.inode.is_some());
+    assert_eq!(app.plan_view().unwrap().unusable(job::now()), None);
+    let screen = render(&mut app, 80, 24, Some(&root));
+    assert!(screen.contains("2 items, frees 4.0M"), "{screen}");
+    assert!(screen.contains("pass   in-use-cwd"), "{screen}");
+
+    // Scrolls, and Esc goes back to the list with the marks kept.
+    press(&mut app, &[KeyCode::Down]);
+    assert_eq!(app.plan_view().unwrap().scroll, 1);
+    press(&mut app, &[KeyCode::Esc]);
+    assert_eq!(view(&app), View::Findings);
+    assert!(matches!(app.browser().unwrap().plan, PlanState::None));
+    assert_eq!(marked(&app).len(), 2);
+}
+
+#[test]
+fn p_rescans_and_reports_marks_that_are_gone() {
+    let f = crates_fixture();
+    let root = f.root();
+    let mut app = app_with(scan(&[&root]));
+    press(
+        &mut app,
+        &[
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+        ],
+    );
+    let paths = marked(&app);
+    let app_target = root.join("app/target");
+    let lib_target = root.join("lib/target");
+    fs::remove_file(lib_target.join("CACHEDIR.TAG")).unwrap();
+    let original_bytes = app
+        .browser()
+        .unwrap()
+        .marked_findings()
+        .find(|f| Path::new(&f.path) == app_target)
+        .unwrap()
+        .bytes;
+    fs::write(app_target.join("extra"), vec![7u8; 2 * MIB]).unwrap();
+    let before = job::now();
+    press(&mut app, &[KeyCode::Char('p')]);
+    run_build(&mut app, &Processes::default());
+    let plan = plan_of(&app);
+    let (created, _) = plan::validity_window(plan).unwrap();
+    assert!((before..=job::now()).contains(&created));
+    let [item] = plan.items.as_slice() else {
+        panic!("expected one item, got {:?}", plan.items);
+    };
+    assert_eq!(Path::new(&item.finding.path), app_target);
+    assert!(item.finding.bytes > original_bytes);
+    assert_eq!(
+        plan.selection.select,
+        std::slice::from_ref(&item.finding.id)
+    );
+    let screen = render(&mut app, 120, 40, Some(&root));
+    assert!(screen.contains("gone since the scan:"), "{screen}");
+    assert!(
+        screen.contains(&format!("{ROOT_PLACEHOLDER}/lib/target")),
+        "{screen}"
+    );
+
+    press(&mut app, &[KeyCode::Esc]);
+    assert_eq!(marked(&app), paths);
+    assert_eq!(shown_paths(&app).len(), 2);
+    fs::remove_file(app_target.join("CACHEDIR.TAG")).unwrap();
+    press(&mut app, &[KeyCode::Char('p')]);
+    run_build(&mut app, &Processes::default());
+    assert_eq!(view(&app), View::Findings);
+    assert!(app.plan_view().is_none());
+    assert!(
+        app.message
+            .as_deref()
+            .unwrap()
+            .contains("all marked findings are gone")
+    );
+}
+
+#[test]
+fn p_prepares_the_roots_again_before_detecting() {
+    let f = crates_fixture();
+    let root = f.root();
+    let original_parent = root.join("original");
+    let moved_parent = root.join("moved");
+    let stable = root.join("app");
+    fs::create_dir(&original_parent).unwrap();
+    fs::rename(root.join("lib"), original_parent.join("lib")).unwrap();
+    let mut app = app_with(scan(&[&stable, &original_parent.join("lib")]));
+    press(
+        &mut app,
+        &[
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+        ],
+    );
+    assert_eq!(marked(&app).len(), 2);
+
+    fs::rename(&original_parent, &moved_parent).unwrap();
+    std::os::unix::fs::symlink(&moved_parent, &original_parent).unwrap();
+    press(&mut app, &[KeyCode::Char('p')]);
+    run_build(&mut app, &Processes::default());
+
+    let plan = plan_of(&app);
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(
+        Path::new(&plan.items[0].finding.path),
+        stable.join("target")
+    );
+    let mut roots = plan.scan.roots.iter().map(Path::new).collect::<Vec<_>>();
+    roots.sort();
+    assert_eq!(
+        roots,
+        [stable.as_path(), moved_parent.join("lib").as_path()]
+    );
+    let screen = render(&mut app, 120, 40, Some(&root));
+    assert!(
+        screen.contains(&format!(
+            "gone since the scan: {ROOT_PLACEHOLDER}/original/lib/target"
+        )),
+        "{screen}"
+    );
+}
+
+#[test]
+fn p_reports_a_mark_from_a_detector_that_did_not_run() {
+    let f = crates_fixture();
+    let root = f.root();
+    let mut data = scan(&[&root]);
+    let missed_path = root.join("node_modules");
+    data.report.findings.push(hand_finding(
+        "node-modules",
+        missed_path.to_str().unwrap(),
+        4096,
+        Tier::Rebuildable,
+    ));
+    let mut app = app_with(data);
+    press(
+        &mut app,
+        &[
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+            KeyCode::End,
+            KeyCode::Char(' '),
+            KeyCode::Char('p'),
+        ],
+    );
+    run_build(&mut app, &Processes::default());
+    assert_eq!(plan_of(&app).items.len(), 1);
+    let screen = render(&mut app, 120, 40, Some(&root));
+    assert!(
+        screen.contains("not checked: node-modules did not run"),
+        "{screen}"
+    );
+    assert!(!screen.contains("gone since the scan"), "{screen}");
+
+    press(
+        &mut app,
+        &[
+            KeyCode::Esc,
+            KeyCode::Home,
+            KeyCode::Char(' '),
+            KeyCode::Char('p'),
+        ],
+    );
+    run_build(&mut app, &Processes::default());
+    assert!(app.plan_view().is_none());
+    assert_eq!(view(&app), View::Findings);
+    let message = app.message.as_deref().unwrap();
+    assert!(
+        message.contains("not checked: node-modules did not run"),
+        "{message}"
+    );
+    assert!(message.contains(missed_path.to_str().unwrap()), "{message}");
+}
+
+#[test]
+fn a_guard_blocks_a_marked_finding_in_the_plan() {
+    let f = crates_fixture();
+    let root = f.root();
+    let mut app = app_with(scan(&[&root]));
+    press(
+        &mut app,
+        &[
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+        ],
+    );
+    press(&mut app, &[KeyCode::Char('p')]);
+    let procs = Processes {
+        procs: vec![Proc {
+            pid: 4242,
+            name: "cargo".into(),
+            cwd: Some(root.join("lib/target/debug")),
+            open: Vec::new(),
+        }],
+        unreadable: 0,
+    };
+    run_build(&mut app, &procs);
+    let p = plan_of(&app);
+    assert_eq!(p.items.len(), 1);
+    assert_eq!(p.blocked.len(), 1);
+    assert_eq!(p.blocked[0].path, root.join("lib/target").to_str().unwrap());
+    let screen = render(&mut app, 120, 40, Some(&root));
+    assert!(screen.contains("blocked, not in the plan (1):"), "{screen}");
+    assert!(
+        screen.contains("blocked by in-use-cwd: working directory of cargo"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn p_reuses_the_running_plan_worker_after_esc_and_tab() {
+    let (_f, mut app) = marked_app(&["/home/me/projects/diskwhy/target"]);
+    press(&mut app, &[KeyCode::Char('p')]);
+    let first = app.take_request().unwrap();
+    first.progress.entries.store(42, Ordering::Relaxed);
+    press(&mut app, &[KeyCode::Esc]);
+    assert_eq!(view(&app), View::Findings);
+    press(&mut app, &[KeyCode::Char('p')]);
+    assert_eq!(marked(&app), ["/home/me/projects/diskwhy/target"]);
+    assert_eq!(view(&app), View::Plan);
+    assert!(app.take_request().is_none());
+    let screen = render(&mut app, 80, 24, None);
+    assert!(screen.contains("from 1 marked finding"), "{screen}");
+    assert!(screen.contains("rescanned 42 entries"), "{screen}");
+
+    press(&mut app, &[KeyCode::Tab]);
+    assert_eq!(view(&app), View::Tree);
+    press(
+        &mut app,
+        &[KeyCode::Tab, KeyCode::Char('p'), KeyCode::Char('w')],
+    );
+    assert_eq!(view(&app), View::Plan);
+    assert!(app.take_request().is_none());
+    assert!(app.plan_view().is_none());
+    assert!(app.on_key(key(KeyCode::Char('q'))));
+
+    app.plan_built(Ok(hand_build()), HOST, UID);
+    assert_eq!(plan_of(&app), &hand_plan());
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('p')]);
+    assert!(app.take_request().is_some());
+    press(&mut app, &[KeyCode::Esc]);
+    app.plan_built(Ok(hand_build()), HOST, UID);
+    assert_eq!(view(&app), View::Findings);
+    assert!(app.plan_view().is_none());
+
+    press(&mut app, &[KeyCode::Char('p')]);
+    assert!(app.take_request().is_some());
+    app.plan_built(Err("scan failed".into()), HOST, UID);
+    assert_eq!(view(&app), View::Findings);
+    assert!(app.message.as_deref().unwrap().contains("scan failed"));
+}
+
+#[test]
+fn p_waits_then_builds_for_the_changed_marks() {
+    let f = crates_fixture();
+    let root = f.root();
+    let mut app = app_with(scan(&[&root]));
+    press(
+        &mut app,
+        &[KeyCode::Tab, KeyCode::Char(' '), KeyCode::Char('p')],
+    );
+    let first = app.take_request().unwrap();
+
+    press(
+        &mut app,
+        &[KeyCode::Esc, KeyCode::Char(' '), KeyCode::Char('p')],
+    );
+    assert_eq!(view(&app), View::Findings);
+    assert!(app.take_request().is_none());
+    assert!(app.message.as_deref().unwrap().contains("nothing marked"));
+
+    press(
+        &mut app,
+        &[KeyCode::Down, KeyCode::Char(' '), KeyCode::Char('p')],
+    );
+    assert_eq!(view(&app), View::Plan);
+    assert!(app.take_request().is_none());
+    let screen = render(&mut app, 80, 24, Some(&root));
+    assert!(
+        screen.contains("waiting for the previous build to finish"),
+        "{screen}"
+    );
+
+    let previous = first.build(Processes::default, HOST.into()).unwrap();
+    assert_eq!(
+        Path::new(&previous.plan.items[0].finding.path),
+        root.join("app/target")
+    );
+    app.plan_built(Ok(previous), HOST, system::euid());
+    press(&mut app, &[KeyCode::Char('w')]);
+    assert!(app.plan_view().is_none());
+    run_build(&mut app, &Processes::default());
+
+    let plan = plan_of(&app);
+    assert_eq!(plan.items.len(), 1);
+    let finding = &plan.items[0].finding;
+    assert_eq!(Path::new(&finding.path), root.join("lib/target"));
+    assert_eq!(plan.selection.select, std::slice::from_ref(&finding.id));
+}
+
+#[test]
+fn plan_preview_80x24() {
+    let (_f, mut app) = preview_app();
+    insta::assert_snapshot!(render_at(&mut app, 80, 24, None, PLAN_AT));
+}
+
+#[test]
+fn plan_preview_120x40() {
+    let (_f, mut app) = preview_app();
+    render_at(&mut app, 80, 24, None, PLAN_AT);
+    let screen = render_at(&mut app, 120, 40, None, PLAN_AT);
+    assert!(screen.contains("warn   git-unpublished"), "{screen}");
+    assert!(
+        screen.contains("blocked by in-use-cwd: working directory of node (pid 4242)"),
+        "{screen}"
+    );
+    insta::assert_snapshot!(screen);
+}
+
+#[test]
+fn write_prompt_80x24() {
+    let (_f, mut app) = preview_app();
+    press(&mut app, &[KeyCode::Char('w')]);
+    assert_eq!(
+        app.plan_view().unwrap().prompt.as_deref(),
+        Some(DEFAULT_PLAN_FILE)
+    );
+    insta::assert_snapshot!(render_at(&mut app, 80, 24, None, PLAN_AT));
+}
+
+#[test]
+fn w_writes_the_plan_file_as_dwhy_plan_does() {
+    let f = crates_fixture();
+    let root = f.root();
+    let mut app = app_with(scan(&[&root]));
+    press(
+        &mut app,
+        &[KeyCode::Tab, KeyCode::Char(' '), KeyCode::Char('p')],
+    );
+    run_build(&mut app, &Processes::default());
+    let out = tempfile::tempdir().unwrap();
+    let file = out.path().join("quick-plan.json");
+    let path = file.to_str().unwrap();
+
+    // Edit the default path; Esc cancels and writes nothing.
+    press(&mut app, &[KeyCode::Char('w')]);
+    press(&mut app, &[KeyCode::Backspace]);
+    assert_eq!(
+        app.plan_view().unwrap().prompt.as_deref(),
+        Some("./dwhy-plan.jso")
+    );
+    assert!(!app.on_key(ctrl('u')));
+    type_text(&mut app, path);
+    press(&mut app, &[KeyCode::Esc]);
+    assert!(app.plan_view().unwrap().prompt.is_none());
+    assert_eq!(app.message.as_deref(), Some("no plan file written"));
+    assert!(!file.exists());
+
+    // Enter writes; `q` in the path is text, not quit.
+    press(&mut app, &[KeyCode::Char('w')]);
+    assert!(!app.on_key(ctrl('u')));
+    type_text(&mut app, path);
+    press(&mut app, &[KeyCode::Enter]);
+    assert!(app.plan_view().unwrap().prompt.is_none());
+    assert_eq!(app.message, Some(format!("wrote {path}")));
+    let saved = fs::read_to_string(&file).unwrap();
+    assert!(saved.ends_with('\n'));
+    assert_eq!(&plan::parse(&saved).unwrap(), plan_of(&app));
+}
+
+#[test]
+fn w_creates_a_long_basename_through_a_parent_symlink() {
+    let (_f, mut app) = preview_app();
+    let out = tempfile::tempdir().unwrap();
+    let parent = out.path().join("parent");
+    fs::create_dir(&parent).unwrap();
+    let alias = out.path().join("alias");
+    std::os::unix::fs::symlink(&parent, &alias).unwrap();
+    let name = "p".repeat(255);
+    let file = parent.join(&name);
+
+    press(&mut app, &[KeyCode::Char('w')]);
+    assert!(!app.on_key(ctrl('u')));
+    type_text(&mut app, alias.join(&name).to_str().unwrap());
+    press(&mut app, &[KeyCode::Enter]);
+    let saved = fs::read_to_string(&file).unwrap();
+    assert_eq!(&plan::parse(&saved).unwrap(), plan_of(&app));
+    assert_eq!(fs::read_dir(parent).unwrap().count(), 1);
+}
+
+#[test]
+fn w_requires_an_unused_path() {
+    let (_f, mut app) = preview_app();
+    let out = tempfile::tempdir().unwrap();
+    let real = out.path().join("real.json");
+    let original = b"keep this file";
+    fs::write(&real, original).unwrap();
+    let inode = fs::metadata(&real).unwrap().ino();
+    let hardlink = out.path().join("baseline.json");
+    fs::hard_link(&real, &hardlink).unwrap();
+    let link = out.path().join("link.json");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let dangling = out.path().join("dangling.json");
+    std::os::unix::fs::symlink(out.path().join("nowhere.json"), &dangling).unwrap();
+    let dir = out.path().to_str().unwrap();
+    let dir_slash = format!("{dir}/");
+    press(&mut app, &[KeyCode::Char('w')]);
+    for path in [
+        real.to_str().unwrap(),
+        hardlink.to_str().unwrap(),
+        link.to_str().unwrap(),
+        dangling.to_str().unwrap(),
+        dir,
+        &dir_slash,
+    ] {
+        assert!(!app.on_key(ctrl('u')));
+        type_text(&mut app, path);
+        press(&mut app, &[KeyCode::Enter]);
+        let message = format!("{path} exists; choose another name");
+        assert_eq!(app.message.as_deref(), Some(message.as_str()));
+        assert_eq!(app.plan_view().unwrap().prompt.as_deref(), Some(path));
+        let screen = render(&mut app, 200, 24, None);
+        assert!(screen.contains("exists; choose another name"), "{screen}");
+        assert!(screen.contains(" write plan to: "), "{screen}");
+        assert_eq!(fs::read(&real).unwrap(), original);
+        assert_eq!(fs::metadata(&real).unwrap().ino(), inode);
+    }
+    assert_eq!(fs::read(&hardlink).unwrap(), original);
+    assert_eq!(fs::metadata(&hardlink).unwrap().ino(), inode);
+    assert_eq!(fs::read_link(&link).unwrap(), real);
+    assert!(!out.path().join("nowhere.json").exists());
+
+    let unused = out.path().join("new.json");
+    assert!(!app.on_key(ctrl('u')));
+    type_text(&mut app, unused.to_str().unwrap());
+    press(&mut app, &[KeyCode::Enter]);
+    assert!(app.plan_view().unwrap().prompt.is_none());
+    let saved = fs::read_to_string(unused).unwrap();
+    assert_eq!(&plan::parse(&saved).unwrap(), plan_of(&app));
+}
+
+#[test]
+fn plan_file_opens_in_the_preview() {
+    let plan = hand_plan();
+    let file = PathBuf::from("/tmp/plans/dwhy-plan.json");
+    let mut app = App::open_plan(plan.clone(), file.clone(), HOST, UID);
+    let view = app.plan_view().unwrap();
+    assert_eq!(view.unusable(PLAN_AT + 60), None);
+    assert_eq!(view.file.as_deref(), Some(file.as_path()));
+    let screen = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(
+        screen.contains("plan /tmp/plans/dwhy-plan.json"),
+        "{screen}"
+    );
+    assert!(!screen.contains("NOT USABLE"), "{screen}");
+    // It is already a file; Esc has nothing to go back to; q quits.
+    press(&mut app, &[KeyCode::Char('w'), KeyCode::Esc, KeyCode::Down]);
+    assert!(app.plan_view().unwrap().prompt.is_none());
+    assert_eq!(app.plan_view().unwrap().scroll, 1);
+    press(&mut app, &[KeyCode::Char('w')]);
+    assert!(app.message.as_deref().unwrap().contains("already a file"));
+    assert!(app.on_key(key(KeyCode::Char('q'))));
+
+    // `plan::usable` decides, as for `dwhy apply`.
+    for (host, uid, now, why) in [
+        ("other", UID, PLAN_AT, "made on testhost, not other"),
+        (HOST, UID + 1, PLAN_AT, "made by uid 1000, not 1001"),
+        (HOST, UID, PLAN_AT + plan::TTL_SECS, "expired at"),
+    ] {
+        let app = App::open_plan(plan.clone(), file.clone(), host, uid);
+        let got = app.plan_view().unwrap().unusable(now).unwrap().to_string();
+        assert!(got.contains(why), "{got}");
+    }
+}
+
+#[test]
+fn an_open_preview_shows_the_capped_deadline_and_expires_at_it() {
+    let mut plan = hand_plan();
+    plan.expires_at = dwhy_core::detect::rfc3339(PLAN_AT + 86_400);
+    let mut app = App::open_plan(plan, "edited.json".into(), HOST, UID);
+    let deadline = PLAN_AT + 3600;
+    let expiry = format!("expires {}", dwhy_core::detect::rfc3339(deadline));
+    let before = render_at(&mut app, 80, 24, None, deadline - 1);
+    assert!(before.contains(&expiry), "{before}");
+    assert!(!before.contains("NOT USABLE"), "{before}");
+    let expired = render_at(&mut app, 80, 24, None, deadline);
+    assert!(
+        expired.contains("NOT USABLE: the plan expired at"),
+        "{expired}"
+    );
+    assert!(expired.contains(&expiry), "{expired}");
+}
+
+#[test]
+fn unusable_plan_banner_80x24() {
+    let file = PathBuf::from("/tmp/plans/dwhy-plan.json");
+    let mut app = App::open_plan(hand_plan(), file, HOST, UID);
+    insta::assert_snapshot!(render_at(
+        &mut app,
+        80,
+        24,
+        None,
+        PLAN_AT + plan::TTL_SECS + 600
+    ));
 }

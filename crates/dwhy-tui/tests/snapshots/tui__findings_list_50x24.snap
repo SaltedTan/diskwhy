@@ -3,8 +3,8 @@ source: crates/dwhy-tui/tests/tui.rs
 expression: screen
 ---
 " dwhy  findings                  all tiers · 1/1  "
-"  tier            size  path                      "
-"> regenerable     4.0G  docker://build-cache      "
+"   tier            size  path                     "
+">  regenerable     4.0G  docker://build-cache     "
 "                                                  "
 "                                                  "
 "                                                  "
@@ -25,4 +25,4 @@ expression: screen
 "                                                  "
 "                                                  "
 " 1/1 · growth since 2026-11-17T09:00:00Z          "
-" ↑↓ PgUp PgDn · Enter details · t tier filter · Ta"
+" ↑↓ · Enter details · Space mark · p plan · t tier"
