@@ -493,8 +493,7 @@ impl Browser {
         Effect::None
     }
 
-    /// `p`: asks for the plan of the marked findings, as
-    /// `dwhy plan --select <ids>` would make it.
+    /// `p`: requests a plan build for the current marks.
     fn start_plan(&mut self) -> Effect {
         if self.marked.is_empty() {
             return Effect::Message("nothing marked: Space marks a finding for the plan".into());

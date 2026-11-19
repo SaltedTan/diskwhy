@@ -1,8 +1,7 @@
 //! The scan the TUI runs: the same pipeline as `dwhy scan` (roots, walk,
 //! filesystems and unaccounted space, detectors, probes, growth on
-//! findings), with no snapshot saved. Also the plan work: building a plan
-//! from marked findings as `dwhy plan --select` does, reading a plan file,
-//! and writing one.
+//! findings), with no snapshot saved. Also the plan work: rescanning for
+//! marked findings, building with core `plan::build`, and handling plan files.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -195,7 +194,8 @@ impl fmt::Display for UnplannedMark {
 }
 
 impl PlanJob {
-    /// Builds the plan as `dwhy plan --select <ids>` does, after a fresh walk.
+    /// Builds a plan for marks found on the rescan and reports missing marks
+    /// separately so the preview can explain why they were left out.
     pub fn build(
         self,
         read_processes: impl FnOnce() -> Processes,

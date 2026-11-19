@@ -7,7 +7,7 @@
 //!
 //! M4a: the tree browser. M4b: the findings list and detail view. M4c:
 //! marking findings, the plan preview (built with core `plan::build` on a
-//! worker thread, as `dwhy plan` builds it) and plan files: `w` writes one,
+//! worker thread) and plan files: `w` writes one,
 //! [`run_plan`] opens one. A plan file the person asks for is the only
 //! thing the TUI writes; nothing is removed.
 
