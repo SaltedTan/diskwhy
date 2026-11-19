@@ -479,42 +479,49 @@ fn a_root_replaced_after_applys_own_scan_is_skipped() {
     assert_eq!(apply::exit_code(&r), 2);
 }
 
+fn git(repo: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args([
+            "--no-optional-locks",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn survey_skips_a_symlink_replacement_without_reporting_its_git_worktrees() {
     let (_t, b) = base();
     let (_other, other) = base();
     let mut found = fixture(&b);
     found.retain(|f| f.detector != "cargo-target");
+    let detector_guard = GuardResult {
+        name: "fixture-detector".into(),
+        status: GuardStatus::Warn,
+        detail: "reported during detection".into(),
+    };
+    found[1].guards.push(detector_guard.clone());
     let scratch = b.join("scratch");
     let original = scratch.join("repo");
     let replacement = other.join("tree/repo");
     let linked = other.join("linked");
-    let git = |repo: &Path, args: &[&str]| {
-        let out = Command::new("git")
-            .args([
-                "--no-optional-locks",
-                "-c",
-                "user.name=Fixture",
-                "-c",
-                "user.email=fixture@example.com",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .current_dir(repo)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
     for repo in [&original, &replacement] {
         fs::create_dir_all(repo).unwrap();
         git(repo, &["init", "-q"]);
@@ -546,15 +553,77 @@ fn survey_skips_a_symlink_replacement_without_reporting_its_git_worktrees() {
         .find(|i| i.detector == "stale-tree")
         .unwrap();
     assert_eq!(skipped.outcome, ApplyOutcome::Skipped);
-    assert_eq!(skipped.guards.len(), 1, "{:?}", skipped.guards);
-    assert_eq!(skipped.guards[0].name, "changed-since-scan");
-    assert_eq!(skipped.guards[0].status, GuardStatus::Block);
+    assert_eq!(skipped.guards.len(), 2, "{:?}", skipped.guards);
+    assert_eq!(skipped.guards[0], detector_guard);
+    assert_eq!(skipped.guards[1].name, "changed-since-scan");
+    assert_eq!(skipped.guards[1].status, GuardStatus::Block);
     assert!(
         !serde_json::to_string(&report)
             .unwrap()
             .contains(other.to_str().unwrap())
     );
-    assert!(checks.iter().any(Check::ready));
+    let ready = checks.iter().find(|c| c.ready()).unwrap();
+    assert!(ready.item.guards.iter().any(|g| g.name == "in-use-cwd"));
+}
+
+#[test]
+fn a_skipped_replacement_still_blocks_removal_of_its_git_dir() {
+    let (_t, b) = base();
+    let (_other, other) = base();
+    let scratch = b.join("scratch");
+    let original = scratch.join("repo");
+    let metadata = b.join("metadata");
+    let git_dir = metadata.join("repo.git");
+    let replacement = other.join("tree/repo");
+    for dir in [&original, &metadata, &replacement] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    git(&original, &["init", "-q"]);
+    git(
+        &replacement,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            git_dir.to_str().unwrap(),
+        ],
+    );
+    let scratch_finding = finding("stale-tree", &scratch, Tier::Review);
+    let metadata_finding = finding("stale-tree", &metadata, Tier::Review);
+    let pol = policy(
+        Tier::Regenerable,
+        &[&scratch_finding.id, &metadata_finding.id],
+    );
+    let found = vec![scratch_finding, metadata_finding];
+    let plan = make_plan(&b, found.clone());
+    assert_eq!(plan.items.len(), 2, "{:?}", plan.blocked);
+    let tree = scan_tree(&b);
+    fs::rename(&scratch, scratch.with_extension("old")).unwrap();
+    symlink(other.join("tree"), &scratch).unwrap();
+
+    let checks = apply::evaluate(&plan, found, &tree, &ctx(), &Processes::default(), &pol);
+    let report = apply::report(&plan, &checks, &pol, true, &env());
+    assert_eq!(apply::exit_code(&report), 2);
+    let item_at = |path: &Path| {
+        report
+            .items
+            .iter()
+            .find(|i| Path::new(&i.path) == path)
+            .unwrap()
+    };
+    let skipped = item_at(&scratch);
+    assert_eq!(skipped.outcome, ApplyOutcome::Skipped);
+    assert_eq!(skipped.guards.len(), 1, "{:?}", skipped.guards);
+    assert_eq!(skipped.guards[0].name, "changed-since-scan");
+    let dependency = item_at(&metadata);
+    assert_eq!(dependency.outcome, ApplyOutcome::Skipped);
+    let guard = dependency
+        .guards
+        .iter()
+        .find(|g| g.name == "git-linked-worktrees")
+        .unwrap();
+    assert_eq!(guard.status, GuardStatus::Block);
+    assert!(guard.detail.contains(original.to_str().unwrap()));
 }
 
 #[test]
@@ -748,6 +817,7 @@ fn execute_skips_replaced_roots_for_commands_and_path_removal() {
     for c in &checks {
         assert_eq!(c.item.outcome, ApplyOutcome::Skipped);
         assert!(c.item.detail.starts_with("changed since the scan: "));
+        assert_eq!(c.item.guards.len(), 1, "{:?}", c.item.guards);
         let changed = c
             .item
             .guards

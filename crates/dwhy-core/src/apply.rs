@@ -113,11 +113,22 @@ impl Check {
     pub fn ready(&self) -> bool {
         self.item.outcome == ApplyOutcome::WouldRemove
     }
+
+    fn skip_changed(&mut self, detail: String) -> (ApplyOutcome, String) {
+        if let Some(f) = &self.fresh {
+            self.item.guards.clone_from(&f.guards);
+        } else {
+            self.item.guards.clear();
+        }
+        let message = format!("changed since the scan: {detail}");
+        add_changed_guard(&mut self.item.guards, detail);
+        (ApplyOutcome::Skipped, message)
+    }
 }
 
 /// Decides every item of `plan` against `fresh`, the findings detected now
-/// in a scan (`tree`) of the plan's roots. Runs the guards on the items the
-/// policy allows. Returns one check per item, in plan order.
+/// in a scan (`tree`) of the plan's roots. Runs the guards on the planned
+/// roots. Returns one check per item, in plan order.
 pub fn evaluate(
     plan: &Plan,
     fresh: Vec<Finding>,
@@ -126,7 +137,6 @@ pub fn evaluate(
     procs: &Processes,
     policy: &Policy,
 ) -> Vec<Check> {
-    let mut changed_roots = Vec::new();
     let mut checks: Vec<Check> = plan
         .items
         .iter()
@@ -137,29 +147,25 @@ pub fn evaluate(
                 tree,
                 ctx,
                 policy,
-                &mut changed_roots,
             )
         })
         .collect();
-    // The guards, once, on everything still ready.
-    let ready: Vec<usize> = (0..checks.len()).filter(|&i| checks[i].ready()).collect();
-    let mut guarded: Vec<Finding> = ready
+    let mut guarded: Vec<Finding> = checks
         .iter()
-        .filter_map(|&i| checks[i].fresh.clone())
+        .zip(&plan.items)
+        .map(|(c, p)| c.fresh.as_ref().unwrap_or(&p.finding).clone())
         .collect();
-    guard::check_excluding(&mut guarded, tree, ctx, procs, &changed_roots);
-    for (i, f) in ready.into_iter().zip(guarded) {
-        let c = &mut checks[i];
-        c.item.guards.clone_from(&f.guards);
+    guard::check(&mut guarded, tree, ctx, procs);
+    for (c, f) in checks.iter_mut().zip(guarded).filter(|(c, _)| c.ready()) {
         if let Some(detail) = changed_root(&f.path, c.inode) {
-            c.item.outcome = ApplyOutcome::Skipped;
-            c.item.detail = format!("changed since the scan: {detail}");
-            add_changed_guard(&mut c.item.guards, detail);
-        } else if f.tier == Tier::Blocked {
+            (c.item.outcome, c.item.detail) = c.skip_changed(detail);
+            continue;
+        }
+        if f.tier == Tier::Blocked {
             c.item.outcome = ApplyOutcome::Skipped;
             c.item.detail = format!("blocked by {}", blocks(&f));
         }
-        c.fresh = Some(f);
+        c.item.guards = f.guards;
     }
     checks
 }
@@ -170,7 +176,6 @@ fn decide(
     tree: &ScanTree,
     ctx: &DetectContext,
     policy: &Policy,
-    changed_roots: &mut Vec<PathBuf>,
 ) -> Check {
     let planned = &item.finding;
     let base = |f: &Finding, outcome, detail: String| Check {
@@ -239,9 +244,8 @@ fn decide(
         return base(f, ApplyOutcome::Refused, why);
     }
     if let Some(detail) = changed_since_scan(f, tree) {
-        changed_roots.push(PathBuf::from(&f.path));
-        let mut c = skip(format!("changed since the scan: {detail}"));
-        add_changed_guard(&mut c.item.guards, detail);
+        let mut c = base(f, ApplyOutcome::Skipped, String::new());
+        (c.item.outcome, c.item.detail) = c.skip_changed(detail);
         return c;
     }
     let now = plan::fingerprint(f, tree, ctx);
@@ -422,9 +426,7 @@ fn run(c: &mut Check, mounts: &MountTable) -> (ApplyOutcome, String) {
         return (ApplyOutcome::Skipped, outcome);
     }
     if let Some(detail) = changed_root(&item.path, c.inode) {
-        let outcome = format!("changed since the scan: {detail}");
-        add_changed_guard(&mut item.guards, detail);
-        return (ApplyOutcome::Skipped, outcome);
+        return c.skip_changed(detail);
     }
     match item.action.kind {
         ActionKind::RemovePath => {
