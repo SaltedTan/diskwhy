@@ -1266,6 +1266,72 @@ fn finding_paths_and_commands_escape_controls() {
 }
 
 #[test]
+fn invisible_cargo_path_characters_are_visible_in_paths_and_previews() {
+    for (character, escape) in [
+        ('\u{200b}', r"\u{200b}"),
+        ('\u{200c}', r"\u{200c}"),
+        ('\u{200d}', r"\u{200d}"),
+        ('\u{feff}', r"\u{feff}"),
+    ] {
+        let path = format!("/p/app{character}/target");
+        let shown_path = format!("/p/app{escape}/target");
+        let mut finding = hand_finding("cargo-target", &path, GIB, Tier::Rebuildable);
+        finding.action.kind = ActionKind::Command;
+        finding.action.text = format!(
+            "cargo clean --target-dir {}",
+            dwhy_core::detect::shell_quote(&path)
+        );
+        finding.recovery.how = Some(format!("cd '/p/app{character}' && cargo build"));
+        let (_f, mut app) = findings_app(vec![finding], None);
+        press(&mut app, &[KeyCode::Tab]);
+        let list = render(&mut app, 80, 24, None);
+        assert!(list.lines().nth(2).unwrap().contains(&shown_path), "{list}");
+
+        press(&mut app, &[KeyCode::Enter]);
+        let detail = render(&mut app, 80, 24, None);
+        assert!(
+            detail.lines().next().unwrap().contains(&shown_path),
+            "{detail}"
+        );
+        assert!(
+            detail.lines().nth(2).unwrap().contains(&shown_path),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(&format!("cargo clean --target-dir '{shown_path}'")),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(&format!("cd '/p/app{escape}' && cargo build")),
+            "{detail}"
+        );
+        assert_eq!(
+            detail.matches("preview — do not copy").count(),
+            2,
+            "{detail}"
+        );
+    }
+}
+
+#[test]
+fn halfwidth_sound_mark_at_the_right_edge_is_escaped_in_command_preview() {
+    let path = format!("/p/{}ｶﾞ/target", "x".repeat(40));
+    let mut finding = hand_finding("cargo-target", &path, GIB, Tier::Rebuildable);
+    finding.action.kind = ActionKind::Command;
+    finding.action.text = format!("cargo clean --target-dir '{path}'");
+    let (_f, mut app) = findings_app(vec![finding], None);
+    press(&mut app, &[KeyCode::Tab, KeyCode::Enter]);
+    let detail = render(&mut app, 80, 24, None);
+    assert!(detail.contains("preview — do not copy"), "{detail}");
+    assert!(
+        detail
+            .lines()
+            .any(|line| line.starts_with("\"│") && line.contains(r"\u{ff9e}/target'")),
+        "{detail}"
+    );
+}
+
+#[test]
 fn wrapped_action_and_recovery_are_previews() {
     let path = format!("/p/{}", "project".repeat(9));
     let mut finding = hand_finding("cargo-target", "/p/target", GIB, Tier::Rebuildable);

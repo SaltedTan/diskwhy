@@ -11,6 +11,7 @@ use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{ActionKind, Finding, FsReport};
 use dwhy_core::units::{human, signed, thousands};
 use ratatui::Frame;
+use ratatui::buffer::CellWidth;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -476,11 +477,38 @@ fn findings_status(b: &Browser, failed: &[(&str, &str)], width: usize) -> Line<'
 
 fn display_units(s: &str) -> impl DoubleEndedIterator<Item = Cow<'_, str>> + Clone {
     s.graphemes(true).map(|g| {
-        if g.contains(|c: char| c.is_control() || c == '\\') {
+        const JOINER: char = '\u{200d}';
+        let cells = cell_width(g);
+        let escape_grapheme = cells == 0 || cells != g.width();
+        let emoji_joined = cells == 2
+            && g.contains(JOINER)
+            && g.split(JOINER)
+                .try_fold(0, |total, part| {
+                    let width = part.width();
+                    (width > 0).then_some(total + width)
+                })
+                .is_some_and(|unjoined| unjoined > cells);
+        let unicode_escape = |c| {
+            escape_grapheme
+                || matches!(
+                    c,
+                    '\u{034f}'
+                        | '\u{0605}'
+                        | '\u{070f}'
+                        | '\u{0890}'..='\u{0891}'
+                        | '\u{08e2}'
+                        | '\u{200c}'
+                        | '\u{e0020}'..='\u{e007f}'
+                )
+                || (c == JOINER && !emoji_joined)
+        };
+        if g.contains(|c: char| c.is_control() || c == '\\' || unicode_escape(c)) {
             let mut escaped = String::new();
             for c in g.chars() {
                 if c.is_control() || c == '\\' {
                     escaped.extend(c.escape_default());
+                } else if unicode_escape(c) {
+                    escaped.extend(c.escape_unicode());
                 } else {
                     escaped.push(c);
                 }
@@ -602,7 +630,7 @@ fn detail_lines(f: &Finding, lossy: bool, base: Option<&str>, width: usize) -> V
 /// first line's indent, plus two columns.
 fn wrap(s: &str, width: usize) -> Vec<String> {
     let units: Vec<_> = display_units(s).collect();
-    if units.iter().map(|g| g.width()).sum::<usize>() <= width || width == 0 {
+    if units.iter().map(|g| grapheme_width(g)).sum::<usize>() <= width || width == 0 {
         return vec![units.into_iter().collect()];
     }
     let indent = s.len() - s.trim_start_matches(' ').len();
@@ -620,7 +648,7 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
         let word_w = word
             .iter()
             .filter(|g| *g != " ")
-            .map(|g| g.width())
+            .map(|g| grapheme_width(g))
             .sum::<usize>();
         if line_w + word_w > width && !line.trim().is_empty() {
             push_line(&line);
@@ -628,12 +656,12 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
             line_w = cont.len();
         }
         for g in word {
-            let g = if g.width() <= width {
-                g.as_ref()
+            let gw = grapheme_width(g);
+            let (g, gw) = if gw <= width {
+                (g.as_ref(), gw)
             } else {
-                "…"
+                ("…", 1)
             };
-            let gw = g.width();
             if g != " " && line_w + gw > width {
                 push_line(&line);
                 line_w = cont.len().min(width - gw);
@@ -648,7 +676,15 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
 }
 
 fn grapheme_width(s: &str) -> usize {
-    s.graphemes(true).map(str::width).sum()
+    s.graphemes(true).map(cell_width).sum()
+}
+
+fn cell_width(g: &str) -> usize {
+    if g.contains(char::is_control) {
+        0
+    } else {
+        usize::from(g.cell_width())
+    }
 }
 
 fn status_text(b: &Browser, mode: SizeMode) -> Vec<Line<'static>> {
@@ -744,7 +780,7 @@ fn middle_units<'a>(
     units: impl DoubleEndedIterator<Item = Cow<'a, str>> + Clone,
     max: usize,
 ) -> String {
-    if units.clone().map(|g| g.width()).sum::<usize>() <= max {
+    if units.clone().map(|g| grapheme_width(&g)).sum::<usize>() <= max {
         return units.collect();
     }
     if max == 0 {
@@ -768,7 +804,7 @@ fn middle_units<'a>(
 }
 
 fn take_columns(room: &mut usize, unit: &str) -> bool {
-    if let Some(left) = room.checked_sub(unit.width()) {
+    if let Some(left) = room.checked_sub(grapheme_width(unit)) {
         *room = left;
         true
     } else {
