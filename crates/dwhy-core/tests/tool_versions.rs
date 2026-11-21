@@ -12,7 +12,7 @@ use dwhy_core::guard::Processes;
 use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection};
 use dwhy_core::report::{
-    ActionKind, DockerSocket, Finding, GuardStatus, PlanScan, Tier, ToolStatus,
+    ActionKind, ApplyOutcome, DockerSocket, Finding, GuardStatus, PlanScan, Tier, ToolStatus,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::tree::ScanTree;
@@ -1094,4 +1094,97 @@ fn reads_running_processes_from_proc() {
     child.kill().unwrap();
     child.wait().unwrap();
     assert_eq!(paths(&found), [s(&v("0.1.9-nightly.2"))]);
+}
+
+#[test]
+fn a_vscode_cli_that_was_a_directory_when_walked_is_never_planned_as_a_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = fs::canonicalize(temp.path()).unwrap();
+    let vscode = home.join(".vscode-server");
+    let old = vscode.join(format!("code-{C1}"));
+    file(&vscode.join(format!("code-{C2}")), 2 * MB);
+    let mtime = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    let ctx = ctx(&home, &[]);
+    let detectors: Vec<Box<dyn Detector>> = vec![Box::new(
+        ToolVersions::with_env(Vec::<(String, String)>::new()).with_running_exes(Vec::new()),
+    )];
+    let detect = |tree| detect::run_with(tree, &ctx, &detectors, Some(&["tool-versions".into()])).0;
+    let procs = Processes::default();
+    let build = |findings: Vec<Finding>, tree: &ScanTree| {
+        plan::build(
+            findings,
+            &Selection {
+                tier: Some(Tier::Rebuildable),
+                select: vec![],
+            },
+            tree,
+            &ctx,
+            &procs,
+            "host".into(),
+            PlanScan {
+                roots: vec![s(&home)],
+                one_filesystem: true,
+                detectors: Some(vec!["tool-versions".into()]),
+            },
+        )
+        .unwrap()
+    };
+    // A plan made while it is a regular file.
+    file(&old, 2 * MB);
+    fs::File::open(&old).unwrap().set_modified(mtime).unwrap();
+    let tree = scan_tree(&home);
+    let plan = build(detect(&tree), &tree);
+    assert_eq!(plan.items.len(), 1, "{:?}", plan.blocked);
+
+    // The walk sees a directory there; by detection it is a regular file
+    // again, with the same size and mtime but another inode. Each replaced
+    // one is renamed, not removed, so its inode cannot be reused.
+    fs::rename(&old, old.with_extension("planned")).unwrap();
+    file(&old.join("blob"), 2 * MB);
+    let walked = scan_tree(&home);
+    assert!(walked.node(walked.find(&old).unwrap()).is_dir);
+    fs::rename(&old, old.with_extension("dir")).unwrap();
+    file(&old, 2 * MB);
+    fs::File::open(&old).unwrap().set_modified(mtime).unwrap();
+    let found = detect(&walked);
+    let cli = found.iter().find(|f| f.path == s(&old)).unwrap();
+    assert!(cli.file_identity.is_some());
+
+    let conflict = format!(
+        "{} changed between the walk and detection (device/inode differ)",
+        old.display()
+    );
+    let replanned = build(found.clone(), &walked);
+    assert!(replanned.items.is_empty(), "{:?}", replanned.items);
+    assert_eq!(replanned.blocked.len(), 1);
+    assert!(
+        replanned.blocked[0]
+            .guards
+            .iter()
+            .any(|g| g.name == "changed-since-scan"
+                && g.status == GuardStatus::Block
+                && g.detail == conflict),
+        "{:?}",
+        replanned.blocked[0].guards
+    );
+    let fp = plan::fingerprint(cli, &walked, &ctx);
+    assert_eq!((fp.dev, fp.inode, fp.newest_mtime), (None, None, None));
+
+    let checks = apply::evaluate(
+        &plan,
+        found,
+        &walked,
+        &ctx,
+        &procs,
+        &Policy {
+            max_tier: Tier::Rebuildable,
+            ..Policy::default()
+        },
+    );
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0].item.outcome, ApplyOutcome::Skipped);
+    assert_eq!(
+        checks[0].item.detail,
+        format!("changed since the scan: {conflict}")
+    );
 }

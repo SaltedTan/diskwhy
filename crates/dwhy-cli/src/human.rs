@@ -508,18 +508,22 @@ pub fn render_apply(
         ApplyOutcome::WouldRemove => "would remove",
     };
     for i in &r.items {
+        // An item's fields can come from a hand-edited plan file (an item
+        // that is gone or does not match), and paths can hold any byte but
+        // NUL and `/`: no control character reaches the terminal raw.
         writeln!(
             w,
             "  {:<12} {:>8}  {:<13} {}",
             label(i.outcome),
             human(i.bytes),
-            i.detector,
-            i.path
+            escape_only_controls(&i.detector),
+            escape_only_controls(&i.path)
         )?;
         let note = match i.outcome {
             ApplyOutcome::WouldRemove => format!("{} → {}", tier_name(i.tier), i.action.text),
             _ => i.detail.clone(),
         };
+        let note = escape_only_controls(&note);
         writeln!(w, "  {:<12} {:>8}  {:<13} {note}", "", "", "")?;
     }
     if items_only {
@@ -926,6 +930,26 @@ pub fn render_doctor(w: &mut impl Write, d: &DoctorReport) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `s` with control characters (newlines, escape sequences) escaped as
+/// Rust escapes (`\n`, `\u{1b}`). Backslashes are left alone: details from
+/// `dwhy-core` already escape them where the text came from a plan file.
+fn escape_only_controls(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains(char::is_control) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        s.chars()
+            .map(|c| {
+                if c.is_control() {
+                    c.escape_default().to_string()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]

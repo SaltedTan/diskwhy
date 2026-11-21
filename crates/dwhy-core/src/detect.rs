@@ -232,6 +232,25 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
+/// `s` with control characters (newlines and escape sequences included)
+/// and backslashes escaped as Rust escapes (`\n`, `\u{1b}`, `\\`), for
+/// text from a plan file or the filesystem that goes into a message shown on
+/// a terminal. Other text is unchanged.
+pub fn escape_controls(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains(|c: char| c.is_control() || c == '\\') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if c.is_control() || c == '\\' {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// The guard on a finding that names a path that is not valid UTF-8.
 pub const PATH_NOT_UTF8: &str = "path-not-utf8";
 

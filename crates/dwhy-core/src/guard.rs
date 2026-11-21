@@ -47,6 +47,16 @@
 //! and do not apply to `user-cache` and `tool-versions` findings: those
 //! repositories are the tools' own checkouts.
 //!
+//! Identities are checked again at this boundary, before any git state is
+//! read: a finding root or repository that is no longer the directory the
+//! walk measured (gone, replaced, a symlink, or behind a symlink or
+//! non-directory) is not read. Such a root gets a blocking
+//! `changed-since-scan`, and such a repository inside a finding blocks it
+//! as one git could not check. A `.git` file whose `gitdir:` or `commondir`
+//! leads into a changed root or repository is not followed. A work tree in
+//! the scan that changed (but is not gone) may use any git directory, so a
+//! finding that holds one cannot be cleared by `git-linked-worktrees`.
+//!
 //! Processes are read from `/proc`; other users' processes cannot be read
 //! without root, which the pass detail says. A guard that cannot check (git
 //! missing or failing, Docker unreachable) blocks. A blocking guard moves
@@ -57,6 +67,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::detect::DetectContext;
+use crate::plan::{self, Measured};
 use crate::report::{Finding, GuardResult, GuardStatus, Tier};
 use crate::tree::{Markers, ScanTree};
 
@@ -162,33 +173,88 @@ fn strip_deleted(s: &str) -> &str {
 /// scanned paths (git repositories are found through it).
 pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, procs: &Processes) {
     use rayon::prelude::*;
+    // Identities first: nothing below a root that changed since the walk is
+    // read. A root the scan did not measure has no repositories of its own
+    // in the tree; those are checked one by one below.
+    let root_changes: Vec<Option<String>> = findings
+        .par_iter()
+        .map(|f| {
+            if !f.path.starts_with('/') {
+                return None;
+            }
+            match plan::measured(&f.path, f.file_identity, tree) {
+                Measured::Unknown => None,
+                m => plan::changed_root(Path::new(&f.path), m, false),
+            }
+        })
+        .collect();
+    let changed_roots: Vec<&Path> = findings
+        .iter()
+        .zip(&root_changes)
+        .filter(|(_, c)| c.is_some())
+        .map(|(f, _)| Path::new(&f.path))
+        .collect();
+    let fs_roots: Vec<&Path> = findings
+        .iter()
+        .zip(&root_changes)
+        .filter(|(f, c)| c.is_none() && f.path.starts_with('/') && git_guarded(f))
+        .map(|(f, _)| Path::new(&f.path))
+        .collect();
     let mut repos = repositories(tree);
+    // The work trees (every one: their `.git` files are read for `users`)
+    // and the repositories in a finding, checked against the walk.
+    let changed_repos: HashMap<Repo, String> = repos
+        .par_iter()
+        .filter(|r| {
+            matches!(r, Repo::WorkTree(_)) || fs_roots.iter().any(|root| r.path().starts_with(root))
+        })
+        .filter_map(|r| {
+            let detail = match changed_roots.iter().find(|c| r.path().starts_with(c)) {
+                Some(c) => format!("{} changed since the scan", c.display()),
+                None => {
+                    let id = tree.find(r.path()).map(|id| tree.node(id))?;
+                    plan::changed_root(r.path(), Measured::Inode(id.dev, id.ino), false)?
+                }
+            };
+            Some((r.clone(), detail))
+        })
+        .collect();
+    let mut changed: Vec<PathBuf> = changed_roots.iter().map(|p| p.to_path_buf()).collect();
+    changed.extend(changed_repos.keys().map(|r| r.path().to_path_buf()));
     let git = ctx.tool_command("git");
     if let Some(git) = git.as_deref() {
-        let roots: Vec<&Path> = findings
-            .iter()
-            .filter(|f| f.path.starts_with('/') && git_guarded(f))
-            .map(|f| Path::new(&f.path))
-            .collect();
         let tracked: HashSet<Repo> = repos
             .par_iter()
             .filter(|r| {
                 matches!(r, Repo::GitDir(_))
-                    && roots.iter().any(|root| r.path().starts_with(root))
-                    && tracked_by_work_tree(git, r.path(), &repos)
+                    && !changed_repos.contains_key(r)
+                    && fs_roots.iter().any(|root| r.path().starts_with(root))
+                    && tracked_by_work_tree(git, r.path(), &repos, &changed)
             })
             .cloned()
             .collect();
         repos.retain(|r| !tracked.contains(r));
     }
     // The work trees in the scan that use each git directory through a
-    // `.git` file.
+    // `.git` file, and those whose git directory is not known because they
+    // (or what their `.git` file points into) changed since the walk. A
+    // work tree that is gone uses nothing.
     let mut users: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    let mut unknown_users: Vec<PathBuf> = Vec::new();
     for r in &repos {
-        if let Repo::WorkTree(dir) = r
-            && let Ok(common) = common_dir(&dir.join(".git"))
-        {
-            users.entry(common).or_default().push(dir.clone());
+        let Repo::WorkTree(dir) = r else {
+            continue;
+        };
+        if changed_repos.contains_key(r) {
+            if !plan::removal_path_absent(dir) {
+                unknown_users.push(dir.clone());
+            }
+            continue;
+        }
+        match common_dir(&dir.join(".git"), &changed) {
+            Ok(common) => users.entry(common).or_default().push(dir.clone()),
+            Err(Pointer::IntoChanged(_)) => unknown_users.push(dir.clone()),
+            Err(Pointer::Unreadable(_)) => {}
         }
     }
     let inside = |f: &Finding| -> Vec<&Repo> {
@@ -204,7 +270,11 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
     // Every repository any finding needs, with the outermost finding it is
     // in, read once and in parallel.
     let mut needed: HashMap<&Repo, PathBuf> = HashMap::new();
-    for f in findings.iter() {
+    for (f, _) in findings
+        .iter()
+        .zip(&root_changes)
+        .filter(|(_, c)| c.is_none())
+    {
         for r in inside(f) {
             let root = PathBuf::from(&f.path);
             let outer = needed.entry(r).or_insert_with(|| root.clone());
@@ -215,18 +285,28 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
     }
     let states: HashMap<&Repo, RepoState> = needed
         .par_iter()
-        .map(|(r, outer)| (*r, RepoState::read(git.as_deref(), r, outer)))
+        .map(|(r, outer)| {
+            let state = match changed_repos.get(*r) {
+                Some(detail) => RepoState::Failed(detail.clone()),
+                None => RepoState::read(git.as_deref(), r, outer, &changed),
+            };
+            (*r, state)
+        })
         .collect();
-    for f in findings.iter_mut() {
+    for (f, root_change) in findings.iter_mut().zip(root_changes) {
         let mut results = Vec::new();
         if f.path.starts_with('/') {
             let root = PathBuf::from(&f.path);
             results.push(in_use_cwd(&root, procs));
             results.push(in_use_open(&root, procs));
-            let mine: Vec<(&Repo, &RepoState)> =
-                inside(f).into_iter().map(|r| (r, &states[r])).collect();
-            if !mine.is_empty() {
-                results.extend(git_guards(&root, &mine, &users));
+            if let Some(detail) = root_change {
+                plan::add_changed_guard(&mut results, detail);
+            } else {
+                let mine: Vec<(&Repo, &RepoState)> =
+                    inside(f).into_iter().map(|r| (r, &states[r])).collect();
+                if !mine.is_empty() {
+                    results.extend(git_guards(&root, &mine, &users, &unknown_users));
+                }
             }
         } else if let Some(name) = f.path.strip_prefix("docker://volume/") {
             results.push(container_mount(name, ctx));
@@ -311,7 +391,7 @@ fn repositories(tree: &ScanTree) -> Vec<Repo> {
 
 /// Whether the work tree around the git directory `dir` tracks its `HEAD`:
 /// a test fixture of a source tree, kept by that repository's history.
-fn tracked_by_work_tree(git: &str, dir: &Path, repos: &[Repo]) -> bool {
+fn tracked_by_work_tree(git: &str, dir: &Path, repos: &[Repo], changed: &[PathBuf]) -> bool {
     let Some(work_tree) = repos
         .iter()
         .filter_map(|r| match r {
@@ -322,6 +402,15 @@ fn tracked_by_work_tree(git: &str, dir: &Path, repos: &[Repo]) -> bool {
     else {
         return false;
     };
+    if changed.iter().any(|c| work_tree.starts_with(c)) {
+        return false;
+    }
+    let git_dir = work_tree.join(".git");
+    if !std::fs::symlink_metadata(&git_dir).is_ok_and(|m| m.is_dir())
+        && common_dir(&git_dir, changed).is_err()
+    {
+        return false;
+    }
     let Some(head) = dir
         .strip_prefix(work_tree)
         .ok()
@@ -439,13 +528,14 @@ enum RepoState {
 }
 
 impl RepoState {
-    /// Reads `repo`; `outer` is the outermost finding it is in.
-    fn read(git: Option<&str>, repo: &Repo, outer: &Path) -> RepoState {
+    /// Reads `repo`; `outer` is the outermost finding it is in, and
+    /// `changed` the roots and repositories not to follow a `.git` file into.
+    fn read(git: Option<&str>, repo: &Repo, outer: &Path, changed: &[PathBuf]) -> RepoState {
         let Some(git) = git else {
             return RepoState::Failed("git is not installed".into());
         };
         let read = match repo {
-            Repo::WorkTree(dir) => Self::read_work_tree(git, dir, outer),
+            Repo::WorkTree(dir) => Self::read_work_tree(git, dir, outer, changed),
             Repo::GitDir(dir) => Self::read_git_dir(git, dir),
         };
         match read {
@@ -479,9 +569,19 @@ impl RepoState {
         })
     }
 
-    fn read_work_tree(git: &str, dir: &Path, outer: &Path) -> Result<RepoState, String> {
+    fn read_work_tree(
+        git: &str,
+        dir: &Path,
+        outer: &Path,
+        changed: &[PathBuf],
+    ) -> Result<RepoState, String> {
         let git_dir = dir.join(".git");
         let gitfile = !std::fs::symlink_metadata(&git_dir).is_ok_and(|m| m.is_dir());
+        let common = if gitfile {
+            common_dir(&git_dir, changed).map_err(Pointer::into_message)?
+        } else {
+            git_dir
+        };
         // One call for the changes, the branch and whether HEAD exists.
         let mut args = no_filters(git, dir)?;
         args.extend(
@@ -512,11 +612,6 @@ impl RepoState {
                 dirty += 1;
             }
         }
-        let common = if gitfile {
-            common_dir(&git_dir)?
-        } else {
-            git_dir
-        };
         let (unpublished, linked) = if common.starts_with(outer) {
             // Everything local (branches, tags, stash, every worktree's
             // HEAD) that no remote branch has.
@@ -611,18 +706,62 @@ fn count(git: &str, dir: &Path, args: &[&str]) -> Result<usize, String> {
         .map_err(|_| format!("unexpected git output: {}", out.trim()))
 }
 
+/// Why a `.git` file was not resolved.
+enum Pointer {
+    /// It, or the `commondir` it leads to, could not be read or parsed.
+    Unreadable(String),
+    /// It leads into a root or repository that changed since the walk.
+    IntoChanged(String),
+}
+
+impl Pointer {
+    fn into_message(self) -> String {
+        match self {
+            Pointer::Unreadable(e) | Pointer::IntoChanged(e) => e,
+        }
+    }
+}
+
 /// The git directory shared by all worktrees of the repository whose `.git`
 /// file is `dot_git`: the file's `gitdir:` target, or the `commondir` named
 /// there. Relative paths are resolved as git does, against the directory
-/// holding the file.
-fn common_dir(dot_git: &Path) -> Result<PathBuf, String> {
-    use std::os::unix::ffi::OsStrExt;
-    let first_line = |p: &Path| -> Result<PathBuf, String> {
-        let text = crate::detectors::read_head(p, 4096)
-            .ok_or_else(|| format!("cannot read {}", p.display()))?;
-        let line = text.split(|&b| b == b'\n').next().unwrap_or_default();
-        Ok(PathBuf::from(OsStr::from_bytes(line.trim_ascii_end())))
+/// holding the file. A target inside one of the `changed` paths is not
+/// read or returned.
+fn common_dir(dot_git: &Path, changed: &[PathBuf]) -> Result<PathBuf, Pointer> {
+    let into_changed = |p: &Path| -> Result<(), Pointer> {
+        match changed.iter().find(|c| p.starts_with(c)) {
+            Some(c) => Err(Pointer::IntoChanged(format!(
+                "{} points into {}, which changed since the scan",
+                dot_git.display(),
+                c.display()
+            ))),
+            None => Ok(()),
+        }
     };
+    let gitdir = gitfile_target(dot_git).map_err(Pointer::Unreadable)?;
+    into_changed(&gitdir)?;
+    let commondir = gitdir.join("commondir");
+    if std::fs::symlink_metadata(&commondir).is_err() {
+        return Ok(gitdir);
+    }
+    let common = normalize(&gitdir.join(first_line(&commondir).map_err(Pointer::Unreadable)?));
+    into_changed(&common)?;
+    Ok(common)
+}
+
+/// The first line of the file at `p`, without a trailing newline or blanks.
+fn first_line(p: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let text = crate::detectors::read_head(p, 4096)
+        .ok_or_else(|| format!("cannot read {}", p.display()))?;
+    let line = text.split(|&b| b == b'\n').next().unwrap_or_default();
+    Ok(PathBuf::from(OsStr::from_bytes(line.trim_ascii_end())))
+}
+
+/// The `gitdir:` target of the `.git` file `dot_git`, resolved against the
+/// directory holding it.
+fn gitfile_target(dot_git: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::ffi::OsStrExt;
     let line = first_line(dot_git)?;
     let target = line
         .as_os_str()
@@ -631,12 +770,7 @@ fn common_dir(dot_git: &Path) -> Result<PathBuf, String> {
         .filter(|t| !t.is_empty())
         .ok_or_else(|| format!("{} is not a gitfile", dot_git.display()))?;
     let base = dot_git.parent().unwrap_or(Path::new("/"));
-    let gitdir = normalize(&base.join(OsStr::from_bytes(target)));
-    let commondir = gitdir.join("commondir");
-    if std::fs::symlink_metadata(&commondir).is_err() {
-        return Ok(gitdir);
-    }
-    Ok(normalize(&gitdir.join(first_line(&commondir)?)))
+    Ok(normalize(&base.join(OsStr::from_bytes(target))))
 }
 
 /// `-c` options switching off every filter driver in the repository's
@@ -720,11 +854,14 @@ fn list(dirs: &[String]) -> String {
     s
 }
 
-/// `users` maps a git directory to the work trees in the scan that use it.
+/// `users` maps a git directory to the work trees in the scan that use it;
+/// `unknown_users` are the work trees in the scan whose git directory is
+/// not known because they changed since the walk.
 fn git_guards(
     root: &Path,
     repos: &[(&Repo, &RepoState)],
     users: &HashMap<PathBuf, Vec<PathBuf>>,
+    unknown_users: &[PathBuf],
 ) -> Vec<GuardResult> {
     let mut failed = Vec::new();
     let mut dirty = Vec::new();
@@ -832,7 +969,21 @@ fn git_guards(
             ),
         };
     }
-    if !linked_out.is_empty() {
+    let unknown: Vec<String> = unknown_users
+        .iter()
+        .filter(|w| !gone.is_empty() && !w.starts_with(root))
+        .map(|w| w.display().to_string())
+        .collect();
+    if !unknown.is_empty() {
+        out.push(GuardResult {
+            name: "git-linked-worktrees".into(),
+            status: GuardStatus::Block,
+            detail: format!(
+                "could not check: work trees changed since the scan, so the git directories they use are not known: {}",
+                list(&unknown)
+            ),
+        });
+    } else if !linked_out.is_empty() {
         out.push(GuardResult {
             name: "git-linked-worktrees".into(),
             status: GuardStatus::Block,

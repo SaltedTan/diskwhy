@@ -1209,6 +1209,75 @@ fn apply_refuses_without_a_terminal_an_expired_plan_and_another_host() {
 }
 
 #[test]
+fn apply_escapes_terminal_controls_from_a_hand_edited_plan() {
+    let h = Home::new();
+    let plan = h.plan("p.json", &[]);
+    let edit = |name: &str, f: &dyn Fn(&mut Value)| -> String {
+        let mut v: Value = serde_json::from_slice(&fs::read(&plan).unwrap()).unwrap();
+        f(&mut v);
+        let file = h.plan_file(name);
+        fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
+        file
+    };
+    let evil = "\n\u{1b}[31mred\u{1b}[0m";
+    let shown = r"\n\u{1b}[31mred\u{1b}[0m";
+
+    // A duplicate ID: an error before the plan is checked any further.
+    let dup = edit("dup.json", &|v| {
+        let item = v["items"][0].clone();
+        v["items"].as_array_mut().unwrap().push(item);
+        for item in v["items"].as_array_mut().unwrap() {
+            item["finding"]["id"] = format!("f_dup{evil}").into();
+        }
+    });
+    let out = h.dwhy(&["apply", &dup, "--dry-run", "-q"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(
+        err,
+        format!("dwhy: error: duplicate finding ID in plan items: f_dup{shown}\n")
+    );
+
+    // An item whose detector and path no longer match the live finding,
+    // and one that is gone: their planned fields reach the output escaped.
+    let mismatched = edit("mismatch.json", &|v| {
+        let mut gone = v["items"][0].clone();
+        let finding = &mut v["items"][0]["finding"];
+        finding["detector"] = format!("user-cache{evil}").into();
+        finding["path"] = format!("{}{evil}", finding["path"].as_str().unwrap()).into();
+        gone["finding"]["id"] = "f_gone0000000".into();
+        gone["finding"]["detector"] = format!("gone{evil}").into();
+        gone["finding"]["path"] = format!("/gone{evil}").into();
+        v["items"].as_array_mut().unwrap().push(gone);
+    });
+    let out = h.dwhy(&["apply", &mismatched, "--dry-run", "-q"]);
+    assert_eq!(out.status.code(), Some(2));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert!(
+        text.contains(&format!(
+            "changed: planned user-cache{shown} {}{shown} does not match the live finding",
+            h.home().join(".cache/pip").display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains(&format!("gone{shown}")), "{text}");
+    assert!(text.contains(&format!("/gone{shown}")), "{text}");
+    // Every line is one of the report's own: two per item, then the summary.
+    assert_eq!(text.lines().count(), 5, "{text}");
+    // JSON keeps the live values and the escaped detail.
+    let out = h.dwhy(&["apply", &mismatched, "--dry-run", "--json", "-q"]);
+    let r = json_of(&out);
+    assert!(
+        r["items"][0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("user-cache{shown}"))
+    );
+    assert!(h.home().join(".cache/pip/http/blob").exists());
+}
+
+#[test]
 fn dry_run_shows_everything_and_removes_nothing() {
     let h = Home::new();
     let plan = h.plan("p.json", &["--tier", "review"]);
