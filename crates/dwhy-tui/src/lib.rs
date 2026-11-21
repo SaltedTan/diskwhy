@@ -198,9 +198,9 @@ where
     B::Error: 'static,
 {
     app.apply_stop = signal.flag.clone();
-    let mut worker = None;
-    let result = run_loop(term, app, rx, signal, poll, read, &mut worker);
-    if let Some(w) = worker {
+    let mut workers = Workers::default();
+    let result = run_loop(term, app, rx, signal, poll, read, &mut workers);
+    if let Some(w) = workers.apply {
         if w.running() {
             w.progress.stop();
             app.stopping();
@@ -211,6 +211,22 @@ where
     result
 }
 
+/// The workers the event loop started: the apply, and plan builds, whose
+/// results arrive on `built`.
+struct Workers {
+    apply: Option<ApplyWorker>,
+    built: (mpsc::Sender<Built>, mpsc::Receiver<Built>),
+}
+
+impl Default for Workers {
+    fn default() -> Self {
+        Self {
+            apply: None,
+            built: mpsc::channel(),
+        }
+    }
+}
+
 fn run_loop<B: Backend>(
     term: &mut Terminal<B>,
     app: &mut App,
@@ -218,12 +234,15 @@ fn run_loop<B: Backend>(
     signal: &Termination,
     mut poll: impl FnMut(Duration) -> io::Result<bool>,
     mut read: impl FnMut() -> io::Result<Event>,
-    worker: &mut Option<ApplyWorker>,
+    workers: &mut Workers,
 ) -> Result<(), Error>
 where
     B::Error: 'static,
 {
-    let (built_tx, built_rx) = mpsc::channel::<Built>();
+    let Workers {
+        apply: worker,
+        built: (built_tx, built_rx),
+    } = workers;
     // The rescan after an apply, once one started.
     let mut rescan: Option<mpsc::Receiver<Msg>> = None;
     while signal.exit_code().is_none() {
@@ -232,6 +251,8 @@ where
         if signal.exit_code().is_some() {
             return Ok(());
         }
+        // Keys first: a key pressed while a result waits acts on the screen
+        // drawn above, not on a result the person has not seen.
         if ready
             && let Event::Key(key) = read()?
             && app.on_key(key)
@@ -559,10 +580,13 @@ mod tests {
             while !handle.is_finished() {
                 std::thread::yield_now();
             }
-            let mut worker = Some(ApplyWorker {
-                progress,
-                handle: Some(handle),
-            });
+            let mut workers = Workers {
+                apply: Some(ApplyWorker {
+                    progress,
+                    handle: Some(handle),
+                }),
+                ..Workers::default()
+            };
             let (_tx, rx) = mpsc::channel();
             let mut keys = [
                 Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
@@ -576,14 +600,111 @@ mod tests {
                 &Termination::default(),
                 |_| Ok(true),
                 || Ok(keys.next().unwrap()),
-                &mut worker,
+                &mut workers,
             )
             .unwrap();
-            assert!(worker.is_none());
+            assert!(workers.apply.is_none());
             assert!(app.take_scan().is_none());
             let screen = term.backend().to_string();
             assert!(screen.contains("dry run results"), "{screen}");
             assert!(screen.contains("fixture apply failure"), "{screen}");
+        }
+    }
+
+    /// Keys pressed while a finished plan build waits in the channel act
+    /// on the progress screen the person saw: `w` opens no save prompt,
+    /// and Esc or Tab leave the plan view, discarding the result without
+    /// starting a build for marks changed meanwhile.
+    #[test]
+    fn plan_build_keys_do_not_act_on_an_unseen_preview() {
+        use app::{PlanState, View};
+        let fixture = Crates::new();
+        let host = system::hostname();
+        for (code, change_marks) in [
+            (KeyCode::Char('w'), false),
+            (KeyCode::Esc, false),
+            (KeyCode::Tab, false),
+            (KeyCode::Esc, true),
+            (KeyCode::Tab, true),
+        ] {
+            let mut app = App::new(Vec::new(), Arc::new(Progress::default()));
+            app.finish(job::scan(&fixture.options(), &Progress::default(), &mut |_| {}).unwrap());
+            let press = |app: &mut App, codes: &[KeyCode]| {
+                for &c in codes {
+                    assert!(!app.on_key(KeyEvent::new(c, KeyModifiers::NONE)));
+                }
+            };
+            press(
+                &mut app,
+                &[
+                    KeyCode::Tab,
+                    KeyCode::Char(' '),
+                    KeyCode::Down,
+                    KeyCode::Char(' '),
+                    KeyCode::Char('p'),
+                ],
+            );
+            let job = app.take_request().unwrap();
+            if change_marks {
+                // Back to the list, unmark one, and `p` again: it waits
+                // for the running build.
+                press(
+                    &mut app,
+                    &[KeyCode::Esc, KeyCode::Char(' '), KeyCode::Char('p')],
+                );
+                assert!(app.take_request().is_none());
+            }
+            let mut workers = Workers::default();
+            let plan = job.build(Processes::default, host.clone());
+            assert!(plan.is_ok(), "{plan:?}");
+            workers.built.0.send((host.clone(), plan)).unwrap();
+
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let progress = term.backend().to_string();
+            let waiting = if change_marks {
+                "waiting for the previous build"
+            } else {
+                "Building the plan"
+            };
+            assert!(progress.contains(waiting), "{progress}");
+            let (_tx, rx) = mpsc::channel();
+            let mut keys = [
+                Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                key('q'),
+            ]
+            .into_iter();
+            run_loop(
+                &mut term,
+                &mut app,
+                &rx,
+                &Termination::default(),
+                |_| Ok(true),
+                || Ok(keys.next().unwrap()),
+                &mut workers,
+            )
+            .unwrap();
+            assert!(app.take_request().is_none());
+            let b = app.browser().unwrap();
+            if code == KeyCode::Char('w') {
+                let view = app.plan_view().expect("the preview is shown after the key");
+                assert!(view.prompt.is_none(), "w acted on an unseen preview");
+                let screen = term.backend().to_string();
+                assert!(screen.contains("w write plan"), "{screen}");
+            } else {
+                assert!(app.plan_view().is_none());
+                let expected = if code == KeyCode::Tab {
+                    View::Tree
+                } else {
+                    View::Findings
+                };
+                assert_eq!(b.view, expected);
+                assert!(
+                    matches!(b.plan, PlanState::None),
+                    "the result is discarded and no build starts: {:?}",
+                    b.plan
+                );
+            }
         }
     }
 

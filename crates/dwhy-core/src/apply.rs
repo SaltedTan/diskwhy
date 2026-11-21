@@ -101,6 +101,11 @@ pub struct Check {
     pub fresh: Option<Finding>,
     /// The apply scan's root identity, `(st_dev, st_ino)`, for ready filesystem items.
     pub inode: Option<(u64, u64)>,
+    /// Whether [`execute_until`] started this item's action: called the
+    /// path removal or spawned the command. False for an item it never
+    /// reached, one stopped or skipped before dispatch, and one whose audit
+    /// `start` line could not be written. Not part of the report.
+    pub dispatched: bool,
     nested: Vec<MeasuredRoot>,
 }
 
@@ -215,6 +220,7 @@ fn decide(
         },
         fresh: fresh.cloned(),
         inode: None,
+        dispatched: false,
         nested: Vec::new(),
     };
     // Backstop for `detect::block_lossy`: never act on a path or command
@@ -311,6 +317,10 @@ fn blocks(f: &Finding) -> String {
     }
 }
 
+/// Why there is no audit log when [`Audit::default_path`] finds no place.
+pub const AUDIT_UNPLACED: &str =
+    "cannot place the audit log: neither XDG_STATE_HOME nor HOME is an absolute path";
+
 /// Appends [`AuditRecord`]s to the audit log, one JSON object per line.
 pub struct Audit {
     path: PathBuf,
@@ -322,6 +332,12 @@ impl Audit {
     /// `$HOME/.local/state/diskwhy/audit.jsonl`.
     pub fn default_path() -> Option<PathBuf> {
         Some(crate::system::state_dir()?.join("audit.jsonl"))
+    }
+
+    /// [`Audit::open`] on `path`, the log's place as
+    /// [`Audit::default_path`] found it; `None` fails with [`AUDIT_UNPLACED`].
+    pub fn open_placed(path: Option<&Path>) -> Result<Audit, String> {
+        Audit::open(path.ok_or(AUDIT_UNPLACED)?)
     }
 
     /// Opens `path` for appending, creating it (mode 0600) and its
@@ -536,6 +552,7 @@ fn run(
     }
     match item.action.kind {
         ActionKind::RemovePath => {
+            c.dispatched = true;
             match crate::remove::remove_tree(Path::new(&item.path), c.inode, mounts) {
                 Ok(r) => (
                     ApplyOutcome::Removed,
@@ -559,6 +576,7 @@ fn run(
             if options.isolate_commands {
                 command.process_group(0);
             }
+            c.dispatched = true;
             match command.output() {
                 Ok(out) if out.status.success() => {
                     (ApplyOutcome::Removed, format!("ran {}", item.action.text))
@@ -584,6 +602,72 @@ fn run(
             }
         }
         ActionKind::Advice => (ApplyOutcome::Skipped, "advice only: nothing to run".into()),
+    }
+}
+
+/// What `dwhy apply` and the TUI show for an item's outcome.
+pub fn outcome_label(o: ApplyOutcome) -> &'static str {
+    match o {
+        ApplyOutcome::Removed => "removed",
+        ApplyOutcome::Failed => "FAILED",
+        ApplyOutcome::Skipped => "skipped",
+        ApplyOutcome::Refused => "refused",
+        ApplyOutcome::WouldRemove => "would remove",
+    }
+}
+
+/// What an exit status of `dwhy apply` ([`exit_code`]) means.
+pub fn exit_meaning(code: u8) -> &'static str {
+    match code {
+        0 => "ok",
+        1 => "failed",
+        2 => "something was skipped",
+        3 => "refused",
+        _ => "",
+    }
+}
+
+/// The one-line summary `dwhy apply` and the TUI show under a report:
+/// what was (or would be) removed and freed, then the counts of failed,
+/// refused and skipped items.
+pub fn summary(r: &ApplyReport) -> String {
+    let count = |o| r.items.iter().filter(|i| i.outcome == o).count();
+    let rest: Vec<String> = [
+        (ApplyOutcome::Failed, "failed"),
+        (ApplyOutcome::Refused, "refused"),
+        (ApplyOutcome::Skipped, "skipped"),
+    ]
+    .into_iter()
+    .filter_map(|(o, word)| {
+        let n = count(o);
+        (n > 0).then(|| format!("{n} {word}"))
+    })
+    .collect();
+    let rest = if rest.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", rest.join(", "))
+    };
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    if r.dry_run {
+        let n = count(ApplyOutcome::WouldRemove);
+        let bytes = total_bytes(
+            r.items
+                .iter()
+                .filter(|i| i.outcome == ApplyOutcome::WouldRemove),
+        );
+        format!(
+            "would remove {n} item{} ({}){rest}; nothing removed",
+            plural(n),
+            crate::units::human(bytes)
+        )
+    } else {
+        let n = count(ApplyOutcome::Removed);
+        format!(
+            "removed {n} item{}, freed about {}{rest}",
+            plural(n),
+            crate::units::human(r.freed)
+        )
     }
 }
 

@@ -926,6 +926,19 @@ fn execute_removes_ready_items_and_audits_everything() {
     assert!(!b.join("cache").exists(), "the regenerable cache is gone");
     assert!(b.join("target/file").exists() && b.join("scratch/file").exists());
     assert_eq!(seen, [b.join("cache").to_string_lossy()]);
+    let dispatched: Vec<(&str, bool)> = checks
+        .iter()
+        .map(|c| (c.item.detector.as_str(), c.dispatched))
+        .collect();
+    assert!(dispatched.contains(&("user-cache", true)), "{dispatched:?}");
+    assert!(
+        dispatched.contains(&("cargo-target", false)),
+        "{dispatched:?}"
+    );
+    assert!(
+        dispatched.contains(&("stale-tree", false)),
+        "{dispatched:?}"
+    );
 
     let r = apply::report(&plan, &checks, &Policy::default(), false, &env());
     assert_eq!(apply::exit_code(&r), 3, "two refused");
@@ -1056,6 +1069,10 @@ fn deepest_items_run_first_and_commands_report_failure() {
         &mut |i| seen.push(i.detector.clone()),
     );
     assert_eq!(seen, ["cargo-target", "stale-tree"]);
+    assert!(
+        checks.iter().all(|c| c.dispatched),
+        "a command that ran and failed was dispatched"
+    );
     let get = |d: &str| &checks.iter().find(|c| c.item.detector == d).unwrap().item;
     assert_eq!(get("cargo-target").outcome, ApplyOutcome::Failed);
     assert!(
@@ -1117,6 +1134,7 @@ fn stop_during_apply_audit_start_prevents_path_and_command_dispatch() {
         );
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(fs::read_to_string(target.join("file")).unwrap(), "keep");
+        assert!(!checks[0].dispatched, "stopped before dispatch");
         let records = audit_lines(&log);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].event, AuditEvent::Start);
@@ -1274,6 +1292,10 @@ fn a_removal_whose_audit_line_cannot_be_written_does_not_run() {
         c.detail.starts_with("not run: cannot write the audit log"),
         "{}",
         c.detail
+    );
+    assert!(
+        checks.iter().all(|c| !c.dispatched),
+        "failed before dispatch"
     );
 }
 

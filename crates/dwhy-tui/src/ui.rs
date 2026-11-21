@@ -9,7 +9,9 @@ use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
 use std::sync::atomic::Ordering;
 
-use dwhy_core::apply::{action_kind_name, guard_status_name, tier_name};
+use dwhy_core::apply::{
+    self, action_kind_name, exit_meaning, guard_status_name, outcome_label, tier_name,
+};
 use dwhy_core::detect::{PATH_NOT_UTF8_RECOVERY_NOTE, is_lossy, rfc3339};
 use dwhy_core::plan;
 use dwhy_core::probes::postgres_wal;
@@ -646,28 +648,6 @@ fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
     }
 }
 
-/// What `dwhy apply` prints for an item's outcome.
-fn outcome_label(o: ApplyOutcome) -> &'static str {
-    match o {
-        ApplyOutcome::Removed => "removed",
-        ApplyOutcome::Failed => "FAILED",
-        ApplyOutcome::Skipped => "skipped",
-        ApplyOutcome::Refused => "refused",
-        ApplyOutcome::WouldRemove => "would remove",
-    }
-}
-
-/// What an exit status of `dwhy apply` means.
-fn exit_meaning(code: u8) -> &'static str {
-    match code {
-        0 => "ok",
-        1 => "failed",
-        2 => "something was skipped",
-        3 => "refused",
-        _ => "",
-    }
-}
-
 /// The apply screen: progress while it runs, then the results. Returns the
 /// lines on screen.
 fn draw_apply(f: &mut Frame, v: &mut ApplyView, a: &PlanAreas) -> usize {
@@ -763,46 +743,8 @@ fn results_lines(done: &job::Applied, width: usize) -> Vec<Line<'static>> {
     let push = |out: &mut Vec<Line<'static>>, s: &str| {
         out.extend(wrap(s, width).into_iter().map(Line::raw));
     };
-    let count = |o| r.items.iter().filter(|i| i.outcome == o).count();
-    let plural = |n: usize| if n == 1 { "" } else { "s" };
-    let rest: Vec<String> = [
-        (ApplyOutcome::Failed, "failed"),
-        (ApplyOutcome::Refused, "refused"),
-        (ApplyOutcome::Skipped, "skipped"),
-    ]
-    .into_iter()
-    .filter_map(|(o, word)| {
-        let n = count(o);
-        (n > 0).then(|| format!("{n} {word}"))
-    })
-    .collect();
-    let rest = if rest.is_empty() {
-        String::new()
-    } else {
-        format!("; {}", rest.join(", "))
-    };
-    let summary = if r.dry_run {
-        let n = count(ApplyOutcome::WouldRemove);
-        let bytes = dwhy_core::apply::total_bytes(
-            r.items
-                .iter()
-                .filter(|i| i.outcome == ApplyOutcome::WouldRemove),
-        );
-        format!(
-            "would remove {n} item{} ({}){rest}; nothing removed",
-            plural(n),
-            human(bytes)
-        )
-    } else {
-        let n = count(ApplyOutcome::Removed);
-        format!(
-            "removed {n} item{}, freed about {}{rest}",
-            plural(n),
-            human(r.freed)
-        )
-    };
     out.extend(
-        wrap(&summary, width)
+        wrap(&apply::summary(r), width)
             .into_iter()
             .map(|l| Line::styled(l, bold)),
     );

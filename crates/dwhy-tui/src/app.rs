@@ -312,13 +312,12 @@ impl App {
         if let State::Applying(v) = &mut self.state
             && v.result.is_none()
         {
+            // Back only when nothing was started: an item that failed
+            // before dispatch (its audit `start` line could not be
+            // written) was left untouched, one that failed after may have
+            // been partly removed.
             v.can_go_back = match &result {
-                Ok(done) => {
-                    v.dry_run
-                        || done.report.items.iter().all(|item| {
-                            matches!(item.outcome, ApplyOutcome::Refused | ApplyOutcome::Skipped)
-                        })
-                }
+                Ok(done) => v.dry_run || !done.any_dispatched,
                 Err(_) => true,
             };
             v.result = Some(result);
@@ -790,7 +789,8 @@ impl Browser {
                     if !self.marked.remove(&i) {
                         self.marked.insert(i);
                     }
-                    self.marked_bytes = plan::distinct_bytes(
+                    self.marked_bytes = plan::distinct_bytes_in_tree(
+                        &self.data.tree,
                         self.marked_findings().map(|f| (f.path.as_str(), f.bytes)),
                     );
                 }

@@ -365,6 +365,83 @@ fn nested_items_count_once() {
     assert_eq!(p.bytes, 500);
 }
 
+/// A scan of `outer` and `outer/child` as two roots, as when `child` is
+/// another filesystem in a one-filesystem scan: the mount table names
+/// `child` as a mount point, so the outer walk does not enter it.
+fn tree_with_mounted_child(outer: &Path) -> ScanTree {
+    let child = outer.join("child");
+    let mounts = MountTable {
+        mounts: vec![dwhy_core::mounts::Mount {
+            id: 1,
+            parent: 0,
+            major: 0,
+            minor: 0,
+            mount_point: child.clone(),
+            fstype: "ext4".into(),
+            source: "/dev/fixture".into(),
+        }],
+    };
+    let opts = ScanOptions {
+        min_dir_bytes: 0,
+        threads: 2,
+        ..ScanOptions::default()
+    };
+    let result = scan::scan(
+        &[outer.to_path_buf(), child.clone()],
+        &opts,
+        &mounts,
+        &Progress::default(),
+    )
+    .unwrap();
+    assert_eq!(result.skipped_mounts.len(), 1, "the outer walk skips child");
+    let tree = result.tree;
+    assert_eq!(tree.roots().len(), 2);
+    let child_node = tree.find(&child).unwrap();
+    assert_eq!(tree.parent(child_node), None, "child is its own root");
+    tree
+}
+
+#[test]
+fn a_separately_scanned_mount_below_another_root_counts_on_its_own() {
+    let (_t, b) = base();
+    let outer = dir(&b.join("outer"));
+    let child = dir(&outer.join("child"));
+    let sub = dir(&outer.join("sub"));
+    let tree = tree_with_mounted_child(&outer);
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    let (outer_s, child_s, sub_s) = (s(&outer), s(&child), s(&sub));
+    let (child_file, sub_file) = (s(&child.join("file")), s(&sub.join("file")));
+    let items = [
+        (outer_s.as_str(), 1000),
+        (child_s.as_str(), 300),
+        // A directory inside the outer root's walk: counted in its bytes.
+        (sub_s.as_str(), 100),
+        // Single files (no tree node) nest by their directory in the tree.
+        (child_file.as_str(), 10),
+        (sub_file.as_str(), 20),
+        ("docker://volume/v", 7),
+    ];
+    assert_eq!(plan::distinct_bytes_in_tree(&tree, items), 1307);
+    // Without the tree, nesting is by path only: child is dropped.
+    assert_eq!(plan::distinct_bytes(items), 1007);
+    // Paths no root covers nest by path, as distinct_bytes does.
+    let elsewhere = [("/nowhere/a", 5), ("/nowhere/a/b", 3)];
+    assert_eq!(plan::distinct_bytes_in_tree(&tree, elsewhere), 5);
+
+    let found = vec![
+        finding("stale-tree", &outer, 1000, Tier::Review),
+        finding("stale-tree", &child, 300, Tier::Review),
+        finding("cargo-target", &sub, 100, Tier::Rebuildable),
+    ];
+    let sel = Selection {
+        tier: Some(Tier::Review),
+        select: vec![],
+    };
+    let p = build_from(&tree, &b, found, &sel);
+    assert_eq!(p.items.len(), 3, "{:?}", p.blocked);
+    assert_eq!(p.bytes, 1300, "child counts; sub is inside outer");
+}
+
 fn fingerprint_of(root: &Path, f: &Finding) -> dwhy_core::report::Fingerprint {
     plan::fingerprint(f, &scan_tree(root), &ctx())
 }
