@@ -2215,6 +2215,189 @@ fn explain_uses_full_snapshot_times_and_matching_growth_coverage() {
     assert_eq!(explain(&target)["finding"]["growth"]["since"], growth_since);
 }
 
+/// Runs dwhy with only `home`'s environment, its state in `state` and no
+/// tools on PATH.
+fn dwhy_home(home: &Path, state: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_dwhy"))
+        .args(args)
+        .env_clear()
+        .env("HOME", home)
+        .env("PATH", state.join("no-bin"))
+        .env("XDG_STATE_HOME", state)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run dwhy")
+}
+
+#[test]
+fn explain_tool_versions_through_their_context_root() {
+    // tool-versions compares a version with its siblings, which for VS Code
+    // Server sit up to three levels up, and some versions are files.
+    const C1: &str = "1111111111111111111111111111111111111111";
+    const C2: &str = "2222222222222222222222222222222222222222";
+    let t = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(t.path()).unwrap();
+    let (home, state) = (base.join("home"), base.join("state"));
+    fs::create_dir_all(&state).unwrap();
+    let write = |p: &Path| {
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, vec![7u8; 2 << 20]).unwrap();
+    };
+    let vscode = home.join(".vscode-server");
+    for c in [C1, C2] {
+        write(&vscode.join(format!("cli/servers/Stable-{c}/server/node")));
+        write(&vscode.join(format!("bin/{c}/node")));
+        write(&vscode.join(format!("code-{c}")));
+    }
+    fs::write(
+        vscode.join("cli/servers/lru.json"),
+        format!("[\"Stable-{C2}\"]"),
+    )
+    .unwrap();
+    // The older legacy server: C1.
+    let legacy = vscode.join(format!("bin/{C1}"));
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+    for p in [legacy.join("node"), legacy.clone()] {
+        fs::File::open(&p).unwrap().set_modified(old).unwrap();
+    }
+    let claude = home.join(".local/share/claude/versions");
+    for v in ["2.1.9", "2.1.10"] {
+        write(&claude.join(v));
+    }
+    let server = vscode.join(format!("cli/servers/Stable-{C1}"));
+    let cli = vscode.join(format!("code-{C1}"));
+    let claude_old = claude.join("2.1.9");
+    let det = ["-q", "--detectors", "tool-versions"];
+    let before = listing(&home);
+    for p in [&server, &legacy, &cli, &claude_old] {
+        let path = p.to_str().unwrap();
+        let out = dwhy_home(
+            &home,
+            &state,
+            &[&["explain", path, "--json"][..], &det].concat(),
+        );
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let v = json_of(&out);
+        assert_eq!(v["path"], path);
+        assert_eq!(
+            v["finding"]["id"],
+            dwhy_core::detect::finding_id("tool-versions", path).as_str(),
+            "{v}"
+        );
+        assert_eq!(v["notes"], serde_json::json!([]), "{v}");
+        // The size is the version's own, a file's included.
+        assert_eq!(v["size"]["apparent"], 2 << 20, "{v}");
+        let allocated = v["size"]["allocated"].as_u64().unwrap();
+        assert!((2 << 20..3 << 20).contains(&allocated), "{v}");
+        let text = dwhy_home(&home, &state, &[&["explain", path][..], &det].concat());
+        let text = String::from_utf8_lossy(&text.stdout);
+        assert!(!text.contains("no detector claims"), "{text}");
+    }
+
+    // By id, through a snapshot of the home.
+    let out = dwhy_home(
+        &home,
+        &state,
+        &[
+            &["scan", home.to_str().unwrap(), "--json", "--snapshot"][..],
+            &det,
+        ]
+        .concat(),
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    for p in [&server, &cli] {
+        let id = dwhy_core::detect::finding_id("tool-versions", p.to_str().unwrap());
+        let out = dwhy_home(
+            &home,
+            &state,
+            &[&["explain", &id, "--json"][..], &det].concat(),
+        );
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let v = json_of(&out);
+        assert_eq!(v["resolved"]["via"], "id");
+        assert_eq!(v["finding"]["id"], id.as_str(), "{v}");
+        assert_eq!(v["gone"], false);
+        assert_eq!(v["notes"], serde_json::json!([]), "{v}");
+    }
+    assert_eq!(listing(&home), before, "explain writes nothing");
+}
+
+#[test]
+fn explain_size_counts_files_hardlinked_from_outside_the_path() {
+    let t = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    let (a, z) = (root.join("a"), root.join("z"));
+    for d in [&a, &z] {
+        fs::create_dir_all(d).unwrap();
+        fs::write(d.join(".dwhy-scratch"), b"").unwrap();
+    }
+    // a/big sorts first, so a walk of both credits the inode to a.
+    fs::write(a.join("big"), vec![1u8; 3 << 20]).unwrap();
+    fs::hard_link(a.join("big"), z.join("big")).unwrap();
+    fs::write(z.join("own"), vec![2u8; 2 << 20]).unwrap();
+    age_tree(&root, 8 * 86_400);
+    let zs = z.to_str().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let alone = json_of(&dwhy_in(
+        state.path(),
+        &["scan", zs, "--json", "-q", "--no-detectors"],
+    ));
+    let out = dwhy_in(
+        state.path(),
+        &["explain", zs, "--json", "-q", "--detectors", "stale-tree"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["finding"]["path"], zs, "{v}");
+    // The size is what `du` says for z: big included.
+    assert_eq!(v["size"]["apparent"], 5 << 20, "{v}");
+    assert_eq!(v["size"]["allocated"], alone["scan"]["totals"]["allocated"]);
+    assert_eq!(v["size"]["apparent"], alone["scan"]["totals"]["apparent"]);
+    // Removing z frees only its own bytes: big stays linked from a.
+    let bytes = v["finding"]["bytes"].as_u64().unwrap();
+    assert!((2 << 20..3 << 20).contains(&bytes), "{v}");
+}
+
+#[test]
+fn explain_notes_partial_coverage_of_the_path() {
+    use std::os::unix::fs::PermissionsExt;
+    if dwhy_core::system::euid() == 0 {
+        return;
+    }
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    let (_t, root) = cargo_fixture();
+    let app = format!("{root}/app");
+    let target = format!("{app}/target");
+    let mut restore = Vec::new();
+    for dir in [&app, &target] {
+        let locked = Path::new(dir).join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        restore.push(Restore(locked));
+    }
+    let state = tempfile::tempdir().unwrap();
+    // A path no detector claims, and a finding at the path.
+    for (path, found) in [(&app, false), (&target, true)] {
+        let note = format!("partial coverage: {path}/locked could not be read");
+        let args = ["explain", path, "-q", "--detectors", "cargo-target"];
+        let v = json_of(&dwhy_in(state.path(), &[&args[..], &["--json"]].concat()));
+        assert_eq!(v["finding"].is_null(), !found, "{v}");
+        let notes = v["notes"].as_array().unwrap();
+        assert_eq!(
+            notes.iter().filter(|n| **n == note.as_str()).count(),
+            1,
+            "{v}"
+        );
+        let text = String::from_utf8_lossy(&dwhy_in(state.path(), &args).stdout).into_owned();
+        assert!(text.contains(&note), "{text}");
+    }
+}
+
 #[test]
 fn explain_rejects_non_utf8_paths() {
     use std::ffi::OsStr;

@@ -352,12 +352,20 @@ pub(crate) fn outermost(findings: Vec<Finding>) -> Vec<Finding> {
     outermost_candidates(findings.into_iter().map(Candidate::reported).collect())
 }
 
+/// Which of two findings at the same path comes first: the cheaper tier,
+/// then the detector name. The nesting rule keeps the first one as the
+/// outer finding, and `explain` picks it for a path.
+pub(crate) fn compare_priority(a: &Finding, b: &Finding) -> std::cmp::Ordering {
+    a.tier
+        .cmp(&b.tier)
+        .then_with(|| a.detector.cmp(&b.detector))
+}
+
 fn outermost_candidates(mut findings: Vec<Candidate>) -> Vec<Finding> {
     findings.sort_by(|a, b| {
         a.path
             .cmp(&b.path)
-            .then_with(|| a.finding.tier.cmp(&b.finding.tier))
-            .then_with(|| a.finding.detector.cmp(&b.finding.detector))
+            .then_with(|| compare_priority(&a.finding, &b.finding))
     });
     let mut kept: Vec<Candidate> = Vec::new();
     let mut nested: Vec<(u64, usize)> = Vec::new();

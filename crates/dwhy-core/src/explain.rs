@@ -79,20 +79,32 @@ pub fn place(path: &str) -> Place {
 /// What explain walks for a filesystem path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Walk {
-    /// The path's parent directory, one level up, so that detectors which
-    /// recognise a directory from its parent (a `target/` next to its
-    /// `Cargo.toml`, a project's `node_modules`) see it.
-    Parent(PathBuf),
-    /// The path itself, with a note when that is because the parent could
-    /// not be used.
+    /// A directory above the path, so that detectors which recognise it
+    /// from around it see that context: its parent, one level up (a
+    /// `target/` next to its `Cargo.toml`, a project's `node_modules`), or
+    /// a context root farther up that holds it (a `tool-versions` version
+    /// directory such as `~/.vscode-server`). `note` says why a context
+    /// root that holds the path could not be walked.
+    Above { dir: PathBuf, note: Option<String> },
+    /// The path itself, with a note when that is because the directory
+    /// above could not be used.
     Itself(Option<String>),
 }
 
 /// Decides what to walk for `abs`, an absolute path whose parent is
-/// canonical (as [`crate::scan::prepare_roots`] makes it). Walking a file's
-/// parent would leave the query without its own node in the tree. Walking
-/// a mount point's parent could skip the query at the filesystem boundary.
-pub fn walk_for(abs: &Path, mounts: &MountTable) -> Walk {
+/// canonical (as [`crate::scan::prepare_roots`] makes it). `context` lists
+/// directories detectors read a path's context from, each with how many
+/// levels below it that context reaches
+/// ([`crate::detectors::ToolVersions::context_roots`]).
+///
+/// A path that lies within reach of a context root is walked from there,
+/// file or directory, when every directory from the path up to that root
+/// is a real directory on the path's filesystem, none of those between is
+/// a mount point, and the root can be opened. Otherwise a directory's
+/// parent is walked, and a file is walked on its own: walking its parent
+/// would find no context for it. Walking a mount point's parent could skip
+/// the query at the filesystem boundary.
+pub fn walk_for(abs: &Path, mounts: &MountTable, context: &[(PathBuf, usize)]) -> Walk {
     if mounts.at(abs).is_some() {
         return Walk::Itself(Some(format!(
             "{} is a mount point; scanned it alone",
@@ -103,27 +115,95 @@ pub fn walk_for(abs: &Path, mounts: &MountTable) -> Walk {
         // The scan of the path reports the error.
         return Walk::Itself(None);
     };
+    let mut context_note = None;
+    if let Some(root) = context_root(abs, context) {
+        match usable_context(abs, md.dev(), root, mounts) {
+            Ok(()) => {
+                return Walk::Above {
+                    dir: root.to_path_buf(),
+                    note: None,
+                };
+            }
+            Err(reason) => {
+                context_note = Some(format!(
+                    "could not walk its context from {}: {reason}",
+                    root.display()
+                ));
+            }
+        }
+    }
+    let itself = |note: Option<String>| {
+        Walk::Itself(match (&context_note, note) {
+            (Some(c), Some(n)) => Some(format!("{c}; {n}")),
+            (c, n) => n.or_else(|| c.clone()),
+        })
+    };
     let Some(parent) = abs.parent() else {
-        return Walk::Itself(None);
+        return itself(None);
     };
     let parent_md = std::fs::symlink_metadata(parent);
     if parent_md.as_ref().is_ok_and(|pmd| pmd.dev() != md.dev()) {
-        return Walk::Itself(Some(format!(
+        return itself(Some(format!(
             "{} is a mount point and its parent is on another filesystem; scanned it alone",
             abs.display()
         )));
     }
     if !md.is_dir() {
-        return Walk::Itself(None);
+        return itself(None);
     }
     match parent_md.and_then(|_| std::fs::read_dir(parent)) {
-        Ok(_) => Walk::Parent(parent.to_path_buf()),
-        Err(e) => Walk::Itself(Some(format!(
+        Ok(_) => Walk::Above {
+            dir: parent.to_path_buf(),
+            note: context_note,
+        },
+        Err(e) => itself(Some(format!(
             "cannot open its parent {}: {e}; scanned {} alone",
             parent.display(),
             abs.display()
         ))),
     }
+}
+
+/// The deepest context root that holds `abs` strictly below it, within
+/// its reach.
+fn context_root<'a>(abs: &Path, context: &'a [(PathBuf, usize)]) -> Option<&'a Path> {
+    context
+        .iter()
+        .filter(|(root, reach)| {
+            abs.strip_prefix(root)
+                .is_ok_and(|rest| (1..=*reach).contains(&rest.components().count()))
+        })
+        .map(|(root, _)| root.as_path())
+        .max_by_key(|root| root.components().count())
+}
+
+/// Whether the walk can start at `root` and still reach `abs` (on device
+/// `dev`): every directory from `abs`'s parent up to `root` is a directory
+/// (not a symlink) on that device, none below `root` is a mount point, and
+/// `root` can be opened.
+fn usable_context(abs: &Path, dev: u64, root: &Path, mounts: &MountTable) -> Result<(), String> {
+    for dir in abs.ancestors().skip(1) {
+        let md = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        if !md.is_dir() {
+            return Err(format!("{} is not a directory", dir.display()));
+        }
+        if md.dev() != dev {
+            return Err(format!(
+                "{} is on another filesystem than {}",
+                dir.display(),
+                abs.display()
+            ));
+        }
+        if dir == root {
+            break;
+        }
+        if mounts.at(dir).is_some() {
+            return Err(format!("{} is a mount point", dir.display()));
+        }
+    }
+    std::fs::read_dir(root)
+        .map(|_| ())
+        .map_err(|e| format!("cannot open it: {e}"))
 }
 
 struct Listing {
@@ -697,7 +777,9 @@ pub fn lossy_finding_paths(findings: &[Finding], tree: &ScanTree) -> HashSet<Str
 
 /// Picks the finding explained from a rescan's `findings`: the one with
 /// `id` when given, else the cheapest tier at `path`. When there is none,
-/// also lists the findings at or below `path`, largest first.
+/// also lists the findings below `path`, largest first. A finding at `path`
+/// itself (another detector's, when `id` names a different one) is not
+/// inside it.
 pub fn pick(
     mut findings: Vec<Finding>,
     path: &str,
@@ -709,11 +791,7 @@ pub fn pick(
             .iter()
             .enumerate()
             .filter(|(_, f)| f.path == path)
-            .min_by(|(_, a), (_, b)| {
-                a.tier
-                    .cmp(&b.tier)
-                    .then_with(|| a.detector.cmp(&b.detector))
-            })
+            .min_by(|(_, a), (_, b)| detect::compare_priority(a, b))
             .map(|(i, _)| i),
     };
     if let Some(i) = at {
@@ -727,9 +805,12 @@ pub fn pick(
     (None, inside)
 }
 
-/// `p` is `root` or, both being absolute paths, lies below it.
+/// Both being absolute paths, `p` lies strictly below `root`.
 fn within(p: &str, root: &str) -> bool {
-    p == root || (root.starts_with('/') && p.starts_with('/') && Path::new(p).starts_with(root))
+    root.starts_with('/')
+        && p.starts_with('/')
+        && Path::new(p) != Path::new(root)
+        && Path::new(p).starts_with(root)
 }
 
 pub fn finding_ref(f: &Finding) -> FindingRef {
@@ -859,14 +940,126 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(root.join("file"), b"x").unwrap();
         let mounts = MountTable::read().unwrap_or_default();
-        assert_eq!(walk_for(&dir, &mounts), Walk::Parent(root.clone()));
-        // A file, a missing path and / are walked themselves, with no note.
-        assert_eq!(walk_for(&root.join("file"), &mounts), Walk::Itself(None));
-        assert_eq!(walk_for(&root.join("nope"), &mounts), Walk::Itself(None));
         assert_eq!(
-            walk_for(Path::new("/"), &MountTable::default()),
+            walk_for(&dir, &mounts, &[]),
+            Walk::Above {
+                dir: root.clone(),
+                note: None
+            }
+        );
+        // A file, a missing path and / are walked themselves, with no note.
+        assert_eq!(
+            walk_for(&root.join("file"), &mounts, &[]),
             Walk::Itself(None)
         );
+        assert_eq!(
+            walk_for(&root.join("nope"), &mounts, &[]),
+            Walk::Itself(None)
+        );
+        assert_eq!(
+            walk_for(Path::new("/"), &MountTable::default(), &[]),
+            Walk::Itself(None)
+        );
+    }
+
+    #[test]
+    fn walks_from_a_context_root_that_holds_the_path() {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let vscode = root.join(".vscode-server");
+        let server = vscode.join("cli/servers/Stable-abc");
+        let legacy = vscode.join("bin/abc");
+        std::fs::create_dir_all(&server).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(vscode.join("code-abc"), b"x").unwrap();
+        std::fs::create_dir_all(server.join("server")).unwrap();
+        std::fs::write(server.join("server/deep-file"), b"x").unwrap();
+        let claude = root.join("share/claude/versions");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("2.1.0"), b"x").unwrap();
+        let context = vec![(vscode.clone(), 3), (claude.clone(), 1)];
+        let mounts = MountTable::read().unwrap_or_default();
+        let above = |dir: &Path| Walk::Above {
+            dir: dir.to_path_buf(),
+            note: None,
+        };
+        // Versions further down, files included, are walked from the root.
+        assert_eq!(walk_for(&server, &mounts, &context), above(&vscode));
+        assert_eq!(walk_for(&legacy, &mounts, &context), above(&vscode));
+        assert_eq!(
+            walk_for(&vscode.join("code-abc"), &mounts, &context),
+            above(&vscode)
+        );
+        assert_eq!(
+            walk_for(&claude.join("2.1.0"), &mounts, &context),
+            above(&claude)
+        );
+        // Out of reach, or the root itself: the usual rules.
+        assert_eq!(
+            walk_for(&server.join("server/deep-file"), &mounts, &context),
+            Walk::Itself(None)
+        );
+        assert_eq!(
+            walk_for(&vscode, &mounts, &context),
+            above(&root),
+            "the root itself is walked from its parent"
+        );
+    }
+
+    #[test]
+    fn falls_back_with_a_note_when_the_context_root_cannot_be_walked() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::system::euid() == 0 {
+            return;
+        }
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let vscode = root.join(".vscode-server");
+        let servers = vscode.join("cli/servers");
+        std::fs::create_dir_all(servers.join("Stable-abc")).unwrap();
+        std::fs::write(vscode.join("code-abc"), b"x").unwrap();
+        // Searchable, not readable: paths below can be statted, the root not listed.
+        std::fs::set_permissions(&vscode, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let _restore = Restore(vscode.clone());
+        let context = vec![(vscode.clone(), 3)];
+        let mounts = MountTable::read().unwrap_or_default();
+        let Walk::Above {
+            dir,
+            note: Some(note),
+        } = walk_for(&servers.join("Stable-abc"), &mounts, &context)
+        else {
+            panic!("the parent is walked, with a note");
+        };
+        assert_eq!(dir, servers);
+        assert!(
+            note.starts_with(&format!(
+                "could not walk its context from {}: cannot open it",
+                vscode.display()
+            )),
+            "{note}"
+        );
+        let Walk::Itself(Some(note)) = walk_for(&vscode.join("code-abc"), &mounts, &context) else {
+            panic!("a file is scanned alone, with a note");
+        };
+        assert!(note.contains("could not walk its context"), "{note}");
+        // A symlinked directory on the way is not followed.
+        std::fs::set_permissions(&vscode, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real = root.join("real-bin");
+        std::fs::create_dir_all(real.join("abc")).unwrap();
+        std::os::unix::fs::symlink(&real, vscode.join("bin")).unwrap();
+        let Walk::Above {
+            note: Some(note), ..
+        } = walk_for(&vscode.join("bin/abc"), &mounts, &context)
+        else {
+            panic!("bin is a symlink");
+        };
+        assert!(note.contains("is not a directory"), "{note}");
     }
 
     #[test]
@@ -881,7 +1074,7 @@ mod tests {
                 continue;
             };
             assert_eq!(
-                walk_for(&m.mount_point, &mounts),
+                walk_for(&m.mount_point, &mounts, &[]),
                 Walk::Itself(Some(format!(
                     "{} is a mount point; scanned it alone",
                     m.mount_point.display()
@@ -909,9 +1102,11 @@ mod tests {
         // Searchable, not readable: the path can be statted, its parent not listed.
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311)).unwrap();
         let _restore = Restore(parent.clone());
-        let Walk::Itself(Some(note)) =
-            walk_for(&parent.join("app"), &MountTable::read().unwrap_or_default())
-        else {
+        let Walk::Itself(Some(note)) = walk_for(
+            &parent.join("app"),
+            &MountTable::read().unwrap_or_default(),
+            &[],
+        ) else {
             panic!("the parent cannot be opened");
         };
         assert!(note.contains("cannot open its parent"), "{note}");
@@ -941,11 +1136,12 @@ mod tests {
         );
         assert_eq!(inside[1].bytes, 20);
 
-        // By id: another detector's finding at the same path does not count.
+        // By id: another detector's finding at the same path does not
+        // count, and is not inside the path either.
         let id = crate::detect::finding_id("node-modules", "/p/app/target");
         let (got, inside) = pick(all(), "/p/app/target", Some(&id));
         assert!(got.is_none());
-        assert_eq!(inside.len(), 1, "what is at the path now");
+        assert!(inside.is_empty(), "{inside:?}");
 
         let (got, _) = pick(all(), "docker://volume/v", None);
         assert_eq!(got.unwrap().detector, "docker-volume");
@@ -970,6 +1166,23 @@ mod tests {
         assert!(got.is_none());
         assert_eq!(inside.len(), 1);
         assert_eq!(inside[0].path, "/p/app/scratch");
+    }
+
+    #[test]
+    fn inside_lists_strict_descendants_only() {
+        let all = vec![
+            f("stale-tree", "/p/app", 100),
+            f("cargo-target", "/p/app/target", 20),
+            f("venv", "/p/app/sub/.venv", 10),
+            f("cargo-target", "/p/apple/target", 5),
+        ];
+        // An id for another detector at /p/app: the stale-tree finding there
+        // is neither picked nor listed inside; what lies below it is.
+        let id = crate::detect::finding_id("node-modules", "/p/app");
+        let (got, inside) = pick(all, "/p/app", Some(&id));
+        assert!(got.is_none());
+        let paths: Vec<&str> = inside.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, ["/p/app/target", "/p/app/sub/.venv"]);
     }
 
     #[test]

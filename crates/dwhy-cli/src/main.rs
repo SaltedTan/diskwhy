@@ -697,6 +697,9 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
     let ctx = DetectContext::from_system();
     let mut size = None;
     let is_docker = matches!(&place, Place::Docker(_));
+    // A walk that could not read part of the path; a failed walk of a
+    // saved path is only a scan issue.
+    let mut coverage = None;
     let (path, tree, only, scan_issue) = match place {
         // Docker objects are not on the walked filesystem: an empty tree.
         Place::Docker(p) => {
@@ -714,10 +717,17 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
             }
             let abs = std::path::absolute(&p)?;
             let input = abs.to_str().ok_or(UTF8_PATH)?;
+            // tool-versions compares a version with what sits around it,
+            // which can be more than one level up.
+            let context = if only.iter().any(|n| n == "tool-versions") {
+                dwhy_core::detectors::ToolVersions::from_system().context_roots(&ctx)
+            } else {
+                Vec::new()
+            };
             let (path, walked) = match scan::absolute_nofollow(&abs) {
                 Ok(resolved) => (
                     resolved.to_str().ok_or(UTF8_PATH)?.to_owned(),
-                    explain_path(&resolved, &args, &mut notes),
+                    explain_path(&resolved, &context, &args, &mut notes),
                 ),
                 Err(source) => (
                     input.to_owned(),
@@ -726,10 +736,11 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
             };
             match walked {
                 Ok((totals, tree, issue)) => {
-                    size = Some(ExplainSize {
-                        allocated: totals.allocated,
-                        apparent: totals.apparent,
+                    size = totals.map(|t| ExplainSize {
+                        allocated: t.allocated,
+                        apparent: t.apparent,
                     });
+                    coverage.clone_from(&issue);
                     (path, Some(tree), Some(only), issue)
                 }
                 Err(e) if saved.is_some() => (path, None, Some(only), Some(e.to_string())),
@@ -785,6 +796,12 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
             (finding, inside)
         }
     };
+    // What the walk of the path could not read, whatever was found.
+    if let Some(issue) = coverage
+        && !notes.contains(&issue)
+    {
+        notes.push(issue);
+    }
     if let (Some(f), Some(tree)) = (&mut finding, &tree) {
         let one = std::slice::from_mut(f);
         probes::run(one, &ctx);
@@ -862,11 +879,16 @@ fn explain_missing(
     explain::absence(path, exists, detector_issue, scan_issue, None, notes)
 }
 
+/// Walks what [`explain::walk_for`] says for `abs`. Returns `abs`'s size
+/// (`None` when it could not be measured), the walked tree, and a note on
+/// partial coverage when the walk could not read something at, above or
+/// below `abs`.
 fn explain_path(
     abs: &Path,
+    context: &[(PathBuf, usize)],
     args: &ExplainArgs,
     notes: &mut Vec<String>,
-) -> std::result::Result<(Totals, ScanTree, Option<String>), scan::ScanError> {
+) -> std::result::Result<(Option<Totals>, ScanTree, Option<String>), scan::ScanError> {
     let mounts = MountTable::read().unwrap_or_default();
     let scan = |root: &Path| {
         measure(
@@ -885,34 +907,60 @@ fn explain_path(
             .map(|u| u.path.as_path())
             .chain(result.errors.iter().map(|(p, _)| p.as_path()))
             .find(|p| abs.starts_with(p) || p.starts_with(abs))
-            .map(|p| format!("{} could not be read", p.display()))
+            .map(|p| format!("partial coverage: {} could not be read", p.display()))
             .or_else(|| {
                 (result.error_count > result.errors.len() as u64)
-                    .then(|| "the scan has unrecorded errors".to_string())
+                    .then(|| "partial coverage: the scan has unrecorded errors".to_string())
             })
     };
-    match explain::walk_for(abs, &mounts) {
-        Walk::Parent(parent) => {
-            let result = scan(&parent)?;
-            let issue = read_issue(&result);
-            if let Some(node) = result.tree.find(abs) {
-                let totals = result.tree.node(node).total;
-                return Ok((totals, result.tree, issue));
-            }
-            notes.push(format!(
-                "{} was not in the scan of its parent {}: scanned it alone",
-                abs.display(),
-                parent.display()
-            ));
-            notes.extend(issue);
+    let dir = match explain::walk_for(abs, &mounts, context) {
+        Walk::Above { dir, note } => {
+            notes.extend(note);
+            Some(dir)
         }
         Walk::Itself(note) => {
             notes.extend(note);
+            None
         }
+    };
+    if let Some(dir) = dir {
+        let result = scan(&dir)?;
+        let issue = read_issue(&result);
+        // The tree has nodes for directories only: a file is in the walk
+        // when its directory is.
+        let is_dir = std::fs::symlink_metadata(abs).is_ok_and(|md| md.is_dir());
+        let node = if is_dir {
+            result.tree.find(abs)
+        } else {
+            abs.parent().and_then(|p| result.tree.find(p))
+        };
+        if let Some(node) = node {
+            // The wider walk credits a hardlinked file to its smallest path
+            // in the walk, which can lie outside `abs`, and has no node for
+            // a file: measure `abs` on its own then, as `du` would.
+            let totals = if is_dir && result.totals().hardlinks_deduped == 0 {
+                Some(result.tree.node(node).total)
+            } else {
+                match scan(abs) {
+                    Ok(own) => Some(own.totals()),
+                    Err(e) => {
+                        notes.push(format!("could not measure {}: {e}", abs.display()));
+                        None
+                    }
+                }
+            };
+            return Ok((totals, result.tree, issue));
+        }
+        notes.push(format!(
+            "{} was not in the scan of {}: scanned it alone",
+            abs.display(),
+            dir.display()
+        ));
+        notes.extend(issue);
     }
     let result = scan(abs)?;
     let issue = read_issue(&result);
-    Ok((result.totals(), result.tree, issue))
+    Ok((Some(result.totals()), result.tree, issue))
 }
 
 fn run_plan(args: PlanArgs) -> Result<u8> {
