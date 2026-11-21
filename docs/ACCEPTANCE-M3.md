@@ -18,7 +18,7 @@ The demo verifies the [M3 acceptance criterion](DESIGN.md#mvp-milestones) with a
 4. Poll the apparent file sizes with `find` and `stat` inside the project's own Postgres container until they total 1.1 GiB. The test uses the sizes it read even if files disappear during a walk. The threshold leaves a margin over the `docker-volume` detector's 1 GiB cutoff for in-use volumes. The poll gives up after 10 minutes.
 5. `dwhy diff --detectors docker-build-cache --json`. The test checks that the demo volume grew by more than 512 MiB since the snapshot.
 6. `dwhy explain docker://volume/<project>_pgdata --json`. The test checks for a `docker-volume` finding with `archive_mode` set to `on` and at least one archive failure in its `postgres_wal` evidence. It checks that the `exited` archive target matches the actual name of the project's `s3test` container and that the advice starts with `restore the archive target s3test`.
-7. A Drop guard runs `down -v --remove-orphans` for the demo project when the test finishes or unwinds from a panic. Every Compose call sets `COMPOSE_PROJECT_NAME` and `-p` to the generated project name. When the demo assertions pass, the test runs teardown and checks that `docker ps -a`, `docker volume ls` and `docker network ls`, filtered by `label=com.docker.compose.project=<project>`, are empty. Ctrl-C skips the guard. After an interrupt, run the cleanup command printed at startup.
+7. A Drop guard runs `down -v --remove-orphans` for the demo project when the test finishes or unwinds from a panic. Every Compose call sets `COMPOSE_PROJECT_NAME` and `-p` to the generated project name. After teardown, whether the demo passed or panicked (including during `up`), the test checks that `docker ps -a`, `docker volume ls` and `docker network ls`, filtered by `label=com.docker.compose.project=<project>`, are empty. A panic that also leaves objects behind, or whose leftover check fails, is reported with both. Ctrl-C skips the guard. After an interrupt, run the cleanup command printed at startup.
 
    ```text
    env -u DOCKER_CONTEXT DOCKER_HOST=<socket URL> COMPOSE_PROJECT_NAME=<project> docker compose -p <project> -f <absolute Compose path> down -v --remove-orphans
@@ -32,7 +32,7 @@ The demo verifies the [M3 acceptance criterion](DESIGN.md#mvp-milestones) with a
 
 ## How to run it
 
-The demo needs Docker Engine 28 or later for the isolated bridge, Docker Compose, and a local copy of `postgres:16-alpine` on the daemon. Docker and `dwhy` use `/var/run/docker.sock` by default or the absolute Unix socket URL set in `DOCKER_HOST` (for example, `unix:///run/user/1000/docker.sock`), regardless of the active Docker context. With an unsupported `DOCKER_HOST`, the test prints `skipped` and returns successfully before contacting Docker. If the selected socket is inaccessible, the test fails.
+The demo needs Docker Engine 28 or later for the isolated bridge, Docker Compose, and a local copy of `postgres:16-alpine` on the daemon. Docker and `dwhy` use `/var/run/docker.sock` by default or the absolute Unix socket URL set in `DOCKER_HOST` (for example, `unix:///run/user/1000/docker.sock`), regardless of the active Docker context. With `DWHY_DOCKER_E2E=1` and an unsupported `DOCKER_HOST` (empty, not UTF-8, or not `unix:///...`), the test fails before contacting Docker. If the selected socket is inaccessible, the test fails.
 
 The demo takes about 6 minutes. It is `#[ignore]`d and also returns at once unless `DWHY_DOCKER_E2E=1` is set. The WAL demo is disabled in normal test runs and in CI.
 
