@@ -2267,6 +2267,61 @@ fn a_logged_command_matching_the_configured_one_is_confirmed() {
 }
 
 #[test]
+fn a_multiline_command_line_archive_command_confirms_its_tab_continued_log_detail() {
+    for (command, tail) in [
+        (
+            "curl -T %p http://s3test:9000/wal/%f \\\n--fail",
+            "\t--fail",
+        ),
+        ("curl -T %p http://s3test:9000/wal/%f\n&& sync", "\t&& sync"),
+    ] {
+        let first = command
+            .lines()
+            .next()
+            .unwrap()
+            .replace("%p", &format!("pg_wal/{WAL}"));
+        let first = first.replace("%f", WAL);
+        let fake = api_only_with(
+            Some(command),
+            &format!("{first}\n2026-11-13T02:10:00Z {tail}"),
+        );
+        let f = probe(&fake);
+        let ev = evidence(&f);
+        assert!(!ev.historical_command, "{command:?}: {:?}", ev.notes);
+        assert_eq!(ev.archive_program.as_deref(), Some("curl"));
+        assert_eq!(ev.targets[0].host, "s3test");
+        assert!(
+            f.action
+                .text
+                .starts_with("restore the archive target s3test;"),
+            "{}",
+            f.action.text
+        );
+    }
+}
+
+#[test]
+fn stderr_after_the_logged_command_is_not_part_of_it() {
+    let fake = api_only_with(
+        Some("curl -T %p http://s3test:9000/wal/%f"),
+        &format!(
+            "curl -T pg_wal/{WAL} http://s3test:9000/wal/{WAL}\n\
+             2026-11-13T02:10:01Z curl: (7) Failed to connect to s3test port 9000"
+        ),
+    );
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert!(!ev.historical_command, "{:?}", ev.notes);
+    assert!(
+        f.action
+            .text
+            .starts_with("restore the archive target s3test;"),
+        "{}",
+        f.action.text
+    );
+}
+
+#[test]
 fn a_reconfigured_archive_command_makes_logged_failures_historical() {
     // The command line now archives to s3test (exited); the failures in
     // the tail were for a command since replaced.

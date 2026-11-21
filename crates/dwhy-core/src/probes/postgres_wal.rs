@@ -1134,11 +1134,11 @@ pub fn scan_log(text: &str) -> LogScan {
         let message = docker_log_message(line).unwrap_or(line);
         let record = postgres_log_record(message);
         if command_detail
-            && record.is_none()
+            && let Some(rest) = message.strip_prefix('\t')
             && let Some(command) = &mut s.failed_command
         {
             command.push('\n');
-            command.push_str(message);
+            command.push_str(rest);
             continue;
         }
         command_detail = false;
@@ -1150,7 +1150,7 @@ pub fn scan_log(text: &str) -> LogScan {
             && level == "DETAIL"
             && let Some(command) = body.strip_prefix("The failed archive command was: ")
         {
-            s.failed_command = Some(command.trim().to_string());
+            s.failed_command = Some(command.to_string());
             command_detail = true;
         }
         previous_failure = false;
@@ -2603,8 +2603,8 @@ mod tests {
             // %r is not expanded by archive_command; it stays as written.
             ("x %r %p", format!("x %r pg_wal/{wal}"), true),
             (
-                "cp %p /a/%f\n  && sync",
-                format!("cp pg_wal/{wal} /a/{wal}\n  && sync"),
+                "cp %p /a/%f \n&& sync",
+                format!("cp pg_wal/{wal} /a/{wal} \n&& sync"),
                 true,
             ),
             // Reconfigured since.
@@ -2708,6 +2708,25 @@ mod tests {
             s.last_failure.unwrap().format(&Rfc3339).unwrap(),
             "2026-11-13T02:09:00.1Z"
         );
+    }
+
+    #[test]
+    fn failed_command_details_continue_only_on_tab_led_lines() {
+        // Postgres's stderr logger writes a tab after each newline of a
+        // message (append_with_tabs in elog.c).
+        let s = scan_log(
+            "2026-11-13T02:10:00Z LOG:  archive command failed with exit code 1\n\
+             2026-11-13T02:10:00Z DETAIL:  The failed archive command was: cp pg_wal/W /a/W \n\
+             2026-11-13T02:10:00Z \t&& sync\n\
+             2026-11-13T02:10:00Z \t  && echo done\n\
+             2026-11-13T02:10:01Z cp: cannot create regular file '/a/W': No space left\n\
+             2026-11-13T02:10:01Z \tstray\n",
+        );
+        assert_eq!(
+            s.failed_command.as_deref(),
+            Some("cp pg_wal/W /a/W \n&& sync\n  && echo done")
+        );
+        assert_eq!(s.failures, 1);
     }
 
     #[test]
