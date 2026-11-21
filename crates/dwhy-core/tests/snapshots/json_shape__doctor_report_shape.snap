@@ -1,0 +1,59 @@
+---
+source: crates/dwhy-core/tests/json_shape.rs
+expression: doctor_sample()
+---
+{
+  "schema": "diskwhy/v1",
+  "tool": {
+    "name": "diskwhy",
+    "version": "0.1.0"
+  },
+  "host": "devbox",
+  "uid": 1000,
+  "euid": 1000,
+  "root": false,
+  "docker_group": true,
+  "docker_socket": {
+    "path": "/var/run/docker.sock",
+    "exists": true,
+    "accessible": true
+  },
+  "tools": [
+    {
+      "name": "docker",
+      "path": "/usr/bin/docker",
+      "off_path": null,
+      "enables": [
+        "docker-volume",
+        "postgres-wal"
+      ]
+    },
+    {
+      "name": "cargo",
+      "path": null,
+      "off_path": "/home/u/.cargo/bin/cargo",
+      "enables": [
+        "cargo-target"
+      ]
+    }
+  ],
+  "detectors": [
+    {
+      "name": "docker-volume",
+      "milestone": "M1",
+      "status": "available",
+      "detail": "Docker socket accessible"
+    }
+  ],
+  "probes": [
+    {
+      "name": "postgres-wal",
+      "milestone": "M3",
+      "status": "available",
+      "detail": "uses docker-volume findings, the Engine API and read-only psql through `docker exec`"
+    }
+  ],
+  "notes": [
+    "member of the docker group (root-equivalent)"
+  ]
+}

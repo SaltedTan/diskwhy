@@ -910,3 +910,74 @@ fn explain_report_shape() {
     let back: ExplainReport = serde_json::from_value(v).unwrap();
     assert!(back.finding.is_none() && !back.gone && back.inside.is_empty());
 }
+
+fn doctor_sample() -> DoctorReport {
+    DoctorReport {
+        schema: SCHEMA.into(),
+        tool: Tool {
+            name: "diskwhy".into(),
+            version: "0.1.0".into(),
+        },
+        host: "devbox".into(),
+        uid: 1000,
+        euid: 1000,
+        root: false,
+        docker_group: true,
+        docker_socket: DockerSocket {
+            path: "/var/run/docker.sock".into(),
+            exists: true,
+            accessible: true,
+        },
+        tools: vec![
+            ToolStatus {
+                name: "docker".into(),
+                path: Some("/usr/bin/docker".into()),
+                off_path: None,
+                enables: vec!["docker-volume".into(), "postgres-wal".into()],
+            },
+            ToolStatus {
+                name: "cargo".into(),
+                path: None,
+                off_path: Some("/home/u/.cargo/bin/cargo".into()),
+                enables: vec!["cargo-target".into()],
+            },
+        ],
+        detectors: vec![DetectorStatus {
+            name: "docker-volume".into(),
+            milestone: "M1".into(),
+            status: DetectorAvailability::Available,
+            detail: "Docker socket accessible".into(),
+        }],
+        probes: vec![DetectorStatus {
+            name: "postgres-wal".into(),
+            milestone: "M3".into(),
+            status: DetectorAvailability::Available,
+            detail: "uses docker-volume findings, the Engine API and read-only psql through `docker exec`"
+                .into(),
+        }],
+        notes: vec!["member of the docker group (root-equivalent)".into()],
+    }
+}
+
+#[test]
+fn doctor_report_shape() {
+    insta::assert_json_snapshot!(doctor_sample());
+}
+
+#[test]
+fn doctor_report_round_trips() {
+    let r = doctor_sample();
+    let back: DoctorReport = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+    assert_eq!(back, r);
+}
+
+#[test]
+fn doctor_report_without_probes_reads_back_with_no_probes() {
+    let mut v = serde_json::to_value(doctor_sample()).unwrap();
+    v.as_object_mut().unwrap().remove("probes").unwrap();
+    let back: DoctorReport = serde_json::from_value(v).unwrap();
+    assert!(back.probes.is_empty());
+    let mut expected = doctor_sample();
+    expected.probes.clear();
+    assert_eq!(back, expected);
+}

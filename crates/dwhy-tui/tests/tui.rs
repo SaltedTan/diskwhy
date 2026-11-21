@@ -1389,7 +1389,7 @@ fn detail_docker_volume_with_postgres_wal_evidence_80x24() {
     let end = render(&mut app, 80, 24, None);
     assert!(end.contains("  cost: n/a: nothing is removed"), "{end}");
     assert!(!end.contains("finding f_"), "{end}");
-    assert!(end.contains("lines 4–24 of 24"), "{end}");
+    assert!(end.contains("lines 5–25 of 25"), "{end}");
     let scroll = app.browser().unwrap().findings.scroll;
     assert!(scroll > 0);
     press(&mut app, &[KeyCode::Down, KeyCode::PageDown]);

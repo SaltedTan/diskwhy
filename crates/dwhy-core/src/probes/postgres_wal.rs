@@ -286,7 +286,9 @@ pub struct MountPoint {
 pub struct Inspect {
     pub id: String,
     pub name: String,
-    /// Arguments after the entrypoint's program (the command, usually).
+    /// The program the container runs (the entrypoint's, usually).
+    pub path: String,
+    /// Arguments after [`path`](Self::path) (the command, usually).
     pub args: Vec<String>,
     pub state: InspectState,
     pub config: InspectConfig,
@@ -593,7 +595,7 @@ fn gather(
 
 /// Settings from the command line, failures from the log tail.
 fn api_only(insp: &Inspect, docker: &dyn Docker, ev: &mut PostgresWal) -> Option<String> {
-    let mut settings = command_settings(&insp.args);
+    let mut settings = command_settings(&insp.path, &insp.args);
     ev.archive_mode = settings.remove("archive_mode");
     ev.archive_timeout = settings.remove("archive_timeout");
     let command = settings.remove("archive_command");
@@ -709,25 +711,111 @@ fn archive_mode_value(value: &str) -> Option<String> {
     matches!(mode.as_str(), "on" | "off" | "always").then_some(mode)
 }
 
+/// Postgres's upper limit for `archive_timeout`: `INT_MAX / 2` seconds.
+const ARCHIVE_TIMEOUT_MAX: f64 = (i32::MAX / 2) as f64;
+
+/// C's `isspace`.
+fn c_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
+}
+
+/// `value` (without surrounding whitespace) when Postgres would accept it
+/// as `archive_timeout`: an integer setting in seconds, read as its
+/// `parse_int` reads one. That is a decimal, octal (`010`) or hex (`0x1e`)
+/// integer, or a decimal number with a fraction or exponent (`1e2`, `10.`,
+/// `.5`). An optional unit (`us`, `ms`, `s`, `min`, `h`, `d`) may follow
+/// after optional whitespace. The value is rounded to whole seconds and
+/// must be from 0 to [`ARCHIVE_TIMEOUT_MAX`]. Hex fractions, which
+/// Postgres also reads, are refused.
 fn archive_timeout_value(value: &str) -> Option<String> {
-    let integer = value.trim_start_matches(|c: char| c.is_ascii_digit());
-    if integer.len() == value.len() {
+    let text = value.trim_start_matches(c_space);
+    let (number, rest) = c_number(text)?;
+    let rest = rest.trim_start_matches(c_space);
+    let (unit, trailing) = rest.split_at(rest.find(c_space).unwrap_or(rest.len()));
+    if !trailing.trim_start_matches(c_space).is_empty() {
         return None;
     }
-    let unit = if let Some(fraction) = integer.strip_prefix('.') {
-        let rest = fraction.trim_start_matches(|c: char| c.is_ascii_digit());
-        if rest.len() == fraction.len() {
+    // Each unit's size in seconds, then the next smaller unit's, which a
+    // fraction is rounded to first.
+    let (size, next) = match unit {
+        "" => (1.0, None),
+        "d" => (86_400.0, Some(3_600.0)),
+        "h" => (3_600.0, Some(60.0)),
+        "min" => (60.0, Some(1.0)),
+        "s" => (1.0, Some(1e-3)),
+        "ms" => (1e-3, Some(1e-6)),
+        "us" => (1e-6, None),
+        _ => return None,
+    };
+    let mut seconds = number * size;
+    if let (false, Some(next)) = (unit.is_empty(), next) {
+        seconds = (seconds / next).round_ties_even() * next;
+    }
+    (0.0..=ARCHIVE_TIMEOUT_MAX)
+        .contains(&seconds.round_ties_even())
+        .then(|| value.trim_matches(c_space).to_string())
+}
+
+/// The number at the start of `s` as `strtol(s, _, 0)` reads it, or
+/// `strtod` when that stops at `.`, `e` or `E`; the text after it.
+fn c_number(s: &str) -> Option<(f64, &str)> {
+    let digits = |s: &str, radix: u32| s.find(|c: char| !c.is_digit(radix)).unwrap_or(s.len());
+    let unsigned = s.strip_prefix(['+', '-']).unwrap_or(s);
+    let sign = s.len() - unsigned.len();
+    let negative = s.starts_with('-');
+    let signed = |v: f64| if negative { -v } else { v };
+    let hex = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+        .filter(|h| h.starts_with(|c: char| c.is_ascii_hexdigit()));
+    let (radix, start) = match hex {
+        Some(_) => (16, 2),
+        None if unsigned.starts_with('0') => (8, 0),
+        None => (10, 0),
+    };
+    let body = &unsigned[start..];
+    let len = digits(body, radix);
+    let after = &body[len..];
+    if !after.starts_with(['.', 'e', 'E']) {
+        if len == 0 {
             return None;
         }
-        rest
-    } else {
-        integer
-    };
-    matches!(
-        unit.trim_start(),
-        "" | "us" | "ms" | "s" | "min" | "h" | "d"
-    )
-    .then(|| value.to_string())
+        let v = body[..len].chars().fold(0.0, |v, c| {
+            v * radix as f64 + c.to_digit(radix).unwrap_or(0) as f64
+        });
+        return Some((signed(v), after));
+    }
+    if radix == 16 {
+        return None;
+    }
+    // strtod, from the start: [sign] digits [. digits] [e [sign] digits].
+    let int = digits(unsigned, 10);
+    let mut end = int;
+    let mut fraction = 0;
+    if unsigned[end..].starts_with('.') {
+        fraction = digits(&unsigned[end + 1..], 10);
+        end += 1 + fraction;
+    }
+    if int + fraction == 0 {
+        return None;
+    }
+    let mantissa = &unsigned[..end];
+    if let Some(exp) = unsigned[end..].strip_prefix(['e', 'E']) {
+        let exp_digits = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+        let n = digits(exp_digits, 10);
+        if n > 0 {
+            end += 1 + (exp.len() - exp_digits.len()) + n;
+        }
+    }
+    let v: f64 = unsigned[..end].parse().ok()?;
+    // strtod reports overflow and underflow as range errors.
+    if !v.is_finite()
+        || v.is_subnormal()
+        || v == 0.0 && mantissa.contains(['1', '2', '3', '4', '5', '6', '7', '8', '9'])
+    {
+        return None;
+    }
+    Some((signed(v), &s[sign + end..]))
 }
 
 fn archive_file_name(name: &str) -> Option<String> {
@@ -762,17 +850,46 @@ fn epoch_time(s: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp_nanos(if s.starts_with('-') { -nanos } else { nanos }).ok()
 }
 
-/// `-c name=value` and `--name=value` settings from a `postgres` command
-/// line (names with `-` read as `_`, as Postgres does).
-pub fn command_settings(args: &[String]) -> HashMap<String, String> {
+/// Shells, whose `-c` takes a script rather than a Postgres setting.
+const SHELLS: &[&str] = &["sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "busybox"];
+
+/// The Postgres options in a container's command line: `args`, the
+/// arguments after `path`, when they start Postgres. That is when the
+/// first is `postgres`, `postmaster` or `docker-entrypoint.sh`, or is an
+/// option the official image's `docker-entrypoint.sh` passes to `postgres`
+/// (`-c …`). A shell `path` never counts, and an `env` one only with a
+/// Postgres program first.
+fn postgres_options<'a>(path: &str, args: &'a [String]) -> Option<&'a [String]> {
+    let base = |s: &'a str| s.rsplit('/').next().unwrap_or(s);
+    let path = path.rsplit('/').next().unwrap_or(path);
+    if SHELLS.contains(&path) {
+        return None;
+    }
+    let first = args.first()?;
+    match base(first) {
+        "postgres" | "postmaster" | "docker-entrypoint.sh" => Some(&args[1..]),
+        _ if first.starts_with('-') && first != "--" && path != "env" => Some(args),
+        _ => None,
+    }
+}
+
+/// `archive_mode`, `archive_timeout` and `archive_command` from the
+/// `-c name=value` and `--name=value` options of a container that starts
+/// `postgres` (see [`postgres_options`]; names with `-` read as `_`, as
+/// Postgres does). Other settings are not kept.
+pub fn command_settings(path: &str, args: &[String]) -> HashMap<String, String> {
     let mut out = HashMap::new();
+    let Some(args) = postgres_options(path, args) else {
+        return out;
+    };
     let mut put = |kv: &str| {
         if let Some((k, v)) = kv.split_once('=') {
             let key = k.trim().to_ascii_lowercase().replace('-', "_");
             let value = match key.as_str() {
                 "archive_mode" => archive_mode_value(v),
                 "archive_timeout" => archive_timeout_value(v),
-                _ => Some(v.to_string()),
+                "archive_command" => Some(v.to_string()),
+                _ => return,
             };
             if let Some(value) = value {
                 out.insert(key, value);
@@ -847,6 +964,8 @@ pub fn scan_log(text: &str) -> LogScan {
         {
             previous_failure = true;
             s.failures += 1;
+            // Only a file named for this failure goes with its time.
+            s.last_failed_wal = None;
             if let Some(t) = line_time(line) {
                 s.last_failure = Some(s.last_failure.map_or(t, |l| l.max(t)));
             }
@@ -908,8 +1027,11 @@ fn line_time(line: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(&format!("{date}T{clock}Z"), &Rfc3339).ok()
 }
 
-const ENDPOINT_FLAGS: &[&str] = &["--endpoint-url", "--endpoint", "--host"];
-const AUTH_FLAGS: &[&str] = &[
+const ENDPOINT_FLAGS: &[&str] = &["--endpoint-url", "--endpoint", "--host", "--url"];
+/// Options whose operand is a credential or names something other than the
+/// archive destination (request metadata, a proxy, a request body), for any
+/// program. Their operands never name a target.
+const OPERAND_FLAGS: &[&str] = &[
     "-u",
     "-p",
     "--user",
@@ -918,7 +1040,30 @@ const AUTH_FLAGS: &[&str] = &[
     "--secret",
     "--token",
     "--key",
+    "--proxy-user",
+    "--oauth2-bearer",
+    "--referer",
+    "--user-agent",
+    "--header",
+    "--proxy-header",
+    "--cookie",
+    "--cookie-jar",
+    "--proxy",
+    "--preproxy",
+    "--socks5",
+    "--socks5-hostname",
+    "--data",
+    "--data-raw",
+    "--data-binary",
+    "--data-urlencode",
+    "--form",
 ];
+/// curl's short forms of such options, as the next word or attached
+/// (`-H value`, `-Hvalue`). Other programs give these letters other
+/// meanings, some without an operand.
+const CURL_OPERAND_FLAGS: &[&str] = &["-U", "-e", "-A", "-H", "-b", "-c", "-x", "-d", "-F"];
+/// How deep quoted shell words (`sh -c '…'`) are read as commands.
+const MAX_NESTING: usize = 2;
 const NETWORK_SCHEMES: &[&str] = &[
     "http",
     "https",
@@ -932,21 +1077,206 @@ const NETWORK_SCHEMES: &[&str] = &[
     "postgresql",
 ];
 
-fn shell_separator(c: char) -> bool {
-    c.is_whitespace() || ";|&()<>".contains(c)
+/// A shell token, as written: nothing is expanded or run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Token<'a> {
+    /// A word with its quotes and expansions.
+    Word(&'a str),
+    /// A redirection (`2>/dev/null`, `>> log`, `>&2`); its target word.
+    Redirect(&'a str),
+    /// `;`, `&`, `|`, `(`, `)` or a newline: the next word starts a command.
+    Break,
 }
 
-fn command_word(input: &str) -> (usize, String, bool) {
+fn word_end(b: u8) -> bool {
+    b.is_ascii_whitespace() || b";|&()<>".contains(&b)
+}
+
+/// The index after the character at `b[i]`, which starts one.
+fn after_char(b: &[u8], i: usize) -> usize {
+    let width = match b[i] {
+        0..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    };
+    (i + width).min(b.len())
+}
+
+/// Skips the character, quoted string or expansion that starts at `b[i]`;
+/// `None` when it is left open.
+fn skip_unit(b: &[u8], i: usize) -> Option<usize> {
+    match (b[i], b.get(i + 1)) {
+        (b'\\', Some(_)) => Some(after_char(b, i + 1)),
+        (b'\'', _) => find_close(b, i + 1, b'\'', false),
+        (b'"', _) => skip_double(b, i + 1),
+        (b'`', _) => find_close(b, i + 1, b'`', true),
+        (b'$', Some(b'(')) => skip_nested(b, i + 2, b'(', b')'),
+        (b'$', Some(b'{')) => skip_nested(b, i + 2, b'{', b'}'),
+        (b'$', Some(b'\'')) => find_close(b, i + 2, b'\'', true),
+        _ => Some(after_char(b, i)),
+    }
+}
+
+/// The index after the first `close` at or after `i`; backslash escapes
+/// the next character when `escapes`.
+fn find_close(b: &[u8], mut i: usize, close: u8, escapes: bool) -> Option<usize> {
+    while i < b.len() {
+        match b[i] {
+            c if c == close => return Some(i + 1),
+            b'\\' if escapes && i + 1 < b.len() => i = after_char(b, i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn skip_double(b: &[u8], mut i: usize) -> Option<usize> {
+    while i < b.len() {
+        i = match (b[i], b.get(i + 1)) {
+            (b'"', _) => return Some(i + 1),
+            (b'\\', Some(_)) => after_char(b, i + 1),
+            (b'`' | b'$', _) => skip_unit(b, i)?,
+            _ => i + 1,
+        };
+    }
+    None
+}
+
+fn skip_nested(b: &[u8], mut i: usize, open: u8, close: u8) -> Option<usize> {
+    let mut depth = 1;
+    while i < b.len() {
+        if b[i] == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i + 1);
+            }
+            i += 1;
+        } else if b[i] == open {
+            depth += 1;
+            i += 1;
+        } else {
+            i = skip_unit(b, i)?;
+        }
+    }
+    None
+}
+
+/// The length of the word at the start of `s`; `None` when a quote or
+/// expansion in it is left open.
+fn word_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() && !word_end(b[i]) {
+        i = skip_unit(b, i)?;
+    }
+    Some(i)
+}
+
+/// The length of a redirection operator (with its file descriptor) at the
+/// start of `s`.
+fn redirect_len(s: &str) -> Option<usize> {
+    if s.starts_with("&>>") {
+        return Some(3);
+    }
+    if s.starts_with("&>") {
+        return Some(2);
+    }
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = &s[digits..];
+    [">>", ">|", ">&", "<<<", "<&", "<>", ">", "<"]
+        .iter()
+        .find(|op| rest.starts_with(**op))
+        .map(|op| digits + op.len())
+}
+
+/// Splits a shell command into tokens without expanding anything. Unquoted
+/// `#` comments are dropped. The second value is the text left unread at a
+/// quote or expansion left open, or a here-document, which is not read.
+fn shell_tokens(input: &str) -> (Vec<Token<'_>>, &str) {
+    let b = input.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    let blank =
+        |i: usize| b[i] == b' ' || b[i] == b'\t' || b[i] == b'\\' && b.get(i + 1) == Some(&b'\n');
+    loop {
+        while i < b.len() {
+            if b[i] == b'\n' {
+                if tokens.last().is_some_and(|t| *t != Token::Break) {
+                    tokens.push(Token::Break);
+                }
+                i += 1;
+            } else if b[i] == b'\\' && b.get(i + 1) == Some(&b'\n') {
+                i += 2;
+            } else if b[i].is_ascii_whitespace() {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if i >= b.len() {
+            return (tokens, "");
+        }
+        let rest = &input[i..];
+        if b[i] == b'#' {
+            i += rest.find('\n').unwrap_or(rest.len());
+            continue;
+        }
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if rest[digits..].starts_with("<<") && !rest[digits..].starts_with("<<<") {
+            return (tokens, rest);
+        }
+        if let Some(op) = redirect_len(rest) {
+            i += op;
+            while i < b.len() && blank(i) {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            let target = &input[i..];
+            match word_len(target) {
+                Some(len) if len > 0 => {
+                    tokens.push(Token::Redirect(&target[..len]));
+                    i += len;
+                }
+                _ => return (tokens, rest),
+            }
+            continue;
+        }
+        if word_end(b[i]) {
+            tokens.push(Token::Break);
+            i += 1;
+            continue;
+        }
+        let Some(len) = word_len(rest) else {
+            return (tokens, rest);
+        };
+        tokens.push(Token::Word(&rest[..len]));
+        i += len;
+    }
+}
+
+/// Whether the command could expand something (`$(`, a backtick, `${`)
+/// outside a comment. Quoting is not trusted to prevent it.
+fn expands(tokens: &[Token], rest: &str) -> bool {
+    let expansion = |s: &str| s.contains("$(") || s.contains('`') || s.contains("${");
+    expansion(rest)
+        || tokens.iter().any(|t| match t {
+            Token::Word(s) | Token::Redirect(s) => expansion(s),
+            Token::Break => false,
+        })
+}
+
+/// A word's value after quote removal. Expansions stay as written: callers
+/// only act on words of commands without one.
+fn unquote(raw: &str) -> String {
     let mut value = String::new();
     let mut quote = None;
-    let mut chars = input.char_indices().peekable();
-    while let Some((i, c)) = chars.next() {
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
         match (quote, c) {
-            (None, c) if shell_separator(c) => return (i, value, true),
             (None, '\'' | '"') => quote = Some(c),
             (Some(q), c) if q == c => quote = None,
             (q, '\\') if q != Some('\'') => {
-                if let Some(&(_, next)) = chars.peek()
+                if let Some(&next) = chars.peek()
                     && (q.is_none() || "\"\\$`\n".contains(next))
                 {
                     chars.next();
@@ -960,7 +1290,7 @@ fn command_word(input: &str) -> (usize, String, bool) {
             _ => value.push(c),
         }
     }
-    (input.len(), value, quote.is_none())
+    value
 }
 
 fn assignment_name(word: &str) -> Option<&str> {
@@ -972,69 +1302,98 @@ fn assignment_name(word: &str) -> Option<&str> {
     .then_some(name)
 }
 
-fn archive_program(mut input: &str, expanded: bool) -> String {
-    loop {
-        input = input.trim_start_matches(char::is_whitespace);
-        let (len, word, closed) = command_word(input);
-        if !closed || len == 0 {
-            return "***".into();
-        }
-        if !expanded && assignment_name(&input[..len]).is_some() {
-            input = &input[len..];
-        } else if !word.is_empty()
-            && word
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_./+-".contains(&b))
-        {
-            return word;
-        } else {
-            return "***".into();
+/// The first command's program: the first word after leading assignments
+/// (whatever their values hold, never expanded) and redirections. `***`
+/// when there is none or it is not a plain path.
+fn archive_program(tokens: &[Token]) -> String {
+    for token in tokens {
+        match token {
+            Token::Redirect(_) => {}
+            Token::Word(raw) if assignment_name(raw).is_some() => {}
+            Token::Word(raw) => {
+                let word = unquote(raw);
+                return if !word.is_empty()
+                    && word
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_./+-".contains(&b))
+                {
+                    word
+                } else {
+                    "***".into()
+                };
+            }
+            Token::Break => break,
         }
     }
+    "***".into()
 }
 
-fn analyze_archive_command(mut input: &str) -> (String, Vec<String>) {
-    let expanded = input.contains("$(") || input.contains('`') || input.contains("${");
-    let program = archive_program(input, expanded);
-    let mut hosts: Vec<String> = Vec::new();
-    if expanded {
-        return (program, hosts);
+fn analyze_archive_command(input: &str) -> (String, Vec<String>) {
+    let (tokens, _) = shell_tokens(input);
+    let mut hosts = Vec::new();
+    collect_hosts(input, 0, &mut hosts);
+    (archive_program(&tokens), hosts)
+}
+
+/// Adds the hosts `input`'s commands name to `hosts`. An argument that
+/// starts quoted and has whitespace in it (`sh -c '…'`) is read as
+/// commands too, at most [`MAX_NESTING`] levels down (`depth` is this
+/// level).
+fn collect_hosts(input: &str, depth: usize, hosts: &mut Vec<String>) {
+    let (tokens, rest) = shell_tokens(input);
+    if expands(&tokens, rest) {
+        return;
     }
-    let mut seen_program = false;
+    let mut program: Option<String> = None;
     let mut endpoint_next = false;
-    let mut auth_next = false;
-    while !input.is_empty() {
-        let sep = input.len() - input.trim_start_matches(shell_separator).len();
-        let separators = &input[..sep];
-        if separators.chars().any(|c| !c.is_whitespace() || c == '\n') {
-            endpoint_next = false;
-            auth_next = false;
-        }
-        input = &input[sep..];
-        if input.is_empty() {
-            break;
-        }
-        let (len, word, closed) = command_word(input);
-        input = &input[len..];
+    let mut skip_next = false;
+    for token in tokens {
+        let raw = match token {
+            Token::Word(raw) => raw,
+            Token::Redirect(_) => continue,
+            Token::Break => {
+                program = None;
+                endpoint_next = false;
+                skip_next = false;
+                continue;
+            }
+        };
+        let word = unquote(raw);
         let endpoint_value = std::mem::take(&mut endpoint_next);
-        if std::mem::take(&mut auth_next) || assignment_name(&word).is_some() {
+        if std::mem::take(&mut skip_next) {
             continue;
         }
-        if !closed {
-            break;
-        }
-        if !seen_program {
-            seen_program = true;
+        // A word that starts quoted is never an assignment; one with
+        // whitespace in it is read as commands (`sh -c '…'`).
+        let script = program.is_some()
+            && !endpoint_value
+            && raw.starts_with(['\'', '"'])
+            && word.contains(|c: char| c.is_ascii_whitespace());
+        if script {
+            if depth < MAX_NESTING {
+                collect_hosts(&word, depth + 1, hosts);
+            }
             continue;
         }
+        if assignment_name(&word).is_some() {
+            continue;
+        }
+        let Some(program) = &program else {
+            program = Some(word.rsplit('/').next().unwrap_or(&word).to_string());
+            continue;
+        };
         let (key, value) = word
             .split_once('=')
             .map_or((word.as_str(), None), |(key, value)| (key, Some(value)));
-        if AUTH_FLAGS.contains(&key) {
-            auth_next = value.is_none();
+        let curl = program == "curl";
+        if OPERAND_FLAGS.contains(&key) || curl && CURL_OPERAND_FLAGS.contains(&word.as_str()) {
+            skip_next = value.is_none();
             continue;
         }
-        if word.starts_with("-u") || word.starts_with("-p") {
+        if word.starts_with("-u")
+            || word.starts_with("-p")
+            || curl && CURL_OPERAND_FLAGS.iter().any(|f| word.starts_with(f))
+        {
             continue;
         }
         let endpoint_flag = ENDPOINT_FLAGS.contains(&key);
@@ -1071,7 +1430,6 @@ fn analyze_archive_command(mut input: &str) -> (String, Vec<String>) {
             hosts.push(host);
         }
     }
-    (program, hosts)
 }
 
 fn endpoint_host(authority: &str, port_required: bool) -> Option<String> {
@@ -1299,6 +1657,12 @@ pub fn diagnosis(ev: &PostgresWal) -> String {
     parts.join("; ")
 }
 
+/// What happens to WAL once archiving works again. Neither archiving nor a
+/// checkpoint frees WAL a replication slot still needs, and a recycled
+/// segment keeps its space.
+const ARCHIVED_WAL: &str = "once archived and no longer needed by replication slots, WAL is \
+     freed or recycled at the next checkpoint (do not remove the volume: it holds the database)";
+
 /// The advice that replaces the detector's, when WAL is the problem. Never
 /// removing the volume: it holds the database.
 pub fn advice(ev: &PostgresWal) -> Option<String> {
@@ -1309,26 +1673,20 @@ pub fn advice(ev: &PostgresWal) -> Option<String> {
                 1 => "1 host matches no container".into(),
                 n => format!("{n} hosts match no container"),
             };
-            format!(
-                "fix archive_command or start its target ({unmatched}); WAL is freed at the next checkpoint \
-                 once it is archived (do not remove the volume: it holds the database)"
-            )
+            format!("fix archive_command or start its target ({unmatched}); {ARCHIVED_WAL}")
         } else if dead.is_empty() {
-            "fix archive_command so archiving succeeds; WAL is freed at the next checkpoint \
-             once it is archived (do not remove the volume: it holds the database)"
-                .into()
+            format!("fix archive_command so archiving succeeds; {ARCHIVED_WAL}")
         } else {
             format!(
-                "restore the archive target {}; WAL is freed at the next checkpoint once it is \
-                 archived (do not remove the volume: it holds the database)",
+                "restore the archive target {}; {ARCHIVED_WAL}",
                 dead.join(", ")
             )
         })
     } else if wal_heavy(ev) {
         Some(
             "check what holds WAL back (pg_replication_slots, max_wal_size, a slow archiver); \
-             WAL is freed at the next checkpoint once nothing needs it (do not remove the \
-             volume: it holds the database)"
+             once nothing needs it, WAL is freed or recycled at the next checkpoint (do not \
+             remove the volume: it holds the database)"
                 .into(),
         )
     } else {
@@ -1444,6 +1802,186 @@ mod tests {
     }
 
     #[test]
+    fn shell_comments_name_no_hosts() {
+        for (command, expected) in [
+            (
+                "curl -T %p https://live/wal/%f # old https://retired/wal/",
+                &["live"][..],
+            ),
+            ("curl -T %p https://live/wal/%f #https://retired", &["live"]),
+            (
+                "# https://retired\ncurl -T %p https://live/wal/%f",
+                &["live"],
+            ),
+            ("curl -T %p https://live/wal/%f # $(cat /secret)", &["live"]),
+            ("curl -T %p https://live/wal/%f # `x` ${Y}", &["live"]),
+            ("curl -T %p https://live/wal#frag", &["live"]),
+            ("curl -T %p '#' https://live/wal", &["live"]),
+            ("curl -T %p \"#\" https://live/wal", &["live"]),
+            (
+                "curl -T %p \"https://live/#x\" \\#https://escaped",
+                &["live"],
+            ),
+            (
+                "curl -T %p https://live/wal/%f # x\ncurl https://next",
+                &["live", "next"],
+            ),
+            // Expansions outside a comment still stop host lookups.
+            ("curl https://live/$(x) # https://retired", &[]),
+        ] {
+            assert_eq!(analyze_archive_command(command).1, expected, "{command}");
+        }
+        assert_eq!(analyze_archive_command("# curl https://x").0, "***");
+    }
+
+    #[test]
+    fn program_after_assignments_and_redirections() {
+        for (command, program) in [
+            (
+                "PGPASSWORD=$(cat /run/secrets/pg) archive-wal %p",
+                "archive-wal",
+            ),
+            (
+                "TOKEN=${TOKEN:-x} A=`cat /k` B=\"$(printf '%s' ')')\" curl -T %p",
+                "curl",
+            ),
+            ("X='a b' Y=\"c d\" rsync %p backup::wal", "rsync"),
+            ("2>/dev/null curl -T %p https://minio/wal/%f", "curl"),
+            ("2> /dev/null curl -T %p", "curl"),
+            (
+                ">>/var/log/archive.log 2>&1 /usr/bin/curl -T %p",
+                "/usr/bin/curl",
+            ),
+            ("&>/dev/null curl -T %p", "curl"),
+            ("&>> log <%p curl -T -", "curl"),
+            ("A=1 >/dev/null B=2 wal-g wal-push %p", "wal-g"),
+            ("curl >/dev/null -T %p", "curl"),
+            // Fails closed.
+            ("X='unclosed curl -T %p", "***"),
+            ("X=$(cat /secret curl -T %p", "***"),
+            ("2> curl", "***"),
+            (">", "***"),
+            ("$(which curl) -T %p", "***"),
+            ("cu$X -T %p", "***"),
+            ("'KEY=value' SECRET", "***"),
+            ("; curl", "***"),
+            ("<<EOF curl", "***"),
+            ("", "***"),
+        ] {
+            assert_eq!(analyze_archive_command(command).0, program, "{command}");
+        }
+        // Redirections never name a host, and the program after one is
+        // still the program.
+        assert_eq!(
+            analyze_archive_command("2>/dev/null https://program x https://store").1,
+            ["store"]
+        );
+    }
+
+    #[test]
+    fn hosts_inside_nested_shell_words() {
+        for (command, expected) in [
+            ("sh -c 'curl -T %p https://minio/wal/%f'", &["minio"][..]),
+            ("bash -lc \"curl -T %p https://minio/wal/%f\"", &["minio"]),
+            (
+                "/bin/sh -c 'test ! -f x && curl -T %p https://minio/wal/%f'",
+                &["minio"],
+            ),
+            (
+                "sh -c 'curl -T %p https://minio/wal/%f # https://retired'",
+                &["minio"],
+            ),
+            (
+                "sh -c 'curl --referer https://old -T %p https://store/wal/%f'",
+                &["store"],
+            ),
+            ("sh -c 'X=https://assigned curl https://store'", &["store"]),
+            ("sh -c 'https://program https://store'", &["store"]),
+            (
+                "ssh backup 'sh -c \"curl -T - https://minio/wal/%f\"'",
+                &["minio"],
+            ),
+            // Bounded depth.
+            ("sh -c 'sh -c \"sh -c \\\"curl https://deep\\\"\"'", &[]),
+            // Expansions anywhere stop host lookups.
+            ("sh -c 'curl -T %p https://minio/$(cat /k)'", &[]),
+            ("sh -c 'curl -T %p https://minio/${K}'", &[]),
+            ("sh -c 'curl -T %p https://minio/`k`'", &[]),
+            ("sh -c 'curl https://minio/\\$(k)'", &[]),
+            ("sh -c '$''(k) https://minio'", &[]),
+        ] {
+            assert_eq!(analyze_archive_command(command).1, expected, "{command}");
+        }
+        assert_eq!(
+            analyze_archive_command("sh -c 'curl -T %p https://minio/wal/%f'").0,
+            "sh"
+        );
+    }
+
+    #[test]
+    fn only_curl_destination_operands_name_hosts() {
+        for (command, expected) in [
+            ("curl --url=https://archive/wal/%f -T %p", &["archive"][..]),
+            ("curl --url https://archive/wal/%f -T %p", &["archive"]),
+            ("curl --url archive:9000 -T %p", &["archive"]),
+            (
+                "curl --referer https://old-archive -T %p https://store/wal/%f",
+                &["store"],
+            ),
+            (
+                "curl --referer=https://old-archive -T %p https://store/wal/%f",
+                &["store"],
+            ),
+            (
+                "curl -e https://old-archive -T %p https://store/wal/%f",
+                &["store"],
+            ),
+            (
+                "curl -ehttps://old-archive -T %p https://store/wal/%f",
+                &["store"],
+            ),
+            (
+                "curl --proxy-user 'https://SECRET' -T %p https://store/wal/%f",
+                &["store"],
+            ),
+            (
+                "curl -U https://SECRET -T %p https://store/wal/%f",
+                &["store"],
+            ),
+            (
+                "curl -Uhttps://SECRET -T %p https://store/wal/%f",
+                &["store"],
+            ),
+            (
+                "curl -A https://agent -H 'Origin: https://origin' https://store",
+                &["store"],
+            ),
+            (
+                "curl --header 'Origin: https://origin' https://store",
+                &["store"],
+            ),
+            (
+                "curl -b https://cookie -x http://proxy:3128 https://store",
+                &["store"],
+            ),
+            (
+                "curl --proxy http://proxy:3128 --oauth2-bearer https://t https://store",
+                &["store"],
+            ),
+            (
+                "curl -d https://body -F f=https://form https://store",
+                &["store"],
+            ),
+            // Other programs keep these letters' own meanings.
+            ("wget -b https://store/wal/%f", &["store"]),
+            ("wget -H https://store/wal/%f", &["store"]),
+            ("wget --referer=https://old https://store", &["store"]),
+        ] {
+            assert_eq!(analyze_archive_command(command).1, expected, "{command}");
+        }
+    }
+
+    #[test]
     fn settings_from_the_command_line() {
         let args: Vec<String> = [
             "postgres",
@@ -1455,10 +1993,154 @@ mod tests {
         ]
         .map(String::from)
         .to_vec();
-        let s = command_settings(&args);
+        for path in [
+            "",
+            "docker-entrypoint.sh",
+            "/usr/local/bin/docker-entrypoint.sh",
+        ] {
+            let s = command_settings(path, &args);
+            assert_eq!(s["archive_mode"], "on");
+            assert_eq!(s["archive_timeout"], "10s");
+            assert_eq!(s["archive_command"], "curl -T %p http://s3test:9000/%f");
+        }
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn settings_only_from_a_postgres_command_line() {
+        // Docker `Cmd` options for the official entrypoint, which adds `postgres`.
+        let s = command_settings("docker-entrypoint.sh", &strings(&["-c", "archive_mode=on"]));
         assert_eq!(s["archive_mode"], "on");
-        assert_eq!(s["archive_timeout"], "10s");
-        assert_eq!(s["archive_command"], "curl -T %p http://s3test:9000/%f");
+        for (path, args) in [
+            (
+                "docker-entrypoint.sh",
+                &["postgres", "-c", "archive_mode=on"][..],
+            ),
+            (
+                "",
+                &[
+                    "/usr/lib/postgresql/17/bin/postgres",
+                    "-c",
+                    "archive_mode=on",
+                ],
+            ),
+            ("env", &["postmaster", "-c", "archive_mode=on"]),
+            (
+                "tini",
+                &["docker-entrypoint.sh", "postgres", "-c", "archive_mode=on"],
+            ),
+        ] {
+            assert_eq!(
+                command_settings(path, &strings(args))
+                    .get("archive_mode")
+                    .map(String::as_str),
+                Some("on"),
+                "{path} {args:?}"
+            );
+        }
+        let script = "archive_command=curl https://SECRET; archive_mode=on; \
+                      exec docker-entrypoint.sh postgres -c archive_mode=on";
+        for (path, args) in [
+            ("docker-entrypoint.sh", &["sh", "-c", script][..]),
+            ("docker-entrypoint.sh", &["/bin/bash", "-lc", script]),
+            ("docker-entrypoint.sh", &["env", "sh", "-c", script]),
+            ("sh", &["-c", script]),
+            ("/bin/dash", &["-c", script]),
+            ("/usr/bin/env", &["-S", script]),
+            ("env", &["sh", "-c", script]),
+            ("tini", &["--", "sh", "-c", script]),
+            ("/start.sh", &["archive_mode=on"]),
+            ("sh", &["postgres", "-c", "archive_mode=on"]),
+        ] {
+            assert!(
+                command_settings(path, &strings(args)).is_empty(),
+                "{path} {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_keep_only_the_archive_settings() {
+        let s = command_settings(
+            "",
+            &strings(&[
+                "postgres",
+                "-c",
+                "primary_conninfo=host=primary password=SECRET",
+                "--shared-buffers=1GB",
+                "-carchive_command=pgbackrest archive-push %p",
+            ]),
+        );
+        assert_eq!(
+            s.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["archive_command"]
+        );
+        assert!(!s.contains_key("primary_conninfo"));
+    }
+
+    #[test]
+    fn archive_timeout_reads_like_postgres() {
+        for (value, expected) in [
+            ("0", Some("0")),
+            ("10s", Some("10s")),
+            ("+60s", Some("+60s")),
+            ("1e2s", Some("1e2s")),
+            ("1E2", Some("1E2")),
+            ("1e+2 s", Some("1e+2 s")),
+            ("10. ms", Some("10. ms")),
+            ("10.", Some("10.")),
+            (".5min", Some(".5min")),
+            ("1.5min", Some("1.5min")),
+            ("1.5 min", Some("1.5 min")),
+            (" 10s ", Some("10s")),
+            ("10\ts", Some("10\ts")),
+            ("010", Some("010")),
+            ("0x1e", Some("0x1e")),
+            ("500us", Some("500us")),
+            ("1h", Some("1h")),
+            ("12427d", Some("12427d")),
+            ("1073741823", Some("1073741823")),
+            ("1073741823s", Some("1073741823s")),
+            ("1073741823.4", Some("1073741823.4")),
+            ("17895697min", Some("17895697min")),
+            ("-0", Some("-0")),
+            ("-0.4", Some("-0.4")),
+            // Outside 0 ..= INT_MAX / 2 seconds.
+            ("-10s", None),
+            ("-1", None),
+            ("1073741824", None),
+            ("1073741823.5", None),
+            ("17895698min", None),
+            ("12428d", None),
+            ("1e10", None),
+            ("1e999", None),
+            ("1e-400", None),
+            // Not a number with a time unit.
+            ("", None),
+            ("s", None),
+            ("+", None),
+            (".", None),
+            ("e2", None),
+            ("1e", None),
+            ("08", None),
+            ("0x1.8p1", None),
+            ("10S", None),
+            ("10 sec", None),
+            ("10kB", None),
+            ("10s x", None),
+            ("10s; SECRET=timeout", None),
+            ("inf", None),
+            ("nan", None),
+        ] {
+            assert_eq!(
+                archive_timeout_value(value).as_deref(),
+                expected,
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
@@ -1532,6 +2214,16 @@ mod tests {
             Some("000000010000000000000097")
         );
         assert!(s.failed_command.unwrap().contains("http://s3test:9000"));
+        // A newer failure without a file name of its own clears the older one.
+        let s = scan_log(&format!(
+            "{log}2026-11-13T02:11:00Z 2026-11-13 02:11:00.000 UTC [61] LOG:  archive command failed with exit code 6\n"
+        ));
+        assert_eq!(s.failures, 3);
+        assert_eq!(
+            s.last_failure.unwrap().format(&Rfc3339).unwrap(),
+            "2026-11-13T02:11:00Z"
+        );
+        assert_eq!(s.last_failed_wal, None);
         // Postgres's own prefix when Docker adds none.
         let s = scan_log(
             "2026-11-13 02:09:00.100 UTC [61] LOG:  archive command failed with exit code 1",
