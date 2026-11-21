@@ -91,20 +91,30 @@ pub(crate) fn short_id(id: &str) -> String {
     id.trim_start_matches("sha256:").chars().take(12).collect()
 }
 
-fn image_tags(img: &Image) -> impl Iterator<Item = &str> {
-    img.repo_tags
-        .iter()
-        .flatten()
+/// An image's tags, without the `<none>:<none>` placeholder.
+fn real_tags(tags: &[String]) -> impl Iterator<Item = &str> {
+    tags.iter()
         .map(String::as_str)
         .filter(|t| *t != "<none>:<none>")
+}
+
+fn image_tags(img: &Image) -> impl Iterator<Item = &str> {
+    real_tags(img.repo_tags.as_deref().unwrap_or_default())
+}
+
+/// The label an image's findings' pseudo-paths use: its first tag (other
+/// than `<none>:<none>`), else its short id. Snapshots record the same
+/// tags, so explain names a saved image with this too.
+pub(crate) fn image_label_from_tags(tags: &[String], id: &str) -> String {
+    real_tags(tags)
+        .next()
+        .map_or_else(|| short_id(id), str::to_string)
 }
 
 /// An image's label, as its findings' pseudo-paths use it: its first tag,
 /// else its short id.
 pub(crate) fn image_label(img: &Image) -> String {
-    image_tags(img)
-        .next()
-        .map_or_else(|| short_id(&img.id), str::to_string)
+    image_label_from_tags(img.repo_tags.as_deref().unwrap_or_default(), &img.id)
 }
 
 /// Whether `label` names `img`: one of its tags, or its short id when it
@@ -175,17 +185,7 @@ pub fn object_id(snap: &Snapshot, path: &str) -> Option<String> {
     if let Some(label) = path.strip_prefix("docker://image/") {
         snap.images()
             .iter()
-            .find(|img| {
-                match img
-                    .repo_tags
-                    .iter()
-                    .flatten()
-                    .find(|t| t.as_str() != "<none>:<none>")
-                {
-                    Some(tag) => tag == label,
-                    None => short_id(&img.id) == label,
-                }
-            })
+            .find(|img| image_label(img) == label)
             .map(|img| img.id.clone())
     } else if let Some(name) = path.strip_prefix("docker://container/") {
         snap.containers()
@@ -234,17 +234,12 @@ fn images(snap: &Snapshot, ctx: &DetectContext) -> Vec<Finding> {
         if unique < MIN_BYTES {
             continue;
         }
-        let tags: Vec<&str> = img
-            .repo_tags
-            .iter()
-            .flatten()
-            .map(String::as_str)
-            .filter(|t| *t != "<none>:<none>")
-            .collect();
-        let (label, targets): (String, Vec<&str>) = if tags.is_empty() {
-            (short_id(&img.id), vec![img.id.as_str()])
+        let tags: Vec<&str> = image_tags(img).collect();
+        let label = image_label(img);
+        let targets: Vec<&str> = if tags.is_empty() {
+            vec![img.id.as_str()]
         } else {
-            (tags[0].to_string(), tags.clone())
+            tags.clone()
         };
         let mut reason = if tags.is_empty() {
             format!("untagged (dangling) image {label}, not used by any container")

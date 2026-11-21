@@ -707,6 +707,11 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
             (p, Some(ScanTree::default()), Some(only), None)
         }
         Place::Path(p) => {
+            // Docker detectors never claim a filesystem path: don't wait on the daemon.
+            let only = explain::filesystem_selection(args.detectors.as_deref());
+            if only.is_empty() {
+                notes.push("no filesystem detector selected (--detectors)".into());
+            }
             let abs = std::path::absolute(&p)?;
             let input = abs.to_str().ok_or(UTF8_PATH)?;
             let (path, walked) = match scan::absolute_nofollow(&abs) {
@@ -725,11 +730,9 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
                         allocated: totals.allocated,
                         apparent: totals.apparent,
                     });
-                    (path, Some(tree), args.detectors.clone(), issue)
+                    (path, Some(tree), Some(only), issue)
                 }
-                Err(e) if saved.is_some() => {
-                    (path, None, args.detectors.clone(), Some(e.to_string()))
-                }
+                Err(e) if saved.is_some() => (path, None, Some(only), Some(e.to_string())),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -802,6 +805,7 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
             base.as_ref(),
             &generated_at,
             daemon.as_deref(),
+            saved_object.as_ref(),
         ));
     }
     let report = ExplainReport {

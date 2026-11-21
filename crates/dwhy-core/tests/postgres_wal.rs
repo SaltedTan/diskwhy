@@ -661,6 +661,62 @@ fn default_user_is_postgres() {
     assert!(fake.asked_for(&format!("psql {PG} user=postgres db=postgres")));
 }
 
+/// The `/system/df` snapshot the volume's finding came from, listing it
+/// with `created` as its `CreatedAt`.
+fn listed_with(created: &str) -> dwhy_core::docker::Snapshot {
+    let body = serde_json::json!({
+        "Volumes": [{"Name": VOLUME, "CreatedAt": created, "UsageData": {"Size": 1, "RefCount": 1}}],
+    });
+    dwhy_core::docker::Snapshot {
+        df: dwhy_core::docker::parse_system_df(&serde_json::to_vec(&body).unwrap()).unwrap(),
+        info: Default::default(),
+    }
+}
+
+fn probe_listed(fake: &Fake, listed: &dwhy_core::docker::Snapshot) -> Finding {
+    let mut f = vec![volume_finding(VOLUME)];
+    postgres_wal::probe_all_with(&mut f, fake, Some(listed));
+    f.pop().unwrap()
+}
+
+#[test]
+fn a_volume_recreated_since_it_was_listed_is_not_given_evidence() {
+    const THEN: &str = "2026-11-01T00:00:00Z";
+    let volume = format!("/volumes/{VOLUME}");
+    let mut fake = Fake::recorded("psql-failing.txt");
+
+    // `docker compose down -v && up` between /system/df and the probe.
+    fake.set_json(
+        &volume,
+        serde_json::json!({"Name": VOLUME, "CreatedAt": "2026-11-15T02:00:00Z"}),
+    );
+    assert_untouched(&probe_listed(&fake, &listed_with(THEN)));
+    assert!(fake.asked_for(&format!("GET {volume}")));
+
+    // Removed since: not confirmed either.
+    fake.gets.remove(&volume);
+    assert_untouched(&probe_listed(&fake, &listed_with(THEN)));
+
+    // Still the volume that was listed.
+    fake.set_json(
+        &volume,
+        serde_json::json!({"Name": VOLUME, "CreatedAt": THEN}),
+    );
+    let f = probe_listed(&fake, &listed_with(THEN));
+    assert_eq!(evidence(&f).container, "pgwal-postgres-1");
+
+    // No creation time recorded or given: nothing to compare, as before.
+    fake.set_json(&volume, serde_json::json!({"Name": VOLUME}));
+    assert!(probe_listed(&fake, &listed_with(THEN)).evidence.is_some());
+    let fake = Fake::recorded("psql-failing.txt");
+    assert!(probe_listed(&fake, &listed_with("")).evidence.is_some());
+    assert!(
+        !fake.asked_for("GET /volumes/"),
+        "{:?}",
+        fake.asked.borrow()
+    );
+}
+
 #[test]
 fn other_findings_are_left_alone() {
     let fake = Fake::recorded("psql-failing.txt");

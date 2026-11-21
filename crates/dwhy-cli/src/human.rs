@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use dwhy_core::apply::{self, action_kind_name, guard_status_name, tier_name};
+use dwhy_core::explain;
 use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{
     ActionKind, ApplyOutcome, ApplyReport, Change, ChangeKind, DetectorAvailability, DiffReport,
@@ -355,7 +356,7 @@ pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
     if let Some(ev) = f.evidence.as_ref().and_then(|e| e.postgres_wal.as_ref()) {
         writeln!(w)?;
         writeln!(w, "evidence ({}):", postgres_wal::NAME)?;
-        writeln!(w, "  {}", postgres_wal::summary(ev))?;
+        writeln!(w, "  {}", postgres_wal::headline(ev))?;
         for n in &ev.notes {
             writeln!(w, "  note: {n}")?;
         }
@@ -373,14 +374,21 @@ pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
     }
 
     writeln!(w)?;
-    match &f.growth {
-        Some(g) => writeln!(
+    // A withheld comparison is the reason on the growth line, not a note.
+    let withheld = r
+        .notes
+        .iter()
+        .find_map(|n| explain::withheld_growth(n))
+        .filter(|_| f.growth.is_none());
+    match (&f.growth, withheld) {
+        (Some(g), _) => writeln!(
             w,
             "growth: {}/day since {}",
             signed(g.bytes_per_day),
             g.since
         )?,
-        None => writeln!(
+        (None, Some(reason)) => writeln!(w, "growth: unknown ({reason})")?,
+        (None, None) => writeln!(
             w,
             "growth: unknown (no eligible snapshot (one filesystem, at least an hour old) lists this finding)"
         )?,
@@ -396,7 +404,13 @@ pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
     if let Some(how) = &f.recovery.how {
         writeln!(w, "  how:  {how}")?;
     }
-    render_notes(w, &r.notes)
+    let notes: Vec<String> = r
+        .notes
+        .iter()
+        .filter(|n| withheld.is_none() || explain::withheld_growth(n).is_none())
+        .cloned()
+        .collect();
+    render_notes(w, &notes)
 }
 
 fn render_notes(w: &mut impl Write, notes: &[String]) -> io::Result<()> {
@@ -1025,6 +1039,113 @@ mod tests {
             lines[reason + 2],
             "postgres-wal: psql in pg-1, archive_mode on, archive_timeout 10s, last archived \
              2026-11-07T07:25:00Z, last failed 2026-11-13T02:10:00Z, archive target s3test exited"
+        );
+    }
+
+    fn explain_report(f: Finding, notes: Vec<String>) -> ExplainReport {
+        ExplainReport {
+            schema: SCHEMA.into(),
+            tool: Tool::current(),
+            host: "h".into(),
+            uid: 1000,
+            generated_at: "2026-11-15T00:00:00Z".into(),
+            query: f.path.clone(),
+            resolved: ExplainResolved {
+                via: ExplainVia::Path,
+                snapshot: None,
+            },
+            path: f.path.clone(),
+            finding: Some(f),
+            gone: false,
+            size: None,
+            inside: vec![],
+            notes,
+        }
+    }
+
+    fn render(r: &ExplainReport) -> String {
+        let mut out = Vec::new();
+        render_explain(&mut out, r).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn explain_shows_api_only_evidence_notes_once() {
+        let mut f = finding(
+            "docker-volume",
+            "docker://volume/pg",
+            30 << 30,
+            Tier::Review,
+            ActionKind::Advice,
+        );
+        let note = "psql not used: docker exec failed; fallback reads command-line settings and up to 200 log lines";
+        f.probe = Some("postgres-wal".into());
+        f.evidence = Some(Evidence {
+            postgres_wal: Some(PostgresWal {
+                container: "pg-1".into(),
+                wal_bytes: None,
+                data_bytes: None,
+                failed_count: Some(3),
+                last_archived_at: None,
+                last_failed_at: None,
+                last_failed_wal: None,
+                archive_mode: Some("on".into()),
+                archive_program: None,
+                archive_timeout: None,
+                targets: vec![],
+                unmatched_hosts: 0,
+                source: EvidenceSource::ApiOnly,
+                notes: vec![note.into()],
+            }),
+        });
+        let text = render(&explain_report(f, vec![]));
+        assert_eq!(text.matches(note).count(), 1, "{text}");
+        assert!(
+            text.contains("  api-only in pg-1, archive_mode on\n"),
+            "{text}"
+        );
+        assert!(text.contains(&format!("  note: {note}\n")), "{text}");
+    }
+
+    #[test]
+    fn explain_gives_the_reason_growth_was_withheld() {
+        let f = || {
+            finding(
+                "docker-container",
+                "docker://container/worker",
+                5 << 30,
+                Tier::Review,
+                ActionKind::Command,
+            )
+        };
+        let withheld = "growth not computed: container worker was a different object in the snapshot of 2026-11-14T00:00:00Z";
+        let other = "renamed: now worker";
+        let text = render(&explain_report(f(), vec![other.into(), withheld.into()]));
+        assert!(
+            text.contains(
+                "growth: unknown (container worker was a different object in the snapshot of 2026-11-14T00:00:00Z)\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("no eligible snapshot"), "{text}");
+        assert!(!text.contains("note: growth not computed"), "{text}");
+        assert!(text.contains(&format!("note: {other}")), "{text}");
+
+        let omitted = "growth omitted: the daemon did not report this volume's creation time, so its identity can't be confirmed";
+        let text = render(&explain_report(f(), vec![omitted.into()]));
+        assert!(
+            text.contains(
+                "growth: unknown (the daemon did not report this volume's creation time, so its identity can't be confirmed)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("note:"), "{text}");
+
+        // Without a withheld note, the usual reason.
+        let text = render(&explain_report(f(), vec![]));
+        assert!(
+            text.contains("growth: unknown (no eligible snapshot"),
+            "{text}"
         );
     }
 
