@@ -1,1 +1,1 @@
-201326592128849018801794708590onaws --endpoint-url http://s3test:9000 s3 cp %p s3://wal/%f10s
+201326592128849018801794708590onaws --endpoint-url http://s3test:9000 s3 cp %p s3://wal/%f10s/var/lib/postgresql/data0

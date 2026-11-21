@@ -31,6 +31,8 @@ fn json(name: &str) -> Value {
 struct Fake {
     gets: HashMap<String, Result<Vec<u8>, GetError>>,
     psql: Result<String, PsqlError>,
+    /// psql replies for particular containers, ahead of `psql`.
+    psql_for: HashMap<String, Result<String, PsqlError>>,
     asked: RefCell<Vec<String>>,
 }
 
@@ -41,6 +43,7 @@ impl Fake {
         let mut f = Fake {
             gets: HashMap::new(),
             psql: Ok(String::from_utf8(data(psql)).unwrap()),
+            psql_for: HashMap::new(),
             asked: RefCell::new(Vec::new()),
         };
         f.set_json("/containers/json?all=1", json("containers.json"));
@@ -90,6 +93,36 @@ impl Fake {
         self.gets.remove(&format!("/containers/{id}/json"));
     }
 
+    /// Adds a running copy of the Postgres container as `id` and `name`,
+    /// listed ahead of it.
+    fn add_copy_of_postgres(&mut self, id: &str, name: &str) {
+        let mut listed = self.gets["/containers/json?all=1"].clone().unwrap();
+        let list: Vec<Value> = serde_json::from_slice(&listed).unwrap();
+        let mut copy = list.iter().find(|c| c["Id"] == PG).unwrap().clone();
+        copy["Id"] = id.into();
+        copy["Names"] = serde_json::json!([format!("/{name}")]);
+        let mut all = vec![copy];
+        all.extend(list);
+        listed = serde_json::to_vec(&all).unwrap();
+        self.gets
+            .insert("/containers/json?all=1".into(), Ok(listed));
+        let mut inspect: Value = serde_json::from_slice(
+            self.gets[&format!("/containers/{PG}/json")]
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        inspect["Id"] = id.into();
+        inspect["Name"] = format!("/{name}").into();
+        self.set_json(&format!("/containers/{id}/json"), inspect);
+        let logs = format!("/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}");
+        let tail = self.gets[&logs].clone();
+        self.gets.insert(
+            format!("/containers/{id}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}"),
+            tail,
+        );
+    }
+
     fn asked_for(&self, prefix: &str) -> bool {
         self.asked.borrow().iter().any(|a| a.starts_with(prefix))
     }
@@ -108,7 +141,10 @@ impl Docker for Fake {
         self.asked
             .borrow_mut()
             .push(format!("psql {id} user={user} db={db}"));
-        self.psql.clone()
+        self.psql_for
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| self.psql.clone())
     }
 }
 
@@ -145,6 +181,15 @@ fn volume_finding(name: &str) -> Finding {
             how: None,
         },
     }
+}
+
+/// Replaces field `i` of the recorded psql row.
+fn set_field(fake: &mut Fake, i: usize, value: &str) {
+    let sep = postgres_wal::FIELD_SEP;
+    let output = fake.psql.as_ref().unwrap().trim_end().to_string();
+    let mut fields: Vec<&str> = output.split(sep).collect();
+    fields[i] = value;
+    fake.psql = Ok(fields.join(&sep.to_string()) + "\n");
 }
 
 fn probe(fake: &Fake) -> Finding {
@@ -348,7 +393,7 @@ fn fallback_notes_export_only_psql_failure_categories() {
         (Err(PsqlError::Failed), "psql failed"),
         (
             Ok(format!(
-                "permission denied for tenant_a{sep}0{sep}0{sep}{sep}{sep}{sep}on{sep}aws{sep}1s"
+                "permission denied for tenant_a{sep}0{sep}0{sep}{sep}{sep}{sep}on{sep}aws{sep}1s{sep}{sep}/var/lib/postgresql/data{sep}0"
             )),
             "psql failed",
         ),
@@ -479,6 +524,9 @@ fn api_only_takes_the_command_from_the_log_when_the_command_line_has_none() {
     assert_eq!(ev.archive_program.as_deref(), Some("aws"));
     assert_eq!(ev.targets[0].host, "s3test");
     assert_eq!(ev.failed_count, Some(3));
+    // Nothing confirms the logged command is still configured.
+    assert!(ev.historical_command);
+    assert_eq!(f.action, volume_finding(VOLUME).action);
 }
 
 #[test]
@@ -644,6 +692,7 @@ fn custom_pgdata_below_the_mount_point() {
         env.retain(|e| !e.as_str().unwrap().starts_with("PGDATA="));
         env.push("PGDATA=/srv/pg/16/data".into());
     });
+    set_field(&mut fake, 10, "/srv/pg/16/data");
     assert_eq!(evidence(&probe(&fake)).source, EvidenceSource::Psql);
 
     // The same mount without PGDATA: the default data directory is elsewhere.
@@ -780,7 +829,7 @@ fn heavy_wal_without_failures_gets_advice() {
     let mut fake = Fake::recorded("psql-healthy.txt");
     let s = '\x1f';
     fake.psql = Ok(format!(
-        "8589934592{s}104857600{s}0{s}1794708590{s}{s}{s}on{s}/bin/true{s}0\n"
+        "8589934592{s}104857600{s}0{s}1794708590{s}{s}{s}on{s}/bin/true{s}0{s}{s}/var/lib/postgresql/data{s}\n"
     ));
     let f = probe(&fake);
     assert!(
@@ -1121,7 +1170,7 @@ fn archiver_events_within_one_second_preserve_order() {
     ] {
         let mut fake = Fake::recorded("psql-healthy.txt");
         fake.psql = Ok(format!(
-            "8589934592{s}104857600{s}151{s}{success}{s}{failure}{s}{s}on{s}/bin/true{s}0\n"
+            "8589934592{s}104857600{s}151{s}{success}{s}{failure}{s}{s}on{s}/bin/true{s}0{s}{s}/var/lib/postgresql/data{s}0\n"
         ));
         let f = probe(&fake);
         assert_eq!(postgres_wal::failing(evidence(&f)), failing);
@@ -1372,15 +1421,9 @@ fn multiline_failed_log_command_does_not_hide_expansions() {
             assert_eq!(ev.targets.len(), expected_targets);
             assert_eq!(ev.unmatched_hosts, 0);
             assert!(!serde_json::to_string(&f).unwrap().contains("TOKEN_SECRET"));
-            if expected_targets == 0 {
-                assert_eq!(f.action, volume_finding(VOLUME).action);
-            } else {
-                assert!(
-                    f.action
-                        .text
-                        .starts_with("restore the archive target s3test;")
-                );
-            }
+            // Only the log names the command: historical, so no repair.
+            assert!(ev.historical_command);
+            assert_eq!(f.action, volume_finding(VOLUME).action);
         }
     }
 }
@@ -1498,20 +1541,21 @@ fn every_archive_command_source_exports_only_program_and_hosts() {
                         ]);
                     } else {
                         v["Args"] = serde_json::json!(["postgres"]);
-                        v["Config"]["Tty"] = true.into();
                     }
+                    v["Config"]["Tty"] = true.into();
                 });
-                if source == "log" {
-                    let log = format!(
-                        "2026-11-13T02:10:00Z LOG: archive command failed with exit code 6\n2026-11-13T02:10:00Z DETAIL: The failed archive command was: {command}\n"
-                    );
-                    fake.gets.insert(
-                        format!(
-                            "/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}"
-                        ),
-                        Ok(log.into_bytes()),
-                    );
-                }
+                // The log names the command as Postgres ran it.
+                let wal = "000000010000000000000097";
+                let ran = command
+                    .replace("%p", &format!("pg_wal/{wal}"))
+                    .replace("%f", wal);
+                let log = format!(
+                    "2026-11-13T02:10:00Z LOG: archive command failed with exit code 6\n2026-11-13T02:10:00Z DETAIL: The failed archive command was: {ran}\n"
+                );
+                fake.gets.insert(
+                    format!("/containers/{PG}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}"),
+                    Ok(log.into_bytes()),
+                );
             }
             let f = probe(&fake);
             let report = serde_json::to_string(&f).unwrap();
@@ -1535,7 +1579,11 @@ fn every_archive_command_source_exports_only_program_and_hosts() {
                 "{source}"
             );
             assert_eq!(evidence(&f).unmatched_hosts, unmatched, "{source}");
-            if host == "s3test" {
+            assert_eq!(evidence(&f).historical_command, source == "log", "{source}");
+            if source == "log" {
+                assert!(!f.reason.contains("(target"), "{}", f.reason);
+                assert_eq!(f.action, volume_finding(VOLUME).action);
+            } else if host == "s3test" {
                 assert!(f.reason.contains("target s3test"), "{}", f.reason);
             } else if host.is_empty() {
                 assert!(!f.reason.contains("(target"), "{}", f.reason);
@@ -1758,7 +1806,7 @@ fn the_psql_query_only_reads_inside_a_read_only_transaction() {
     let sql = postgres_wal::QUERY;
     // One statement.
     assert!(!sql.contains(';'));
-    // Nine columns, in the order parse_psql reads them.
+    // Twelve columns, in the order parse_psql reads them.
     let columns = select_list(sql);
     let expected = [
         "pg_catalog.pg_ls_waldir()",
@@ -1770,6 +1818,9 @@ fn the_psql_query_only_reads_inside_a_read_only_transaction() {
         "pg_catalog.current_setting('archive_mode')",
         "pg_catalog.current_setting('archive_command')",
         "pg_catalog.current_setting('archive_timeout')",
+        "pg_catalog.current_setting('archive_library', true)",
+        "pg_catalog.current_setting('data_directory')",
+        "pg_catalog.pg_ls_archive_statusdir()",
     ];
     assert_eq!(columns.len(), expected.len(), "{columns:?}");
     for (column, want) in columns.iter().zip(expected) {
@@ -1790,6 +1841,7 @@ fn the_psql_query_only_reads_inside_a_read_only_transaction() {
                 matches!(
                     name,
                     "pg_ls_waldir"
+                        | "pg_ls_archive_statusdir"
                         | "pg_database_size"
                         | "pg_database"
                         | "pg_stat_archiver"
@@ -1839,4 +1891,506 @@ fn the_psql_query_only_reads_inside_a_read_only_transaction() {
             "{w}"
         );
     }
+}
+
+const SIDECAR: &str = "dd44000000000000000000000000000000000000000000000000000000000004";
+const LOGS: &str = "logs?stdout=1&stderr=1&timestamps=1&tail=200";
+
+/// Edits the Postgres container's listing and inspection alike.
+fn edit_postgres(fake: &mut Fake, edit: impl Fn(&mut Value)) {
+    fake.edit_listed(PG, &edit);
+    fake.edit(&format!("/containers/{PG}/json"), &edit);
+}
+
+fn set_env(fake: &mut Fake, id: &str, key: &str, value: &str) {
+    fake.edit(&format!("/containers/{id}/json"), |v| {
+        let env = v["Config"]["Env"].as_array_mut().unwrap();
+        env.retain(|e| !e.as_str().unwrap().starts_with(&format!("{key}=")));
+        env.push(format!("{key}={value}").into());
+    });
+}
+
+fn probe_volumes(fake: &Fake, names: &[&str]) -> Vec<Finding> {
+    let mut f: Vec<Finding> = names.iter().map(|n| volume_finding(n)).collect();
+    postgres_wal::probe_all(&mut f, fake);
+    f
+}
+
+#[test]
+fn pgdata_with_dot_dot_matches_the_mount_it_names() {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    edit_postgres(&mut fake, |v| {
+        v["Mounts"] = serde_json::json!([
+            {"Type": "volume", "Name": "old-data", "Destination": "/var/lib/postgresql/old"},
+            {"Type": "volume", "Name": VOLUME, "Destination": "/var/lib/postgresql//live/"},
+        ]);
+    });
+    set_env(&mut fake, PG, "PGDATA", "/var/lib/postgresql/old/../live");
+    set_field(&mut fake, 10, "/var/lib/postgresql/./live");
+    let found = probe_volumes(&fake, &[VOLUME, "old-data"]);
+    assert_eq!(evidence(&found[0]).source, EvidenceSource::Psql);
+    assert_eq!(found[1], volume_finding("old-data"));
+
+    // Read lexically, `old/..` is `old`'s parent; `old/../old` is `old`.
+    set_env(&mut fake, PG, "PGDATA", "/var/lib/postgresql/live/../old");
+    set_field(&mut fake, 10, "/var/lib/postgresql/old");
+    let found = probe_volumes(&fake, &[VOLUME, "old-data"]);
+    assert_eq!(found[0], volume_finding(VOLUME));
+    assert_eq!(evidence(&found[1]).container, "pgwal-postgres-1");
+}
+
+#[test]
+fn the_container_where_psql_answers_wins_over_a_sidecar() {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    fake.add_copy_of_postgres(SIDECAR, "pgwal-sidecar-1");
+    fake.psql_for.insert(SIDECAR.into(), Err(PsqlError::Exec));
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert_eq!(ev.source, EvidenceSource::Psql);
+    assert_eq!(ev.container, "pgwal-postgres-1");
+    // The sidecar, listed first, was tried before.
+    assert!(fake.asked_for(&format!("psql {SIDECAR}")));
+    assert!(fake.asked_for(&format!("psql {PG}")));
+
+    // When no psql answers, the first container's API-only evidence.
+    fake.psql = Err(PsqlError::Failed);
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert_eq!(ev.source, EvidenceSource::ApiOnly);
+    assert_eq!(ev.container, "pgwal-sidecar-1");
+    assert!(fake.asked_for(&format!("GET /containers/{SIDECAR}/{LOGS}")));
+}
+
+#[test]
+fn a_server_whose_data_directory_is_on_another_mount_is_skipped() {
+    // psql answers, but the server keeps its data on /srv/other.
+    for other_mount in [true, false] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        if other_mount {
+            edit_postgres(&mut fake, |v| {
+                v["Mounts"].as_array_mut().unwrap().push(serde_json::json!({
+                    "Type": "volume", "Name": "other", "Destination": "/srv/other"
+                }));
+            });
+        }
+        set_field(&mut fake, 10, "/srv/other");
+        let found = probe_volumes(&fake, &[VOLUME, "other"]);
+        assert_eq!(found[0], volume_finding(VOLUME), "{other_mount}");
+        // Nor is the other volume at PGDATA: it gets nothing either.
+        assert_eq!(found[1], volume_finding("other"), "{other_mount}");
+    }
+
+    // A second container whose server is on the volume still gives evidence.
+    let mut fake = Fake::recorded("psql-failing.txt");
+    fake.add_copy_of_postgres(SIDECAR, "pgwal-sidecar-1");
+    let mut elsewhere = fake.psql.clone().unwrap();
+    elsewhere = elsewhere.replace("/var/lib/postgresql/data", "/srv/other");
+    fake.psql_for.insert(SIDECAR.into(), Ok(elsewhere));
+    assert_eq!(evidence(&probe(&fake)).container, "pgwal-postgres-1");
+
+    // Without psql, the command line's data_directory says the same.
+    for option in ["-c", "--data-directory=/srv/other"] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        fake.psql = Err(PsqlError::Exec);
+        fake.edit(&format!("/containers/{PG}/json"), |v| {
+            let args = v["Args"].as_array_mut().unwrap();
+            if option == "-c" {
+                args.extend(["-c".into(), "data_directory=/srv/other".into()]);
+            } else {
+                args.push(option.into());
+            }
+        });
+        assert_untouched(&probe(&fake));
+        assert!(!fake.asked_for(&format!("GET /containers/{PG}/{LOGS}")));
+    }
+
+    // A data_directory on the volume, however spelled, is kept.
+    let mut fake = Fake::recorded("psql-failing.txt");
+    fake.psql = Err(PsqlError::Exec);
+    fake.edit(&format!("/containers/{PG}/json"), |v| {
+        let args = v["Args"].as_array_mut().unwrap();
+        args.extend([
+            "-c".into(),
+            "data_directory=/var/lib/postgresql/data/../data".into(),
+        ]);
+    });
+    assert_eq!(evidence(&probe(&fake)).source, EvidenceSource::ApiOnly);
+}
+
+/// The healthy fixture with heavy WAL and the given fields replaced.
+fn heavy(fields: &[(usize, &str)]) -> Fake {
+    let mut fake = Fake::recorded("psql-healthy.txt");
+    set_field(&mut fake, 0, "8589934592");
+    set_field(&mut fake, 1, "104857600");
+    for (i, value) in fields {
+        set_field(&mut fake, *i, value);
+    }
+    fake
+}
+
+#[test]
+fn archiving_on_with_nothing_set_to_archive() {
+    for command in ["", "   "] {
+        let fake = heavy(&[(7, command)]);
+        let f = probe(&fake);
+        let ev = evidence(&f);
+        assert_eq!(ev.archive_program, None);
+        assert_eq!(ev.archive_library, None);
+        assert!(postgres_wal::no_archiver(ev));
+        assert!(
+            f.reason
+                .contains("archiving is on but neither archive_command nor archive_library is set"),
+            "{}",
+            f.reason
+        );
+        assert!(!f.reason.contains("reports no failure"), "{}", f.reason);
+        assert!(
+            f.action
+                .text
+                .starts_with("set archive_command or archive_library, or turn archive_mode off"),
+            "{}",
+            f.action.text
+        );
+        assert!(f.action.text.contains("do not remove the volume"));
+    }
+    // An old failure does not turn it into a repair either.
+    let fake = heavy(&[(2, "5"), (4, "1794708600"), (7, "")]);
+    let f = probe(&fake);
+    assert!(
+        f.action.text.starts_with("set archive_command"),
+        "{}",
+        f.action.text
+    );
+
+    // Without heavy WAL, the detector's advice stands.
+    let mut fake = Fake::recorded("psql-healthy.txt");
+    set_field(&mut fake, 7, "");
+    let f = probe(&fake);
+    assert!(f.reason.contains("neither archive_command"), "{}", f.reason);
+    assert_eq!(f.action, volume_finding(VOLUME).action);
+}
+
+#[test]
+fn a_failing_archive_library_needs_the_configured_archiver_repaired() {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    set_field(&mut fake, 7, "");
+    set_field(&mut fake, 9, "basic_archive");
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert_eq!(ev.archive_library.as_deref(), Some("basic_archive"));
+    assert_eq!(ev.archive_program, None);
+    assert!(f.reason.contains("archiving is failing"), "{}", f.reason);
+    assert!(
+        f.action
+            .text
+            .starts_with("repair the configured archiver so archiving succeeds;"),
+        "{}",
+        f.action.text
+    );
+    assert!(postgres_wal::headline(ev).contains("archive_library basic_archive"));
+
+    // Healthy with a library: not "nothing set to archive".
+    let fake = heavy(&[(7, ""), (9, "basic_archive"), (11, "")]);
+    let f = probe(&fake);
+    assert!(!postgres_wal::no_archiver(evidence(&f)));
+    assert!(
+        f.action.text.contains("pg_replication_slots"),
+        "{}",
+        f.action.text
+    );
+
+    // The library's name is exported only when it is a plain word.
+    let mut fake = Fake::recorded("psql-failing.txt");
+    set_field(&mut fake, 7, "");
+    set_field(&mut fake, 9, "lib SECRET");
+    let f = probe(&fake);
+    assert_eq!(evidence(&f).archive_library.as_deref(), Some("***"));
+    assert!(!serde_json::to_string(&f).unwrap().contains("SECRET"));
+}
+
+#[test]
+fn a_ready_backlog_without_recorded_failures_is_reported() {
+    // An archiver that crashes (exit above 125) is not counted.
+    let fake = heavy(&[(11, "481")]);
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert_eq!(ev.ready_wal_files, Some(481));
+    assert!(
+        f.reason.contains(
+            "481 WAL files wait to be archived and nothing archived since 2026-11-15T02:09:50Z; \
+             pg_stat_archiver does not count archiver crashes"
+        ),
+        "{}",
+        f.reason
+    );
+    assert!(!f.reason.contains("reports no failure"), "{}", f.reason);
+    assert!(
+        f.action
+            .text
+            .starts_with("check for a crashing or slow archiver"),
+        "{}",
+        f.action.text
+    );
+    assert!(postgres_wal::headline(ev).contains("481 WAL files ready to archive"));
+
+    let fake = heavy(&[(3, ""), (11, "481")]);
+    assert!(probe(&fake).reason.contains("and nothing archived yet"));
+
+    // No backlog: something else holds the WAL.
+    let f = probe(&heavy(&[(11, "0")]));
+    assert!(
+        f.reason.contains("no WAL files wait to be archived"),
+        "{}",
+        f.reason
+    );
+    assert!(f.action.text.contains("pg_replication_slots"));
+
+    // A backlog without heavy WAL is not a diagnosis.
+    let mut fake = Fake::recorded("psql-healthy.txt");
+    set_field(&mut fake, 11, "3");
+    let f = probe(&fake);
+    assert!(
+        f.reason.contains("the archiver reports no failure;"),
+        "{}",
+        f.reason
+    );
+    assert_eq!(f.action, volume_finding(VOLUME).action);
+}
+
+#[test]
+fn wal_on_another_mount_is_labelled_cluster_level() {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    edit_postgres(&mut fake, |v| {
+        v["Mounts"].as_array_mut().unwrap().push(serde_json::json!({
+            "Type": "volume", "Name": "pg-wal", "Destination": "/var/lib/postgresql/wal"
+        }));
+    });
+    set_env(
+        &mut fake,
+        PG,
+        "POSTGRES_INITDB_WALDIR",
+        "/var/lib/postgresql/wal",
+    );
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert!(ev.wal_on_other_mount);
+    assert!(
+        ev.notes
+            .iter()
+            .any(|n| n.starts_with("pg_wal is on another mount (POSTGRES_INITDB_WALDIR)")),
+        "{:?}",
+        ev.notes
+    );
+    assert!(
+        f.reason.starts_with(
+            "cluster pg_wal (on another mount) holds 29.0G vs 53.0M data; archiving is failing"
+        ),
+        "{}",
+        f.reason
+    );
+    assert!(!postgres_wal::wal_heavy(ev));
+    // The WAL is not what fills this volume: the detector's advice stands.
+    assert_eq!(f.action, volume_finding(VOLUME).action);
+    assert!(
+        serde_json::to_value(&f).unwrap()["evidence"]["postgres_wal"]["wal_on_other_mount"] == true
+    );
+
+    // A WAL directory inside the volume, or unset, is not another mount.
+    for dir in ["/var/lib/postgresql/data/../data/wal", ""] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        set_env(&mut fake, PG, "POSTGRES_INITDB_WALDIR", dir);
+        let f = probe(&fake);
+        assert!(!evidence(&f).wal_on_other_mount, "{dir:?}");
+        assert!(
+            f.action
+                .text
+                .starts_with("restore the archive target s3test;")
+        );
+        assert!(
+            serde_json::to_value(&f).unwrap()["evidence"]["postgres_wal"]
+                .get("wal_on_other_mount")
+                .is_none()
+        );
+    }
+}
+
+/// API-only evidence with `command` on the command line (when given) and
+/// a log tail whose failure names `logged`.
+fn api_only_with(command: Option<&str>, logged: &str) -> Fake {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    fake.psql = Err(PsqlError::Exec);
+    fake.edit(&format!("/containers/{PG}/json"), |v| {
+        let mut args = vec![serde_json::json!("postgres")];
+        args.extend(["-c".into(), "archive_mode=on".into()]);
+        if let Some(command) = command {
+            args.extend(["-c".into(), format!("archive_command={command}").into()]);
+        }
+        v["Args"] = args.into();
+        v["Config"]["Tty"] = true.into();
+    });
+    let log = format!(
+        "2026-11-13T02:10:00Z LOG: archive command failed with exit code 6\n\
+         2026-11-13T02:10:00Z DETAIL: The failed archive command was: {logged}\n"
+    );
+    fake.gets
+        .insert(format!("/containers/{PG}/{LOGS}"), Ok(log.into_bytes()));
+    fake
+}
+
+const WAL: &str = "000000010000000000000097";
+
+#[test]
+fn a_logged_command_matching_the_configured_one_is_confirmed() {
+    let fake = api_only_with(
+        Some("curl -T %p http://s3test:9000/wal/%f"),
+        &format!("curl -T pg_wal/{WAL} http://s3test:9000/wal/{WAL}"),
+    );
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert!(!ev.historical_command);
+    assert_eq!(ev.archive_program.as_deref(), Some("curl"));
+    assert_eq!(ev.targets[0].state, "exited");
+    assert!(!f.reason.contains("historical"), "{}", f.reason);
+    assert!(
+        f.action
+            .text
+            .starts_with("restore the archive target s3test;"),
+        "{}",
+        f.action.text
+    );
+    assert!(
+        !serde_json::to_value(&f).unwrap()["evidence"]["postgres_wal"]
+            .as_object()
+            .unwrap()
+            .contains_key("historical_command")
+    );
+}
+
+#[test]
+fn a_multiline_command_line_archive_command_confirms_its_tab_continued_log_detail() {
+    for (command, tail) in [
+        (
+            "curl -T %p http://s3test:9000/wal/%f \\\n--fail",
+            "\t--fail",
+        ),
+        ("curl -T %p http://s3test:9000/wal/%f\n&& sync", "\t&& sync"),
+    ] {
+        let first = command
+            .lines()
+            .next()
+            .unwrap()
+            .replace("%p", &format!("pg_wal/{WAL}"));
+        let first = first.replace("%f", WAL);
+        let fake = api_only_with(
+            Some(command),
+            &format!("{first}\n2026-11-13T02:10:00Z {tail}"),
+        );
+        let f = probe(&fake);
+        let ev = evidence(&f);
+        assert!(!ev.historical_command, "{command:?}: {:?}", ev.notes);
+        assert_eq!(ev.archive_program.as_deref(), Some("curl"));
+        assert_eq!(ev.targets[0].host, "s3test");
+        assert!(
+            f.action
+                .text
+                .starts_with("restore the archive target s3test;"),
+            "{}",
+            f.action.text
+        );
+    }
+}
+
+#[test]
+fn stderr_after_the_logged_command_is_not_part_of_it() {
+    let fake = api_only_with(
+        Some("curl -T %p http://s3test:9000/wal/%f"),
+        &format!(
+            "curl -T pg_wal/{WAL} http://s3test:9000/wal/{WAL}\n\
+             2026-11-13T02:10:01Z curl: (7) Failed to connect to s3test port 9000"
+        ),
+    );
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert!(!ev.historical_command, "{:?}", ev.notes);
+    assert!(
+        f.action
+            .text
+            .starts_with("restore the archive target s3test;"),
+        "{}",
+        f.action.text
+    );
+}
+
+#[test]
+fn a_reconfigured_archive_command_makes_logged_failures_historical() {
+    // The command line now archives to s3test (exited); the failures in
+    // the tail were for a command since replaced.
+    let fake = api_only_with(
+        Some("curl -T %p http://s3test:9000/wal/%f"),
+        &format!("curl -T pg_wal/{WAL} http://old-archive:9000/wal/{WAL}"),
+    );
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert!(ev.historical_command);
+    assert_eq!(ev.failed_count, Some(1));
+    // Evidence from the configured command is kept.
+    assert_eq!(ev.archive_program.as_deref(), Some("curl"));
+    assert_eq!(ev.targets[0].host, "s3test");
+    assert!(
+        ev.notes
+            .iter()
+            .any(|n| n.contains("differs from the command line's archive_command")),
+        "{:?}",
+        ev.notes
+    );
+    assert!(f.reason.contains("possibly historical"), "{}", f.reason);
+    assert!(!f.reason.contains("(target"), "{}", f.reason);
+    assert_eq!(f.action, volume_finding(VOLUME).action);
+    assert!(!serde_json::to_string(&f).unwrap().contains("old-archive"));
+
+    // An empty archive_command on the command line: nothing archives now.
+    let fake = api_only_with(
+        Some(""),
+        &format!("curl -T pg_wal/{WAL} http://s3test:9000/wal/{WAL}"),
+    );
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert!(ev.historical_command);
+    assert!(
+        ev.notes.iter().any(|n| n.contains("empty archive_command")),
+        "{:?}",
+        ev.notes
+    );
+    // The logged command still says where it went.
+    assert_eq!(ev.targets[0].host, "s3test");
+    assert_eq!(f.action, volume_finding(VOLUME).action);
+}
+
+#[test]
+fn a_command_only_in_the_log_is_historical_evidence() {
+    let fake = api_only_with(
+        None,
+        &format!("curl -T pg_wal/{WAL} http://s3test:9000/wal/{WAL}"),
+    );
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert!(ev.historical_command);
+    assert_eq!(ev.archive_program.as_deref(), Some("curl"));
+    assert_eq!(ev.targets[0].state, "exited");
+    assert!(
+        ev.notes
+            .iter()
+            .any(|n| n.contains("comes from the log tail only")),
+        "{:?}",
+        ev.notes
+    );
+    assert!(
+        f.reason.contains(
+            "possibly historical (the logged archive command is not confirmed as configured)"
+        ),
+        "{}",
+        f.reason
+    );
+    assert!(postgres_wal::summary(ev).contains("log tail only"));
+    assert_eq!(f.action, volume_finding(VOLUME).action);
 }

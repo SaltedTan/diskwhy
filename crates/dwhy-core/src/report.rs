@@ -417,10 +417,34 @@ pub struct PostgresWal {
     pub source: EvidenceSource,
     #[serde(default)]
     pub notes: Vec<String>,
+    /// `archive_library` (Postgres 15+), with the same character rules as
+    /// [`archive_program`](Self::archive_program) (`***` when it breaks
+    /// them). Absent when unset or unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_library: Option<String>,
+    /// WAL files waiting to be archived (`.ready` files in
+    /// `pg_wal/archive_status`). Only with `psql`; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_wal_files: Option<u64>,
+    /// True when `pg_wal` lives on another mount than the volume
+    /// (`POSTGRES_INITDB_WALDIR`): `wal_bytes` is then the cluster's WAL,
+    /// not bytes in this volume. Absent when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub wal_on_other_mount: bool,
+    /// With `api-only`: true when the failed command in the log tail is not
+    /// confirmed as the configured `archive_command` (the container's
+    /// command line sets none, an empty one or a different one), so the
+    /// logged failures may be historical. Absent when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub historical_command: bool,
 }
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

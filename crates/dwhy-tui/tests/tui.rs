@@ -757,6 +757,10 @@ fn pg_volume_finding() -> Finding {
             unmatched_hosts: 0,
             source: EvidenceSource::Psql,
             notes: vec!["archive target s3test is a stopped container".into()],
+            archive_library: None,
+            ready_wal_files: None,
+            wal_on_other_mount: false,
+            historical_command: false,
         },
     );
     f
