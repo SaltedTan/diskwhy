@@ -221,6 +221,83 @@ impl ToolVersions {
         }
     }
 
+    fn rustup_home(&self, ctx: &DetectContext) -> Option<PathBuf> {
+        self.dir(ctx, "RUSTUP_HOME", ".rustup")
+    }
+
+    fn uv_python_dir(&self, ctx: &DetectContext) -> Option<PathBuf> {
+        self.var("UV_PYTHON_INSTALL_DIR")
+            .or_else(|| self.xdg_data(ctx).map(|d| d.join("uv/python")))
+    }
+
+    fn pyenv_root(&self, ctx: &DetectContext) -> Option<PathBuf> {
+        self.dir(ctx, "PYENV_ROOT", ".pyenv")
+    }
+
+    fn nvm_dir(&self, ctx: &DetectContext) -> Option<PathBuf> {
+        self.dir(ctx, "NVM_DIR", ".nvm")
+    }
+
+    fn fnm_dir(&self, ctx: &DetectContext) -> Option<PathBuf> {
+        self.var("FNM_DIR")
+            .or_else(|| self.xdg_data(ctx).map(|d| d.join("fnm")))
+    }
+
+    fn vscode_roots(&self, ctx: &DetectContext) -> Vec<PathBuf> {
+        match self.var("VSCODE_AGENT_FOLDER") {
+            Some(p) => vec![p],
+            None => match &ctx.home {
+                Some(h) => vec![h.join(".vscode-server"), h.join(".vscode-server-insiders")],
+                None => Vec::new(),
+            },
+        }
+    }
+
+    fn claude_versions(&self, ctx: &DetectContext) -> Option<PathBuf> {
+        self.xdg_data(ctx).map(|d| d.join("claude/versions"))
+    }
+
+    fn codex_standalone(&self, home: &Path) -> PathBuf {
+        self.var("CODEX_HOME")
+            .unwrap_or_else(|| home.join(".codex"))
+            .join("packages/standalone")
+    }
+
+    /// The directories each kind of version is read from, with how many
+    /// levels below one a version it reports lies. Walking the one that
+    /// holds a version gives the detector what it compares the version
+    /// with: its siblings, and for VS Code Server the folder holding
+    /// `cli/servers/<name>`, `bin/<commit>` and the `code-<commit>` files.
+    /// `dwhy explain` walks from here when a path lies inside one.
+    pub fn context_roots(&self, ctx: &DetectContext) -> Vec<(PathBuf, usize)> {
+        let mut out: Vec<(PathBuf, usize)> = [
+            self.rustup_home(ctx).map(|r| r.join("toolchains")),
+            self.uv_python_dir(ctx),
+            self.pyenv_root(ctx).map(|r| r.join("versions")),
+            self.nvm_dir(ctx).map(|r| r.join("versions/node")),
+            self.fnm_dir(ctx).map(|r| r.join("node-versions")),
+            go_sdk_dir(ctx),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|d| (d, 1))
+        .collect();
+        out.extend(self.vscode_roots(ctx).into_iter().map(|d| (d, 3)));
+        if let Some(home) = &ctx.home {
+            out.extend(
+                [
+                    self.claude_versions(ctx),
+                    Some(self.codex_standalone(home).join("releases")),
+                    Some(home.join(".t3/runtime/versions")),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|d| (d, 1)),
+            );
+        }
+        out
+    }
+
     fn rustup(
         &self,
         tree: &ScanTree,
@@ -229,7 +306,7 @@ impl ToolVersions {
         home_scanned: bool,
         out: &mut Vec<Candidate>,
     ) {
-        let Some(root) = self.dir(ctx, "RUSTUP_HOME", ".rustup") else {
+        let Some(root) = self.rustup_home(ctx) else {
             return;
         };
         let installs = installs_in(tree, &root.join("toolchains"), rust_group);
@@ -291,10 +368,7 @@ impl ToolVersions {
         home_scanned: bool,
         out: &mut Vec<Candidate>,
     ) {
-        let Some(root) = self
-            .var("UV_PYTHON_INSTALL_DIR")
-            .or_else(|| self.xdg_data(ctx).map(|d| d.join("uv/python")))
-        else {
+        let Some(root) = self.uv_python_dir(ctx) else {
             return;
         };
         let installs = installs_in(tree, &root, uv_group);
@@ -429,7 +503,7 @@ impl ToolVersions {
         home_scanned: bool,
         out: &mut Vec<Candidate>,
     ) {
-        let Some(root) = self.dir(ctx, "PYENV_ROOT", ".pyenv") else {
+        let Some(root) = self.pyenv_root(ctx) else {
             return;
         };
         let versions = root.join("versions");
@@ -492,7 +566,7 @@ impl ToolVersions {
         home_scanned: bool,
         out: &mut Vec<Candidate>,
     ) {
-        let Some(root) = self.dir(ctx, "NVM_DIR", ".nvm") else {
+        let Some(root) = self.nvm_dir(ctx) else {
             return;
         };
         let installs = installs_in(tree, &root.join("versions/node"), node_group);
@@ -548,10 +622,7 @@ impl ToolVersions {
         home_scanned: bool,
         out: &mut Vec<Candidate>,
     ) {
-        let Some(root) = self
-            .var("FNM_DIR")
-            .or_else(|| self.xdg_data(ctx).map(|d| d.join("fnm")))
-        else {
+        let Some(root) = self.fnm_dir(ctx) else {
             return;
         };
         let installs = installs_in(tree, &root.join("node-versions"), node_group);
@@ -601,7 +672,7 @@ impl ToolVersions {
     }
 
     fn go_sdk(&self, tree: &ScanTree, ctx: &DetectContext, out: &mut Vec<Candidate>) {
-        let Some(root) = ctx.home.as_ref().map(|h| h.join("sdk")) else {
+        let Some(root) = go_sdk_dir(ctx) else {
             return;
         };
         let installs = installs_in(tree, &root, |name| {
@@ -652,14 +723,7 @@ impl ToolVersions {
     }
 
     fn vscode(&self, tree: &ScanTree, ctx: &DetectContext, out: &mut Vec<Candidate>) {
-        let roots: Vec<PathBuf> = match self.var("VSCODE_AGENT_FOLDER") {
-            Some(p) => vec![p],
-            None => match &ctx.home {
-                Some(h) => vec![h.join(".vscode-server"), h.join(".vscode-server-insiders")],
-                None => return,
-            },
-        };
-        for root in roots {
+        for root in self.vscode_roots(ctx) {
             if tree.find(&root).is_none() {
                 continue;
             }
@@ -722,29 +786,25 @@ impl ToolVersions {
             return;
         };
         let running = OnceCell::new();
-        if let Some(data) = self.xdg_data(ctx) {
-            // One executable file per version (a directory is accepted too).
-            let dir = data.join("claude/versions");
-            if is_scanned_dir(tree, &dir) {
-                let group = |name: &str| num_version(name).map(|v| (String::new(), v));
-                let mut installs = only_grouped(installs_in(tree, &dir, group));
-                installs.extend(files_in(&dir, group));
-                installs.sort_by(|a, b| a.name.cmp(&b.name));
-                let current = link_name(&home.join(".local/bin/claude"));
-                self.agent_versions(
-                    &installs,
-                    current.as_deref(),
-                    "Claude Code",
-                    "the version ~/.local/bin/claude runs",
-                    &running,
-                    out,
-                );
-            }
+        // One executable file per version (a directory is accepted too).
+        if let Some(dir) = self.claude_versions(ctx)
+            && is_scanned_dir(tree, &dir)
+        {
+            let group = |name: &str| num_version(name).map(|v| (String::new(), v));
+            let mut installs = only_grouped(installs_in(tree, &dir, group));
+            installs.extend(files_in(&dir, group));
+            installs.sort_by(|a, b| a.name.cmp(&b.name));
+            let current = link_name(&home.join(".local/bin/claude"));
+            self.agent_versions(
+                &installs,
+                current.as_deref(),
+                "Claude Code",
+                "the version ~/.local/bin/claude runs",
+                &running,
+                out,
+            );
         }
-        let codex = self
-            .var("CODEX_HOME")
-            .unwrap_or_else(|| home.join(".codex"))
-            .join("packages/standalone");
+        let codex = self.codex_standalone(home);
         let installs = only_grouped(installs_in(tree, &codex.join("releases"), version_group));
         let current = link_name(&codex.join("current"));
         self.agent_versions(
@@ -861,6 +921,11 @@ impl ToolVersions {
         };
         Some(Candidate::new(t.path.clone(), finding))
     }
+}
+
+/// Where `golang.org/dl` downloads Go SDKs.
+fn go_sdk_dir(ctx: &DetectContext) -> Option<PathBuf> {
+    ctx.home.as_ref().map(|h| h.join("sdk"))
 }
 
 const PINS_NOTE: &str =

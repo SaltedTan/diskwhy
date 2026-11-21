@@ -1189,3 +1189,107 @@ fn a_vscode_cli_that_was_a_directory_when_walked_is_never_planned_as_a_file() {
         format!("changed since the scan: {conflict}")
     );
 }
+
+/// What `dwhy explain` relies on: every version a scan of the home reports
+/// is also reported by a walk of only the context root holding it, which
+/// is within that root's reach.
+#[test]
+fn context_roots_hold_every_reported_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = fs::canonicalize(temp.path()).unwrap();
+    let home = home.as_path();
+    rustup_home(
+        home,
+        &tc("stable"),
+        &[&tc("stable"), &tc("1.80.0"), &tc("1.81.0")],
+    );
+    let uv = uv_root(home);
+    for v in ["3.11.2", "3.12.15"] {
+        install(&uv.join(format!("cpython-{v}-linux-x86_64-gnu")));
+    }
+    for v in ["3.11.7", "3.12.1"] {
+        install(&home.join(".pyenv/versions").join(v));
+    }
+    for n in ["v20.10.0", "v22.11.0"] {
+        install(&home.join(".nvm/versions/node").join(n));
+        install(
+            &home
+                .join(".local/share/fnm/node-versions")
+                .join(n)
+                .join("installation"),
+        );
+    }
+    install(&home.join("sdk/go1.20.1"));
+    install(&home.join("sdk/go1.21.1"));
+    let vscode = home.join(".vscode-server");
+    for c in [C1, C2] {
+        install(&vscode.join(format!("cli/servers/Stable-{c}")));
+        install(&vscode.join(format!("bin/{c}")));
+        file(&vscode.join(format!("code-{c}")), 2 * MB);
+    }
+    text(
+        &vscode.join("cli/servers/lru.json"),
+        &format!("[\"Stable-{C2}\"]"),
+    );
+    let old = SystemTime::now() - Duration::from_secs(30 * 86_400);
+    let legacy = vscode.join(format!("bin/{C1}"));
+    for p in [legacy.join("bin/tool"), legacy.join("bin"), legacy.clone()] {
+        fs::File::open(&p).unwrap().set_modified(old).unwrap();
+    }
+    for v in ["2.1.9", "2.1.10"] {
+        file(&home.join(".local/share/claude/versions").join(v), 2 * MB);
+    }
+    for v in ["0.160.0", "0.169.0"] {
+        install(
+            &home
+                .join(".codex/packages/standalone/releases")
+                .join(format!("{v}-x86_64-unknown-linux-musl")),
+        );
+    }
+    for n in ["0.1.9-nightly.1", "0.1.10-nightly.2"] {
+        install(&home.join(".t3/runtime/versions").join(n));
+    }
+
+    let d = ToolVersions::with_env(Vec::<(String, String)>::new()).with_running_exes(Vec::new());
+    let found = run(&d, home, home, &[]);
+    let kinds = [
+        ".rustup/",
+        ".local/share/uv/",
+        ".pyenv/",
+        ".nvm/",
+        ".local/share/fnm/",
+        "sdk/",
+        "cli/servers/",
+        ".vscode-server/bin/",
+        ".vscode-server/code-",
+        ".local/share/claude/",
+        ".codex/",
+        ".t3/",
+    ];
+    for k in kinds {
+        assert!(
+            found.iter().any(|f| f.path.contains(k)),
+            "nothing found for {k}: {:?}",
+            paths(&found)
+        );
+    }
+    let roots = d.context_roots(&ctx(home, &[]));
+    for f in &found {
+        let path = Path::new(&f.path);
+        let (root, _) = roots
+            .iter()
+            .filter(|(r, reach)| {
+                path.strip_prefix(r)
+                    .is_ok_and(|rest| rest.components().count() <= *reach)
+            })
+            .max_by_key(|(r, _)| r.components().count())
+            .unwrap_or_else(|| panic!("no context root holds {}", f.path));
+        let again = run(&d, root, home, &[]);
+        assert!(
+            again.iter().any(|g| g.id == f.id),
+            "{} not found from {}",
+            f.path,
+            root.display()
+        );
+    }
+}

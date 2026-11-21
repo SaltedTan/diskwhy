@@ -994,7 +994,7 @@ pub struct ExplainReport {
     /// matches. Omitted when the path has no measurement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<ExplainSize>,
-    /// Findings at or below `path`, when `finding` is `None`; largest first.
+    /// Findings below `path`, when `finding` is `None`; largest first.
     #[serde(default)]
     pub inside: Vec<FindingRef>,
     /// Detectors that did not run or failed, and other caveats.
@@ -1027,9 +1027,9 @@ pub struct ExplainSnapshot {
     pub created_at: String,
 }
 
-/// Allocated and apparent bytes attributed to the queried path in the walk.
-/// Each hardlinked inode is counted once in the walk at its lexicographically
-/// smallest scanned path, which can lie outside the query.
+/// Allocated and apparent bytes of the queried path, as `du -s` of that
+/// path alone gives them: each hardlinked inode inside it is counted once,
+/// even when it also has a link elsewhere in the wider walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainSize {
     pub allocated: u64,
