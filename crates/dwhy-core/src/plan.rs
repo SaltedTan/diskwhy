@@ -27,7 +27,7 @@ use crate::report::{
     ActionKind, FileIdentity, Finding, Fingerprint, GitFingerprint, GuardResult, GuardStatus, Plan,
     PlanItem, PlanScan, PlanSelection, SCHEMA, Tier, Tool, check_schema,
 };
-use crate::tree::{Markers, ScanTree, TreeNode};
+use crate::tree::{Markers, NodeId, ScanTree, TreeNode};
 
 /// The guard that blocks a finding whose live root differs from the measured root.
 const CHANGED_SINCE_SCAN: &str = "changed-since-scan";
@@ -214,7 +214,12 @@ pub fn build(
     let largest = |a: &Finding, b: &Finding| b.bytes.cmp(&a.bytes).then_with(|| a.id.cmp(&b.id));
     items.sort_by(|a, b| largest(&a.finding, &b.finding));
     blocked.sort_by(largest);
-    let bytes = items_bytes(&items);
+    let bytes = distinct_bytes_in_tree(
+        tree,
+        items
+            .iter()
+            .map(|i| (i.finding.path.as_str(), i.finding.bytes)),
+    );
     Ok(Plan {
         schema: SCHEMA.into(),
         tool: Tool::current(),
@@ -233,15 +238,6 @@ pub fn build(
     })
 }
 
-/// The bytes of the items, leaving out any item inside another item.
-fn items_bytes(items: &[PlanItem]) -> u64 {
-    distinct_bytes(
-        items
-            .iter()
-            .map(|i| (i.finding.path.as_str(), i.finding.bytes)),
-    )
-}
-
 /// The sum of `(path, bytes)` pairs, leaving out any pair whose absolute
 /// path lies inside another pair's: an outer finding's bytes already hold
 /// those of findings nested in it. Pseudo-paths (`docker://…`) never nest.
@@ -256,6 +252,45 @@ pub fn distinct_bytes<'a>(items: impl IntoIterator<Item = (&'a str, u64)>) -> u6
                     .any(|(o, _)| o.is_absolute() && o != p && p.starts_with(o))
         })
         .map(|(_, b)| b)
+        .sum()
+}
+
+/// [`distinct_bytes`] for findings of the scan in `tree`: a pair is left
+/// out only when it also lies inside another pair in the tree, below that
+/// pair's node. A scan root mounted below another root (scanned as its own
+/// root because a one-filesystem walk does not enter it) is not inside the
+/// outer root's node, so its bytes count on their own. A path the tree has
+/// no node for (a single file) is placed at its nearest ancestor in the
+/// tree; paths the tree does not cover at all nest by path, as in
+/// [`distinct_bytes`].
+pub fn distinct_bytes_in_tree<'a>(
+    tree: &ScanTree,
+    items: impl IntoIterator<Item = (&'a str, u64)>,
+) -> u64 {
+    let items: Vec<(&Path, u64, Option<NodeId>)> = items
+        .into_iter()
+        .map(|(p, b)| {
+            let p = Path::new(p);
+            let at = p
+                .is_absolute()
+                .then(|| p.ancestors().find_map(|a| tree.find(a)))
+                .flatten();
+            (p, b, at)
+        })
+        .collect();
+    let inside = |inner: Option<NodeId>, outer: Option<NodeId>| match (inner, outer) {
+        (Some(i), Some(o)) => tree.is_within(i, o),
+        _ => true,
+    };
+    items
+        .iter()
+        .filter(|(p, _, at)| {
+            !p.is_absolute()
+                || !items.iter().any(|(o, _, o_at)| {
+                    o.is_absolute() && o != p && p.starts_with(o) && inside(*at, *o_at)
+                })
+        })
+        .map(|(_, b, _)| b)
         .sum()
 }
 

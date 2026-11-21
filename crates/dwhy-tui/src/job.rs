@@ -4,7 +4,7 @@
 //! marked findings, building with core `plan::build`, and handling plan
 //! files; and applying a plan through core `apply`, as `dwhy apply` does.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
@@ -21,7 +21,8 @@ use dwhy_core::guard::Processes;
 use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection};
 use dwhy_core::report::{
-    ApplyItem, ApplyReport, DetectorRun, Finding, Plan, PlanScan, ScanReport, UnreadableReason,
+    ActionKind, ApplyItem, ApplyReport, DetectorRun, Finding, Plan, PlanScan, ScanReport,
+    UnreadableReason,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions, ScanResult};
 use dwhy_core::system;
@@ -346,7 +347,15 @@ pub struct BuiltPlan {
 #[derive(Debug)]
 pub enum UnplannedMark {
     Gone(String),
-    NotChecked { path: String, reason: String },
+    NotChecked {
+        path: String,
+        reason: String,
+    },
+    /// Still found, but its action is advice only now: nothing to plan.
+    AdviceOnly {
+        path: String,
+        reason: String,
+    },
 }
 
 impl fmt::Display for UnplannedMark {
@@ -354,6 +363,7 @@ impl fmt::Display for UnplannedMark {
         match self {
             Self::Gone(path) => write!(f, "gone since the scan: {path}"),
             Self::NotChecked { path, reason } => write!(f, "not checked: {reason} ({path})"),
+            Self::AdviceOnly { path, reason } => write!(f, "now advice-only: {reason} ({path})"),
         }
     }
 }
@@ -377,22 +387,34 @@ impl PlanJob {
             &dwhy_core::detectors::registry(),
             opts.detectors.as_deref(),
         );
-        let ids: HashSet<&str> = findings.iter().map(|f| f.id.as_str()).collect();
+        let found: HashMap<&str, &Finding> = findings.iter().map(|f| (f.id.as_str(), f)).collect();
         let mut select = Vec::new();
         let mut unplanned = Vec::new();
         for PlanMark { id, detector, path } in self.marks {
-            if ids.contains(id.as_str()) {
-                select.push(id);
+            if let Some(f) = found.get(id.as_str()) {
+                if f.action.kind == ActionKind::Advice {
+                    // `plan::select` refuses an advice-only finding named
+                    // by id, which would fail the whole build.
+                    unplanned.push(UnplannedMark::AdviceOnly {
+                        path,
+                        reason: f.action.text.clone(),
+                    });
+                } else {
+                    select.push(id);
+                }
                 continue;
             }
             let reason = match runs.iter().find(|run| run.name == detector) {
                 Some(DetectorRun {
                     error: Some(error), ..
                 }) => format!("{detector} failed: {error}"),
-                Some(run) if run.ran => {
-                    unplanned.push(UnplannedMark::Gone(path));
-                    continue;
-                }
+                Some(run) if run.ran => match not_covered(&result, Path::new(&path)) {
+                    Some(reason) => reason,
+                    None => {
+                        unplanned.push(UnplannedMark::Gone(path));
+                        continue;
+                    }
+                },
                 Some(run) => format!("{detector} did not run: {}", run.detail),
                 None => format!("{detector} did not run"),
             };
@@ -430,6 +452,64 @@ impl PlanJob {
         )?;
         Ok(BuiltPlan { plan, unplanned })
     }
+}
+
+/// Why the rescan in `result` could not have found a filesystem finding at
+/// `path`: within the walk of the deepest root above it, the path or an
+/// ancestor could not be listed, a scan error was recorded at or above it,
+/// or it lies at or below a mount point that walk did not enter. `None`
+/// when the walk covered it (or it is under no root, such as a pseudo-path
+/// like `docker://…`).
+fn not_covered(result: &ScanResult, path: &Path) -> Option<String> {
+    let root = result
+        .roots
+        .iter()
+        .map(|r| r.path.as_path())
+        .filter(|r| path.starts_with(r))
+        .max_by_key(|r| r.components().count())?;
+    let above = |p: &Path| p.starts_with(root) && path.starts_with(p);
+    if let Some(u) = result
+        .unreadable
+        .iter()
+        .find(|u| u.reason == UnreadableReason::PermissionDenied && above(&u.path))
+    {
+        return Some(format!(
+            "the rescan could not read {}",
+            u.path.to_string_lossy()
+        ));
+    }
+    if let Some(u) = result.unreadable.iter().find(|u| {
+        u.reason == UnreadableReason::EntriesDenied
+            && u.path.starts_with(root)
+            && path
+                .parent()
+                .is_some_and(|parent| parent.starts_with(&u.path))
+    }) {
+        return Some(format!(
+            "the rescan could not read every entry in {}",
+            u.path.to_string_lossy()
+        ));
+    }
+    if let Some((p, error)) = result.errors.iter().find(|(p, _)| above(p)) {
+        return Some(format!(
+            "the rescan hit an error at {}: {error}",
+            p.to_string_lossy()
+        ));
+    }
+    if result.error_count > result.errors.len() as u64 {
+        return Some("the rescan hit errors that were not all recorded".into());
+    }
+    if let Some(skip) = result
+        .skipped_mounts
+        .iter()
+        .find(|s| s.path != root && above(&s.path))
+    {
+        return Some(format!(
+            "the rescan did not enter the mount point {}",
+            skip.path.to_string_lossy()
+        ));
+    }
+    None
 }
 
 /// Reads and parses a plan file, as `dwhy apply` does.
@@ -521,6 +601,10 @@ pub struct Applied {
     /// What `dwhy apply` exits with for this report.
     pub exit: u8,
     pub audit_errors: Vec<String>,
+    /// Whether any item's action was started (a path removal called or a
+    /// command spawned). False for a dry run and when every item was left
+    /// untouched, even one that failed before dispatch.
+    pub any_dispatched: bool,
 }
 
 /// An apply that failed before running any item: what `dwhy apply` prints
@@ -609,14 +693,11 @@ impl ApplyJob {
                 audit: None,
                 exit,
                 audit_errors: Vec::new(),
+                any_dispatched: false,
             });
         }
-        let path = opts.audit_log.as_deref().ok_or_else(|| {
-            ApplyFailed::audit(
-                "cannot place the audit log: neither XDG_STATE_HOME nor HOME is an absolute path",
-            )
-        })?;
-        let mut audit = Audit::open(path).map_err(ApplyFailed::audit)?;
+        let mut audit =
+            Audit::open_placed(opts.audit_log.as_deref()).map_err(ApplyFailed::audit)?;
         let mounts = MountTable::read()
             .map_err(|e| ApplyFailed::error(format!("cannot read the mount table: {e}")))?;
         let total = checks.iter().filter(|c| c.ready()).count();
@@ -647,6 +728,7 @@ impl ApplyJob {
             audit: Some(audit.path().to_path_buf()),
             exit,
             audit_errors,
+            any_dispatched: checks.iter().any(|c| c.dispatched),
         })
     }
 }
@@ -714,13 +796,122 @@ mod tests {
     use std::sync::Arc;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use dwhy_core::report::SkipReason;
+    use dwhy_core::report::{SkipReason, Totals};
     use dwhy_core::scan::{SkippedRecord, UnreadableRecord};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     use super::*;
     use crate::{App, ui};
+
+    #[test]
+    fn a_path_the_rescan_did_not_cover_is_not_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        for d in ["denied", "partial/inner", "failed", "mounted", "fine"] {
+            fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let opts = ScanOptions {
+            threads: 2,
+            ..ScanOptions::default()
+        };
+        let mut result = scan::scan(
+            std::slice::from_ref(&root),
+            &opts,
+            &MountTable::default(),
+            &Progress::default(),
+        )
+        .unwrap();
+        let dev = result.roots[0].dev;
+        let unreadable = |path: PathBuf, reason| UnreadableRecord {
+            path,
+            dev,
+            reason,
+            entries_unknown: 1,
+            known_bytes: 0,
+            owner_uid: dwhy_core::system::euid(),
+        };
+        result.unreadable.extend([
+            unreadable(root.join("denied"), UnreadableReason::PermissionDenied),
+            unreadable(root.join("partial"), UnreadableReason::EntriesDenied),
+        ]);
+        result
+            .errors
+            .push((root.join("failed"), "I/O error".into()));
+        result.error_count = 1;
+        result.skipped_mounts.push(SkippedRecord {
+            path: root.join("mounted"),
+            parent_dev: dev,
+            fstype: Some("ext4".into()),
+            reason: SkipReason::OtherFilesystem,
+        });
+        let why = |rel: &str| not_covered(&result, &root.join(rel));
+        let r = root.to_string_lossy();
+        assert_eq!(
+            why("denied/target").as_deref(),
+            Some(format!("the rescan could not read {r}/denied").as_str())
+        );
+        assert!(why("denied").unwrap().contains("could not read"));
+        assert_eq!(
+            why("partial/inner/target").as_deref(),
+            Some(format!("the rescan could not read every entry in {r}/partial").as_str())
+        );
+        assert!(why("partial").is_none(), "partial itself was listed");
+        assert_eq!(
+            why("failed/target").as_deref(),
+            Some(format!("the rescan hit an error at {r}/failed: I/O error").as_str())
+        );
+        assert_eq!(
+            why("mounted/target").as_deref(),
+            Some(format!("the rescan did not enter the mount point {r}/mounted").as_str())
+        );
+        assert_eq!(why("fine/target"), None);
+        assert_eq!(why("failedish/target"), None, "by component, not text");
+        assert_eq!(not_covered(&result, Path::new("docker://volume/v")), None);
+        assert_eq!(not_covered(&result, Path::new("/elsewhere/target")), None);
+
+        // `mounted` scanned as its own root: the outer walk's records do
+        // not cover what the inner walk saw, but the inner walk's do.
+        result.roots.push(scan::RootResult {
+            path: root.join("mounted"),
+            dev: dev + 1,
+            totals: Totals::default(),
+        });
+        result.skipped_mounts.push(SkippedRecord {
+            path: root.join("mounted/sub"),
+            parent_dev: dev + 1,
+            fstype: Some("ext4".into()),
+            reason: SkipReason::OtherFilesystem,
+        });
+        result
+            .unreadable
+            .push(unreadable(root.clone(), UnreadableReason::EntriesDenied));
+        result.errors.push((root.clone(), "I/O error".into()));
+        result.error_count = 2;
+        let why = |rel: &str| not_covered(&result, &root.join(rel));
+        assert_eq!(why("mounted/proj/target"), None);
+        assert_eq!(why("mounted/target"), None);
+        assert_eq!(
+            why("mounted/sub/target").as_deref(),
+            Some(format!("the rescan did not enter the mount point {r}/mounted/sub").as_str())
+        );
+        assert_eq!(
+            why("fine/target").as_deref(),
+            Some(format!("the rescan could not read every entry in {r}").as_str())
+        );
+        result.unreadable.pop();
+        let why = |rel: &str| not_covered(&result, &root.join(rel));
+        assert_eq!(
+            why("fine/target").as_deref(),
+            Some(format!("the rescan hit an error at {r}: I/O error").as_str())
+        );
+        result.errors.pop();
+
+        // Errors past the recorded ones could be anywhere.
+        result.error_count = 2;
+        let why = not_covered(&result, &root.join("fine/target")).unwrap();
+        assert!(why.contains("not all recorded"), "{why}");
+    }
 
     #[test]
     fn browser_shows_directory_diagnostics_and_skipped_mounts() {

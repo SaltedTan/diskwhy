@@ -500,13 +500,6 @@ pub fn render_apply(
     audit: Option<&Path>,
     items_only: bool,
 ) -> io::Result<()> {
-    let label = |o: ApplyOutcome| match o {
-        ApplyOutcome::Removed => "removed",
-        ApplyOutcome::Failed => "FAILED",
-        ApplyOutcome::Skipped => "skipped",
-        ApplyOutcome::Refused => "refused",
-        ApplyOutcome::WouldRemove => "would remove",
-    };
     for i in &r.items {
         // An item's fields can come from a hand-edited plan file (an item
         // that is gone or does not match), and paths can hold any byte but
@@ -514,7 +507,7 @@ pub fn render_apply(
         writeln!(
             w,
             "  {:<12} {:>8}  {:<13} {}",
-            label(i.outcome),
+            apply::outcome_label(i.outcome),
             human(i.bytes),
             escape_only_controls(&i.detector),
             escape_only_controls(&i.path)
@@ -529,46 +522,7 @@ pub fn render_apply(
     if items_only {
         return Ok(());
     }
-    let count = |o| r.items.iter().filter(|i| i.outcome == o).count();
-    let mut rest = Vec::new();
-    for (o, word) in [
-        (ApplyOutcome::Failed, "failed"),
-        (ApplyOutcome::Refused, "refused"),
-        (ApplyOutcome::Skipped, "skipped"),
-    ] {
-        let n = count(o);
-        if n > 0 {
-            rest.push(format!("{n} {word}"));
-        }
-    }
-    let rest = if rest.is_empty() {
-        String::new()
-    } else {
-        format!("; {}", rest.join(", "))
-    };
-    let plural = |n: usize| if n == 1 { "" } else { "s" };
-    if r.dry_run {
-        let n = count(ApplyOutcome::WouldRemove);
-        let bytes = apply::total_bytes(
-            r.items
-                .iter()
-                .filter(|i| i.outcome == ApplyOutcome::WouldRemove),
-        );
-        writeln!(
-            w,
-            "would remove {n} item{} ({}){rest}; nothing removed",
-            plural(n),
-            human(bytes)
-        )?;
-    } else {
-        let n = count(ApplyOutcome::Removed);
-        writeln!(
-            w,
-            "removed {n} item{}, freed about {}{rest}",
-            plural(n),
-            human(r.freed)
-        )?;
-    }
+    writeln!(w, "{}", apply::summary(r))?;
     if let Some(p) = audit {
         writeln!(w, "audit log: {}", p.display())?;
     }

@@ -2151,6 +2151,201 @@ fn p_reports_a_mark_from_a_detector_that_did_not_run() {
 }
 
 #[test]
+fn p_labels_a_mark_under_an_unreadable_directory_not_checked() {
+    if is_root() {
+        return;
+    }
+    let f = crates_fixture();
+    let root = f.root();
+    let mut app = app_with(scan(&[&root]));
+    press(
+        &mut app,
+        &[
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+        ],
+    );
+    assert_eq!(marked(&app).len(), 2);
+    let lib = root.join("lib");
+    fs::set_permissions(&lib, fs::Permissions::from_mode(0o000)).unwrap();
+    let _unlock = Unlock(lib);
+
+    press(&mut app, &[KeyCode::Char('p')]);
+    run_build(&mut app, &Processes::default());
+    let plan = plan_of(&app);
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(
+        Path::new(&plan.items[0].finding.path),
+        root.join("app/target")
+    );
+    let screen = render(&mut app, 120, 40, Some(&root));
+    assert!(
+        screen.contains(&format!(
+            "not checked: the rescan could not read {ROOT_PLACEHOLDER}/lib"
+        )),
+        "{screen}"
+    );
+    assert!(!screen.contains("gone since the scan"), "{screen}");
+
+    // Only the unreadable mark: not "all gone".
+    press(
+        &mut app,
+        &[
+            KeyCode::Esc,
+            KeyCode::Home,
+            KeyCode::Char(' '),
+            KeyCode::Char('p'),
+        ],
+    );
+    assert_eq!(marked(&app), [root.join("lib/target").to_string_lossy()]);
+    run_build(&mut app, &Processes::default());
+    assert!(app.plan_view().is_none());
+    assert_eq!(view(&app), View::Findings);
+    let message = app.message.as_deref().unwrap();
+    assert!(
+        message.contains("not checked: the rescan could not read"),
+        "{message}"
+    );
+    assert!(!message.contains("gone"), "{message}");
+}
+
+#[test]
+fn p_leaves_out_a_mark_that_became_advice_only() {
+    let f = crates_fixture();
+    let root = f.root();
+    // A crate whose name is not UTF-8: its finding is advice only (as a
+    // volume a container started using would be). Make the scan's copy
+    // removable, as if it changed between the scan and `p`.
+    let lossy = root.join(OsStr::from_bytes(b"l\xffb"));
+    fs::create_dir_all(lossy.join("target/debug")).unwrap();
+    fs::write(lossy.join("Cargo.toml"), b"[package]\n").unwrap();
+    fs::write(lossy.join("target/CACHEDIR.TAG"), CARGO_TAG).unwrap();
+    fs::write(lossy.join("target/debug/out"), vec![6u8; 2 * MIB]).unwrap();
+    let mut data = scan(&[&root]);
+    let advice = data
+        .report
+        .findings
+        .iter_mut()
+        .find(|f| f.path.contains('\u{FFFD}'))
+        .unwrap();
+    assert_eq!(advice.action.kind, ActionKind::Advice);
+    let advice_text = advice.action.text.clone();
+    advice.action = Action {
+        kind: ActionKind::RemovePath,
+        text: "remove it".into(),
+        argv: None,
+    };
+    advice.tier = Tier::Rebuildable;
+    let advice_path = advice.path.clone();
+    let mut app = app_with(data);
+    press(&mut app, &[KeyCode::Tab]);
+    for p in [
+        root.join("app/target").to_string_lossy(),
+        advice_path.into(),
+    ] {
+        press(&mut app, &[KeyCode::Home]);
+        while selected_path(&app) != p {
+            press(&mut app, &[KeyCode::Down]);
+        }
+        press(&mut app, &[KeyCode::Char(' ')]);
+    }
+    assert_eq!(marked(&app).len(), 2);
+
+    press(&mut app, &[KeyCode::Char('p')]);
+    run_build(&mut app, &Processes::default());
+    let plan = plan_of(&app);
+    assert_eq!(plan.items.len(), 1, "the other mark is still planned");
+    assert_eq!(
+        Path::new(&plan.items[0].finding.path),
+        root.join("app/target")
+    );
+    let screen = render(&mut app, 120, 40, Some(&root));
+    assert!(screen.contains("now advice-only: "), "{screen}");
+
+    // Only the advice-only mark: no plan, and it says why.
+    press(&mut app, &[KeyCode::Esc, KeyCode::Home]);
+    while selected_path(&app) != root.join("app/target").to_string_lossy() {
+        press(&mut app, &[KeyCode::Down]);
+    }
+    press(&mut app, &[KeyCode::Char(' '), KeyCode::Char('p')]);
+    assert_eq!(marked(&app).len(), 1);
+    run_build(&mut app, &Processes::default());
+    assert!(app.plan_view().is_none());
+    assert_eq!(view(&app), View::Findings);
+    let message = app.message.as_deref().unwrap();
+    assert!(
+        message.starts_with(&format!("no plan: now advice-only: {advice_text}")),
+        "{message}"
+    );
+    assert!(!message.contains("gone"), "{message}");
+}
+
+#[test]
+fn marked_bytes_count_a_separately_mounted_root_on_its_own() {
+    use dwhy_core::mounts::{Mount, MountTable};
+    let f = fixture(false);
+    let outer = f.root();
+    let child = outer.join("big");
+    let sub = outer.join("mid/sub");
+    // `big` is a mount point the outer walk does not enter, scanned as
+    // its own root, as in a one-filesystem scan.
+    let mounts = MountTable {
+        mounts: vec![Mount {
+            id: 1,
+            parent: 0,
+            major: 0,
+            minor: 0,
+            mount_point: child.clone(),
+            fstype: "ext4".into(),
+            source: "/dev/fixture".into(),
+        }],
+    };
+    let opts_scan = dwhy_core::scan::ScanOptions {
+        threads: 2,
+        ..dwhy_core::scan::ScanOptions::default()
+    };
+    let result = dwhy_core::scan::scan(
+        &[outer.clone(), child.clone()],
+        &opts_scan,
+        &mounts,
+        &Progress::default(),
+    )
+    .unwrap();
+    assert_eq!(result.tree.roots().len(), 2);
+    let mut report = dwhy_core::account::system_scan_report(&result, &mounts);
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    report.findings = vec![
+        hand_finding("stale-tree", &path(&outer), 2 * GIB, Tier::Review),
+        hand_finding("stale-tree", &path(&child), GIB, Tier::Review),
+        hand_finding("cargo-target", &path(&sub), GIB / 2, Tier::Rebuildable),
+    ];
+    let mut app = app_with(Scanned {
+        report,
+        tree: result.tree,
+        marks: Default::default(),
+        growth_base: None,
+        plan_options: opts(vec![outer.clone()]),
+    });
+    press(
+        &mut app,
+        &[
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+        ],
+    );
+    assert_eq!(marked(&app), [path(&outer), path(&child)]);
+    assert_eq!(app.browser().unwrap().marked_bytes(), 3 * GIB);
+    // A directory inside the outer root's walk is in its bytes already.
+    press(&mut app, &[KeyCode::Down, KeyCode::Char(' ')]);
+    assert_eq!(marked(&app).len(), 3);
+    assert_eq!(app.browser().unwrap().marked_bytes(), 3 * GIB);
+}
+
+#[test]
 fn a_guard_blocks_a_marked_finding_in_the_plan() {
     let f = crates_fixture();
     let root = f.root();
@@ -2612,6 +2807,7 @@ fn hand_applied() -> Applied {
         audit: Some("/tmp/state/diskwhy/audit.jsonl".into()),
         exit: 3,
         audit_errors: Vec::new(),
+        any_dispatched: true,
     }
 }
 
@@ -3039,8 +3235,16 @@ fn a_plan_session_rescans_the_plans_roots_and_esc_returns_after_a_dry_run() {
 }
 
 #[test]
-fn apply_results_allow_escape_after_refusals_and_skips() {
-    for (outcome, returns) in [(ApplyOutcome::Skipped, true), (ApplyOutcome::Failed, false)] {
+fn apply_results_allow_escape_only_when_nothing_was_dispatched() {
+    // (the first item's outcome, whether any action was started, Esc returns)
+    for (outcome, dispatched, returns) in [
+        (ApplyOutcome::Skipped, false, true),
+        // Its audit `start` line could not be written: never dispatched.
+        (ApplyOutcome::Failed, false, true),
+        // Dispatched and failed: it may be partly removed.
+        (ApplyOutcome::Failed, true, false),
+        (ApplyOutcome::Removed, true, false),
+    ] {
         let mut app = dialog_app(false);
         press(
             &mut app,
@@ -3056,6 +3260,7 @@ fn apply_results_allow_escape_after_refusals_and_skips() {
         result.report.freed = 0;
         result.report.items[0].outcome = outcome;
         result.exit = dwhy_core::apply::exit_code(&result.report);
+        result.any_dispatched = dispatched;
         app.apply_done(Ok(result));
 
         let screen = render(&mut app, 80, 24, None);
@@ -3071,6 +3276,92 @@ fn apply_results_allow_escape_after_refusals_and_skips() {
             assert!(app.apply_view().is_some());
         }
     }
+}
+
+/// A scratch dir old enough for `stale-tree` (a `review` item) under a
+/// temp dir, with the options to scan it.
+fn stale_scratch() -> (tempfile::TempDir, PathBuf, Options) {
+    use std::time::{Duration, SystemTime};
+    let fixture = tempfile::tempdir().unwrap();
+    let base = fixture.path().canonicalize().unwrap();
+    let scratch = base.join("scratch");
+    fs::create_dir(&scratch).unwrap();
+    let marker = scratch.join(".dwhy-scratch");
+    let payload = scratch.join("blob");
+    fs::write(&marker, "").unwrap();
+    fs::write(&payload, vec![1u8; 2 * MIB]).unwrap();
+    let old = SystemTime::now() - Duration::from_secs(30 * 86_400);
+    for path in [&marker, &payload, &scratch] {
+        fs::File::open(path).unwrap().set_modified(old).unwrap();
+    }
+    let options = Options {
+        detectors: Some(vec!["stale-tree".into()]),
+        ..opts(vec![scratch.clone()])
+    };
+    (fixture, base, options)
+}
+
+#[test]
+fn escape_after_a_real_apply_depends_on_whether_anything_was_dispatched() {
+    use dwhy_core::apply::Env;
+    // Every write to /dev/full fails, so the audit `start` line fails.
+    if !Path::new("/dev/full").exists() {
+        return;
+    }
+    let (_fixture, base, options) = stale_scratch();
+    let scratch = base.join("scratch");
+    let env = Env::from_system();
+    let data = job::scan(&options, &Progress::default(), &mut |_| {}).unwrap();
+    let mut app = app_with(data).with_options(Options {
+        audit_log: Some("/dev/full".into()),
+        ..options
+    });
+    press(
+        &mut app,
+        &[KeyCode::Tab, KeyCode::Char(' '), KeyCode::Char('p')],
+    );
+    let plan = app
+        .take_request()
+        .unwrap()
+        .build(Processes::default, env.host.clone());
+    app.plan_built(plan, &env.host, env.uid);
+    press(
+        &mut app,
+        &[KeyCode::Char('x'), KeyCode::Char(' '), KeyCode::Char('y')],
+    );
+    let result = app
+        .take_apply()
+        .unwrap()
+        .run(Processes::default, &env)
+        .unwrap();
+    let item = &result.report.items[0];
+    assert_eq!(item.outcome, ApplyOutcome::Failed);
+    assert!(item.detail.starts_with("not run:"), "{}", item.detail);
+    assert!(!result.any_dispatched);
+    assert!(scratch.exists());
+    app.apply_done(Ok(result));
+    let screen = render(&mut app, 80, 24, None);
+    assert!(screen.contains("Esc back to the dialog"), "{screen}");
+    press(&mut app, &[KeyCode::Esc]);
+    let view = app.plan_view().expect("back in the preview");
+    assert_eq!(view.confirm.as_ref().unwrap().confirmed.len(), 1);
+
+    // With a working audit log the item is removed: Esc stays.
+    app.options.audit_log = Some(base.join("audit.jsonl"));
+    press(&mut app, &[KeyCode::Char('y')]);
+    let result = app
+        .take_apply()
+        .unwrap()
+        .run(Processes::default, &env)
+        .unwrap();
+    assert_eq!(result.report.items[0].outcome, ApplyOutcome::Removed);
+    assert!(result.any_dispatched);
+    assert!(!scratch.exists());
+    app.apply_done(Ok(result));
+    let screen = render(&mut app, 80, 24, None);
+    assert!(!screen.contains("Esc back to the dialog"), "{screen}");
+    press(&mut app, &[KeyCode::Esc]);
+    assert!(app.apply_view().is_some());
 }
 
 #[test]

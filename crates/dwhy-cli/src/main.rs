@@ -1052,9 +1052,7 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
             }
         }
     }
-    let path = Audit::default_path()
-        .ok_or("cannot place the audit log: neither XDG_STATE_HOME nor HOME is an absolute path")?;
-    let mut audit = Audit::open(&path)?;
+    let mut audit = Audit::open_placed(Audit::default_path().as_deref())?;
     let mounts = MountTable::read().map_err(|e| format!("cannot read the mount table: {e}"))?;
     let quiet = args.quiet;
     let mut status: Option<StatusLine> = None;
