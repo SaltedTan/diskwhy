@@ -2714,8 +2714,9 @@ fn q_and_ctrl_c_stop_a_running_apply_before_returning() {
 #[test]
 fn blocked_and_advice_items_are_not_counted_or_said_to_go_ahead() {
     use dwhy_core::units::human;
-    for kind in ["blocked", "advice"] {
-        // A hand-edited plan: its trash item made blocked, or advice only.
+    for kind in ["blocked", "advice", "review-advice"] {
+        // A hand-edited plan: its trash item made blocked, or advice only
+        // (in its own tier or in review, as docker-volume reports in-use volumes).
         let mut plan = hand_plan();
         let cargo = plan.items[0].finding.bytes;
         let trash = &mut plan.items[1].finding;
@@ -2725,6 +2726,9 @@ fn blocked_and_advice_items_are_not_counted_or_said_to_go_ahead() {
             _ => {
                 trash.action.kind = ActionKind::Advice;
                 trash.action.text = "empty the trash from your file manager".into();
+                if kind == "review-advice" {
+                    trash.tier = Tier::Review;
+                }
             }
         }
         let mut app = App::open_plan(plan, "/tmp/plans/dwhy-plan.json".into(), HOST, UID);
@@ -2739,11 +2743,17 @@ fn blocked_and_advice_items_are_not_counted_or_said_to_go_ahead() {
             !screen.contains(&format!("frees ≈ {}", human(both))),
             "{screen}"
         );
+        // Nothing to tick: no checkbox, no review count, no refusal note.
+        assert!(!screen.contains("[ ]"), "{screen}");
+        assert!(!screen.contains("review confirmed"), "{screen}");
+        assert!(!screen.contains("Unconfirmed review"), "{screen}");
         press(&mut app, &[KeyCode::Down]);
         let screen = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
         assert!(!screen.contains("no confirmation needed"), "{screen}");
+        assert!(!screen.contains("not confirmed"), "{screen}");
         let status = match kind {
             "blocked" => "blocked: never applied",
+            "review-advice" => "review: advice only, nothing runs",
             _ => "advice only, nothing runs",
         };
         assert!(screen.contains(status), "{screen}");
@@ -2756,6 +2766,9 @@ fn blocked_and_advice_items_are_not_counted_or_said_to_go_ahead() {
         };
         assert!(message.contains(expected), "{message}");
         assert!(confirmed(&app).is_empty());
+        let screen = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+        assert!(!screen.contains("[x]"), "{screen}");
+        assert!(!screen.contains("review: confirmed"), "{screen}");
     }
 }
 

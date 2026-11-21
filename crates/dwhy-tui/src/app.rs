@@ -684,10 +684,16 @@ pub(crate) fn dialog_policy(plan: &Plan, confirmed: &BTreeSet<String>) -> Policy
             .items
             .iter()
             .map(|i| &i.finding)
-            .filter(|f| f.tier == Tier::Review && confirmed.contains(&f.id))
+            .filter(|f| needs_review_confirm(f) && confirmed.contains(&f.id))
             .map(|f| f.id.clone())
             .collect(),
     }
+}
+
+/// Whether the confirm dialog offers `f` a tick: a review item that runs
+/// something (apply skips advice-only items whatever their tier).
+pub(crate) fn needs_review_confirm(f: &Finding) -> bool {
+    f.tier == Tier::Review && f.action.kind != ActionKind::Advice
 }
 
 /// The scanning screen's labels for `paths` (`.` when there are none).
@@ -1014,13 +1020,6 @@ impl PlanView {
             }
             KeyCode::Char(' ') if c.actions_visible && unmodified_action(key) => {
                 match items.get(c.selected).map(|i| &i.finding) {
-                    Some(f) if f.tier == Tier::Review => {
-                        if !c.confirmed.remove(&f.id) {
-                            c.confirmed.insert(f.id.clone());
-                        }
-                        c.layout = None;
-                        c.actions_visible = false;
-                    }
                     Some(f) if f.tier == Tier::Blocked => {
                         return ConfirmKey::Message(
                             "blocked items are never applied; nothing to confirm".into(),
@@ -1030,6 +1029,13 @@ impl PlanView {
                         return ConfirmKey::Message(
                             "advice only: nothing runs for this item".into(),
                         );
+                    }
+                    Some(f) if f.tier == Tier::Review => {
+                        if !c.confirmed.remove(&f.id) {
+                            c.confirmed.insert(f.id.clone());
+                        }
+                        c.layout = None;
+                        c.actions_visible = false;
                     }
                     Some(_) => {
                         return ConfirmKey::Message(

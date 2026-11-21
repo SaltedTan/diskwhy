@@ -26,7 +26,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     App, ApplyView, Browser, Confirm, FindingList, PlanState, PlanView, RootsGone, SizeMode, State,
-    View, sanitize,
+    View, needs_review_confirm, sanitize,
 };
 use crate::job::{self, ApplyStep, Mark, PermissionMark, Scanned, Stage};
 
@@ -496,15 +496,15 @@ fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: boo
     *header = std::mem::take(header).style(Style::new().add_modifier(Modifier::REVERSED));
     f.render_widget(Paragraph::new(shown), inner);
     let status = match p.items.get(c.selected).map(|i| &i.finding) {
+        Some(f) if f.tier == Tier::Blocked => "blocked: never applied".into(),
+        Some(f) if f.action.kind == ActionKind::Advice => {
+            format!("{}: advice only, nothing runs", tier_name(f.tier))
+        }
         Some(f) if f.tier == Tier::Review && c.confirmed.contains(&f.id) => {
             "review: confirmed".to_string()
         }
         Some(f) if f.tier == Tier::Review => {
             "review: not confirmed, so it is refused (Space confirms it)".into()
-        }
-        Some(f) if f.tier == Tier::Blocked => "blocked: never applied".into(),
-        Some(f) if f.action.kind == ActionKind::Advice => {
-            format!("{}: advice only, nothing runs", tier_name(f.tier))
         }
         Some(f) => format!("{}: no confirmation needed", tier_name(f.tier)),
         None => String::new(),
@@ -540,11 +540,11 @@ fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
     let plural = |n: usize| if n == 1 { "" } else { "s" };
     let reviews = items
         .iter()
-        .filter(|i| i.finding.tier == Tier::Review)
+        .filter(|i| needs_review_confirm(&i.finding))
         .count();
     let confirmed = items
         .iter()
-        .filter(|i| i.finding.tier == Tier::Review && c.confirmed.contains(&i.finding.id))
+        .filter(|i| needs_review_confirm(&i.finding) && c.confirmed.contains(&i.finding.id))
         .count();
     // What apply would run: core's tier policy for these ticks, and no
     // advice-only item (apply skips those).
@@ -581,10 +581,10 @@ fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
         let start = lines.len();
         let f = &item.finding;
         let lossy = is_lossy(&f.path);
-        let check = match f.tier {
-            Tier::Review if c.confirmed.contains(&f.id) => "[x] ",
-            Tier::Review => "[ ] ",
-            _ => "    ",
+        let check = match needs_review_confirm(f) {
+            true if c.confirmed.contains(&f.id) => "[x] ",
+            true => "[ ] ",
+            false => "    ",
         };
         let header = format!(
             "{check}{:<TIER_W$} {:>8}  ",
