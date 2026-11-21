@@ -971,14 +971,19 @@ pub struct ExplainReport {
     /// When the rescan began, RFC 3339 (UTC).
     pub generated_at: String,
     /// The argument as given: a finding id, a path or a `docker://` pseudo-path.
+    /// For an id query this stays the requested id, even when the finding
+    /// now has another one (`finding.id`).
     pub query: String,
     pub resolved: ExplainResolved,
     /// The path examined: absolute for a filesystem path, else the
-    /// pseudo-path (for a saved Docker object renamed since, its current one).
+    /// pseudo-path (for a saved Docker object renamed or retagged since,
+    /// its current one).
     pub path: String,
-    /// The finding at `path` (with the requested id for an id query).
-    /// Guards, growth and probe evidence are included when available.
-    /// `None` when no finding matched.
+    /// The finding at `path`. For an id query its id is the requested one,
+    /// except after a Docker rename or retag: ids derive from the path, so
+    /// `finding.id` is then the current, path-based id and `query` holds
+    /// the requested one. Guards, growth and probe evidence are included
+    /// when available. `None` when no finding matched.
     #[serde(default)]
     pub finding: Option<Finding>,
     /// True when the saved filesystem path or saved Docker object is

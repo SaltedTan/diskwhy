@@ -30,6 +30,10 @@ pub fn run(findings: &mut [Finding], ctx: &DetectContext) {
         && ctx.docker_socket.accessible
         && !ctx.cancel.is_canceled()
     {
-        postgres_wal::probe_all(findings, &postgres_wal::Live::from_context(ctx));
+        postgres_wal::probe_all_with(
+            findings,
+            &postgres_wal::Live::from_context(ctx),
+            ctx.docker.fetched().as_deref(),
+        );
     }
 }

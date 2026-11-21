@@ -659,7 +659,7 @@ fn lossy_finding_ids_are_omitted_when_ambiguous_on_either_side() {
         assert!(findings[1..].iter().all(|f| f.growth.is_none()));
         if old_count == 1 && new_count == 1 {
             assert_eq!(
-                explain::fill_growth(&mut findings[1], Some(&old), after, None),
+                explain::fill_growth(&mut findings[1], Some(&old), after, None, None),
                 None
             );
             assert!(findings[1].growth.is_none());

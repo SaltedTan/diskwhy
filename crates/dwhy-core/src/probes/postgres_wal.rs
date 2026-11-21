@@ -379,10 +379,24 @@ impl Listed {
 /// Probes every finding [`applies_to`] matches. Gives up quietly when the
 /// container list cannot be fetched: the findings stay as detected.
 pub fn probe_all(findings: &mut [Finding], docker: &dyn Docker) {
+    probe_all_with(findings, docker, None);
+}
+
+/// [`probe_all`], checking each volume against `listed`, the `/system/df`
+/// snapshot its finding came from: when that recorded the volume's
+/// `CreatedAt`, evidence is kept only if `GET /volumes/{name}` still gives
+/// the same time after probing. A volume recreated under its name in the
+/// meantime (`docker compose down -v && up`) is another volume, and its
+/// WAL says nothing about the finding.
+pub fn probe_all_with(
+    findings: &mut [Finding],
+    docker: &dyn Docker,
+    listed: Option<&crate::docker::Snapshot>,
+) {
     if !findings.iter().any(applies_to) {
         return;
     }
-    let Some(listed) = docker
+    let Some(containers) = docker
         .get("/containers/json?all=1")
         .ok()
         .and_then(|b| serde_json::from_slice::<Vec<Listed>>(&b).ok())
@@ -394,10 +408,54 @@ pub fn probe_all(findings: &mut [Finding], docker: &dyn Docker) {
         let Some(volume) = f.path.strip_prefix("docker://volume/") else {
             continue;
         };
-        if let Some(ev) = probe_volume(volume, &listed, docker, &mut cache) {
+        if let Some(ev) = probe_volume(volume, &containers, docker, &mut cache)
+            && same_volume(volume, listed, docker)
+        {
             annotate(f, ev);
         }
     }
+}
+
+/// `GET /volumes/{name}` (only what the probe reads).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct VolumeInspect {
+    created_at: String,
+}
+
+/// Whether `volume` is still the one `listed` recorded. Nothing to compare
+/// (no snapshot, or no creation time on either side) counts as the same;
+/// a volume the daemon no longer gives, or cannot, does not.
+fn same_volume(
+    volume: &str,
+    listed: Option<&crate::docker::Snapshot>,
+    docker: &dyn Docker,
+) -> bool {
+    let Some(created) = listed
+        .and_then(|l| l.volumes().iter().find(|v| v.name == volume))
+        .map(|v| v.created_at.as_str())
+        .filter(|t| !t.is_empty())
+    else {
+        return true;
+    };
+    docker
+        .get(&format!("/volumes/{}", path_segment(volume)))
+        .ok()
+        .and_then(|body| serde_json::from_slice::<VolumeInspect>(&body).ok())
+        .is_some_and(|now| now.created_at.is_empty() || now.created_at == created)
+}
+
+/// `s` percent-encoded for one URL path segment.
+fn path_segment(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
 }
 
 /// Inspect responses, fetched once per container.
@@ -1280,7 +1338,19 @@ pub fn advice(ev: &PostgresWal) -> Option<String> {
 
 /// A line of detail for text output: where the evidence came from and the
 /// settings behind the diagnosis.
+/// One line of evidence for list views; API-only evidence carries its
+/// notes in parentheses. Views that print the notes on their own lines use
+/// [`headline`].
 pub fn summary(ev: &PostgresWal) -> String {
+    let mut s = headline(ev);
+    if ev.source == EvidenceSource::ApiOnly && !ev.notes.is_empty() {
+        s.push_str(&format!(" ({})", ev.notes.join("; ")));
+    }
+    s
+}
+
+/// The evidence in one line, without its notes.
+pub fn headline(ev: &PostgresWal) -> String {
     let mut bits = vec![format!(
         "{} in {}",
         match ev.source {
@@ -1308,11 +1378,7 @@ pub fn summary(ev: &PostgresWal) -> String {
         let t: Vec<String> = ev.targets.iter().map(describe_target).collect();
         bits.push(format!("archive target {}", t.join(", ")));
     }
-    let mut s = bits.join(", ");
-    if ev.source == EvidenceSource::ApiOnly && !ev.notes.is_empty() {
-        s.push_str(&format!(" ({})", ev.notes.join("; ")));
-    }
-    s
+    bits.join(", ")
 }
 
 /// Puts the evidence on the finding: the probe's name, the evidence, the

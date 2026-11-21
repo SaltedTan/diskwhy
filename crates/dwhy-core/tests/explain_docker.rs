@@ -187,7 +187,7 @@ fn a_container_recreated_under_its_name_leaves_the_saved_finding_gone() {
         out.notes,
         [
             "docker://container/old-job now belongs to a different object (id c90000000000); \
-             the saved finding's object is no longer listed. Run `dwhy explain <path>` to see the current one."
+             the saved finding's object is no longer listed. Run `dwhy explain docker://container/old-job` to see the current one."
         ]
     );
 
@@ -195,7 +195,14 @@ fn a_container_recreated_under_its_name_leaves_the_saved_finding_gone() {
     let mut base = saved_snapshot(Some(&daemon()));
     base.findings.push(saved_finding("docker-container", path));
     assert_eq!(
-        explain::fill_growth(&mut f, Some(&base), "2026-11-15T00:00:00Z", Some(&now)).as_deref(),
+        explain::fill_growth(
+            &mut f,
+            Some(&base),
+            "2026-11-15T00:00:00Z",
+            Some(&now),
+            None
+        )
+        .as_deref(),
         Some(
             "growth not computed: container old-job was a different object in the snapshot of 2026-11-14T00:00:00Z"
         )
@@ -237,7 +244,7 @@ fn a_volume_recreated_with_a_new_creation_time_is_replaced() {
         out.notes,
         [
             "docker://volume/orphan_pg now belongs to a different object (id 2026-11-14T12:00:00Z); \
-             the saved finding's object is no longer listed. Run `dwhy explain <path>` to see the current one."
+             the saved finding's object is no longer listed. Run `dwhy explain docker://volume/orphan_pg` to see the current one."
         ]
     );
 
@@ -271,9 +278,17 @@ fn a_listed_volume_without_a_live_creation_time_has_no_growth() {
     let before = daemon();
     let mut base = saved_snapshot(Some(&before));
     base.findings.push(saved_finding("docker-volume", path));
-    for baseline in [Some(&base), None] {
+    let explained = explain::saved_object(&base, path);
+    assert!(explained.is_some());
+    // The baseline, or the snapshot that resolved the id, recorded a
+    // creation time the daemon no longer gives.
+    for (baseline, object) in [
+        (Some(&base), None),
+        (Some(&base), explained.as_ref()),
+        (None, explained.as_ref()),
+    ] {
         assert_eq!(
-            explain::fill_growth(&mut finding, baseline, sampled_at, Some(&now)).as_deref(),
+            explain::fill_growth(&mut finding, baseline, sampled_at, Some(&now), object).as_deref(),
             Some(
                 "growth omitted: the daemon did not report this volume's creation time, so its identity can't be confirmed"
             )
@@ -284,10 +299,98 @@ fn a_listed_volume_without_a_live_creation_time_has_no_growth() {
     let out = explain_now("docker-volume", path, &before);
     let mut finding = out.finding.unwrap();
     assert_eq!(
-        explain::fill_growth(&mut finding, Some(&base), sampled_at, Some(&before)),
+        explain::fill_growth(&mut finding, Some(&base), sampled_at, Some(&before), None),
         None
     );
     assert_eq!(finding.growth.unwrap().bytes_per_day, 313_524_224);
+}
+
+#[test]
+fn name_only_volume_growth_needs_no_creation_time_nobody_recorded() {
+    let path = "docker://volume/orphan_pg";
+    let sampled_at = "2026-11-15T00:00:00Z";
+    let mut now = daemon();
+    for v in now.df.volumes.as_mut().unwrap() {
+        v.created_at.clear();
+    }
+    let mut finding = explain::pick(findings(&now), path, None)
+        .0
+        .expect("the volume is detected");
+
+    // A direct query with no baseline: nothing to warn about.
+    assert_eq!(
+        explain::fill_growth(&mut finding, None, sampled_at, Some(&now), None),
+        None
+    );
+    assert!(finding.growth.is_none());
+
+    // A legacy baseline without creation times compares by name, as before.
+    let mut legacy = saved_snapshot(Some(&daemon()));
+    for v in &mut legacy.docker.as_mut().unwrap().volumes {
+        v.created_at = None;
+    }
+    legacy.findings.push(saved_finding("docker-volume", path));
+    assert_eq!(
+        explain::fill_growth(&mut finding, Some(&legacy), sampled_at, Some(&now), None),
+        None
+    );
+    assert!(finding.growth.is_some());
+}
+
+#[test]
+fn growth_is_withheld_when_a_name_moved_to_another_object() {
+    let sampled_at = "2026-11-15T00:00:00Z";
+    let new_id = "c9000000000000000000000000000000000000000000000000000000000000f9";
+    let path = "docker://container/old-job";
+    let mut base = saved_snapshot(Some(&daemon()));
+    base.findings.push(saved_finding("docker-container", path));
+
+    // old-job was renamed away and a new container took its name.
+    let mut now = daemon();
+    let mut newer = container(&mut now, OLD_JOB).clone();
+    container(&mut now, OLD_JOB).names = vec!["/old-job-kept".into()];
+    newer.id = new_id.into();
+    now.df.containers.as_mut().unwrap().push(newer);
+    let mut f = explain::pick(findings(&now), path, None)
+        .0
+        .expect("the new container is detected under the name");
+    assert_eq!(f.action.argv.as_ref().unwrap().last().unwrap(), new_id);
+    assert_eq!(
+        explain::fill_growth(&mut f, Some(&base), sampled_at, Some(&now), None).as_deref(),
+        Some(
+            "growth not computed: container old-job was a different object in the snapshot of 2026-11-14T00:00:00Z"
+        )
+    );
+    assert!(f.growth.is_none());
+
+    // ci-runner:local moved to a new build; the old image keeps ci-runner:v2.
+    let path = "docker://image/ci-runner:local";
+    base.findings.push(saved_finding("docker-image", path));
+    let images = now.df.images.as_mut().unwrap();
+    let ci = images.iter_mut().find(|i| i.id.contains("dddd")).unwrap();
+    ci.repo_tags = Some(vec!["ci-runner:v2".into()]);
+    let mut rebuilt = ci.clone();
+    rebuilt.id = "sha256:9999000000000000000000000000000000000000000000000000000000000009".into();
+    rebuilt.repo_tags = Some(vec!["ci-runner:local".into()]);
+    images.push(rebuilt);
+    let mut f = explain::pick(findings(&now), path, None)
+        .0
+        .expect("the rebuilt image is detected under the tag");
+    assert_eq!(
+        explain::fill_growth(&mut f, Some(&base), sampled_at, Some(&now), None).as_deref(),
+        Some(
+            "growth not computed: image ci-runner:local was a different object in the snapshot of 2026-11-14T00:00:00Z"
+        )
+    );
+    assert!(f.growth.is_none());
+
+    // The same objects: growth is computed.
+    let mut f = explain::pick(findings(&daemon()), path, None).0.unwrap();
+    assert_eq!(
+        explain::fill_growth(&mut f, Some(&base), sampled_at, Some(&daemon()), None),
+        None
+    );
+    assert!(f.growth.is_some());
 }
 
 #[test]
@@ -325,9 +428,28 @@ fn images_are_matched_by_id_across_tags() {
         out.notes,
         [
             "docker://image/ci-runner:local now belongs to a different object (id 999900000000); \
-             the saved finding's object is no longer listed. Run `dwhy explain <path>` to see the current one."
+             the saved finding's object is no longer listed. Run `dwhy explain docker://image/ci-runner:local` to see the current one."
         ]
     );
+
+    // The replacement also carries a tag it lists first: the hint names
+    // the path its finding has.
+    for img in now.df.images.as_mut().unwrap() {
+        if img.id.contains("9999") {
+            img.repo_tags = Some(vec!["ci-runner:latest".into(), "ci-runner:local".into()]);
+        }
+    }
+    let out = explain_now("docker-image", path, &now);
+    assert!(out.gone);
+    assert_eq!(
+        out.notes,
+        [
+            "docker://image/ci-runner:local now belongs to a different object (id 999900000000); \
+             the saved finding's object is no longer listed. Run `dwhy explain docker://image/ci-runner:latest` to see the current one."
+        ]
+    );
+    let (current, _) = explain::pick(findings(&now), "docker://image/ci-runner:latest", None);
+    assert!(current.is_some(), "the hint names a path a detector claims");
 }
 
 #[test]

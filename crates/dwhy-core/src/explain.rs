@@ -5,7 +5,6 @@
 //! writes.
 
 use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -23,6 +22,13 @@ use crate::snapshot::{self, Entry};
 use crate::tree::ScanTree;
 
 pub const PATH_HINT: &str = "run `dwhy explain <path>` with its path";
+
+/// How a note on withheld growth starts when the daemon did not give what
+/// confirms a volume's identity.
+pub const GROWTH_OMITTED: &str = "growth omitted: ";
+/// How a note on withheld growth starts when the snapshot recorded a
+/// different object at the finding's pseudo-path.
+pub const GROWTH_NOT_COMPUTED: &str = "growth not computed: ";
 
 /// What `dwhy explain` was asked about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,20 +57,20 @@ pub fn is_finding_id(arg: &str) -> bool {
         })
 }
 
-pub fn classify(arg: impl AsRef<OsStr>) -> Query {
-    let arg = arg.as_ref();
-    if let Some(id) = arg.to_str().filter(|s| is_finding_id(s)) {
-        Query::Id(id.to_owned())
+/// What an argument names. The CLI refuses arguments that are not UTF-8
+/// before asking.
+pub fn classify(arg: &str) -> Query {
+    if is_finding_id(arg) {
+        Query::Id(arg.to_owned())
     } else {
         Query::Place(place(arg))
     }
 }
 
 /// A finding's path (as a snapshot records it) or a path argument.
-pub fn place(path: impl AsRef<OsStr>) -> Place {
-    let path = path.as_ref();
-    if let Some(pseudo) = path.to_str().filter(|s| s.starts_with("docker://")) {
-        Place::Docker(pseudo.to_owned())
+pub fn place(path: &str) -> Place {
+    if path.starts_with("docker://") {
+        Place::Docker(path.to_owned())
     } else {
         Place::Path(PathBuf::from(path))
     }
@@ -197,16 +203,19 @@ pub struct Resolved {
 }
 
 /// Turns a finding id into its path: the newest snapshot of this host and
-/// uid that lists it, and the finding's path there. A path saved lossily
-/// (v1 snapshots store a non-UTF-8 path with U+FFFD) is refused: it could
-/// name another file.
+/// uid that lists it, and the finding's path there. A saved path with
+/// U+FFFD is refused: v1 snapshots store a non-UTF-8 path that way, so it
+/// could name another file.
 pub fn resolve_id(dir: &Path, host: &str, uid: u32, id: &str) -> Result<Resolved, String> {
     match newest_listing(dir, host, uid, id, None).map_err(|e| format!("{e}; {PATH_HINT}"))? {
         (Some(found), _) => {
             if found.finding.path.contains(char::REPLACEMENT_CHARACTER) {
                 return Err(format!(
-                    "the saved path for {id} was not valid UTF-8 and can't be checked reliably; \
-                     run `dwhy explain <path>` with the real path"
+                    "the saved path for {id} contains U+FFFD, which v1 snapshots also write in place \
+                     of bytes that are not UTF-8, so it can't be checked reliably; if the name \
+                     really contains U+FFFD, run `dwhy explain <path>` with that path; otherwise \
+                     explain can't take the path (it needs UTF-8): explain its parent directory, \
+                     or rename it to valid UTF-8"
                 ));
             }
             Ok(Resolved {
@@ -299,10 +308,7 @@ pub fn saved_object(snap: &Snapshot, path: &str) -> Option<SavedObject> {
         DockerKind::Image => docker
             .images
             .iter()
-            .find(|i| match i.tags.first() {
-                Some(tag) => tag == name,
-                None => crate::detectors::short_id(&i.id) == name,
-            })
+            .find(|i| crate::detectors::image_label_from_tags(&i.tags, &i.id) == name)
             .map(|i| i.id.clone()),
         DockerKind::Container => docker
             .containers
@@ -331,8 +337,14 @@ pub enum Identity {
     /// present by name alone if the daemon omitted its creation time.
     /// `measured` is false when the daemon gave no size for it.
     Present { path: String, measured: bool },
-    /// The saved id is not listed, but its name now names another object.
-    Replaced { replacement_id: String },
+    /// The saved id is not listed, but its name now names another object:
+    /// its short id (a volume's creation time) and the pseudo-path the
+    /// detectors give it, which for an image matched by a later tag is
+    /// its first tag.
+    Replaced {
+        replacement_id: String,
+        replacement_path: String,
+    },
     /// Neither the id nor the name is listed.
     Gone,
     /// The daemon did not report the list to look in.
@@ -356,6 +368,7 @@ pub fn identity(saved: &SavedObject, now: &docker::Snapshot) -> Identity {
             } else if let Some(img) = images.iter().find(|i| image_named(i, &saved.name)) {
                 Identity::Replaced {
                     replacement_id: short_id(&img.id),
+                    replacement_path: at(image_label(img)),
                 }
             } else {
                 Identity::Gone
@@ -373,6 +386,7 @@ pub fn identity(saved: &SavedObject, now: &docker::Snapshot) -> Identity {
             } else if let Some(c) = containers.iter().find(|c| container_name(c) == saved.name) {
                 Identity::Replaced {
                     replacement_id: short_id(&c.id),
+                    replacement_path: at(container_name(c)),
                 }
             } else {
                 Identity::Gone
@@ -390,6 +404,7 @@ pub fn identity(saved: &SavedObject, now: &docker::Snapshot) -> Identity {
                 {
                     Identity::Replaced {
                         replacement_id: v.created_at.clone(),
+                        replacement_path: at(v.name.clone()),
                     }
                 }
                 Some(v) => Identity::Present {
@@ -402,39 +417,90 @@ pub fn identity(saved: &SavedObject, now: &docker::Snapshot) -> Identity {
     }
 }
 
+/// The immutable id the daemon lists now at a Docker pseudo-path, in
+/// [`SavedObject::id`]'s terms: the image or container id, or a volume's
+/// creation time. `None` when nothing is listed there or a volume's
+/// creation time is missing.
+fn live_id(now: &docker::Snapshot, path: &str) -> Option<String> {
+    use crate::detectors::{container_name, image_label};
+    let (kind, name) = docker_kind(path)?;
+    match kind {
+        DockerKind::Image => now
+            .images()
+            .iter()
+            .find(|i| image_label(i) == name)
+            .map(|i| i.id.clone()),
+        DockerKind::Container => now
+            .containers()
+            .iter()
+            .find(|c| container_name(c) == name)
+            .map(|c| c.id.clone()),
+        DockerKind::Volume => now
+            .volumes()
+            .iter()
+            .find(|v| v.name == name)
+            .map(|v| v.created_at.clone())
+            .filter(|time| !time.is_empty()),
+    }
+}
+
 /// Fills growth for a selected finding, or returns a note when Docker
-/// identity prevents the comparison.
+/// identity prevents the comparison. `explained` is the object the
+/// snapshot that resolved an id recorded ([`Resolved::docker`]).
+///
+/// Growth is withheld when the growth baseline recorded a different object
+/// at the finding's pseudo-path than the daemon lists there now (a
+/// container renamed away and another given its name, a tag moved to
+/// another image, a volume recreated). A volume is checked by creation
+/// time: when the explained object or the baseline recorded one but the
+/// daemon omits it now, its identity can't be confirmed. Snapshots without
+/// volume creation times compare by name.
 pub fn fill_growth(
     finding: &mut Finding,
     base: Option<&Snapshot>,
     now: &str,
     daemon: Option<&docker::Snapshot>,
+    explained: Option<&SavedObject>,
 ) -> Option<String> {
+    let baseline = base.and_then(|b| saved_object(b, &finding.path));
     if let Some((DockerKind::Volume, name)) = docker_kind(&finding.path)
+        && (explained.is_some_and(|o| o.kind == DockerKind::Volume) || baseline.is_some())
         && daemon.is_some_and(|d| {
             d.volumes()
                 .iter()
                 .any(|v| v.name == name && v.created_at.is_empty())
         })
     {
-        return Some(
-            "growth omitted: the daemon did not report this volume's creation time, so its identity can't be confirmed"
-                .into(),
-        );
+        return Some(format!(
+            "{GROWTH_OMITTED}the daemon did not report this volume's creation time, so its identity can't be confirmed"
+        ));
     }
     let base = base?;
-    if let Some(saved) = saved_object(base, &finding.path)
-        && daemon.is_some_and(|d| matches!(identity(&saved, d), Identity::Replaced { .. }))
-    {
-        return Some(format!(
-            "growth not computed: {} {} was a different object in the snapshot of {}",
-            saved.kind.word(),
-            saved.name,
-            base.created_at
-        ));
+    if let (Some(old), Some(d)) = (&baseline, daemon) {
+        let different = live_id(d, &finding.path).is_some_and(|id| id != old.id)
+            || match identity(old, d) {
+                Identity::Replaced { .. } => true,
+                Identity::Present { path, .. } => path != finding.path,
+                Identity::Gone | Identity::Unknown => false,
+            };
+        if different {
+            return Some(format!(
+                "{GROWTH_NOT_COMPUTED}{} {} was a different object in the snapshot of {}",
+                old.kind.word(),
+                old.name,
+                base.created_at
+            ));
+        }
     }
     crate::growth::fill_growth(std::slice::from_mut(finding), base, now);
     None
+}
+
+/// The reason growth was withheld, from one of [`fill_growth`]'s notes:
+/// what follows [`GROWTH_OMITTED`] or [`GROWTH_NOT_COMPUTED`].
+pub fn withheld_growth(note: &str) -> Option<&str> {
+    note.strip_prefix(GROWTH_OMITTED)
+        .or_else(|| note.strip_prefix(GROWTH_NOT_COMPUTED))
 }
 
 /// The outcome of explaining a saved id whose path is a Docker pseudo-path.
@@ -494,11 +560,14 @@ pub fn explain_docker_id(
             }
             out.path = path;
         }
-        Identity::Replaced { replacement_id } => {
+        Identity::Replaced {
+            replacement_id,
+            replacement_path,
+        } => {
             out.gone = true;
             out.notes.push(format!(
                 "{} now belongs to a different object (id {replacement_id}); the saved finding's \
-                 object is no longer listed. Run `dwhy explain <path>` to see the current one.",
+                 object is no longer listed. Run `dwhy explain {replacement_path}` to see the current one.",
                 saved.path
             ));
         }
@@ -579,9 +648,20 @@ pub fn absence(
 /// `--detectors` for a `docker://` query: the Docker detectors, limited
 /// to `only` when given.
 pub fn docker_selection(only: Option<&[String]>) -> Vec<String> {
+    selection(only, |needs| needs == Needs::Docker)
+}
+
+/// `--detectors` for a filesystem path: every detector but Docker's,
+/// limited to `only` when given. Docker detectors never claim a filesystem
+/// path, so the daemon is not asked.
+pub fn filesystem_selection(only: Option<&[String]>) -> Vec<String> {
+    selection(only, |needs| needs != Needs::Docker)
+}
+
+fn selection(only: Option<&[String]>, keep: impl Fn(Needs) -> bool) -> Vec<String> {
     CATALOG
         .iter()
-        .filter(|d| d.needs == Needs::Docker && only.is_none_or(|o| o.iter().any(|n| n == d.name)))
+        .filter(|d| keep(d.needs) && only.is_none_or(|o| o.iter().any(|n| n == d.name)))
         .map(|d| d.name.to_string())
         .collect()
 }
@@ -772,15 +852,6 @@ mod tests {
     }
 
     #[test]
-    fn classifies_non_utf8_as_a_native_path() {
-        use std::os::unix::ffi::OsStrExt;
-        for bytes in [b"f_0123456789a\xff".as_slice(), b"docker://volume/\xff"] {
-            let arg = OsStr::from_bytes(bytes);
-            assert_eq!(classify(arg), Query::Place(Place::Path(arg.into())));
-        }
-    }
-
-    #[test]
     fn walks_the_parent_of_a_directory() {
         let t = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
@@ -915,6 +986,21 @@ mod tests {
         let only = vec!["cargo-target".to_string(), "docker-volume".to_string()];
         assert_eq!(docker_selection(Some(&only)), ["docker-volume"]);
         assert!(docker_selection(Some(&only[..1])).is_empty());
+    }
+
+    #[test]
+    fn filesystem_selection_leaves_out_docker_detectors() {
+        let all = filesystem_selection(None);
+        assert!(all.iter().any(|n| n == "cargo-target"), "{all:?}");
+        assert_eq!(
+            all.len() + docker_selection(None).len(),
+            CATALOG.len(),
+            "every detector is one or the other"
+        );
+        assert!(all.iter().all(|n| !n.starts_with("docker-")), "{all:?}");
+        let only = vec!["cargo-target".to_string(), "docker-volume".to_string()];
+        assert_eq!(filesystem_selection(Some(&only)), ["cargo-target"]);
+        assert!(filesystem_selection(Some(&only[1..])).is_empty());
     }
 
     #[test]

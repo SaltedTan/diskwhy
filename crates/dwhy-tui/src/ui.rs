@@ -1517,7 +1517,7 @@ fn detail_lines(f: &Finding, lossy: bool, base: Option<&str>, width: usize) -> V
     if let Some(ev) = f.evidence.as_ref().and_then(|e| e.postgres_wal.as_ref()) {
         text(String::new());
         text(format!("evidence ({}):", postgres_wal::NAME));
-        text(format!("  {}", postgres_wal::summary(ev)));
+        text(format!("  {}", postgres_wal::headline(ev)));
         for n in &ev.notes {
             text(format!("  note: {n}"));
         }

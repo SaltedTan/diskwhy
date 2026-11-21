@@ -20,7 +20,9 @@ pub use docker::{
     BUILD_CACHE_AGE_HOURS, DockerBuildCache, DockerContainer, DockerImage, DockerPresence,
     DockerVolume, docker_presence, object_id,
 };
-pub(crate) use docker::{container_name, image_label, image_named, short_id};
+pub(crate) use docker::{
+    container_name, image_label, image_label_from_tags, image_named, short_id,
+};
 pub use git_worktree::{
     GitWorktree, STALE_DAYS, WorktreeEntry, parse_porcelain, parse_porcelain_z,
 };

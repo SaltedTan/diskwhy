@@ -1656,6 +1656,87 @@ fn explain_a_finding_by_path() {
     assert!(state_listing(st).is_empty(), "explain writes no state");
 }
 
+/// Runs `dwhy explain` with `DOCKER_HOST` on a socket that accepts and
+/// never answers, and a `docker` on PATH so the Docker detectors are
+/// available. Returns the output and whether anything connected.
+fn explain_with_silent_docker(state: &Path, args: &[&str]) -> (Output, bool) {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    let dock = tempfile::tempdir().unwrap();
+    let sock = dock.path().join("docker.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let bin = dock.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::write(bin.join("docker"), "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(bin.join("docker"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dwhy"))
+        .arg("explain")
+        .args(args)
+        .env("XDG_STATE_HOME", state)
+        .env("DOCKER_HOST", format!("unix://{}", sock.display()))
+        .env("PATH", path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Held open: a daemon that never answers would keep explain waiting.
+    let mut held = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while child.try_wait().unwrap().is_none() {
+        if let Ok((conn, _)) = listener.accept() {
+            held.push(conn);
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!(
+                "explain still running after 60s ({} connections)",
+                held.len()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if let Ok((conn, _)) = listener.accept() {
+        held.push(conn);
+    }
+    (child.wait_with_output().unwrap(), !held.is_empty())
+}
+
+#[test]
+fn explain_a_filesystem_path_never_asks_docker() {
+    let (_t, root) = cargo_fixture();
+    let target = format!("{root}/app/target");
+    let state = tempfile::tempdir().unwrap();
+    let (out, connected) = explain_with_silent_docker(state.path(), &[&target, "--json", "-q"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(!connected, "explain contacted the Docker socket");
+    let v = json_of(&out);
+    assert_eq!(v["finding"]["detector"], "cargo-target", "{v}");
+    let notes = v["notes"].to_string();
+    assert!(!notes.contains("docker"), "{notes}");
+
+    // Only Docker detectors selected: none run, and a note says so.
+    let (out, connected) = explain_with_silent_docker(
+        state.path(),
+        &[&target, "--json", "-q", "--detectors", "docker-volume"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(!connected, "explain contacted the Docker socket");
+    let v = json_of(&out);
+    assert_eq!(v["finding"], Value::Null);
+    assert_eq!(
+        v["notes"],
+        serde_json::json!(["no filesystem detector selected (--detectors)"])
+    );
+}
+
 #[test]
 fn explain_a_node_modules_dir_through_its_parent() {
     // node-modules recognises node_modules from the project holding it, so
@@ -2248,8 +2329,11 @@ fn explain_refuses_an_id_whose_saved_path_was_lossy() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains(&format!(
-            "the saved path for {id} was not valid UTF-8 and can't be checked reliably; \
-             run `dwhy explain <path>` with the real path"
+            "the saved path for {id} contains U+FFFD, which v1 snapshots also write in place \
+             of bytes that are not UTF-8, so it can't be checked reliably; if the name \
+             really contains U+FFFD, run `dwhy explain <path>` with that path; otherwise \
+             explain can't take the path (it needs UTF-8): explain its parent directory, \
+             or rename it to valid UTF-8"
         )),
         "{err}"
     );
