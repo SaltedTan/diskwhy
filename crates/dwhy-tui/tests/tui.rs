@@ -99,6 +99,7 @@ fn opts(paths: Vec<PathBuf>) -> Options {
         // Never write the machine's audit log.
         audit_log: None,
         context: None,
+        cancel: Default::default(),
     }
 }
 

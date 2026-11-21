@@ -56,6 +56,7 @@ fn ctx(cargo: Option<&str>) -> DetectContext {
             accessible: false,
         },
         docker: dwhy_core::docker::Source::none(),
+        cancel: Default::default(),
     }
 }
 

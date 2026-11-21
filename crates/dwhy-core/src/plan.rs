@@ -495,7 +495,11 @@ pub fn fingerprint(f: &Finding, tree: &ScanTree, ctx: &DetectContext) -> Fingerp
             && guard::git_guarded(f)
             && let Some(git) = ctx.tool_command("git")
         {
-            fp.git = guard::work_tree_state(&git, p)
+            let git = crate::gitcmd::Git {
+                cmd: &git,
+                cancel: &ctx.cancel,
+            };
+            fp.git = guard::work_tree_state(git, p)
                 .ok()
                 .map(|(head, status)| GitFingerprint {
                     head,

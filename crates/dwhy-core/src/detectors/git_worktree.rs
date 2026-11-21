@@ -30,6 +30,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::detect::{Candidate, DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
+use crate::gitcmd::Git;
 use crate::report::{Action, ActionKind, Finding, GuardResult, GuardStatus, Recovery, Tier};
 use crate::tree::{Markers, NodeId, ScanTree};
 use crate::units::human;
@@ -160,8 +161,15 @@ impl Detector for GitWorktree {
         };
         let mut out = Vec::new();
         let mut errors = Vec::new();
+        let run = Git {
+            cmd: &git,
+            cancel: &ctx.cancel,
+        };
         for repo_dir in repos_with_worktrees(tree) {
-            match list(&git, &repo_dir) {
+            if ctx.cancel.is_canceled() {
+                return Err(crate::gitcmd::CANCELED.into());
+            }
+            match list(run, &repo_dir) {
                 Ok(entries) => out.extend(self.findings(tree, ctx, &git, &repo_dir, &entries)),
                 Err(e) => errors.push(format!("{}: {e}", repo_dir.display())),
             }
@@ -236,7 +244,7 @@ fn resolve(base: &Path, path: &Path) -> PathBuf {
 
 /// `git worktree list --porcelain -z`, or without `-z` when git refuses it
 /// (git before 2.36).
-fn list(git: &str, repo: &Path) -> Result<Vec<WorktreeEntry>, String> {
+fn list(git: Git<'_>, repo: &Path) -> Result<Vec<WorktreeEntry>, String> {
     match crate::gitcmd::run_bytes(git, repo, &["worktree", "list", "--porcelain", "-z"]) {
         Ok(out) => Ok(parse_porcelain_z(&out)),
         Err(_) => {

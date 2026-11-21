@@ -24,9 +24,12 @@ pub fn statuses(ctx: &DetectContext) -> Vec<DetectorStatus> {
 
 /// Runs every probe on the findings it applies to, against the real system.
 /// Best effort: a probe that cannot get evidence leaves the finding as the
-/// detector made it.
+/// detector made it. Nothing runs once `ctx.cancel` is cancelled.
 pub fn run(findings: &mut [Finding], ctx: &DetectContext) {
-    if findings.iter().any(postgres_wal::applies_to) && ctx.docker_socket.accessible {
+    if findings.iter().any(postgres_wal::applies_to)
+        && ctx.docker_socket.accessible
+        && !ctx.cancel.is_canceled()
+    {
         postgres_wal::probe_all(findings, &postgres_wal::Live::from_context(ctx));
     }
 }

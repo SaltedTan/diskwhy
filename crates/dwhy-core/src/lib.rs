@@ -8,10 +8,12 @@
 //! plan out with [`remove`] or the tools' own commands. M3: [`snapshot`]s
 //! record scans so later runs can tell what grew ([`growth`]), and
 //! [`probes`] explain why a finding is big; [`explain`] picks what `dwhy
-//! explain` reports.
+//! explain` reports. [`cancel`] stops the read-only child processes of a scan
+//! or plan build that its caller abandons.
 
 pub mod account;
 pub mod apply;
+pub mod cancel;
 pub mod detect;
 pub mod detectors;
 pub mod docker;

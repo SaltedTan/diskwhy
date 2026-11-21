@@ -67,6 +67,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use crate::detect::DetectContext;
+use crate::gitcmd::Git;
 use crate::plan::{self, Measured};
 use crate::report::{Finding, GuardResult, GuardStatus, Tier};
 use crate::tree::{Markers, ScanTree};
@@ -221,8 +222,12 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
         .collect();
     let mut changed: Vec<PathBuf> = changed_roots.iter().map(|p| p.to_path_buf()).collect();
     changed.extend(changed_repos.keys().map(|r| r.path().to_path_buf()));
-    let git = ctx.tool_command("git");
-    if let Some(git) = git.as_deref() {
+    let git_cmd = ctx.tool_command("git");
+    let git = git_cmd.as_deref().map(|cmd| Git {
+        cmd,
+        cancel: &ctx.cancel,
+    });
+    if let Some(git) = git {
         let tracked: HashSet<Repo> = repos
             .par_iter()
             .filter(|r| {
@@ -288,7 +293,7 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
         .map(|(r, outer)| {
             let state = match changed_repos.get(*r) {
                 Some(detail) => RepoState::Failed(detail.clone()),
-                None => RepoState::read(git.as_deref(), r, outer, &changed),
+                None => RepoState::read(git, r, outer, &changed),
             };
             (*r, state)
         })
@@ -391,7 +396,7 @@ fn repositories(tree: &ScanTree) -> Vec<Repo> {
 
 /// Whether the work tree around the git directory `dir` tracks its `HEAD`:
 /// a test fixture of a source tree, kept by that repository's history.
-fn tracked_by_work_tree(git: &str, dir: &Path, repos: &[Repo], changed: &[PathBuf]) -> bool {
+fn tracked_by_work_tree(git: Git<'_>, dir: &Path, repos: &[Repo], changed: &[PathBuf]) -> bool {
     let Some(work_tree) = repos
         .iter()
         .filter_map(|r| match r {
@@ -530,7 +535,7 @@ enum RepoState {
 impl RepoState {
     /// Reads `repo`; `outer` is the outermost finding it is in, and
     /// `changed` the roots and repositories not to follow a `.git` file into.
-    fn read(git: Option<&str>, repo: &Repo, outer: &Path, changed: &[PathBuf]) -> RepoState {
+    fn read(git: Option<Git<'_>>, repo: &Repo, outer: &Path, changed: &[PathBuf]) -> RepoState {
         let Some(git) = git else {
             return RepoState::Failed("git is not installed".into());
         };
@@ -545,7 +550,7 @@ impl RepoState {
     }
 
     /// A bare repository or separate git dir: no work tree to look at.
-    fn read_git_dir(git: &str, dir: &Path) -> Result<RepoState, String> {
+    fn read_git_dir(git: Git<'_>, dir: &Path) -> Result<RepoState, String> {
         Ok(RepoState::Read {
             common: dir.to_path_buf(),
             dirty: 0,
@@ -570,7 +575,7 @@ impl RepoState {
     }
 
     fn read_work_tree(
-        git: &str,
+        git: Git<'_>,
         dir: &Path,
         outer: &Path,
         changed: &[PathBuf],
@@ -669,7 +674,7 @@ impl RepoState {
 /// plan's fingerprint of the work tree `dir`. The branch headers are left
 /// out: ahead/behind counts change with every fetch. Runs no filter driver
 /// or fsmonitor, like the guards.
-pub(crate) fn work_tree_state(git: &str, dir: &Path) -> Result<(String, String), String> {
+pub(crate) fn work_tree_state(git: Git<'_>, dir: &Path) -> Result<(String, String), String> {
     let mut args = no_filters(git, dir)?;
     args.extend(
         [
@@ -699,7 +704,7 @@ pub(crate) fn work_tree_state(git: &str, dir: &Path) -> Result<(String, String),
 }
 
 /// Runs a git command that prints a count.
-fn count(git: &str, dir: &Path, args: &[&str]) -> Result<usize, String> {
+fn count(git: Git<'_>, dir: &Path, args: &[&str]) -> Result<usize, String> {
     let out = crate::gitcmd::run(git, dir, args)?;
     out.trim()
         .parse()
@@ -776,7 +781,7 @@ fn gitfile_target(dot_git: &Path) -> Result<PathBuf, String> {
 /// `-c` options switching off every filter driver in the repository's
 /// config, so that `git status` runs none of their programs when it hashes
 /// a file.
-fn no_filters(git: &str, dir: &Path) -> Result<Vec<String>, String> {
+fn no_filters(git: Git<'_>, dir: &Path) -> Result<Vec<String>, String> {
     let keys = crate::gitcmd::run(git, dir, &["config", "--list", "--name-only", "-z"])?;
     let mut drivers: Vec<&str> = keys
         .split('\0')

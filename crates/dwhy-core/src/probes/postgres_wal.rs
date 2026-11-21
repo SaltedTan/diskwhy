@@ -9,15 +9,15 @@
 //! responses.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Output};
+use std::time::Duration;
 
 use serde::Deserialize;
 
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use crate::cancel::{Cancel, RunError};
 use crate::detect::{DetectContext, PATH_NOT_UTF8};
 use crate::docker::{Api, GetError};
 use crate::report::{
@@ -80,6 +80,8 @@ pub enum PsqlError {
     Exec,
     Timeout,
     Failed,
+    /// The run was cancelled ([`Cancel`]): its caller has gone.
+    Canceled,
 }
 
 impl PsqlError {
@@ -88,6 +90,7 @@ impl PsqlError {
             Self::Exec => "docker exec failed",
             Self::Timeout => "psql: timed out",
             Self::Failed => "psql failed",
+            Self::Canceled => "psql: canceled",
         }
     }
 }
@@ -99,6 +102,8 @@ pub struct Live {
     /// How to invoke `docker`; `None` when it is not installed.
     pub docker: Option<String>,
     pub exec_timeout: Duration,
+    /// Kills `docker exec` when cancelled.
+    pub cancel: Cancel,
 }
 
 impl Live {
@@ -110,6 +115,7 @@ impl Live {
             },
             docker: ctx.tool_command("docker"),
             exec_timeout: EXEC_TIMEOUT,
+            cancel: ctx.cancel.clone(),
         }
     }
 }
@@ -141,7 +147,7 @@ impl Docker for Live {
         for name in UNSET_PG_ENV {
             cmd.env_remove(name);
         }
-        let out = run_with_timeout(cmd, self.exec_timeout)?;
+        let out = run_with_timeout(cmd, self.exec_timeout, &self.cancel)?;
         if !out.status.success() {
             return Err(if out.stderr.starts_with(b"Error response from daemon:") {
                 PsqlError::Exec
@@ -205,52 +211,17 @@ pub fn psql_argv(docker: &str, socket: &str, container_id: &str, sql: &str) -> V
     .collect()
 }
 
-/// Runs `cmd` with no stdin, killing it after `timeout`.
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Output, PsqlError> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| PsqlError::Exec)?;
-    let drain = |r: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(r) = r {
-                let _ = r.take(1 << 20).read_to_end(&mut buf);
-            }
-            buf
-        })
-    };
-    let out = drain(
-        child
-            .stdout
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    );
-    let err = drain(
-        child
-            .stderr
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    );
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(PsqlError::Timeout);
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(_) => return Err(PsqlError::Exec),
-        }
-    };
-    Ok(Output {
-        status,
-        stdout: out.join().unwrap_or_default(),
-        stderr: err.join().unwrap_or_default(),
+/// Runs `cmd` with no stdin, killing it after `timeout` or when `cancel`
+/// is cancelled. Keeps up to 1 MiB of stdout and of stderr.
+fn run_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<Output, PsqlError> {
+    crate::cancel::output(&mut cmd, cancel, Some(timeout), 1 << 20).map_err(|e| match e {
+        RunError::Canceled => PsqlError::Canceled,
+        RunError::Timeout => PsqlError::Timeout,
+        RunError::Spawn(_) | RunError::Wait(_) => PsqlError::Exec,
     })
 }
 
@@ -1362,6 +1333,7 @@ pub fn annotate(f: &mut Finding, ev: PostgresWal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn hosts_from_archive_commands() {
@@ -1506,15 +1478,68 @@ mod tests {
 
     #[test]
     fn run_with_timeout_kills_a_hung_command() {
+        let cancel = Cancel::default();
         let mut c = Command::new("sleep");
         c.arg("5");
         let start = Instant::now();
-        let e = run_with_timeout(c, Duration::from_millis(200)).unwrap_err();
+        let e = run_with_timeout(c, Duration::from_millis(200), &cancel).unwrap_err();
         assert!(matches!(e, PsqlError::Timeout), "{e:?}");
         assert!(start.elapsed() < Duration::from_secs(3));
         let mut c = Command::new("echo");
         c.arg("hi");
-        let out = run_with_timeout(c, Duration::from_secs(5)).unwrap();
+        let out = run_with_timeout(c, Duration::from_secs(5), &cancel).unwrap();
         assert_eq!(out.stdout, b"hi\n");
+    }
+
+    #[test]
+    fn cancel_kills_docker_exec_at_once() {
+        use crate::cancel::tests::{gone, read_pid, sleeper, within};
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let docker = sleeper(dir.path(), &pid_file);
+        let cancel = Cancel::default();
+        let worker = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                run_with_timeout(Command::new(docker), Duration::from_secs(60), &cancel)
+            })
+        };
+        assert!(within(Duration::from_secs(10), || read_pid(&pid_file).is_some()));
+        let pid = read_pid(&pid_file).unwrap();
+        let start = Instant::now();
+        cancel.cancel();
+        assert!(start.elapsed() < Duration::from_millis(500));
+        let e = worker.join().unwrap().unwrap_err();
+        assert!(matches!(e, PsqlError::Canceled), "{e:?}");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(within(Duration::from_secs(1), || gone(pid)));
+    }
+
+    #[test]
+    fn a_cancelled_token_runs_no_docker_exec() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let docker = dir.path().join("docker");
+        std::fs::write(
+            &docker,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cancel = Cancel::default();
+        cancel.cancel();
+        let live = Live {
+            api: Api {
+                socket: dir.path().join("unused.sock"),
+                timeout: API_TIMEOUT,
+            },
+            docker: Some(docker.to_string_lossy().into_owned()),
+            exec_timeout: EXEC_TIMEOUT,
+            cancel,
+        };
+        let e = live.psql("pg", "postgres", "postgres", QUERY).unwrap_err();
+        assert!(matches!(e, PsqlError::Canceled), "{e:?}");
+        assert!(!marker.exists());
     }
 }

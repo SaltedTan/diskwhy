@@ -395,6 +395,7 @@ fn docker_exec_passes_role_and_literal_database_only_by_environment() {
         },
         docker: Some(docker.to_string_lossy().into_owned()),
         exec_timeout: postgres_wal::EXEC_TIMEOUT,
+        cancel: Default::default(),
     };
 
     let user = "operator@example.test";
@@ -433,6 +434,7 @@ fn docker_exec_failure_uses_only_fixed_categories() {
         },
         docker: Some(docker.to_string_lossy().into_owned()),
         exec_timeout: postgres_wal::EXEC_TIMEOUT,
+        cancel: Default::default(),
     };
     for (stderr, category) in [
         (
@@ -988,6 +990,7 @@ fn doctor_requires_the_volume_detectors_docker_cli() {
             accessible: true,
         },
         docker: dwhy_core::docker::Source::none(),
+        cancel: Default::default(),
     };
     let status = probes::statuses(&ctx).pop().unwrap();
     assert_eq!(status.status, DetectorAvailability::Unavailable);

@@ -361,6 +361,7 @@ fn run_tui(args: TuiArgs) -> Result<u8> {
         dry_run: args.dry_run,
         audit_log: Audit::default_path(),
         context: None,
+        cancel: Default::default(),
     };
     match &args.plan {
         Some(file) => dwhy_tui::run_plan(file, opts),
