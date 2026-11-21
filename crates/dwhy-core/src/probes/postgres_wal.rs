@@ -853,12 +853,15 @@ fn epoch_time(s: &str) -> Option<OffsetDateTime> {
 /// Shells, whose `-c` takes a script rather than a Postgres setting.
 const SHELLS: &[&str] = &["sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "busybox"];
 
+/// Programs that start Postgres with the options after them.
+const POSTGRES_PROGRAMS: &[&str] = &["postgres", "postmaster", "docker-entrypoint.sh"];
+
 /// The Postgres options in a container's command line: `args`, the
 /// arguments after `path`, when they start Postgres. That is when the
-/// first is `postgres`, `postmaster` or `docker-entrypoint.sh`, or is an
-/// option the official image's `docker-entrypoint.sh` passes to `postgres`
-/// (`-c …`). A shell `path` never counts, and an `env` one only with a
-/// Postgres program first.
+/// first is one of [`POSTGRES_PROGRAMS`], or is an option (`-c …`) and
+/// `path` is one of them (or empty), as when the official image's
+/// `docker-entrypoint.sh` passes `Cmd` options to `postgres`. A shell
+/// `path` never counts.
 fn postgres_options<'a>(path: &str, args: &'a [String]) -> Option<&'a [String]> {
     let base = |s: &'a str| s.rsplit('/').next().unwrap_or(s);
     let path = path.rsplit('/').next().unwrap_or(path);
@@ -866,10 +869,15 @@ fn postgres_options<'a>(path: &str, args: &'a [String]) -> Option<&'a [String]> 
         return None;
     }
     let first = args.first()?;
-    match base(first) {
-        "postgres" | "postmaster" | "docker-entrypoint.sh" => Some(&args[1..]),
-        _ if first.starts_with('-') && first != "--" && path != "env" => Some(args),
-        _ => None,
+    if POSTGRES_PROGRAMS.contains(&base(first)) {
+        Some(&args[1..])
+    } else if first.starts_with('-')
+        && first != "--"
+        && (path.is_empty() || POSTGRES_PROGRAMS.contains(&path))
+    {
+        Some(args)
+    } else {
+        None
     }
 }
 
@@ -1062,8 +1070,11 @@ const OPERAND_FLAGS: &[&str] = &[
 /// (`-H value`, `-Hvalue`). Other programs give these letters other
 /// meanings, some without an operand.
 const CURL_OPERAND_FLAGS: &[&str] = &["-U", "-e", "-A", "-H", "-b", "-c", "-x", "-d", "-F"];
-/// How deep quoted shell words (`sh -c '…'`) are read as commands.
+/// How deep shell scripts (`sh -c '…'`) are read as commands.
 const MAX_NESTING: usize = 2;
+/// How deep quotes and expansions may nest in one word before it is
+/// treated as left open.
+const MAX_WORD_NESTING: usize = 64;
 const NETWORK_SCHEMES: &[&str] = &[
     "http",
     "https",
@@ -1103,16 +1114,20 @@ fn after_char(b: &[u8], i: usize) -> usize {
     (i + width).min(b.len())
 }
 
-/// Skips the character, quoted string or expansion that starts at `b[i]`;
-/// `None` when it is left open.
-fn skip_unit(b: &[u8], i: usize) -> Option<usize> {
+/// Skips the character, quoted string or expansion that starts at `b[i]`,
+/// `depth` quotes and expansions down; `None` when it is left open or
+/// nests deeper than [`MAX_WORD_NESTING`].
+fn skip_unit(b: &[u8], i: usize, depth: usize) -> Option<usize> {
+    if depth > MAX_WORD_NESTING {
+        return None;
+    }
     match (b[i], b.get(i + 1)) {
         (b'\\', Some(_)) => Some(after_char(b, i + 1)),
         (b'\'', _) => find_close(b, i + 1, b'\'', false),
-        (b'"', _) => skip_double(b, i + 1),
+        (b'"', _) => skip_double(b, i + 1, depth + 1),
         (b'`', _) => find_close(b, i + 1, b'`', true),
-        (b'$', Some(b'(')) => skip_nested(b, i + 2, b'(', b')'),
-        (b'$', Some(b'{')) => skip_nested(b, i + 2, b'{', b'}'),
+        (b'$', Some(b'(')) => skip_nested(b, i + 2, b'(', b')', depth + 1),
+        (b'$', Some(b'{')) => skip_nested(b, i + 2, b'{', b'}', depth + 1),
         (b'$', Some(b'\'')) => find_close(b, i + 2, b'\'', true),
         _ => Some(after_char(b, i)),
     }
@@ -1131,32 +1146,32 @@ fn find_close(b: &[u8], mut i: usize, close: u8, escapes: bool) -> Option<usize>
     None
 }
 
-fn skip_double(b: &[u8], mut i: usize) -> Option<usize> {
+fn skip_double(b: &[u8], mut i: usize, depth: usize) -> Option<usize> {
     while i < b.len() {
         i = match (b[i], b.get(i + 1)) {
             (b'"', _) => return Some(i + 1),
             (b'\\', Some(_)) => after_char(b, i + 1),
-            (b'`' | b'$', _) => skip_unit(b, i)?,
+            (b'`' | b'$', _) => skip_unit(b, i, depth)?,
             _ => i + 1,
         };
     }
     None
 }
 
-fn skip_nested(b: &[u8], mut i: usize, open: u8, close: u8) -> Option<usize> {
-    let mut depth = 1;
+fn skip_nested(b: &[u8], mut i: usize, open: u8, close: u8, depth: usize) -> Option<usize> {
+    let mut open_brackets = 1;
     while i < b.len() {
         if b[i] == close {
-            depth -= 1;
-            if depth == 0 {
+            open_brackets -= 1;
+            if open_brackets == 0 {
                 return Some(i + 1);
             }
             i += 1;
         } else if b[i] == open {
-            depth += 1;
+            open_brackets += 1;
             i += 1;
         } else {
-            i = skip_unit(b, i)?;
+            i = skip_unit(b, i, depth)?;
         }
     }
     None
@@ -1168,7 +1183,7 @@ fn word_len(s: &str) -> Option<usize> {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() && !word_end(b[i]) {
-        i = skip_unit(b, i)?;
+        i = skip_unit(b, i, 0)?;
     }
     Some(i)
 }
@@ -1335,10 +1350,10 @@ fn analyze_archive_command(input: &str) -> (String, Vec<String>) {
     (archive_program(&tokens), hosts)
 }
 
-/// Adds the hosts `input`'s commands name to `hosts`. An argument that
-/// starts quoted and has whitespace in it (`sh -c '…'`) is read as
-/// commands too, at most [`MAX_NESTING`] levels down (`depth` is this
-/// level).
+/// Adds the hosts `input`'s commands name to `hosts`. A shell's script
+/// (the operand of `-c`, `-lc` and the like) and a quoted `ssh` argument
+/// with whitespace in it (the remote command) are read as commands too, at
+/// most [`MAX_NESTING`] levels down (`depth` is this level).
 fn collect_hosts(input: &str, depth: usize, hosts: &mut Vec<String>) {
     let (tokens, rest) = shell_tokens(input);
     if expands(&tokens, rest) {
@@ -1347,6 +1362,7 @@ fn collect_hosts(input: &str, depth: usize, hosts: &mut Vec<String>) {
     let mut program: Option<String> = None;
     let mut endpoint_next = false;
     let mut skip_next = false;
+    let mut script_next = false;
     for token in tokens {
         let raw = match token {
             Token::Word(raw) => raw,
@@ -1355,6 +1371,7 @@ fn collect_hosts(input: &str, depth: usize, hosts: &mut Vec<String>) {
                 program = None;
                 endpoint_next = false;
                 skip_next = false;
+                script_next = false;
                 continue;
             }
         };
@@ -1363,12 +1380,10 @@ fn collect_hosts(input: &str, depth: usize, hosts: &mut Vec<String>) {
         if std::mem::take(&mut skip_next) {
             continue;
         }
-        // A word that starts quoted is never an assignment; one with
-        // whitespace in it is read as commands (`sh -c '…'`).
-        let script = program.is_some()
-            && !endpoint_value
-            && raw.starts_with(['\'', '"'])
-            && word.contains(|c: char| c.is_ascii_whitespace());
+        let script = std::mem::take(&mut script_next)
+            || program.as_deref() == Some("ssh")
+                && raw.starts_with(['\'', '"'])
+                && word.contains(|c: char| c.is_ascii_whitespace());
         if script {
             if depth < MAX_NESTING {
                 collect_hosts(&word, depth + 1, hosts);
@@ -1382,6 +1397,14 @@ fn collect_hosts(input: &str, depth: usize, hosts: &mut Vec<String>) {
             program = Some(word.rsplit('/').next().unwrap_or(&word).to_string());
             continue;
         };
+        if SHELLS.contains(&program.as_str())
+            && word.starts_with('-')
+            && !word.starts_with("--")
+            && word.contains('c')
+        {
+            script_next = true;
+            continue;
+        }
         let (key, value) = word
             .split_once('=')
             .map_or((word.as_str(), None), |(key, value)| (key, Some(value)));
@@ -1901,6 +1924,22 @@ mod tests {
                 "ssh backup 'sh -c \"curl -T - https://minio/wal/%f\"'",
                 &["minio"],
             ),
+            (
+                "bash -o pipefail -ec 'curl -T %p https://minio/wal/%f'",
+                &["minio"],
+            ),
+            ("busybox sh -c 'curl https://minio/wal/%f'", &["minio"]),
+            // Quoted arguments of other programs are not scripts.
+            (
+                "curl -T %p https://minio/wal/%f || { echo \"upload to https://backup failed\" >&2; exit 1; }",
+                &["minio"],
+            ),
+            ("curl -w 'see https://docs' https://store", &["store"]),
+            (
+                "archive-wal 'sh -c curl https://other' https://store",
+                &["store"],
+            ),
+            ("sh --login 'curl https://other'", &[]),
             // Bounded depth.
             ("sh -c 'sh -c \"sh -c \\\"curl https://deep\\\"\"'", &[]),
             // Expansions anywhere stop host lookups.
@@ -1915,6 +1954,24 @@ mod tests {
         assert_eq!(
             analyze_archive_command("sh -c 'curl -T %p https://minio/wal/%f'").0,
             "sh"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_words_fail_closed() {
+        for unit in ["$(", "\"$(", "${"] {
+            let command = format!("curl https://store {}", unit.repeat(100_000));
+            assert_eq!(
+                analyze_archive_command(&command),
+                ("curl".to_string(), Vec::<String>::new()),
+                "{unit}"
+            );
+        }
+        let deep = format!("{}curl{}", "$(".repeat(100), ")".repeat(100));
+        assert_eq!(analyze_archive_command(&deep).0, "***");
+        assert_eq!(
+            analyze_archive_command("X=\"$(cat \"$(echo \"$(k)\")\")\" archive-wal %p").0,
+            "archive-wal"
         );
     }
 
@@ -2053,6 +2110,10 @@ mod tests {
             ("env", &["sh", "-c", script]),
             ("tini", &["--", "sh", "-c", script]),
             ("/start.sh", &["archive_mode=on"]),
+            ("/start.sh", &["-c", "archive_mode=on"]),
+            ("python3", &["-c", "archive_mode=on"]),
+            ("tini", &["-c", "archive_mode=on"]),
+            ("env", &["-c", "archive_mode=on"]),
             ("sh", &["postgres", "-c", "archive_mode=on"]),
         ] {
             assert!(
