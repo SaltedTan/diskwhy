@@ -35,6 +35,7 @@ fn findings(d: &docker::Snapshot) -> Vec<Finding> {
             accessible: true,
         },
         docker: Source::fixed(d.clone()),
+        cancel: Default::default(),
     };
     [
         &DockerImage as &dyn Detector,

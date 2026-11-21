@@ -29,6 +29,7 @@ use crossterm::event::{self, Event};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use dwhy_core::apply;
+use dwhy_core::cancel::Cancel;
 use dwhy_core::guard::Processes;
 use dwhy_core::scan::Progress;
 use dwhy_core::system;
@@ -136,7 +137,8 @@ fn run_terminal(
 }
 
 /// Scans in a background thread. Not joined: quitting mid-scan leaves it
-/// to end with the process.
+/// to end with the process, and cancels the commands it runs
+/// ([`Options::cancel`]).
 fn spawn_scan(
     scan: impl FnOnce(&mut dyn FnMut(Stage)) -> Result<job::ScanOutcome, String> + Send + 'static,
 ) -> io::Result<mpsc::Receiver<Msg>> {
@@ -198,8 +200,12 @@ where
     B::Error: 'static,
 {
     app.apply_stop = signal.flag.clone();
+    // Scans and plan builds are not joined: once the loop ends (quit,
+    // signal, error or panic), kill the git and psql children they run.
+    let children = CancelOnDrop(app.options.cancel.clone());
     let mut workers = Workers::default();
     let result = run_loop(term, app, rx, signal, poll, read, &mut workers);
+    drop(children);
     if let Some(w) = workers.apply {
         if w.running() {
             w.progress.stop();
@@ -209,6 +215,15 @@ where
         w.finish(app)?;
     }
     result
+}
+
+/// Cancels the token when dropped. Never waits.
+struct CancelOnDrop(Cancel);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 /// The workers the event loop started: the apply, and plan builds, whose
@@ -267,7 +282,8 @@ where
         }
         if let Some(job) = app.take_request() {
             let tx = built_tx.clone();
-            // Guards read /proc and run git. Not joined, like the scan.
+            // Guards read /proc and run git. Not joined, like the scan;
+            // the session's token cancels its git on quit.
             std::thread::Builder::new()
                 .name("dwhy-tui-plan".into())
                 .spawn(move || {
@@ -522,6 +538,7 @@ mod tests {
                         accessible: false,
                     },
                     docker: dwhy_core::docker::Source::none(),
+                    cancel: Default::default(),
                 }),
                 ..Options::default()
             }
@@ -557,6 +574,92 @@ mod tests {
 
     fn key(c: char) -> Event {
         Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    /// `q` while a plan build's guards run git: the loop returns at once,
+    /// and the git child, still running in the detached worker, is killed.
+    #[test]
+    fn quitting_mid_plan_build_kills_its_git() {
+        use dwhy_core::report::ToolStatus;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+        let fixture = Crates::new();
+        // A work tree at a finding's root: its guards and fingerprint run git.
+        std::fs::create_dir_all(fixture.base.join("work/app/target/.git")).unwrap();
+        let pid_file = fixture.base.join("git.pid");
+        let git = fixture.base.join("git");
+        std::fs::write(
+            &git,
+            format!(
+                "#!/bin/sh\necho $$ > '{0}.tmp'\nmv '{0}.tmp' '{0}'\nexec sleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut opts = fixture.options();
+        opts.context.as_mut().unwrap().tools.push(ToolStatus {
+            name: "git".into(),
+            path: None,
+            off_path: Some(git.to_str().unwrap().into()),
+            enables: vec![],
+        });
+        let mut app = App::new(Vec::new(), Arc::new(Progress::default())).with_options(opts);
+        let scanned = job::scan(&app.options, &Progress::default(), &mut |_| {}).unwrap();
+        app.finish(scanned);
+        for code in [
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+            KeyCode::Down,
+            KeyCode::Char(' '),
+        ] {
+            assert!(!app.on_key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+        assert!(!app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)));
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (_tx, rx) = mpsc::channel();
+        let read_pid =
+            || -> Option<u32> { std::fs::read_to_string(&pid_file).ok()?.trim().parse().ok() };
+        let mut pid = None;
+        let mut pressed = None;
+        let started = Instant::now();
+        event_loop(
+            &mut term,
+            &mut app,
+            &rx,
+            &Termination::default(),
+            |_| {
+                // The loop starts the build after the first poll.
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "git never started"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(read_pid().is_some())
+            },
+            || {
+                pid = read_pid();
+                pressed = Some(Instant::now());
+                Ok(key('q'))
+            },
+        )
+        .unwrap();
+        assert!(pressed.unwrap().elapsed() < Duration::from_secs(1));
+        let screen = term.backend().to_string();
+        assert!(screen.contains("Building the plan"), "{screen}");
+        // Dead: gone, or a zombie the worker has yet to reap.
+        let pid = pid.unwrap();
+        let dead = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |s| {
+                s.rsplit_once(')')
+                    .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !dead() {
+            assert!(Instant::now() < deadline, "git {pid} outlived the quit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

@@ -2641,6 +2641,7 @@ impl Twin {
                 accessible: false,
             },
             docker: dwhy_core::docker::Source::none(),
+            cancel: Default::default(),
         }
     }
     /// The TUI session's options for this fixture.
@@ -2654,6 +2655,7 @@ impl Twin {
             dry_run: false,
             audit_log: Some(self.audit()),
             context: Some(self.context()),
+            cancel: Default::default(),
         }
     }
     /// `dwhy tui --plan FILE` on this fixture.

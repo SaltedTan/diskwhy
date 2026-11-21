@@ -56,6 +56,7 @@ fn ctx_with(git: Option<&str>, docker: std::sync::Arc<Source>) -> DetectContext 
             accessible: false,
         },
         docker,
+        cancel: Default::default(),
     }
 }
 

@@ -52,6 +52,7 @@ fn ctx(home: Option<&Path>) -> DetectContext {
             accessible: false,
         },
         docker: dwhy_core::docker::Source::none(),
+        cancel: Default::default(),
     }
 }
 

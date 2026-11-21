@@ -77,6 +77,7 @@ fn ctx(home: &Path) -> DetectContext {
             accessible: true,
         },
         docker: Source::fixed(snapshot()),
+        cancel: Default::default(),
     }
 }
 

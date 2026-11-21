@@ -73,6 +73,9 @@ pub struct DetectContext {
     pub docker_socket: DockerSocket,
     /// The Docker snapshot, fetched once on first use.
     pub docker: Arc<crate::docker::Source>,
+    /// Cancels the read-only commands (git, psql) detectors, probes and
+    /// guards run with this context; a fresh token by default.
+    pub cancel: crate::cancel::Cancel,
 }
 
 impl DetectContext {
@@ -99,6 +102,7 @@ impl DetectContext {
             tools: crate::doctor::resolve_tools(),
             docker_socket,
             docker,
+            cancel: Default::default(),
         }
     }
 
@@ -565,6 +569,7 @@ mod tests {
                 accessible: false,
             },
             docker: crate::docker::Source::none(),
+            cancel: Default::default(),
         }
     }
 

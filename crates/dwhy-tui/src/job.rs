@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dwhy_core::account;
 use dwhy_core::apply::{self, Audit, Policy};
+use dwhy_core::cancel::Cancel;
 use dwhy_core::detect::{self, DetectContext};
 use dwhy_core::growth;
 use dwhy_core::guard::Processes;
@@ -53,6 +54,10 @@ pub struct Options {
     /// (`DetectContext::from_system`). Tests pass a fixed one; its `now` is
     /// replaced with the current time on each use.
     pub context: Option<DetectContext>,
+    /// Cancels the read-only commands (git, `docker exec … psql`) that scans
+    /// and plan builds with these options run. The TUI cancels it on quit:
+    /// those workers are not joined. An apply never uses it.
+    pub cancel: Cancel,
 }
 
 impl Options {
@@ -98,12 +103,16 @@ impl Options {
     }
 
     fn detect_context(&self) -> DetectContext {
-        match &self.context {
+        let ctx = match &self.context {
             Some(ctx) => DetectContext {
                 now: now(),
                 ..ctx.clone()
             },
             None => DetectContext::from_system(),
+        };
+        DetectContext {
+            cancel: self.cancel.clone(),
+            ..ctx
         }
     }
 
@@ -670,7 +679,12 @@ impl ApplyJob {
             .walk(&roots, &mounts, &progress.scan)
             .map_err(ApplyFailed::error)?;
         progress.set(ApplyStep::Checking);
-        let ctx = opts.detect_context();
+        // Not the session's token: quitting waits for the apply instead,
+        // and a guard cut short must not decide an item.
+        let ctx = DetectContext {
+            cancel: Cancel::default(),
+            ..opts.detect_context()
+        };
         let (findings, _) = detect::run_with(
             &result.tree,
             &ctx,

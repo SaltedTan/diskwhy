@@ -60,6 +60,7 @@ fn ctx() -> DetectContext {
             accessible: false,
         },
         docker: Source::none(),
+        cancel: Default::default(),
     }
 }
 

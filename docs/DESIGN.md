@@ -126,7 +126,7 @@ The results screen shows each item's outcome and reason, the exit status `dwhy a
 
 Page Up and Page Down move by one screen, and Home and End go to either end. In the tree, findings list, detail, plan preview, confirmation and results, `k` and `j` also move up and down, and `g` and `G` go to the beginning and end. In the tree, Right and `l` open a directory, and Left and `h` go up to the parent. Ctrl-C also quits.
 
-The TUI restores the terminal on exit, including after a panic. It reports errors locating, opening or writing the audit log on stderr after restoring the terminal and exits 1. Otherwise, a normal quit exits 0 regardless of the apply status displayed on the results screen. On SIGHUP, SIGINT or SIGTERM it exits with `128 + signal number`.
+The TUI restores the terminal on exit, including after a panic. Quitting does not wait for a scan or plan build in progress: the TUI kills the read-only commands it started (git, `docker exec … psql`) and starts no more. It reports errors locating, opening or writing the audit log on stderr after restoring the terminal and exits 1. Otherwise, a normal quit exits 0 regardless of the apply status displayed on the results screen. On SIGHUP, SIGINT or SIGTERM it exits with `128 + signal number`.
 
 ### JSON contract
 

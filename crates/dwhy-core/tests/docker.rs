@@ -46,6 +46,7 @@ fn ctx_with(source: Arc<Source>) -> DetectContext {
             accessible: true,
         },
         docker: source,
+        cancel: Default::default(),
     }
 }
 
