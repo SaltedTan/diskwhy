@@ -5,7 +5,8 @@
 //! a scanned worktree's `.git` file points to (`gitdir: <repo>/.git/worktrees/
 //! <name>`), even when the repository itself is outside the scan. For each
 //! one, diskwhy runs `git --no-optional-locks -C <repo> worktree list
-//! --porcelain -z` and looks at every linked worktree (never the main one).
+//! --porcelain -z` (without `-z` on git before 2.36) and looks at every
+//! linked worktree (never the main one).
 //! Paths are kept as raw bytes from git's output and git's metadata files,
 //! so a worktree whose name is not valid UTF-8 is measured exactly:
 //!
@@ -96,10 +97,17 @@ pub fn parse_porcelain(out: &str) -> Vec<WorktreeEntry> {
 /// bytes, so a name that is not valid UTF-8 survives; the other fields are
 /// text. The first entry is the main worktree.
 pub fn parse_porcelain_z(out: &[u8]) -> Vec<WorktreeEntry> {
+    parse_porcelain_delimited(out, b'\0')
+}
+
+/// Parses porcelain output whose fields end with `delim`: NUL for `-z`, a
+/// newline for git before 2.36, which has no `-z` and prints paths
+/// unquoted, so their raw bytes survive there too.
+fn parse_porcelain_delimited(out: &[u8], delim: u8) -> Vec<WorktreeEntry> {
     let text = |v: &[u8]| String::from_utf8_lossy(v).into_owned();
     let mut entries = Vec::new();
     let mut cur: Option<WorktreeEntry> = None;
-    for field in out.split(|&b| b == b'\0') {
+    for field in out.split(|&b| b == delim) {
         if field.is_empty() {
             entries.extend(cur.take());
             continue;
@@ -226,9 +234,16 @@ fn resolve(base: &Path, path: &Path) -> PathBuf {
     out
 }
 
+/// `git worktree list --porcelain -z`, or without `-z` when git refuses it
+/// (git before 2.36).
 fn list(git: &str, repo: &Path) -> Result<Vec<WorktreeEntry>, String> {
-    let out = crate::gitcmd::run_bytes(git, repo, &["worktree", "list", "--porcelain", "-z"])?;
-    Ok(parse_porcelain_z(&out))
+    match crate::gitcmd::run_bytes(git, repo, &["worktree", "list", "--porcelain", "-z"]) {
+        Ok(out) => Ok(parse_porcelain_z(&out)),
+        Err(_) => {
+            let out = crate::gitcmd::run_bytes(git, repo, &["worktree", "list", "--porcelain"])?;
+            Ok(parse_porcelain_delimited(&out, b'\n'))
+        }
+    }
 }
 
 fn git_action(git: &str, repo: &Path, args: &[&str]) -> Action {

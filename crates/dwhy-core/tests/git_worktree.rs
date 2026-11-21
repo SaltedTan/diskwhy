@@ -633,3 +633,47 @@ fn non_utf8_worktrees_through_git_files_and_prune_accounting() {
     assert_eq!(p.bytes, want);
     assert!(p.reason.starts_with("1 worktree of"), "{}", p.reason);
 }
+
+/// Git before 2.36 has no `worktree list -z`: it exits 129 with
+/// "unknown switch". The detector falls back to newline-separated porcelain,
+/// which such git prints with paths unquoted, so raw bytes still survive.
+#[test]
+fn git_without_worktree_list_z_still_finds_worktrees() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_t, root) = tmp();
+    let Some(wt) = non_utf8_dir(&root, b"wt\xff") else {
+        return;
+    };
+    let r = repo(&root);
+    worktree_at(&r, &wt, "wt-raw", 2);
+    let sibling = root.join("wt\u{FFFD}");
+    write(&sibling.join("big.bin"), 6 * MB);
+    age_tree(&wt, 30);
+    age_tree(&sibling, 30);
+
+    let (_bin_t, bin) = tmp();
+    let old_git = bin.join("old-git");
+    fs::write(
+        &old_git,
+        "#!/bin/sh\n\
+         for a in \"$@\"; do\n\
+         \x20 if [ \"$a\" = -z ]; then echo \"error: unknown switch \\`z'\" >&2; exit 129; fi\n\
+         done\n\
+         exec git \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&old_git, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_git = old_git.to_str().unwrap();
+
+    let tree = scan_tree(&root);
+    let want = tree.node(tree.find(&wt).unwrap()).freeable();
+    let mut found = GitWorktree
+        .detect_candidates(&tree, &ctx_with(None, Some(old_git)))
+        .unwrap();
+    found.sort_by(|a, b| a.path().cmp(b.path()));
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path(), wt.as_path());
+    assert_eq!(found[0].finding.bytes, want);
+    assert_eq!(found[0].finding.tier, Tier::Review);
+}
