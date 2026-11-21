@@ -982,9 +982,10 @@ fn title_with(
     } else {
         format!(" {right} ")
     };
-    let room = width.saturating_sub(LEFT.len() + right.len() + 1);
+    let right_w = grapheme_width(&right);
+    let room = width.saturating_sub(LEFT.len() + right_w + 1);
     let place = place(room);
-    let pad = width.saturating_sub(LEFT.len() + grapheme_width(&place) + right.len());
+    let pad = width.saturating_sub(LEFT.len() + grapheme_width(&place) + right_w);
     let style = Style::new().add_modifier(Modifier::REVERSED);
     Paragraph::new(Line::from(vec![
         Span::styled(LEFT, style.add_modifier(Modifier::BOLD)),
@@ -1295,7 +1296,8 @@ fn findings_title(b: &Browser, tw: usize) -> Paragraph<'static> {
     rights.push(count);
     // ` dwhy  ` + place + ` ` + ` right `, as in `title_with`.
     const PLACE: &str = "findings";
-    let fits = |place: usize, right: &str| " dwhy  ".len() + place + 1 + right.width() + 2 <= tw;
+    let fits =
+        |place: usize, right: &str| " dwhy  ".len() + place + 1 + grapheme_width(right) + 2 <= tw;
     let (place, right) = rights[..whole]
         .iter()
         .find(|r| fits(PLACE.len(), r))

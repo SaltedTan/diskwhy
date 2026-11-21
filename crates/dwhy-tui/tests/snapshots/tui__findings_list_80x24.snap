@@ -2,7 +2,7 @@
 source: crates/dwhy-tui/tests/tui.rs
 expression: screen
 ---
-" dwhy  findings                                                all tiers · 7/7  "
+" dwhy  findings                                                 all tiers · 7/7 "
 "   tier            size      growth  detector       path                        "
 "   review         29.4G     +1.2G/d  docker-volume  docker://volume/pgdata      "
 ">  rebuildable     3.2G   +120.0M/d  cargo-target   /home/me/proj…diskwhy/target"

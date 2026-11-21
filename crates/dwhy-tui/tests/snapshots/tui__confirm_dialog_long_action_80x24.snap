@@ -2,7 +2,7 @@
 source: crates/dwhy-tui/tests/tui.rs
 expression: end
 ---
-" dwhy  apply this plan?                                         2 items · 3.3G  "
+" dwhy  apply this plan?                                          2 items · 3.3G "
 "┌ Remove these items? ─────────────────────────────────────────────────────────┐"
 "│ 2 items, 1 of 1 review confirmed, frees ≈ 3.3G                               │"
 "│                                                                              │"

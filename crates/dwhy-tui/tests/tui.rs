@@ -1127,6 +1127,34 @@ fn compact_findings_only_open_when_a_row_fits() {
 }
 
 #[test]
+fn findings_title_never_garbles_the_place_or_pads_short() {
+    let finding = hand_finding("cargo-target", "/abc", 1024, Tier::Review);
+    let (_f, mut app) = findings_app(vec![finding], None);
+    press(&mut app, &[KeyCode::Tab]);
+    for marked in [false, true] {
+        if marked {
+            press(&mut app, &[KeyCode::Char(' ')]);
+        }
+        for width in 23..=80 {
+            let screen = render(&mut app, width, 24, None);
+            let title = screen.lines().next().unwrap();
+            // The place is `findings` whole or nothing, and the right part
+            // ends one space before the edge.
+            assert!(!title.contains('…'), "{width}: {title}");
+            assert!(
+                title.contains(" dwhy  findings ") || !title.contains("fin"),
+                "{width}: {title}"
+            );
+            let tail: Vec<char> = title.chars().rev().take(3).collect();
+            assert!(
+                tail[..2] == ['"', ' '] && tail[2] != ' ',
+                "{width}: {title}"
+            );
+        }
+    }
+}
+
+#[test]
 fn compact_findings_metadata_keeps_counts_and_failures_at_23x24() {
     let finding = hand_finding("cargo-target", "/abc", 1024, Tier::Review);
     let (_f, mut app) = findings_app(vec![finding], None);
