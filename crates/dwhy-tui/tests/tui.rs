@@ -496,7 +496,12 @@ fn combined_diagnostics_leave_the_directory_name_visible_at_80x24() {
     // Narrower, the status lines are cut at the end with `…`.
     let screen = render(&mut app, 40, 24, Some(&root));
     let status: Vec<_> = screen.lines().skip(21).take(2).collect();
-    assert!(status[0].starts_with("\" 0B allocated here"), "{screen}");
+    // An empty directory's own size depends on the filesystem (0B on tmpfs,
+    // one block on ext4), so only the line's shape is checked.
+    assert!(
+        status[0].contains(" allocated here · 0 findings"),
+        "{screen}"
+    );
     assert!(
         status[1].starts_with("\" this directory: 2 entries"),
         "{screen}"
