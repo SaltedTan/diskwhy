@@ -1120,7 +1120,10 @@ pub struct LogScan {
     pub last_failure: Option<OffsetDateTime>,
     /// From `archiving write-ahead log file "…" failed too many times`.
     pub last_failed_wal: Option<String>,
-    /// From `The failed archive command was: …`.
+    /// From `The failed archive command was: …`, as Postgres ran it: each
+    /// following tab-led line (Postgres's stderr logger puts a tab after
+    /// every newline in a message) adds a newline and the line without
+    /// that tab.
     pub failed_command: Option<String>,
 }
 
