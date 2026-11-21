@@ -1,6 +1,6 @@
 ---
 source: crates/dwhy-tui/tests/tui.rs
-expression: "render(&mut app, 80, 24, None)"
+expression: "render_at(&mut app, 80, 24, None, PLAN_AT + plan::TTL_SECS + 600)"
 ---
 " dwhy  plan /tmp/plans/dwhy-plan.json                           2 items · 3.3G  "
 " NOT USABLE: the plan expired at 2026-11-19T10:00:00Z (plans last 60 minutes);  "
@@ -25,4 +25,4 @@ expression: "render(&mut app, 80, 24, None)"
 "      branch: diskwhy (main, 2 commits)                                         "
 "                                                                                "
 " lines 1–19 of 31                                                               "
-" ↑↓ PgUp PgDn scroll · q quit                                                   "
+" ↑↓ PgUp PgDn scroll · x apply · q quit                                         "

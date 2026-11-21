@@ -1,29 +1,34 @@
 //! Drawing the app. Laid out to stay legible at 80×24: one title line, a
 //! line per filesystem (at most three, tree view only), the list, a status
 //! line, key help. A status message replaces the status line, or the key
-//! help while the `w` prompt is open.
+//! help while the `w` prompt is open. A `dwhy tui --dry-run` session shows
+//! `DRY RUN` at the left of the title line on every screen.
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
+use std::ops::Range;
 use std::sync::atomic::Ordering;
 
 use dwhy_core::apply::{action_kind_name, guard_status_name, tier_name};
 use dwhy_core::detect::{PATH_NOT_UTF8_RECOVERY_NOTE, is_lossy, rfc3339};
 use dwhy_core::plan;
 use dwhy_core::probes::postgres_wal;
-use dwhy_core::report::{ActionKind, Finding, FsReport, GuardStatus};
+use dwhy_core::report::{ActionKind, ApplyOutcome, Finding, FsReport, GuardStatus, Plan, Tier};
 use dwhy_core::units::{human, signed, thousands};
 use ratatui::Frame;
 use ratatui::buffer::CellWidth;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Browser, FindingList, PlanState, PlanView, SizeMode, State, View, sanitize};
-use crate::job::{self, Mark, PermissionMark, Scanned, Stage};
+use crate::app::{
+    App, ApplyView, Browser, Confirm, FindingList, PlanState, PlanView, SizeMode, State, View,
+    sanitize,
+};
+use crate::job::{self, ApplyStep, Mark, PermissionMark, Scanned, Stage};
 
 /// Filesystem lines shown before "… N more".
 const MAX_FS_LINES: usize = 3;
@@ -38,7 +43,7 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
     let area = f.area();
     let fs_lines = match &app.state {
         State::Scanning { .. } => 1,
-        State::Plan(_) => 0,
+        State::Plan(_) | State::RootsRemoved | State::Applying(_) => 0,
         State::Browsing(b) if b.view != View::Tree || b.fs_offset.is_some() => 0,
         State::Browsing(b) => b.data.report.fs.len().clamp(1, MAX_FS_LINES),
     };
@@ -58,11 +63,25 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
         Constraint::Length(1),
     ])
     .areas(area);
+    let title = if app.dry_run() {
+        const BADGE: &str = " DRY RUN ";
+        let [badge, rest] =
+            Layout::horizontal([Constraint::Length(BADGE.len() as u16), Constraint::Min(0)])
+                .areas(title);
+        let style = Style::new().add_modifier(Modifier::BOLD);
+        f.render_widget(Paragraph::new(Span::styled(BADGE, style)), badge);
+        rest
+    } else {
+        title
+    };
     app.viewport = list.height as usize;
     let width = area.width as usize;
+    // The title line's width: less than `width` behind the DRY RUN badge.
+    let tw = title.width as usize;
     let dim = Style::new().add_modifier(Modifier::DIM);
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let prompt_open = app.plan_view().is_some_and(|v| v.prompt.is_some());
+    let dry_session = app.dry_run();
     let areas = PlanAreas {
         title,
         list,
@@ -71,8 +90,13 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
     };
 
     match &mut app.state {
+        State::RootsRemoved => {
+            f.render_widget(title_line("rescan", "", tw), title);
+            f.render_widget(Paragraph::new("  all scanned roots were removed"), list);
+            f.render_widget(Paragraph::new(Span::styled(" q quit", dim)), keys);
+        }
         State::Scanning { progress, stage } => {
-            f.render_widget(title_line("scanning", "", width), title);
+            f.render_widget(title_line("scanning", "", tw), title);
             f.render_widget(Paragraph::new(Span::styled(" measuring…", dim)), fs);
             let mut lines = vec![Line::raw(""), Line::raw("  Scanning")];
             lines.extend(
@@ -99,16 +123,20 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
             f.render_widget(Paragraph::new(Span::styled(" q quit", dim)), keys);
         }
         State::Plan(view) => {
-            app.viewport = draw_plan(f, view, &areas, " ↑↓ PgUp PgDn scroll · q quit", now);
+            let help = " ↑↓ PgUp PgDn scroll · x apply · q quit";
+            app.viewport = draw_plan(f, view, &areas, help, dry_session, now);
+        }
+        State::Applying(v) => {
+            app.viewport = draw_apply(f, v, &areas);
         }
         State::Browsing(b) if b.view == View::Plan => match &mut b.plan {
             PlanState::Ready(view) => {
                 let help =
-                    " ↑↓ PgUp PgDn scroll · w write plan file · Esc back · Tab tree · q quit";
-                app.viewport = draw_plan(f, view, &areas, help, now);
+                    " ↑↓ PgUp PgDn scroll · x apply · w write plan · Esc back · Tab tree · q quit";
+                app.viewport = draw_plan(f, view, &areas, help, dry_session, now);
             }
             PlanState::Building { progress, marks } => {
-                f.render_widget(title_line("plan", "", width), title);
+                f.render_widget(title_line("plan", "", tw), title);
                 let message = if *marks == b.marked {
                     let n = marks.len();
                     let lines = vec![
@@ -155,7 +183,7 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
                 .iter()
                 .filter_map(|d| d.error.as_deref().map(|e| (d.name.as_str(), e)))
                 .collect();
-            f.render_widget(title_line("findings", &count, width), title);
+            f.render_widget(title_line("findings", &count, tw), title);
             let marks = Marks {
                 lossy: &b.lossy_paths,
                 marked: &b.marked,
@@ -171,7 +199,7 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
                 return;
             };
             f.render_widget(
-                title_with(tier_name(finding.tier), width, |room| {
+                title_with(tier_name(finding.tier), tw, |room| {
                     middle_units(display_units(&finding.path), room)
                 }),
                 title,
@@ -198,7 +226,7 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
                 let height = list.height as usize;
                 *offset = (*offset).min(reports.len().saturating_sub(height.max(1)));
                 let end = (*offset + height).min(reports.len());
-                f.render_widget(title_line("filesystems", "", width), title);
+                f.render_widget(title_line("filesystems", "", tw), title);
                 f.render_widget(Paragraph::new(fs_text(&reports[*offset..end], width)), list);
                 let msg = if end > *offset {
                     format!(" {}–{end} of {} filesystems", *offset + 1, reports.len())
@@ -216,7 +244,7 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
             } else {
                 sanitize(&path)
             };
-            f.render_widget(title_line(&place, app.mode.label(), width), title);
+            f.render_widget(title_line(&place, app.mode.label(), tw), title);
             let shown = if reports.len() > MAX_FS_LINES {
                 MAX_FS_LINES - 1
             } else {
@@ -258,10 +286,20 @@ struct PlanAreas {
 }
 
 /// The plan preview: a banner when `dwhy apply` would refuse the plan, the
-/// plan's lines (scrollable), and the status line or the `w` prompt.
-/// Returns the lines on screen.
-fn draw_plan(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, help: &str, now: i64) -> usize {
-    let width = a.title.width as usize;
+/// plan's lines (scrollable), and the status line or the `w` prompt; or
+/// the confirm dialog `x` opened. Returns the lines on screen.
+fn draw_plan(
+    f: &mut Frame,
+    v: &mut PlanView,
+    a: &PlanAreas,
+    help: &str,
+    dry_session: bool,
+    now: i64,
+) -> usize {
+    if v.confirm.is_some() {
+        return draw_confirm(f, v, a, dry_session);
+    }
+    let width = a.list.width as usize;
     let dim = Style::new().add_modifier(Modifier::DIM);
     let p = v.plan();
     let right = format!(
@@ -275,7 +313,7 @@ fn draw_plan(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, help: &str, now: i6
         None => "plan preview".into(),
     };
     f.render_widget(
-        title_with(&right, width, |room| {
+        title_with(&right, a.title.width as usize, |room| {
             middle_units(display_units(&place), room)
         }),
         a.title,
@@ -339,6 +377,469 @@ fn draw_plan(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, help: &str, now: i6
         }
     }
     height
+}
+
+/// The confirm dialog: a summary, then every item (tier, size, path,
+/// action), with a checkbox on each `review` item. Returns the action page size.
+fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: bool) -> usize {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let (p, c) = v.confirmation().unwrap();
+    let items = &p.items;
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let verb = if dry_session { "dry run" } else { "apply" };
+    let right = format!(
+        "{} item{} · {}",
+        items.len(),
+        plural(items.len()),
+        human(p.bytes)
+    );
+    f.render_widget(
+        title_line(
+            &format!("{verb} this plan?"),
+            &right,
+            a.title.width as usize,
+        ),
+        a.title,
+    );
+    let block = Block::bordered().title(if dry_session {
+        " Dry run: nothing is removed "
+    } else {
+        " Remove these items? "
+    });
+    let inner = block.inner(a.list);
+    let width = inner.width as usize;
+    let available = inner.height as usize;
+    let y = if dry_session { "y dry run" } else { "y apply" };
+    let keys = format!(" ↑↓ · PgUp/PgDn scroll · Space tick · {y} · d dry run · Esc back · q quit");
+    if c.layout.as_ref().is_none_or(|layout| layout.width != width) {
+        c.layout = Some(confirm_layout(p, c, width));
+    }
+    let layout = c.layout.as_ref().unwrap();
+    let row = &layout.rows[c.selected];
+    let head = layout.head.len().min(available.saturating_sub(1));
+    let height = available - head;
+    c.actions_visible = height > 1 + row.label_height
+        && layout.head[0].width() <= width
+        && row.path_visible
+        && layout.lines[row.lines.start].width() <= width
+        && a.keys.height > 0
+        && grapheme_width(&keys) <= a.keys.width as usize;
+    if !c.actions_visible {
+        let notice = if a.list.height > 0 { a.list } else { a.status };
+        let warning = wrap(" enlarge the terminal to confirm", notice.width as usize);
+        f.render_widget(Paragraph::new(warning.join("\n")), notice);
+        f.render_widget(
+            Paragraph::new(Span::styled(" Esc back · q quit", dim)),
+            a.keys,
+        );
+        return 0;
+    }
+    f.render_widget(block, a.list);
+    let action = row.lines.start + 1 + row.label_height..row.lines.end;
+    c.scroll = c
+        .scroll
+        .max(row.lines.end.saturating_sub(height))
+        .min(row.lines.start)
+        .min(layout.lines.len().saturating_sub(height));
+
+    let mut shown = layout.head[..head].to_vec();
+    let (selected, viewport) = if row.lines.len() > height {
+        let footer = if c.selected + 1 == items.len() {
+            &layout.lines[row.lines.end..]
+        } else {
+            &[]
+        };
+        let action_room = height - 1 - row.label_height;
+        let footer = &footer[..footer.len().min(action_room - 1)];
+        let action_height = action_room - footer.len();
+        c.action_scroll = c.action_scroll.min(action.len() - action_height);
+        let start = action.start + c.action_scroll;
+        shown.extend_from_slice(&layout.lines[row.lines.start..action.start]);
+        shown.extend_from_slice(&layout.lines[start..start + action_height]);
+        shown.extend_from_slice(footer);
+        (head, action_height)
+    } else {
+        c.action_scroll = 0;
+        let end = (c.scroll + height).min(layout.lines.len());
+        shown.extend_from_slice(&layout.lines[c.scroll..end]);
+        (head + row.lines.start - c.scroll, action.len())
+    };
+    let header = &mut shown[selected];
+    header.spans[0].content = Cow::Borrowed("> ");
+    *header = std::mem::take(header).style(Style::new().add_modifier(Modifier::REVERSED));
+    f.render_widget(Paragraph::new(shown), inner);
+    let status = match p.items.get(c.selected).map(|i| &i.finding) {
+        Some(f) if f.tier == Tier::Review && c.confirmed.contains(&f.id) => {
+            "review: confirmed".to_string()
+        }
+        Some(f) if f.tier == Tier::Review => {
+            "review: not confirmed, so it is refused (Space confirms it)".into()
+        }
+        Some(f) => format!("{}: no confirmation needed", tier_name(f.tier)),
+        None => String::new(),
+    };
+    let status = format!(" item {}/{} · {status}", c.selected + 1, p.items.len());
+    f.render_widget(
+        Paragraph::new(middle(&status, a.status.width as usize)),
+        a.status,
+    );
+    f.render_widget(Paragraph::new(Span::styled(keys, dim)), a.keys);
+    viewport
+}
+
+#[derive(Debug)]
+pub(crate) struct ConfirmLayout {
+    width: usize,
+    head: Vec<Line<'static>>,
+    lines: Vec<Line<'static>>,
+    rows: Vec<ConfirmRow>,
+}
+
+#[derive(Debug)]
+struct ConfirmRow {
+    lines: Range<usize>,
+    path_visible: bool,
+    label_height: usize,
+}
+
+fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let items = &p.items;
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let reviews = items
+        .iter()
+        .filter(|i| i.finding.tier == Tier::Review)
+        .count();
+    let confirmed = items
+        .iter()
+        .filter(|i| i.finding.tier == Tier::Review && c.confirmed.contains(&i.finding.id))
+        .count();
+    let going = plan::distinct_bytes(
+        items
+            .iter()
+            .map(|i| &i.finding)
+            .filter(|f| f.tier != Tier::Review || c.confirmed.contains(&f.id))
+            .map(|f| (f.path.as_str(), f.bytes)),
+    );
+    let mut summary = format!("{} item{}", items.len(), plural(items.len()));
+    if reviews > 0 {
+        summary.push_str(&format!(", {confirmed} of {reviews} review confirmed"));
+    }
+    summary.push_str(&format!(", frees ≈ {}", human(going)));
+
+    let mut head = vec![Line::styled(format!(" {summary}"), bold)];
+    if confirmed < reviews {
+        head.extend(
+            wrap(
+                " Unconfirmed review items are refused, as by dwhy apply without --confirm.",
+                width,
+            )
+            .into_iter()
+            .map(|l| Line::styled(l, dim)),
+        );
+    }
+    head.push(Line::raw(""));
+
+    let mut rows = Vec::with_capacity(items.len());
+    let mut lines = Vec::new();
+    for item in items {
+        let start = lines.len();
+        let f = &item.finding;
+        let lossy = is_lossy(&f.path);
+        let check = match f.tier {
+            Tier::Review if c.confirmed.contains(&f.id) => "[x] ",
+            Tier::Review => "[ ] ",
+            _ => "    ",
+        };
+        let header = format!(
+            "{check}{:<TIER_W$} {:>8}  ",
+            tier_name(f.tier),
+            human(f.bytes),
+        );
+        let path = middle_units(
+            display_units(&f.path),
+            width.saturating_sub(2 + header.width()),
+        );
+        const MIN_PATH_TAIL_GRAPHEMES: usize = 8;
+        let name = f.path.trim_end_matches('/').rsplit('/').next().unwrap();
+        let tail: Vec<_> = display_units(name)
+            .rev()
+            .take(MIN_PATH_TAIL_GRAPHEMES)
+            .collect();
+        let tail: String = tail.into_iter().rev().collect();
+        let path_visible = !path.is_empty() && path.trim_end_matches('/').ends_with(&tail);
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::raw(header),
+            Span::styled(path, Style::new().add_modifier(Modifier::BOLD)),
+        ]));
+        let (action, label_height) = wrap_action(
+            "      ",
+            &f.action.text,
+            lossy,
+            f.action.kind != ActionKind::Advice,
+            width,
+        );
+        lines.extend(action.into_iter().map(Line::raw));
+        rows.push(ConfirmRow {
+            lines: start..lines.len(),
+            path_visible,
+            label_height,
+        });
+    }
+    if !p.blocked.is_empty() {
+        lines.push(Line::raw(""));
+        let n = p.blocked.len();
+        lines.extend(
+            wrap(
+                &format!(
+                    "  {n} blocked finding{} not in the plan: never applied",
+                    plural(n)
+                ),
+                width,
+            )
+            .into_iter()
+            .map(|l| Line::styled(l, dim)),
+        );
+    }
+
+    ConfirmLayout {
+        width,
+        head,
+        lines,
+        rows,
+    }
+}
+
+/// What `dwhy apply` prints for an item's outcome.
+fn outcome_label(o: ApplyOutcome) -> &'static str {
+    match o {
+        ApplyOutcome::Removed => "removed",
+        ApplyOutcome::Failed => "FAILED",
+        ApplyOutcome::Skipped => "skipped",
+        ApplyOutcome::Refused => "refused",
+        ApplyOutcome::WouldRemove => "would remove",
+    }
+}
+
+/// What an exit status of `dwhy apply` means.
+fn exit_meaning(code: u8) -> &'static str {
+    match code {
+        0 => "ok",
+        1 => "failed",
+        2 => "something was skipped",
+        3 => "refused",
+        _ => "",
+    }
+}
+
+/// The apply screen: progress while it runs, then the results. Returns the
+/// lines on screen.
+fn draw_apply(f: &mut Frame, v: &mut ApplyView, a: &PlanAreas) -> usize {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let tw = a.title.width as usize;
+    let width = a.list.width as usize;
+    let what = if v.dry_run { "dry run" } else { "apply" };
+    let Some(result) = &v.result else {
+        f.render_widget(title_line(&format!("{what}: running"), "", tw), a.title);
+        let mut lines = vec![Line::raw("")];
+        let intro = if v.dry_run {
+            "  Dry run: rescanning the plan's roots and checking every item again. Nothing is removed."
+        } else {
+            "  Applying the plan: rescanning its roots and checking every item again, then removing the ready ones, deepest first."
+        };
+        lines.extend(wrap(intro, width).into_iter().map(Line::raw));
+        f.render_widget(Paragraph::new(lines), a.list);
+        let msg = if v.stopping {
+            " stopping: the item in progress finishes; no more items run".to_string()
+        } else {
+            match v.progress.step() {
+                ApplyStep::Rescanning => format!(
+                    " rescanning… {} entries, {}",
+                    thousands(v.progress.scan.entries.load(Ordering::Relaxed)),
+                    human(v.progress.scan.allocated.load(Ordering::Relaxed))
+                ),
+                ApplyStep::Checking => " running detectors and guards…".into(),
+                ApplyStep::Removing { done, total, path } => {
+                    format!(" removing {} of {total}: {path}", done + 1)
+                }
+            }
+        };
+        let msg = middle_units(display_units(&msg), a.status.width as usize);
+        f.render_widget(Paragraph::new(Span::styled(msg, bold)), a.status);
+        let keys = if v.dry_run {
+            " q quit"
+        } else {
+            " q quit after the item in progress (no more items run)"
+        };
+        f.render_widget(Paragraph::new(Span::styled(keys, dim)), a.keys);
+        return a.list.height as usize;
+    };
+
+    let exit = match result {
+        Ok(done) => done.exit,
+        Err(e) => e.exit,
+    };
+    if v.lines.as_ref().is_none_or(|(cached, _)| *cached != width) {
+        let lines = match result {
+            Ok(done) => results_lines(done, width),
+            Err(e) => {
+                let mut lines: Vec<_> = wrap(&e.message, width)
+                    .into_iter()
+                    .map(|l| Line::styled(l, bold))
+                    .collect();
+                lines.push(Line::raw(format!(
+                    "  dwhy apply would exit {} ({}) · nothing was removed",
+                    e.exit,
+                    exit_meaning(e.exit)
+                )));
+                lines
+            }
+        };
+        v.lines = Some((width, lines));
+    }
+    let (_, lines) = v.lines.as_ref().unwrap();
+    f.render_widget(
+        title_line(&format!("{what} results"), &format!("exit {exit}"), tw),
+        a.title,
+    );
+    let height = a.list.height as usize;
+    v.scroll = v.scroll.min(lines.len().saturating_sub(height.max(1)));
+    let end = (v.scroll + height).min(lines.len());
+    let status = format!(" lines {}–{end} of {}", v.scroll + 1, lines.len());
+    f.render_widget(Paragraph::new(lines[v.scroll..end].to_vec()), a.list);
+    f.render_widget(Paragraph::new(status), a.status);
+    let keys = if v.can_go_back() {
+        " ↑↓ scroll · Enter rescan · Esc back to the dialog · q quit"
+    } else {
+        " ↑↓ scroll · Enter rescan · q quit"
+    };
+    f.render_widget(Paragraph::new(Span::styled(keys, dim)), a.keys);
+    height
+}
+
+/// The results: `dwhy apply`'s summary, its exit status and the audit log,
+/// then each item's outcome with the reason.
+fn results_lines(done: &job::Applied, width: usize) -> Vec<Line<'static>> {
+    let r = &done.report;
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let push = |out: &mut Vec<Line<'static>>, s: &str| {
+        out.extend(wrap(s, width).into_iter().map(Line::raw));
+    };
+    let count = |o| r.items.iter().filter(|i| i.outcome == o).count();
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let rest: Vec<String> = [
+        (ApplyOutcome::Failed, "failed"),
+        (ApplyOutcome::Refused, "refused"),
+        (ApplyOutcome::Skipped, "skipped"),
+    ]
+    .into_iter()
+    .filter_map(|(o, word)| {
+        let n = count(o);
+        (n > 0).then(|| format!("{n} {word}"))
+    })
+    .collect();
+    let rest = if rest.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", rest.join(", "))
+    };
+    let summary = if r.dry_run {
+        let n = count(ApplyOutcome::WouldRemove);
+        let bytes = dwhy_core::apply::total_bytes(
+            r.items
+                .iter()
+                .filter(|i| i.outcome == ApplyOutcome::WouldRemove),
+        );
+        format!(
+            "would remove {n} item{} ({}){rest}; nothing removed",
+            plural(n),
+            human(bytes)
+        )
+    } else {
+        let n = count(ApplyOutcome::Removed);
+        format!(
+            "removed {n} item{}, freed about {}{rest}",
+            plural(n),
+            human(r.freed)
+        )
+    };
+    out.extend(
+        wrap(&summary, width)
+            .into_iter()
+            .map(|l| Line::styled(l, bold)),
+    );
+    push(
+        &mut out,
+        &format!(
+            "  dwhy apply would exit {} ({})",
+            done.exit,
+            exit_meaning(done.exit)
+        ),
+    );
+    match &done.audit {
+        Some(p) => push(&mut out, &format!("  audit log: {}", p.to_string_lossy())),
+        None => push(&mut out, "  dry run: no audit line written"),
+    }
+    for i in &r.items {
+        push(&mut out, "");
+        let header = format!(
+            "{:<12} {:>8}  {}",
+            outcome_label(i.outcome),
+            human(i.bytes),
+            i.path
+        );
+        let first = out.len();
+        push(&mut out, &header);
+        for line in &mut out[first..] {
+            *line = std::mem::take(line).style(bold);
+        }
+        if i.outcome == ApplyOutcome::WouldRemove {
+            push(
+                &mut out,
+                &format!("  {} · {}, would run:", i.detector, tier_name(i.tier)),
+            );
+            out.extend(command_lines(
+                "    ",
+                &i.action.text,
+                is_lossy(&i.path),
+                i.action.kind != ActionKind::Advice,
+                width,
+            ));
+        } else if let Some(rest) = (i.action.kind == ActionKind::Command)
+            .then(|| command_detail(&i.detail, &i.action.text))
+            .flatten()
+        {
+            // The command itself follows the copy rules, not the prose.
+            push(&mut out, &format!("  {} · {rest}", i.detector));
+            out.extend(command_lines(
+                "    ",
+                &i.action.text,
+                is_lossy(&i.path),
+                true,
+                width,
+            ));
+        } else {
+            push(&mut out, &format!("  {} · {}", i.detector, i.detail));
+        }
+    }
+    out
+}
+
+/// Core's detail for a command it ran (`ran CMD`, `CMD failed (…): …`)
+/// without the command, which is shown on its own lines.
+fn command_detail(detail: &str, command: &str) -> Option<String> {
+    if command.is_empty() {
+        return None;
+    }
+    if detail.strip_prefix("ran ") == Some(command) {
+        return Some("ran:".into());
+    }
+    let rest = detail.strip_prefix(command)?;
+    Some(format!("the command{rest}:"))
 }
 
 /// The plan in `dwhy plan`'s order: a summary, the items by size with
@@ -849,6 +1350,19 @@ fn command_lines(
     is_command: bool,
     width: usize,
 ) -> impl Iterator<Item = Line<'static>> {
+    wrap_action(prefix, text, lossy, is_command, width)
+        .0
+        .into_iter()
+        .map(Line::raw)
+}
+
+fn wrap_action(
+    prefix: &str,
+    text: &str,
+    lossy: bool,
+    is_command: bool,
+    width: usize,
+) -> (Vec<String>, usize) {
     let withheld = if !is_command {
         None
     } else if is_lossy(text) {
@@ -862,17 +1376,23 @@ fn command_lines(
     };
     let original = format!("{prefix}{}", withheld.unwrap_or(text));
     let mut lines = wrap(&original, width);
+    if withheld.is_some() {
+        let label_height = lines.len();
+        return (lines, label_height);
+    }
     let copyable =
         text.bytes().all(|b| (b' '..=b'~').contains(&b)) && lines.as_slice() == [original.as_str()];
-    if withheld.is_none() && is_command && !copyable {
+    if is_command && !copyable {
         lines = wrap("  preview — do not copy", width);
+        let label_height = lines.len();
         lines.extend(
             wrap(&original, width.saturating_sub(1))
                 .into_iter()
                 .map(|line| format!("│{line}")),
         );
+        return (lines, label_height);
     }
-    lines.into_iter().map(Line::raw)
+    (lines, 0)
 }
 
 /// Wraps a scan finding in `dwhy explain` field order. `base` is the

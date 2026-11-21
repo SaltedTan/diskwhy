@@ -131,6 +131,9 @@ struct TuiArgs {
         conflicts_with_all = ["paths", "one_file_system", "cross_filesystems"]
     )]
     plan: Option<PathBuf>,
+    /// Applying from the TUI only shows what would happen: `y` is a dry run too.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -333,6 +336,7 @@ fn main() -> ExitCode {
             one_file_system: false,
             cross_filesystems: false,
             plan: None,
+            dry_run: false,
         }),
     };
     match res {
@@ -347,15 +351,19 @@ fn main() -> ExitCode {
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn run_tui(args: TuiArgs) -> Result<u8> {
+    let opts = dwhy_tui::Options {
+        paths: args.paths,
+        cross_filesystems: args.cross_filesystems,
+        detectors: None,
+        threads: 0,
+        snapshot_dir: snapshot::default_dir(),
+        dry_run: args.dry_run,
+        audit_log: Audit::default_path(),
+        context: None,
+    };
     match &args.plan {
-        Some(file) => dwhy_tui::run_plan(file),
-        None => dwhy_tui::run(dwhy_tui::Options {
-            paths: args.paths,
-            cross_filesystems: args.cross_filesystems,
-            detectors: None,
-            threads: 0,
-            snapshot_dir: snapshot::default_dir(),
-        }),
+        Some(file) => dwhy_tui::run_plan(file, opts),
+        None => dwhy_tui::run(opts),
     }
     .map_err(|e| {
         let mut message = String::new();
@@ -1041,11 +1049,14 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
     let mounts = MountTable::read().map_err(|e| format!("cannot read the mount table: {e}"))?;
     let quiet = args.quiet;
     let mut status: Option<StatusLine> = None;
-    apply::execute(&plan, &mut checks, &mut audit, &mounts, &env, &mut |item| {
+    let audit_errors = apply::execute(&plan, &mut checks, &mut audit, &mounts, &env, &mut |item| {
         drop(status.take());
         status = status_line(quiet, &format!("removing {}…", item.path));
     });
     drop(status);
+    for error in audit_errors {
+        eprintln!("dwhy: error: {}", error.escape_debug());
+    }
     let r = apply::report(&plan, &checks, &policy, false, &env);
     print_apply(&r, args.json, Some(audit.path()))?;
     Ok(apply::exit_code(&r))

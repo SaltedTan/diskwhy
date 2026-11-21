@@ -1,28 +1,33 @@
 //! The scan the TUI runs: the same pipeline as `dwhy scan` (roots, walk,
 //! filesystems and unaccounted space, detectors, probes, growth on
 //! findings), with no snapshot saved. Also the plan work: rescanning for
-//! marked findings, building with core `plan::build`, and handling plan files.
+//! marked findings, building with core `plan::build`, and handling plan
+//! files; and applying a plan through core `apply`, as `dwhy apply` does.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dwhy_core::account;
+use dwhy_core::apply::{self, Audit, Policy};
 use dwhy_core::detect::{self, DetectContext};
 use dwhy_core::growth;
 use dwhy_core::guard::Processes;
 use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection};
-use dwhy_core::report::{DetectorRun, Finding, Plan, PlanScan, ScanReport, UnreadableReason};
+use dwhy_core::report::{
+    ApplyItem, ApplyReport, DetectorRun, Finding, Plan, PlanScan, ScanReport, UnreadableReason,
+};
 use dwhy_core::scan::{self, Progress, ScanOptions, ScanResult};
 use dwhy_core::system;
 use dwhy_core::tree::{NodeId, ScanTree};
 
-/// What to scan.
+/// What to scan, and how this session applies plans.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     /// Directories to scan; empty means the current directory, as in `dwhy scan`.
@@ -37,6 +42,16 @@ pub struct Options {
     /// (`snapshot::default_dir()`); `None`: findings get no growth.
     /// Only read, never written.
     pub snapshot_dir: Option<PathBuf>,
+    /// `dwhy tui --dry-run`: `y` in the confirm dialog is a dry run too.
+    pub dry_run: bool,
+    /// The audit log apply appends to, as `dwhy apply` does
+    /// (`apply::Audit::default_path()`); `None`: a real apply fails before
+    /// removing anything. A dry run writes no audit line.
+    pub audit_log: Option<PathBuf>,
+    /// What detectors know about the system; `None`: the real system
+    /// (`DetectContext::from_system`). Tests pass a fixed one; its `now` is
+    /// replaced with the current time on each use.
+    pub context: Option<DetectContext>,
 }
 
 impl Options {
@@ -47,6 +62,10 @@ impl Options {
         if let Some(names) = &self.detectors {
             detect::validate_selection(names)?;
         }
+        self.prepare_roots()
+    }
+
+    fn prepare_roots(&self) -> Result<Vec<PathBuf>, String> {
         let paths = if self.paths.is_empty() {
             vec![PathBuf::from(".")]
         } else {
@@ -68,6 +87,27 @@ impl Options {
             ..ScanOptions::default()
         };
         scan::scan(roots, &opts, mounts, progress).map_err(|e| e.to_string())
+    }
+
+    fn detect_context(&self) -> DetectContext {
+        match &self.context {
+            Some(ctx) => DetectContext {
+                now: now(),
+                ..ctx.clone()
+            },
+            None => DetectContext::from_system(),
+        }
+    }
+
+    /// The options a rescan of `plan` uses: its roots, filesystem setting
+    /// and detectors, as `dwhy apply` rescans them; the rest from `self`.
+    pub fn for_plan(&self, plan: &Plan) -> Options {
+        Options {
+            paths: plan.scan.roots.iter().map(PathBuf::from).collect(),
+            cross_filesystems: !plan.scan.one_filesystem,
+            detectors: plan.scan.detectors.clone(),
+            ..self.clone()
+        }
     }
 }
 
@@ -125,7 +165,13 @@ pub fn scan(
     let mut report = account::system_scan_report(&result, &mounts);
 
     stage(Stage::Detecting);
-    detect::detect_into(&mut report, &result.tree, opts.detectors.as_deref(), true);
+    detect::detect_into_with(
+        &mut report,
+        &result.tree,
+        &opts.detect_context(),
+        opts.detectors.as_deref(),
+        true,
+    );
     let growth_base = opts
         .snapshot_dir
         .as_deref()
@@ -139,10 +185,41 @@ pub fn scan(
         growth_base,
         plan_options: Options {
             paths: roots,
-            snapshot_dir: None,
             ..opts.clone()
         },
     })
+}
+
+/// A scan to run off the UI thread: the rescan after an apply.
+#[derive(Debug)]
+pub struct ScanJob {
+    pub options: Options,
+    pub progress: Arc<Progress>,
+}
+
+pub struct ScanOutcome {
+    pub scanned: Option<Scanned>,
+    pub removed: Vec<PathBuf>,
+}
+
+impl ScanJob {
+    pub fn run(mut self, stage: &mut dyn FnMut(Stage)) -> Result<ScanOutcome, String> {
+        let mut removed = Vec::new();
+        self.options.paths.retain(|path| {
+            if fs::symlink_metadata(path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+                removed.push(path.clone());
+                false
+            } else {
+                true
+            }
+        });
+        let scanned = if self.options.paths.is_empty() && !removed.is_empty() {
+            None
+        } else {
+            Some(scan(&self.options, &self.progress, stage)?)
+        };
+        Ok(ScanOutcome { scanned, removed })
+    }
 }
 
 /// A plan to build off the UI thread.
@@ -203,7 +280,7 @@ impl PlanJob {
         let roots = opts.roots()?;
         let mounts = MountTable::read().unwrap_or_default();
         let result = opts.walk(&roots, &mounts, &self.progress)?;
-        let ctx = DetectContext::from_system();
+        let ctx = opts.detect_context();
         let (findings, runs) = detect::run_with(
             &result.tree,
             &ctx,
@@ -270,6 +347,218 @@ pub fn read_plan(path: &Path) -> Result<Plan, String> {
     let text =
         fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     plan::parse(&text)
+}
+
+/// An apply to run off the UI thread: `dwhy apply PLAN --max-tier review
+/// --confirm <the review items ticked in the dialog>`, with `--yes` (the
+/// dialog was the confirmation) or `--dry-run`.
+#[derive(Debug)]
+pub struct ApplyJob {
+    pub plan: Plan,
+    pub policy: Policy,
+    pub dry_run: bool,
+    /// Threads, detector context and audit log; the roots come from the plan.
+    pub options: Options,
+    pub progress: Arc<ApplyProgress>,
+}
+
+/// What a running apply is doing, for the progress line, and the request
+/// to stop it.
+#[derive(Debug, Default)]
+pub struct ApplyProgress {
+    /// The rescan's counters.
+    pub scan: Progress,
+    step: Mutex<ApplyStep>,
+    stop: Arc<AtomicUsize>,
+}
+
+pub(crate) const APPLY_STOP_REQUESTED: usize = usize::MAX;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ApplyStep {
+    #[default]
+    Rescanning,
+    /// Detectors and guards.
+    Checking,
+    /// Running item `done + 1` of `total` (deepest first).
+    Removing {
+        done: usize,
+        total: usize,
+        path: String,
+    },
+}
+
+impl ApplyProgress {
+    pub(crate) fn with_stop(stop: Arc<AtomicUsize>) -> Self {
+        Self {
+            scan: Progress::default(),
+            step: Mutex::default(),
+            stop,
+        }
+    }
+
+    pub fn step(&self) -> ApplyStep {
+        self.step.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    fn set(&self, step: ApplyStep) {
+        if let Ok(mut s) = self.step.lock() {
+            *s = step;
+        }
+    }
+
+    /// Asks the apply to stop: the item in progress finishes, no other runs.
+    pub fn stop(&self) {
+        let _ = self.stop.compare_exchange(
+            0,
+            APPLY_STOP_REQUESTED,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn stopping(&self) -> bool {
+        self.stop.load(Ordering::Relaxed) != 0
+    }
+}
+
+/// A finished apply.
+#[derive(Debug, Clone)]
+pub struct Applied {
+    pub report: ApplyReport,
+    /// The audit log written to; `None` for a dry run.
+    pub audit: Option<PathBuf>,
+    /// What `dwhy apply` exits with for this report.
+    pub exit: u8,
+    pub audit_errors: Vec<String>,
+}
+
+/// An apply that failed before running any item: what `dwhy apply` prints
+/// as `dwhy: refused: …` (exit 3) or `dwhy: error: …` (exit 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyFailed {
+    pub message: String,
+    pub exit: u8,
+    pub audit_error: bool,
+}
+
+impl ApplyFailed {
+    fn error(message: impl Into<String>) -> ApplyFailed {
+        ApplyFailed {
+            message: message.into(),
+            exit: 1,
+            audit_error: false,
+        }
+    }
+
+    fn audit(message: impl Into<String>) -> ApplyFailed {
+        ApplyFailed {
+            audit_error: true,
+            ..Self::error(message)
+        }
+    }
+}
+
+impl ApplyJob {
+    /// Runs the apply as `dwhy apply --yes` (or `--dry-run`) does: checks
+    /// the plan is usable here and now, rescans its roots, re-runs its
+    /// detectors and the guards, decides every item with core
+    /// `apply::evaluate`, and (unless a dry run) runs the ready ones with
+    /// `apply::execute_until`, writing the audit log. Cleanup commands have
+    /// no direct access to the terminal's standard streams.
+    pub fn run(
+        self,
+        read_processes: impl FnOnce() -> Processes,
+        env: &apply::Env,
+    ) -> Result<Applied, ApplyFailed> {
+        let ApplyJob {
+            plan,
+            policy,
+            dry_run,
+            options,
+            progress,
+        } = self;
+        if let Some(names) = &plan.scan.detectors {
+            detect::validate_selection(names).map_err(ApplyFailed::error)?;
+        }
+        if let Err(e) = plan::usable(&plan, &env.host, env.uid, now()) {
+            return Err(ApplyFailed {
+                message: format!("refused: {e}"),
+                exit: 3,
+                audit_error: false,
+            });
+        }
+        progress.set(ApplyStep::Rescanning);
+        let opts = options.for_plan(&plan);
+        let roots = opts.prepare_roots().map_err(ApplyFailed::error)?;
+        let mounts = MountTable::read().unwrap_or_default();
+        let result = opts
+            .walk(&roots, &mounts, &progress.scan)
+            .map_err(ApplyFailed::error)?;
+        progress.set(ApplyStep::Checking);
+        let ctx = opts.detect_context();
+        let (findings, _) = detect::run_with(
+            &result.tree,
+            &ctx,
+            &dwhy_core::detectors::registry(),
+            opts.detectors.as_deref(),
+        );
+        let mut checks = apply::evaluate(
+            &plan,
+            findings,
+            &result.tree,
+            &ctx,
+            &read_processes(),
+            &policy,
+        );
+        if dry_run {
+            let report = apply::report(&plan, &checks, &policy, true, env);
+            let exit = apply::exit_code(&report);
+            return Ok(Applied {
+                report,
+                audit: None,
+                exit,
+                audit_errors: Vec::new(),
+            });
+        }
+        let path = opts.audit_log.as_deref().ok_or_else(|| {
+            ApplyFailed::audit(
+                "cannot place the audit log: neither XDG_STATE_HOME nor HOME is an absolute path",
+            )
+        })?;
+        let mut audit = Audit::open(path).map_err(ApplyFailed::audit)?;
+        let mounts = MountTable::read()
+            .map_err(|e| ApplyFailed::error(format!("cannot read the mount table: {e}")))?;
+        let total = checks.iter().filter(|c| c.ready()).count();
+        let mut done = 0;
+        let audit_errors = apply::execute_until(
+            &plan,
+            &mut checks,
+            &mut audit,
+            &mounts,
+            env,
+            &mut |item: &ApplyItem| {
+                progress.set(ApplyStep::Removing {
+                    done,
+                    total,
+                    path: item.path.clone(),
+                });
+                done += 1;
+            },
+            apply::ExecuteOptions {
+                stop: &|| progress.stopping(),
+                isolate_commands: true,
+            },
+        );
+        let report = apply::report(&plan, &checks, &policy, false, env);
+        let exit = apply::exit_code(&report);
+        Ok(Applied {
+            report,
+            audit: Some(audit.path().to_path_buf()),
+            exit,
+            audit_errors,
+        })
+    }
 }
 
 #[derive(Debug)]

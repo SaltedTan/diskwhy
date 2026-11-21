@@ -1070,6 +1070,66 @@ fn deepest_items_run_first_and_commands_report_failure() {
 }
 
 #[test]
+fn stop_during_apply_audit_start_prevents_path_and_command_dispatch() {
+    thread_local! {
+        static STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    for command in [false, true] {
+        STOP.with(|flag| flag.set(false));
+        let (_t, b) = base();
+        let target = b.join("cache");
+        write(&target.join("file"), "keep");
+        let mut fresh = finding("user-cache", &target, Tier::Regenerable);
+        if command {
+            fresh.action.kind = ActionKind::Command;
+            fresh.action.argv = Some(vec![
+                "/bin/rm".into(),
+                "-rf".into(),
+                "--".into(),
+                target.to_str().unwrap().into(),
+            ]);
+        }
+        let plan = make_plan(&b, vec![fresh.clone()]);
+        let mut checks = evaluate(&b, &plan, vec![fresh], &Policy::default());
+        assert!(checks[0].ready());
+
+        let log = b.join("audit.jsonl");
+        let mut audit = Audit::open(&log).unwrap();
+        let env = Env {
+            now: || {
+                STOP.with(|flag| flag.set(true));
+                "2026-11-16T05:00:00Z".into()
+            },
+            ..env()
+        };
+        let errors = apply::execute_until(
+            &plan,
+            &mut checks,
+            &mut audit,
+            &no_mounts(),
+            &env,
+            &mut |_| assert!(!STOP.with(std::cell::Cell::get)),
+            apply::ExecuteOptions {
+                stop: &|| STOP.with(std::cell::Cell::get),
+                isolate_commands: false,
+            },
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(fs::read_to_string(target.join("file")).unwrap(), "keep");
+        let records = audit_lines(&log);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].event, AuditEvent::Start);
+        assert_eq!(records[1].event, AuditEvent::End);
+        assert_eq!(records[1].outcome, Some(ApplyOutcome::Skipped));
+        assert_eq!(
+            records[1].detail.as_deref(),
+            Some("not run: apply was stopped before this item")
+        );
+    }
+}
+
+#[test]
 fn an_item_inside_another_is_counted_once() {
     let (_t, b) = base();
     write(&b.join("scratch/app/target/file"), "t");
@@ -1187,7 +1247,7 @@ fn a_removal_whose_audit_line_cannot_be_written_does_not_run() {
     let mut checks = evaluate(&b, &plan, found, &Policy::default());
     // Every write to /dev/full fails with ENOSPC.
     let mut audit = Audit::open(Path::new("/dev/full")).unwrap();
-    apply::execute(
+    let errors = apply::execute(
         &plan,
         &mut checks,
         &mut audit,
@@ -1195,6 +1255,14 @@ fn a_removal_whose_audit_line_cannot_be_written_does_not_run() {
         &env(),
         &mut |_| {},
     );
+    assert_eq!(errors.len(), 3, "one write error per item: {errors:?}");
+    for name in ["cache", "target", "scratch"] {
+        let path = b.join(name);
+        assert!(
+            errors.iter().any(|e| e.starts_with(path.to_str().unwrap())),
+            "{errors:?}"
+        );
+    }
     assert!(b.join("cache/file").exists(), "nothing removed");
     let c = &checks
         .iter()

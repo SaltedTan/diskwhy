@@ -15,14 +15,14 @@ use dwhy_core::guard::{Proc, Processes};
 use dwhy_core::plan;
 use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{
-    Action, ActionKind, ArchiveTarget, EvidenceSource, Finding, Fingerprint, FsReport, Growth,
-    GuardResult, GuardStatus, Plan, PlanItem, PlanScan, PlanSelection, PostgresWal, Recovery, Tier,
-    Tool,
+    Action, ActionKind, ApplyItem, ApplyOutcome, ApplyReport, ArchiveTarget, EvidenceSource,
+    Finding, Fingerprint, FsReport, Growth, GuardResult, GuardStatus, Plan, PlanItem, PlanScan,
+    PlanSelection, PostgresWal, Recovery, Tier, Tool,
 };
 use dwhy_core::scan::Progress;
 use dwhy_core::{detect, growth, snapshot, system};
 use dwhy_tui::app::{App, DEFAULT_PLAN_FILE, PlanState, RowKind, SizeMode, State, View};
-use dwhy_tui::job::{self, BuiltPlan, Options, PermissionMark, Scanned};
+use dwhy_tui::job::{self, Applied, ApplyFailed, BuiltPlan, Options, PermissionMark, Scanned};
 use dwhy_tui::ui;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -93,6 +93,10 @@ fn opts(paths: Vec<PathBuf>) -> Options {
         threads: 2,
         // Never read the machine's snapshots.
         snapshot_dir: None,
+        dry_run: false,
+        // Never write the machine's audit log.
+        audit_log: None,
+        context: None,
     }
 }
 
@@ -142,6 +146,11 @@ fn key(code: KeyCode) -> KeyEvent {
 
 fn press(app: &mut App, codes: &[KeyCode]) {
     for &c in codes {
+        if matches!(c, KeyCode::Char(' ' | 'y' | 'd'))
+            && app.plan_view().is_some_and(|view| view.confirm.is_some())
+        {
+            render(app, 80, 24, None);
+        }
         assert!(!app.on_key(key(c)), "{c:?} must not quit");
     }
 }
@@ -2509,4 +2518,636 @@ fn unusable_plan_banner_80x24() {
         None,
         PLAN_AT + plan::TTL_SECS + 600
     ));
+}
+
+// ---------------------------------------------------------------------------
+// M4d: the confirm dialog, apply and its results. Nothing here applies: the
+// state machine hands out the apply job, and tests feed results back. Real
+// applies on temp fixtures are in crates/dwhy-cli/tests/cli.rs and
+// src/lib.rs.
+// ---------------------------------------------------------------------------
+
+/// The hand plan with its trash item in the `review` tier, as the trash
+/// detector reports it: one review item and one rebuildable item.
+fn review_plan() -> Plan {
+    let mut plan = hand_plan();
+    plan.items[1].finding.tier = Tier::Review;
+    plan
+}
+
+fn review_id() -> String {
+    review_plan().items[1].finding.id.clone()
+}
+
+/// `dwhy tui --plan` on the review plan, a minute after it was made.
+fn dialog_app(dry_run: bool) -> App {
+    let file = PathBuf::from("/tmp/plans/dwhy-plan.json");
+    let mut app = App::open_plan(review_plan(), file, HOST, UID).with_options(Options {
+        dry_run,
+        ..Options::default()
+    });
+    app.clock = || PLAN_AT + 60;
+    app
+}
+
+fn confirmed(app: &App) -> Vec<String> {
+    let c = app.plan_view().unwrap().confirm.as_ref().unwrap();
+    c.confirmed.iter().cloned().collect()
+}
+
+/// A finished apply of the review plan: the cargo target removed by its
+/// command, the review item refused, and an item skipped.
+fn hand_applied() -> Applied {
+    let plan = review_plan();
+    let item = |f: &Finding, outcome, detail: &str| ApplyItem {
+        id: f.id.clone(),
+        detector: f.detector.clone(),
+        path: f.path.clone(),
+        tier: f.tier,
+        bytes: f.bytes,
+        action: f.action.clone(),
+        outcome,
+        detail: detail.into(),
+        guards: f.guards.clone(),
+    };
+    let cargo = &plan.items[0].finding;
+    let trash = &plan.items[1].finding;
+    let venv = hand_finding(
+        "venv",
+        "/home/me/projects/site/.venv",
+        250 << 20,
+        Tier::Rebuildable,
+    );
+    let items = vec![
+        item(
+            cargo,
+            ApplyOutcome::Removed,
+            &format!("ran {}", cargo.action.text),
+        ),
+        item(
+            trash,
+            ApplyOutcome::Refused,
+            &format!("review items need a person's --confirm {}", trash.id),
+        ),
+        item(
+            &venv,
+            ApplyOutcome::Skipped,
+            "changed since the plan: newest file 2026-11-19T09:00:30Z, was 2026-11-12T08:30:00Z",
+        ),
+    ];
+    Applied {
+        report: ApplyReport {
+            schema: "diskwhy/v1".into(),
+            tool: Tool::current(),
+            host: HOST.into(),
+            uid: UID,
+            generated_at: dwhy_core::detect::rfc3339(PLAN_AT + 120),
+            plan_created_at: plan.created_at.clone(),
+            dry_run: false,
+            max_tier: Tier::Review,
+            confirm: Vec::new(),
+            freed: cargo.bytes,
+            items,
+        },
+        audit: Some("/tmp/state/diskwhy/audit.jsonl".into()),
+        exit: 3,
+        audit_errors: Vec::new(),
+    }
+}
+
+#[test]
+fn x_opens_the_dialog_only_for_a_usable_plan() {
+    let mut app = dialog_app(false);
+    press(&mut app, &[KeyCode::Char('x')]);
+    assert!(app.plan_view().unwrap().confirm.is_some());
+    press(&mut app, &[KeyCode::Esc]);
+    assert!(app.plan_view().unwrap().confirm.is_none());
+    assert_eq!(app.message.as_deref(), Some("nothing applied"));
+    assert!(app.take_apply().is_none());
+
+    // `plan::usable` decides, as for `dwhy apply`; the status line says why.
+    let file = PathBuf::from("/tmp/plans/dwhy-plan.json");
+    for (host, uid, clock, why) in [
+        (
+            "other",
+            UID,
+            (|| PLAN_AT + 60) as fn() -> i64,
+            "made on testhost, not other",
+        ),
+        (HOST, UID + 1, || PLAN_AT + 60, "made by uid 1000, not 1001"),
+        (HOST, UID, || PLAN_AT + plan::TTL_SECS, "expired at"),
+    ] {
+        let mut app = App::open_plan(review_plan(), file.clone(), host, uid);
+        app.clock = clock;
+        press(&mut app, &[KeyCode::Char('x')]);
+        assert!(app.plan_view().unwrap().confirm.is_none());
+        let msg = app.message.clone().unwrap();
+        assert!(msg.starts_with("cannot apply: "), "{msg}");
+        assert!(msg.contains(why), "{msg}");
+        let screen = render_at(&mut app, 120, 24, None, PLAN_AT + 60);
+        assert!(screen.contains("cannot apply: "), "{screen}");
+    }
+
+    // A preview built from marks opens it too; Tab does not leave it.
+    let (_f, mut app) = preview_app();
+    app.clock = || PLAN_AT + 60;
+    press(&mut app, &[KeyCode::Char('x'), KeyCode::Tab]);
+    assert!(app.plan_view().unwrap().confirm.is_some());
+    press(&mut app, &[KeyCode::Esc]);
+    assert_eq!(app.browser().unwrap().view, View::Plan);
+}
+
+#[test]
+fn modified_apply_keys_do_not_open_or_submit_the_dialog() {
+    let (_fixture, mut browser) = preview_app();
+    browser.clock = || PLAN_AT + 60;
+    for mut app in [dialog_app(false), browser, dialog_app(true)] {
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            assert!(!app.on_key(KeyEvent::new(KeyCode::Char('x'), modifiers)));
+            assert!(app.plan_view().unwrap().confirm.is_none());
+        }
+        press(&mut app, &[KeyCode::Char('x')]);
+        render(&mut app, 80, 24, None);
+        for code in [KeyCode::Char('y'), KeyCode::Char('d')] {
+            for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                assert!(!app.on_key(KeyEvent::new(code, modifiers)));
+                assert!(app.take_apply().is_none());
+                assert!(app.plan_view().unwrap().confirm.is_some());
+            }
+        }
+    }
+}
+
+#[test]
+fn space_confirms_only_review_items() {
+    let mut app = dialog_app(false);
+    press(&mut app, &[KeyCode::Char('x'), KeyCode::Char(' ')]);
+    assert!(
+        confirmed(&app).is_empty(),
+        "the rebuildable item has no box"
+    );
+    assert!(
+        app.message
+            .as_deref()
+            .unwrap()
+            .contains("only review items"),
+        "{:?}",
+        app.message
+    );
+    press(&mut app, &[KeyCode::Down, KeyCode::Char(' ')]);
+    assert_eq!(confirmed(&app), [review_id()]);
+    press(&mut app, &[KeyCode::Char(' ')]);
+    assert!(confirmed(&app).is_empty(), "Space again unticks it");
+    press(&mut app, &[KeyCode::Char(' '), KeyCode::Down, KeyCode::Up]);
+    assert_eq!(confirmed(&app), [review_id()]);
+}
+
+#[test]
+fn y_and_d_start_the_apply_with_the_ticked_review_items() {
+    // Unticked: `--max-tier review` with no `--confirm`, so core refuses it.
+    let mut app = dialog_app(false);
+    press(&mut app, &[KeyCode::Char('x'), KeyCode::Char('y')]);
+    let job = app.take_apply().expect("y asks for an apply");
+    assert!(!job.dry_run);
+    assert_eq!(job.policy.max_tier, Tier::Review);
+    assert!(job.policy.confirm.is_empty());
+    assert_eq!(job.plan, review_plan());
+    let v = app.apply_view().expect("the apply screen is shown");
+    assert!(v.result.is_none() && !v.dry_run);
+    let screen = render(&mut app, 80, 24, None);
+    assert!(screen.contains("rescanning…"), "{screen}");
+    assert!(
+        screen.contains("q quit after the item in progress"),
+        "{screen}"
+    );
+    // Keys other than q do nothing while it runs.
+    press(&mut app, &[KeyCode::Enter, KeyCode::Esc]);
+    assert!(app.take_scan().is_none());
+    assert!(app.apply_view().unwrap().result.is_none());
+
+    // Ticked: `--confirm <id>`.
+    let mut app = dialog_app(false);
+    press(
+        &mut app,
+        &[
+            KeyCode::Char('x'),
+            KeyCode::End,
+            KeyCode::Char(' '),
+            KeyCode::Char('y'),
+        ],
+    );
+    let job = app.take_apply().unwrap();
+    assert_eq!(job.policy.confirm, [review_id()]);
+
+    // d is a dry run with the same policy.
+    let mut app = dialog_app(false);
+    press(
+        &mut app,
+        &[
+            KeyCode::Char('x'),
+            KeyCode::End,
+            KeyCode::Char(' '),
+            KeyCode::Char('d'),
+        ],
+    );
+    let job = app.take_apply().unwrap();
+    assert!(job.dry_run);
+    assert_eq!(job.policy.confirm, [review_id()]);
+    assert!(app.apply_view().unwrap().dry_run);
+
+    // Time passes in the dialog: y checks the plan again.
+    let mut app = dialog_app(false);
+    press(&mut app, &[KeyCode::Char('x')]);
+    app.clock = || PLAN_AT + plan::TTL_SECS;
+    press(&mut app, &[KeyCode::Char('y')]);
+    assert!(app.take_apply().is_none());
+    assert!(app.plan_view().unwrap().confirm.is_none());
+    assert!(app.message.as_deref().unwrap().contains("expired at"));
+}
+
+#[test]
+fn a_dry_run_session_makes_y_a_dry_run() {
+    let mut app = dialog_app(true);
+    assert!(render(&mut app, 80, 24, None).starts_with("\" DRY RUN  dwhy  plan "));
+    press(&mut app, &[KeyCode::Char('x')]);
+    let screen = render(&mut app, 80, 24, None);
+    assert!(screen.contains("y dry run · d dry run"), "{screen}");
+    press(&mut app, &[KeyCode::Char('y')]);
+    assert!(app.take_apply().unwrap().dry_run);
+    assert!(render(&mut app, 80, 24, None).contains(" DRY RUN "));
+}
+
+#[test]
+fn enter_on_the_results_rescans_the_same_roots_and_clears_the_marks() {
+    let f = crates_fixture();
+    let root = f.root();
+    let mut app = app_with(scan(&[&root]));
+    app.options = opts(vec![root.clone()]);
+    press(
+        &mut app,
+        &[KeyCode::Tab, KeyCode::Char(' '), KeyCode::Char('p')],
+    );
+    run_build(&mut app, &Processes::default());
+    press(&mut app, &[KeyCode::Char('x'), KeyCode::Char('y')]);
+    assert!(app.take_apply().is_some());
+    app.apply_done(Ok(hand_applied()));
+
+    // Esc stays: the plan was applied.
+    press(&mut app, &[KeyCode::Esc]);
+    assert!(app.apply_view().is_some());
+    assert!(app.message.as_deref().unwrap().contains("Enter rescans"));
+
+    press(&mut app, &[KeyCode::Enter]);
+    let job = app.take_scan().expect("Enter asks for a rescan");
+    assert_eq!(job.options.paths, std::slice::from_ref(&root));
+    assert_eq!(job.options.detectors, opts(Vec::new()).detectors);
+    assert!(matches!(app.state, State::Scanning { .. }));
+    let screen = render(&mut app, 80, 24, Some(&root));
+    assert!(screen.contains("Scanning"), "{screen}");
+    let data = job::scan(&job.options, &job.progress, &mut |_| {}).unwrap();
+    app.finish(data);
+    assert_eq!(view(&app), View::Tree);
+    assert!(marked(&app).is_empty(), "marks are cleared");
+    assert_eq!(app.browser().unwrap().data.report.findings.len(), 2);
+}
+
+#[test]
+fn a_plan_session_rescans_the_plans_roots_and_esc_returns_after_a_dry_run() {
+    let mut app = dialog_app(false);
+    press(
+        &mut app,
+        &[
+            KeyCode::Char('x'),
+            KeyCode::End,
+            KeyCode::Char(' '),
+            KeyCode::Char('d'),
+        ],
+    );
+    assert!(app.take_apply().is_some());
+    let mut dry = hand_applied();
+    dry.report.dry_run = true;
+    dry.audit = None;
+    app.apply_done(Ok(dry));
+    // Nothing was removed: Esc goes back to the dialog, ticks kept.
+    press(&mut app, &[KeyCode::Esc]);
+    assert_eq!(confirmed(&app), [review_id()]);
+    press(&mut app, &[KeyCode::Char('y')]);
+    assert!(app.take_apply().is_some());
+    app.apply_done(Err(ApplyFailed {
+        message: "cannot read the mount table: gone".into(),
+        exit: 1,
+        audit_error: false,
+    }));
+    let screen = render(&mut app, 80, 24, None);
+    assert!(screen.contains("dwhy apply would exit 1"), "{screen}");
+    assert!(screen.contains("Esc back to the dialog"), "{screen}");
+    press(&mut app, &[KeyCode::Enter]);
+    let job = app.take_scan().unwrap();
+    assert_eq!(job.options.paths, [PathBuf::from("/home/me")]);
+    assert!(!job.options.cross_filesystems);
+    assert_eq!(job.options.detectors, None);
+}
+
+#[test]
+fn apply_results_allow_escape_after_refusals_and_skips() {
+    for (outcome, returns) in [(ApplyOutcome::Skipped, true), (ApplyOutcome::Failed, false)] {
+        let mut app = dialog_app(false);
+        press(
+            &mut app,
+            &[
+                KeyCode::Char('x'),
+                KeyCode::End,
+                KeyCode::Char(' '),
+                KeyCode::Char('y'),
+            ],
+        );
+        assert!(app.take_apply().is_some());
+        let mut result = hand_applied();
+        result.report.freed = 0;
+        result.report.items[0].outcome = outcome;
+        result.exit = dwhy_core::apply::exit_code(&result.report);
+        app.apply_done(Ok(result));
+
+        let screen = render(&mut app, 80, 24, None);
+        assert_eq!(
+            screen.contains("Esc back to the dialog"),
+            returns,
+            "{screen}"
+        );
+        press(&mut app, &[KeyCode::Esc]);
+        if returns {
+            assert_eq!(confirmed(&app), [review_id()]);
+        } else {
+            assert!(app.apply_view().is_some());
+        }
+    }
+}
+
+#[test]
+fn apply_rescan_reports_removed_roots_and_stays_open() {
+    use dwhy_core::apply::Env;
+    use std::time::{Duration, SystemTime};
+
+    for saved_plan in [false, true] {
+        for keep_root in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let base = fixture.path().canonicalize().unwrap();
+            let scratch = base.join("scratch");
+            let other = base.join("keep");
+            fs::create_dir(&scratch).unwrap();
+            fs::create_dir(&other).unwrap();
+            fs::write(other.join("keep.txt"), "safe").unwrap();
+            let marker = scratch.join(".dwhy-scratch");
+            let payload = scratch.join("blob");
+            fs::write(&marker, "").unwrap();
+            fs::write(&payload, vec![1u8; 2 * MIB]).unwrap();
+            let old = SystemTime::now() - Duration::from_secs(30 * 86_400);
+            for path in [&marker, &payload, &scratch] {
+                fs::File::open(path).unwrap().set_modified(old).unwrap();
+            }
+            let mut paths = vec![scratch.clone()];
+            if keep_root {
+                paths.push(other.clone());
+            }
+            let options = Options {
+                detectors: Some(vec!["stale-tree".into()]),
+                audit_log: Some(base.join("audit.jsonl")),
+                ..opts(paths)
+            };
+            let data = job::scan(&options, &Progress::default(), &mut |_| {}).unwrap();
+            assert_eq!(data.report.findings.len(), 1);
+            let env = Env::from_system();
+            let mut app = if saved_plan {
+                let plan = job::PlanJob {
+                    options: data.plan_options,
+                    progress: Arc::default(),
+                    marks: data.report.findings.iter().map(Into::into).collect(),
+                }
+                .build(Processes::default, env.host.clone())
+                .unwrap()
+                .plan;
+                App::open_plan(plan, base.join("plan.json"), &env.host, env.uid)
+                    .with_options(options)
+            } else {
+                let mut app = app_with(data).with_options(options);
+                press(
+                    &mut app,
+                    &[KeyCode::Tab, KeyCode::Char(' '), KeyCode::Char('p')],
+                );
+                let plan = app
+                    .take_request()
+                    .unwrap()
+                    .build(Processes::default, env.host.clone());
+                app.plan_built(plan, &env.host, env.uid);
+                app
+            };
+
+            press(
+                &mut app,
+                &[KeyCode::Char('x'), KeyCode::Char(' '), KeyCode::Char('y')],
+            );
+            let result = app
+                .take_apply()
+                .unwrap()
+                .run(Processes::default, &env)
+                .unwrap();
+            assert_eq!(result.report.items[0].outcome, ApplyOutcome::Removed);
+            assert!(!scratch.exists());
+            app.apply_done(Ok(result));
+            press(&mut app, &[KeyCode::Enter]);
+            let outcome = app.take_scan().unwrap().run(&mut |_| {}).unwrap();
+            assert_eq!(outcome.removed, std::slice::from_ref(&scratch));
+            app.scan_done(outcome);
+
+            let screen = render(&mut app, 80, 24, None);
+            assert!(
+                screen.contains(&format!("removed: {}", scratch.display())),
+                "{screen}"
+            );
+            assert_eq!(fs::read_to_string(other.join("keep.txt")).unwrap(), "safe");
+            if keep_root {
+                let browser = app.browser().unwrap();
+                assert_eq!(browser.data.plan_options.paths, [other]);
+                assert_eq!(browser.marked_findings().count(), 0);
+            } else {
+                assert!(
+                    screen.contains("all scanned roots were removed"),
+                    "{screen}"
+                );
+                assert!(screen.contains("q quit"), "{screen}");
+                press(&mut app, &[KeyCode::Enter, KeyCode::Esc]);
+                assert!(app.take_scan().is_none());
+                assert!(app.on_key(key(KeyCode::Char('q'))));
+            }
+        }
+    }
+}
+
+#[test]
+fn confirm_dialog_80x24() {
+    let mut app = dialog_app(false);
+    press(&mut app, &[KeyCode::Char('x')]);
+    insta::assert_snapshot!(render_at(&mut app, 80, 24, None, PLAN_AT + 60));
+}
+
+#[test]
+fn confirm_dialog_long_action_80x24() {
+    let mut plan = review_plan();
+    let finding = &mut plan.items[1].finding;
+    let cargo_path = format!(
+        "/home/me/{}/target-final",
+        "long-directory-component/".repeat(70)
+    );
+    finding.action.kind = ActionKind::Command;
+    finding.action.text = format!("cargo clean --target-dir {cargo_path}");
+    let mut app = App::open_plan(plan, "/tmp/plans/dwhy-plan.json".into(), HOST, UID);
+    app.clock = || PLAN_AT + 60;
+    press(&mut app, &[KeyCode::Char('x'), KeyCode::Down]);
+    let short = render_at(&mut app, 80, 8, None, PLAN_AT + 60);
+    assert!(short.contains("enlarge the terminal to confirm"), "{short}");
+    for code in [' ', 'd', 'y'] {
+        assert!(!app.on_key(key(KeyCode::Char(code))));
+    }
+    assert!(confirmed(&app).is_empty());
+    assert!(app.take_apply().is_none());
+
+    let first = render_at(&mut app, 80, 11, None, PLAN_AT + 60);
+    assert!(first.contains("preview — do not copy"), "{first}");
+    assert!(first.contains("cargo clean --target-dir"), "{first}");
+    press(&mut app, &[KeyCode::PageDown]);
+    let second = render_at(&mut app, 80, 11, None, PLAN_AT + 60);
+    assert!(second.contains("preview — do not copy"), "{second}");
+    assert!(second.contains("long-directory-component"), "{second}");
+    assert!(!second.contains("cargo clean --target-dir"), "{second}");
+    press(&mut app, &[KeyCode::PageUp]);
+    assert_eq!(render_at(&mut app, 80, 11, None, PLAN_AT + 60), first);
+
+    let start = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(start.contains("preview — do not copy"), "{start}");
+    assert!(!start.contains("target-final"), "{start}");
+
+    for _ in 0..3 {
+        press(&mut app, &[KeyCode::PageDown]);
+        let page = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+        assert!(page.contains("> [ ] review"), "{page}");
+        assert!(page.contains("preview — do not copy"), "{page}");
+    }
+    press(&mut app, &[KeyCode::Char(' ')]);
+    let end = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(end.contains("target-final"), "{end}");
+    assert!(end.contains("> [x] review"), "{end}");
+    assert!(end.contains("preview — do not copy"), "{end}");
+    assert_eq!(confirmed(&app), [review_id()]);
+    insta::assert_snapshot!(end);
+
+    for _ in 0..3 {
+        press(&mut app, &[KeyCode::PageUp]);
+        let page = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+        assert!(page.contains("> [x] review"), "{page}");
+        assert!(page.contains("preview — do not copy"), "{page}");
+    }
+    let top = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(top.contains("[x] review"), "{top}");
+    assert!(!top.contains("target-final"), "{top}");
+}
+
+#[test]
+fn apply_keys_require_a_readable_confirmation_frame() {
+    let mut app = dialog_app(false);
+    press(&mut app, &[KeyCode::Char('x'), KeyCode::Down]);
+    for code in [' ', 'd', 'y'] {
+        assert!(!app.on_key(key(KeyCode::Char(code))));
+    }
+    assert!(confirmed(&app).is_empty());
+    assert!(app.take_apply().is_none());
+
+    for (width, height) in [(80, 5), (80, 8), (30, 24), (70, 24)] {
+        let screen = render_at(&mut app, width, height, None, PLAN_AT + 60);
+        assert!(!screen.contains("[ ]"), "{screen}");
+        assert!(screen.contains("enlarge the terminal to"), "{screen}");
+        if (width, height) == (80, 5) {
+            insta::assert_snapshot!("confirm_dialog_enlarge_80x5", screen);
+        }
+        for code in [' ', 'd', 'y'] {
+            assert!(!app.on_key(key(KeyCode::Char(code))));
+        }
+        assert!(confirmed(&app).is_empty());
+        assert!(app.take_apply().is_none());
+    }
+
+    assert!(app.on_key(key(KeyCode::Char('q'))));
+    assert!(!app.on_key(key(KeyCode::Esc)));
+    assert!(app.plan_view().unwrap().confirm.is_none());
+    press(&mut app, &[KeyCode::Char('x'), KeyCode::Down]);
+    let visible = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(visible.contains("> [ ] review"), "{visible}");
+    assert!(!app.on_key(key(KeyCode::Char(' '))));
+    assert_eq!(confirmed(&app), [review_id()]);
+    render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(!app.on_key(key(KeyCode::Char('y'))));
+    let job = app.take_apply().unwrap();
+    assert!(!job.dry_run);
+    assert_eq!(job.policy.confirm, [review_id()]);
+}
+
+#[test]
+fn confirm_dialog_keeps_the_withheld_action_notice_when_paging() {
+    let mut plan = review_plan();
+    let finding = &mut plan.items[1].finding;
+    finding.action.kind = ActionKind::Command;
+    finding.action.text = "cargo clean --target-dir /home/me/\u{fffd}".into();
+    let mut app = App::open_plan(plan, "/tmp/plans/dwhy-plan.json".into(), HOST, UID);
+    app.clock = || PLAN_AT + 60;
+    press(&mut app, &[KeyCode::Char('x'), KeyCode::Down]);
+    let before = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(before.contains("command withheld"), "{before}");
+    assert!(before.contains("not valid UTF-8"), "{before}");
+    assert!(before.contains("shown exactly"), "{before}");
+    press(&mut app, &[KeyCode::PageDown]);
+    assert_eq!(render_at(&mut app, 80, 24, None, PLAN_AT + 60), before);
+    press(&mut app, &[KeyCode::PageUp]);
+    assert_eq!(render_at(&mut app, 80, 24, None, PLAN_AT + 60), before);
+}
+
+#[test]
+fn confirm_dialog_confirmed_80x24() {
+    let mut app = dialog_app(false);
+    press(
+        &mut app,
+        &[KeyCode::Char('x'), KeyCode::Down, KeyCode::Char(' ')],
+    );
+    insta::assert_snapshot!(render_at(&mut app, 80, 24, None, PLAN_AT + 60));
+}
+
+#[test]
+fn confirm_dialog_120x40() {
+    let mut app = dialog_app(false);
+    press(&mut app, &[KeyCode::Char('x')]);
+    insta::assert_snapshot!(render_at(&mut app, 120, 40, None, PLAN_AT + 60));
+}
+
+#[test]
+fn confirm_dialog_confirmed_120x40() {
+    let mut app = dialog_app(false);
+    press(
+        &mut app,
+        &[KeyCode::Char('x'), KeyCode::Down, KeyCode::Char(' ')],
+    );
+    insta::assert_snapshot!(render_at(&mut app, 120, 40, None, PLAN_AT + 60));
+}
+
+#[test]
+fn dry_run_header_80x24() {
+    let mut app = dialog_app(true);
+    press(&mut app, &[KeyCode::Char('x')]);
+    insta::assert_snapshot!(render_at(&mut app, 80, 24, None, PLAN_AT + 60));
+}
+
+#[test]
+fn apply_results_80x24() {
+    let mut app = dialog_app(false);
+    press(&mut app, &[KeyCode::Char('x'), KeyCode::Char('y')]);
+    assert!(app.take_apply().is_some());
+    app.apply_done(Ok(hand_applied()));
+    insta::assert_snapshot!(render_at(&mut app, 80, 24, None, PLAN_AT + 120));
 }

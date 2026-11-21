@@ -15,6 +15,7 @@
 //! state to compare against, so editing one can make it stale but cannot
 //! widen what apply may do.
 
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, Stat};
@@ -442,7 +443,7 @@ pub fn to_json(plan: &Plan) -> serde_json::Result<String> {
     Ok(text)
 }
 
-/// Parses a plan file and checks its schema.
+/// Parses a plan file, checking its schema and the [`Plan::items`] ID constraint.
 pub fn parse(text: &str) -> Result<Plan, String> {
     #[derive(serde::Deserialize)]
     struct Head {
@@ -450,7 +451,17 @@ pub fn parse(text: &str) -> Result<Plan, String> {
     }
     let head: Head = serde_json::from_str(text).map_err(|e| format!("not a diskwhy plan: {e}"))?;
     check_schema(&head.schema)?;
-    serde_json::from_str(text).map_err(|e| format!("not a diskwhy plan: {e}"))
+    let plan: Plan = serde_json::from_str(text).map_err(|e| format!("not a diskwhy plan: {e}"))?;
+    let mut ids = HashSet::new();
+    for item in &plan.items {
+        if !ids.insert(&item.finding.id) {
+            return Err(format!(
+                "duplicate finding ID in plan items: {}",
+                item.finding.id
+            ));
+        }
+    }
+    Ok(plan)
 }
 
 /// Why a plan cannot be applied at all.
@@ -474,8 +485,8 @@ impl std::fmt::Display for Unusable {
     }
 }
 
-/// Checks that `plan` was made here, by this uid, and has not expired at
-/// `now` (seconds since the epoch).
+/// Checks the plan's host, uid, validity window and root path encoding.
+/// `now` is in seconds since the epoch.
 pub fn usable(plan: &Plan, host: &str, uid: u32, now: i64) -> Result<(), Unusable> {
     if plan.host != host {
         return Err(Unusable::Elsewhere(format!(

@@ -41,4 +41,4 @@ expression: screen
 "                                                                                                                        "
 "                                                                                                                        "
 " lines 1–30 of 30                                                                                                       "
-" ↑↓ PgUp PgDn scroll · w write plan file · Esc back · Tab tree · q quit                                                 "
+" ↑↓ PgUp PgDn scroll · x apply · w write plan · Esc back · Tab tree · q quit                                            "

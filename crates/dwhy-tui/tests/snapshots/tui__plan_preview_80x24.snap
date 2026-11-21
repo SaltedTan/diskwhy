@@ -1,6 +1,6 @@
 ---
 source: crates/dwhy-tui/tests/tui.rs
-expression: "render(&mut app, 80, 24, None)"
+expression: "render_at(&mut app, 80, 24, None, PLAN_AT)"
 ---
 " dwhy  plan preview                                             2 items · 3.3G  "
 "2 items, frees 3.3G, 1 blocked                                                  "
@@ -25,4 +25,4 @@ expression: "render(&mut app, 80, 24, None)"
 "regenerable    90.0M  /home/me/.local/share/Trash                               "
 "  f_0fd120489cb2 · trash                                                        "
 " lines 1–21 of 31                                                               "
-" ↑↓ PgUp PgDn scroll · w write plan file · Esc back · Tab tree · q quit         "
+" ↑↓ PgUp PgDn scroll · x apply · w write plan · Esc back · Tab tree · q quit    "
