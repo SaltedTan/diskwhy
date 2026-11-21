@@ -21,7 +21,7 @@ use dwhy_core::report::{
 };
 use dwhy_core::scan::Progress;
 use dwhy_core::{detect, growth, snapshot, system};
-use dwhy_tui::app::{App, DEFAULT_PLAN_FILE, PlanState, RowKind, SizeMode, State, View};
+use dwhy_tui::app::{App, DEFAULT_PLAN_FILE, PlanState, RootsGone, RowKind, SizeMode, State, View};
 use dwhy_tui::job::{self, Applied, ApplyFailed, BuiltPlan, Options, PermissionMark, Scanned};
 use dwhy_tui::ui;
 use ratatui::Terminal;
@@ -2675,7 +2675,197 @@ fn modified_apply_keys_do_not_open_or_submit_the_dialog() {
                 assert!(app.plan_view().unwrap().confirm.is_some());
             }
         }
+        // Alt+Space and Ctrl+Space neither tick nor untick the second item
+        // (a review item, except in the preview built from marks).
+        press(&mut app, &[KeyCode::Down]);
+        let review = app.plan_view().unwrap().plan().items[1].finding.tier == Tier::Review;
+        for ticked in [false, true] {
+            render(&mut app, 80, 24, None);
+            for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                assert!(!app.on_key(KeyEvent::new(KeyCode::Char(' '), modifiers)));
+                assert_eq!(confirmed(&app).is_empty(), !ticked);
+                assert_eq!(app.message, None, "{modifiers:?}+Space is ignored");
+            }
+            if !review {
+                break;
+            }
+            if !ticked {
+                press(&mut app, &[KeyCode::Char(' ')]);
+                assert_eq!(confirmed(&app).len(), 1);
+            }
+        }
     }
+}
+
+#[test]
+fn q_and_ctrl_c_stop_a_running_apply_before_returning() {
+    for quit in [key(KeyCode::Char('q')), ctrl('c')] {
+        let mut app = dialog_app(false);
+        press(&mut app, &[KeyCode::Char('x'), KeyCode::Char('y')]);
+        let job = app.take_apply().expect("y asks for an apply");
+        assert!(!job.progress.stopping());
+        assert!(matches!(app.state, State::Applying(_)));
+        assert!(app.on_key(quit), "{quit:?} quits");
+        // Latched by the key itself, before the event loop winds down.
+        assert!(job.progress.stopping(), "{quit:?} stops the apply");
+    }
+}
+
+#[test]
+fn blocked_and_advice_items_are_not_counted_or_said_to_go_ahead() {
+    use dwhy_core::units::human;
+    for kind in ["blocked", "advice", "review-advice"] {
+        // A hand-edited plan: its trash item made blocked, or advice only
+        // (in its own tier or in review, as docker-volume reports in-use volumes).
+        let mut plan = hand_plan();
+        let cargo = plan.items[0].finding.bytes;
+        let trash = &mut plan.items[1].finding;
+        let both = cargo + trash.bytes;
+        match kind {
+            "blocked" => trash.tier = Tier::Blocked,
+            _ => {
+                trash.action.kind = ActionKind::Advice;
+                trash.action.text = "empty the trash from your file manager".into();
+                if kind == "review-advice" {
+                    trash.tier = Tier::Review;
+                }
+            }
+        }
+        let mut app = App::open_plan(plan, "/tmp/plans/dwhy-plan.json".into(), HOST, UID);
+        app.clock = || PLAN_AT + 60;
+        press(&mut app, &[KeyCode::Char('x')]);
+        let screen = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+        assert!(
+            screen.contains(&format!("frees ≈ {}", human(cargo))),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains(&format!("frees ≈ {}", human(both))),
+            "{screen}"
+        );
+        // Nothing to tick: no checkbox, no review count, no refusal note.
+        assert!(!screen.contains("[ ]"), "{screen}");
+        assert!(!screen.contains("review confirmed"), "{screen}");
+        assert!(!screen.contains("Unconfirmed review"), "{screen}");
+        press(&mut app, &[KeyCode::Down]);
+        let screen = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+        assert!(!screen.contains("no confirmation needed"), "{screen}");
+        assert!(!screen.contains("not confirmed"), "{screen}");
+        let status = match kind {
+            "blocked" => "blocked: never applied",
+            "review-advice" => "review: advice only, nothing runs",
+            _ => "advice only, nothing runs",
+        };
+        assert!(screen.contains(status), "{screen}");
+        press(&mut app, &[KeyCode::Char(' ')]);
+        let message = app.message.clone().unwrap();
+        assert!(!message.contains("goes ahead"), "{message}");
+        let expected = match kind {
+            "blocked" => "never applied",
+            _ => "advice only",
+        };
+        assert!(message.contains(expected), "{message}");
+        assert!(confirmed(&app).is_empty());
+        let screen = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+        assert!(!screen.contains("[x]"), "{screen}");
+        assert!(!screen.contains("review: confirmed"), "{screen}");
+    }
+}
+
+/// Every command fragment on a confirm screen sits under its own `preview
+/// — do not copy` label, and every withheld notice is whole.
+fn assert_whole_actions(screen: &str) {
+    let lines: Vec<&str> = screen.lines().collect();
+    let mut labelled = false;
+    for line in &lines {
+        if line.contains("preview — do not copy") {
+            labelled = true;
+        } else if line.starts_with("\"││") {
+            assert!(labelled, "a command fragment without its label:\n{screen}");
+        } else {
+            labelled = false;
+        }
+    }
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("command withheld") {
+            let end = lines[i..]
+                .iter()
+                .take(2)
+                .any(|l| l.contains("shown exactly"));
+            assert!(end, "a withheld notice cut at its end:\n{screen}");
+        }
+        if line.contains("shown exactly") {
+            let start = lines[..=i]
+                .iter()
+                .rev()
+                .take(2)
+                .any(|l| l.contains("command withheld"));
+            assert!(start, "a withheld notice cut at its start:\n{screen}");
+        }
+    }
+}
+
+#[test]
+fn confirm_dialog_neighbors_keep_their_copy_label() {
+    let mut plan = review_plan();
+    plan.items[0].finding.action.text = format!(
+        "cargo clean --target-dir /home/me/{}target",
+        "long-directory-component/".repeat(40)
+    );
+    let mut app = App::open_plan(plan, "/tmp/plans/dwhy-plan.json".into(), HOST, UID);
+    app.clock = || PLAN_AT + 60;
+    press(&mut app, &[KeyCode::Char('x')]);
+    for height in 10..=40 {
+        press(&mut app, &[KeyCode::Home]);
+        let first = render_at(&mut app, 80, height, None, PLAN_AT + 60);
+        assert_whole_actions(&first);
+        // Down from the long command to the short review item.
+        press(&mut app, &[KeyCode::Down]);
+        let second = render_at(&mut app, 80, height, None, PLAN_AT + 60);
+        assert_whole_actions(&second);
+        if !second.contains("enlarge the terminal") {
+            assert!(second.contains("> [ ] review"), "{second}");
+        }
+    }
+    // At 80×24 the long command no longer fits above the review item.
+    let screen = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(screen.contains("> [ ] review"), "{screen}");
+    assert!(!screen.contains("long-directory-component"), "{screen}");
+}
+
+#[test]
+fn confirm_dialog_never_splits_a_neighbors_withheld_notice() {
+    let mut plan = review_plan();
+    let withheld = &mut plan.items[1].finding;
+    withheld.action.kind = ActionKind::Command;
+    withheld.action.text = "cargo clean --target-dir /home/me/\u{fffd}".into();
+    let mut venv = hand_finding(
+        "venv",
+        "/home/me/projects/site/.venv",
+        250 << 20,
+        Tier::Rebuildable,
+    );
+    venv.action.text = "rm -rf /home/me/projects/site/.venv".into();
+    plan.items.push(PlanItem {
+        finding: venv,
+        fingerprint: fingerprint(),
+    });
+    let mut app = App::open_plan(plan, "/tmp/plans/dwhy-plan.json".into(), HOST, UID);
+    app.clock = || PLAN_AT + 60;
+    press(&mut app, &[KeyCode::Char('x')]);
+    let mut seen = false;
+    for height in 8..=30 {
+        press(&mut app, &[KeyCode::Home]);
+        for step in 0..3 {
+            if step > 0 {
+                press(&mut app, &[KeyCode::Down]);
+            }
+            let screen = render_at(&mut app, 80, height, None, PLAN_AT + 60);
+            assert_whole_actions(&screen);
+            seen |= step != 1 && screen.contains("command withheld");
+        }
+    }
+    assert!(seen, "the notice was shown whole for a neighbor");
 }
 
 #[test]
@@ -2889,7 +3079,7 @@ fn apply_rescan_reports_removed_roots_and_stays_open() {
     use std::time::{Duration, SystemTime};
 
     for saved_plan in [false, true] {
-        for keep_root in [false, true] {
+        for (keep_root, lose_other) in [(false, false), (true, false), (true, true)] {
             let fixture = tempfile::tempdir().unwrap();
             let base = fixture.path().canonicalize().unwrap();
             let scratch = base.join("scratch");
@@ -2954,9 +3144,21 @@ fn apply_rescan_reports_removed_roots_and_stays_open() {
             assert_eq!(result.report.items[0].outcome, ApplyOutcome::Removed);
             assert!(!scratch.exists());
             app.apply_done(Ok(result));
+            if lose_other {
+                // Gone, but not by this apply: unavailable, not removed.
+                fs::remove_dir_all(&other).unwrap();
+            }
             press(&mut app, &[KeyCode::Enter]);
-            let outcome = app.take_scan().unwrap().run(&mut |_| {}).unwrap();
+            let job = app.take_scan().unwrap();
+            assert_eq!(job.removed_by_apply, std::slice::from_ref(&scratch));
+            let outcome = job.run(&mut |_| {}).unwrap();
             assert_eq!(outcome.removed, std::slice::from_ref(&scratch));
+            let unavailable: &[PathBuf] = if lose_other {
+                std::slice::from_ref(&other)
+            } else {
+                &[]
+            };
+            assert_eq!(outcome.unavailable, unavailable);
             app.scan_done(outcome);
 
             let screen = render(&mut app, 80, 24, None);
@@ -2964,12 +3166,22 @@ fn apply_rescan_reports_removed_roots_and_stays_open() {
                 screen.contains(&format!("removed: {}", scratch.display())),
                 "{screen}"
             );
-            assert_eq!(fs::read_to_string(other.join("keep.txt")).unwrap(), "safe");
-            if keep_root {
+            if lose_other {
+                let message = app.message.clone().unwrap();
+                assert!(
+                    message.contains(&format!("unavailable: {}", other.display())),
+                    "{message}"
+                );
+                assert!(screen.contains("no scanned roots remain"), "{screen}");
+                assert!(!screen.contains("all scanned roots"), "{screen}");
+                assert!(app.on_key(key(KeyCode::Char('q'))));
+            } else if keep_root {
+                assert_eq!(fs::read_to_string(other.join("keep.txt")).unwrap(), "safe");
                 let browser = app.browser().unwrap();
                 assert_eq!(browser.data.plan_options.paths, [other]);
                 assert_eq!(browser.marked_findings().count(), 0);
             } else {
+                assert_eq!(fs::read_to_string(other.join("keep.txt")).unwrap(), "safe");
                 assert!(
                     screen.contains("all scanned roots were removed"),
                     "{screen}"
@@ -2981,6 +3193,147 @@ fn apply_rescan_reports_removed_roots_and_stays_open() {
             }
         }
     }
+}
+
+#[test]
+fn a_root_that_disappears_without_the_apply_is_unavailable() {
+    let f = crates_fixture();
+    let root = f.root();
+    let mut app = app_with(scan(&[&root]));
+    app.options = opts(vec![root.clone()]);
+    press(
+        &mut app,
+        &[KeyCode::Tab, KeyCode::Char(' '), KeyCode::Char('p')],
+    );
+    run_build(&mut app, &Processes::default());
+    press(&mut app, &[KeyCode::Char('x'), KeyCode::Char('y')]);
+    assert!(app.take_apply().is_some());
+    // The apply removed a path elsewhere; the root goes for another reason.
+    app.apply_done(Ok(hand_applied()));
+    let gone = root.with_extension("moved");
+    fs::rename(&root, &gone).unwrap();
+    let _restore = Rename(gone, root.clone());
+    press(&mut app, &[KeyCode::Enter]);
+    let job = app.take_scan().unwrap();
+    assert_eq!(
+        job.removed_by_apply,
+        [PathBuf::from("/home/me/projects/diskwhy/target")]
+    );
+    let outcome = job.run(&mut |_| {}).unwrap();
+    assert!(outcome.removed.is_empty());
+    assert_eq!(outcome.unavailable, std::slice::from_ref(&root));
+    app.scan_done(outcome);
+    assert!(matches!(
+        app.state,
+        State::RootsGone(RootsGone::Unavailable)
+    ));
+    let screen = render(&mut app, 80, 24, Some(&root));
+    assert!(
+        screen.contains("all scanned roots are unavailable"),
+        "{screen}"
+    );
+    assert!(!screen.contains("removed"), "{screen}");
+    assert!(screen.contains("unavailable: /tmp/dwhyXXXXXX"), "{screen}");
+}
+
+/// Renames a fixture back on drop, so the temp dir is cleaned up.
+struct Rename(PathBuf, PathBuf);
+
+impl Drop for Rename {
+    fn drop(&mut self) {
+        let _ = fs::rename(&self.0, &self.1);
+    }
+}
+
+fn rescan_job(paths: Vec<PathBuf>, removed_by_apply: Vec<PathBuf>) -> job::ScanJob {
+    job::ScanJob {
+        options: opts(paths),
+        progress: Arc::default(),
+        removed_by_apply,
+    }
+}
+
+#[test]
+fn rescan_leaves_out_a_root_below_what_is_now_a_file() {
+    let t = tempfile::tempdir().unwrap();
+    let base = t.path().canonicalize().unwrap();
+    let parent = base.join("parent");
+    let child = parent.join("child");
+    let keep = base.join("keep");
+    fs::create_dir_all(&child).unwrap();
+    fs::create_dir(&keep).unwrap();
+    fs::write(keep.join("data"), b"kept").unwrap();
+    fs::remove_dir_all(&parent).unwrap();
+    // `child`'s lookup now fails with ENOTDIR.
+    fs::write(&parent, b"a file now").unwrap();
+    let outcome = rescan_job(vec![child.clone(), keep.clone()], Vec::new())
+        .run(&mut |_| {})
+        .unwrap();
+    assert_eq!(outcome.unavailable, std::slice::from_ref(&child));
+    assert!(outcome.removed.is_empty());
+    let scanned = outcome.scanned.expect("the other root is scanned");
+    assert_eq!(scanned.plan_options.paths, [keep]);
+}
+
+#[test]
+fn rescan_leaves_out_a_root_that_goes_before_the_walk() {
+    for removed_by_apply in [false, true] {
+        let t = tempfile::tempdir().unwrap();
+        let base = t.path().canonicalize().unwrap();
+        let (a, b) = (base.join("a"), base.join("b"));
+        for d in [&a, &b] {
+            fs::create_dir(d).unwrap();
+            fs::write(d.join("data"), b"x").unwrap();
+        }
+        let applied = if removed_by_apply {
+            vec![base.clone()]
+        } else {
+            Vec::new()
+        };
+        let mut walks = 0;
+        let outcome = rescan_job(vec![a.clone(), b.clone()], applied)
+            .run(&mut |stage| {
+                // The roots were prepared; `b` goes before it is walked.
+                if stage == job::Stage::Walking {
+                    walks += 1;
+                    if walks == 1 {
+                        fs::remove_dir_all(&b).unwrap();
+                    }
+                }
+            })
+            .unwrap();
+        assert_eq!(walks, 2, "the scan started again without b");
+        let (removed, unavailable) = if removed_by_apply {
+            (outcome.removed, outcome.unavailable)
+        } else {
+            (outcome.unavailable, outcome.removed)
+        };
+        assert_eq!(removed, std::slice::from_ref(&b));
+        assert!(unavailable.is_empty());
+        assert_eq!(outcome.scanned.unwrap().plan_options.paths, [a]);
+    }
+}
+
+#[test]
+fn rescan_still_fails_on_a_root_it_may_not_read() {
+    if is_root() {
+        return;
+    }
+    let t = tempfile::tempdir().unwrap();
+    let base = t.path().canonicalize().unwrap();
+    let locked = base.join("locked");
+    let inner = locked.join("inner");
+    fs::create_dir_all(&inner).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let _unlock = Unlock(locked);
+    let keep = base.join("keep");
+    fs::create_dir(&keep).unwrap();
+    let error = rescan_job(vec![inner.clone(), keep], Vec::new())
+        .run(&mut |_| {})
+        .err()
+        .expect("permission denied fails the rescan");
+    assert!(error.contains(&inner.display().to_string()), "{error}");
+    assert!(error.contains("ermission denied"), "{error}");
 }
 
 #[test]

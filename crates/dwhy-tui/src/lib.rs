@@ -70,6 +70,7 @@ pub fn run(opts: Options) -> Result<u8, Error> {
             job::scan(&opts, &progress, stage).map(|data| job::ScanOutcome {
                 scanned: Some(data),
                 removed: Vec::new(),
+                unavailable: Vec::new(),
             })
         })
     })

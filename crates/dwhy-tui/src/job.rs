@@ -65,13 +65,26 @@ impl Options {
         self.prepare_roots()
     }
 
-    fn prepare_roots(&self) -> Result<Vec<PathBuf>, String> {
-        let paths = if self.paths.is_empty() {
+    /// The paths as given; `.` when there are none.
+    fn input_paths(&self) -> Vec<PathBuf> {
+        if self.paths.is_empty() {
             vec![PathBuf::from(".")]
         } else {
             self.paths.clone()
-        };
-        scan::prepare_roots(&paths, !self.cross_filesystems).map_err(|e| e.to_string())
+        }
+    }
+
+    fn prepare_roots(&self) -> Result<Vec<PathBuf>, String> {
+        scan::prepare_roots(&self.input_paths(), !self.cross_filesystems).map_err(|e| e.to_string())
+    }
+
+    fn scan_options(&self) -> ScanOptions {
+        ScanOptions {
+            one_filesystem: !self.cross_filesystems,
+            min_dir_bytes: u64::MAX,
+            threads: self.threads,
+            ..ScanOptions::default()
+        }
     }
 
     fn walk(
@@ -80,13 +93,7 @@ impl Options {
         mounts: &MountTable,
         progress: &Progress,
     ) -> Result<ScanResult, String> {
-        let opts = ScanOptions {
-            one_filesystem: !self.cross_filesystems,
-            min_dir_bytes: u64::MAX,
-            threads: self.threads,
-            ..ScanOptions::default()
-        };
-        scan::scan(roots, &opts, mounts, progress).map_err(|e| e.to_string())
+        scan::scan(roots, &self.scan_options(), mounts, progress).map_err(|e| e.to_string())
     }
 
     fn detect_context(&self) -> DetectContext {
@@ -156,10 +163,66 @@ pub fn scan(
     progress: &Progress,
     stage: &mut dyn FnMut(Stage),
 ) -> Result<Scanned, String> {
+    scan_roots(opts, progress, stage).map_err(|failed| match failed {
+        ScanFailed::MissingRoot { message, .. } | ScanFailed::Other(message) => message,
+    })
+}
+
+/// Why [`scan_roots`] failed.
+enum ScanFailed {
+    /// A root, or one of its ancestors, was missing or not a directory when
+    /// the scan looked it up (`ENOENT`, `ENOTDIR`).
+    MissingRoot {
+        path: PathBuf,
+        /// The roots to try again with: those given, without `path`.
+        rest: Vec<PathBuf>,
+        message: String,
+    },
+    Other(String),
+}
+
+impl ScanFailed {
+    /// Sorts a failure to look up one of `roots`.
+    fn from_scan(error: scan::ScanError, roots: &[PathBuf]) -> ScanFailed {
+        match error {
+            scan::ScanError::Root { path, source }
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                let message = scan::ScanError::Root {
+                    path: path.clone(),
+                    source,
+                }
+                .to_string();
+                let rest = roots.iter().filter(|r| **r != path).cloned().collect();
+                ScanFailed::MissingRoot {
+                    path,
+                    rest,
+                    message,
+                }
+            }
+            error => ScanFailed::Other(error.to_string()),
+        }
+    }
+}
+
+fn scan_roots(
+    opts: &Options,
+    progress: &Progress,
+    stage: &mut dyn FnMut(Stage),
+) -> Result<Scanned, ScanFailed> {
+    if let Some(names) = &opts.detectors {
+        detect::validate_selection(names).map_err(ScanFailed::Other)?;
+    }
+    let paths = opts.input_paths();
+    let roots = scan::prepare_roots(&paths, !opts.cross_filesystems)
+        .map_err(|e| ScanFailed::from_scan(e, &paths))?;
     stage(Stage::Walking);
-    let roots = opts.roots()?;
     let mounts = MountTable::read().unwrap_or_default();
-    let result = opts.walk(&roots, &mounts, progress)?;
+    let result = scan::scan(&roots, &opts.scan_options(), &mounts, progress)
+        .map_err(|e| ScanFailed::from_scan(e, &roots))?;
 
     stage(Stage::Accounting);
     let mut report = account::system_scan_report(&result, &mounts);
@@ -195,30 +258,57 @@ pub fn scan(
 pub struct ScanJob {
     pub options: Options,
     pub progress: Arc<Progress>,
+    /// Paths the apply before this rescan removed (`ApplyOutcome::Removed`):
+    /// a root missing at or below one of them was removed, any other
+    /// missing root is unavailable.
+    pub removed_by_apply: Vec<PathBuf>,
 }
 
 pub struct ScanOutcome {
+    /// `None` when no root was left to scan.
     pub scanned: Option<Scanned>,
+    /// Roots missing because the apply removed them.
     pub removed: Vec<PathBuf>,
+    /// Roots missing for another reason (an unmounted drive, a directory
+    /// removed by something else).
+    pub unavailable: Vec<PathBuf>,
 }
 
 impl ScanJob {
-    pub fn run(mut self, stage: &mut dyn FnMut(Stage)) -> Result<ScanOutcome, String> {
-        let mut removed = Vec::new();
-        self.options.paths.retain(|path| {
-            if fs::symlink_metadata(path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
-                removed.push(path.clone());
-                false
-            } else {
-                true
+    /// Scans the roots that are still there. A root missing (or below
+    /// something that is no longer a directory) when the scan looks it up
+    /// is left out and the scan starts again with the others; any other
+    /// error fails the rescan.
+    pub fn run(self, stage: &mut dyn FnMut(Stage)) -> Result<ScanOutcome, String> {
+        let ScanJob {
+            mut options,
+            progress,
+            removed_by_apply,
+        } = self;
+        let mut missing = Vec::new();
+        let scanned = loop {
+            match scan_roots(&options, &progress, stage) {
+                Ok(scanned) => break Some(scanned),
+                Err(ScanFailed::MissingRoot { path, rest, .. }) => {
+                    missing.push(path);
+                    if rest.is_empty() {
+                        break None;
+                    }
+                    options.paths = rest;
+                    progress.entries.store(0, Ordering::Relaxed);
+                    progress.allocated.store(0, Ordering::Relaxed);
+                }
+                Err(ScanFailed::Other(message)) => return Err(message),
             }
-        });
-        let scanned = if self.options.paths.is_empty() && !removed.is_empty() {
-            None
-        } else {
-            Some(scan(&self.options, &self.progress, stage)?)
         };
-        Ok(ScanOutcome { scanned, removed })
+        let (removed, unavailable) = missing
+            .into_iter()
+            .partition(|root| removed_by_apply.iter().any(|r| root.starts_with(r)));
+        Ok(ScanOutcome {
+            scanned,
+            removed,
+            unavailable,
+        })
     }
 }
 
