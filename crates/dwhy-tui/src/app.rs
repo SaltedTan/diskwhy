@@ -203,12 +203,25 @@ pub enum State {
         progress: Arc<Progress>,
         stage: Stage,
     },
-    RootsRemoved,
+    /// A rescan found none of its roots.
+    RootsGone(RootsGone),
     Browsing(Box<Browser>),
     /// `dwhy tui --plan FILE`: a plan file and no scan.
     Plan(Box<PlanView>),
     /// Applying a plan, or its results.
     Applying(Box<ApplyView>),
+}
+
+/// Why a rescan after an apply had no roots left to scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootsGone {
+    /// The apply removed every one of them.
+    Removed,
+    /// None was removed by the apply: they are unavailable (an unmounted
+    /// drive, a directory removed by something else).
+    Unavailable,
+    /// The apply removed some; the others are unavailable.
+    Mixed,
 }
 
 #[derive(Debug)]
@@ -410,16 +423,33 @@ impl App {
     }
 
     pub fn scan_done(&mut self, outcome: ScanOutcome) {
-        if let Some(data) = outcome.scanned {
-            self.finish(data);
-        } else {
-            self.state = State::RootsRemoved;
+        let ScanOutcome {
+            scanned,
+            removed,
+            unavailable,
+        } = outcome;
+        match scanned {
+            Some(data) => self.finish(data),
+            None => {
+                self.state = State::RootsGone(match (removed.is_empty(), unavailable.is_empty()) {
+                    (false, true) => RootsGone::Removed,
+                    (true, _) => RootsGone::Unavailable,
+                    (false, false) => RootsGone::Mixed,
+                });
+            }
         }
-        if !outcome.removed.is_empty() {
-            self.message = Some(format!(
-                "removed: {}",
-                root_labels(&outcome.removed).join(", ")
+        let mut parts = Vec::new();
+        if !removed.is_empty() {
+            parts.push(format!("removed: {}", root_labels(&removed).join(", ")));
+        }
+        if !unavailable.is_empty() {
+            parts.push(format!(
+                "unavailable: {}",
+                root_labels(&unavailable).join(", ")
             ));
+        }
+        if !parts.is_empty() {
+            self.message = Some(parts.join(" · "));
         }
     }
 
@@ -437,7 +467,7 @@ impl App {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
-            return true;
+            return self.quit();
         }
         // The prompt takes every other key, `q` included: it is text.
         if let Some(view) = self.plan_view_mut().filter(|v| v.prompt.is_some()) {
@@ -445,7 +475,7 @@ impl App {
             return false;
         }
         if key.code == KeyCode::Char('q') {
-            return true;
+            return self.quit();
         }
         self.message = None;
         let viewport = self.viewport;
@@ -471,7 +501,7 @@ impl App {
                 self.message = view.on_key(key, page, now);
                 return false;
             }
-            State::Scanning { .. } | State::RootsRemoved | State::Applying(_) => return false,
+            State::Scanning { .. } | State::RootsGone(_) | State::Applying(_) => return false,
         };
         if key.code == KeyCode::Tab {
             b.view = match b.view {
@@ -539,6 +569,15 @@ impl App {
         false
     }
 
+    /// `q` or Ctrl-C: asks a running apply to stop now, before the event
+    /// loop winds down, so no other item starts after the key. Returns true.
+    fn quit(&mut self) -> bool {
+        if let State::Applying(v) = &self.state {
+            v.progress.stop();
+        }
+        true
+    }
+
     /// `y` or `d` in the dialog: checks the plan again (time has passed)
     /// and hands the apply to the caller. Returns the status message.
     fn start_apply(&mut self, dry_run: bool) -> Option<String> {
@@ -548,23 +587,12 @@ impl App {
             view.confirm = None;
             return Some(format!("cannot apply: {why}"));
         }
-        let confirmed = &view.confirm.as_ref()?.confirmed;
-        let policy = Policy {
-            max_tier: Tier::Review,
-            confirm: view
-                .plan
-                .items
-                .iter()
-                .map(|i| &i.finding)
-                .filter(|f| f.tier == Tier::Review && confirmed.contains(&f.id))
-                .map(|f| f.id.clone())
-                .collect(),
-        };
+        let policy = dialog_policy(&view.plan, &view.confirm.as_ref()?.confirmed);
         let plan = view.plan.clone();
         let rescan = match &self.state {
             State::Plan(_) => self.options.for_plan(&plan),
             State::Browsing(b) => b.data.plan_options.clone(),
-            State::Scanning { .. } | State::RootsRemoved | State::Applying(_) => unreachable!(),
+            State::Scanning { .. } | State::RootsGone(_) | State::Applying(_) => unreachable!(),
         };
         let job = ApplyJob {
             plan,
@@ -607,13 +635,27 @@ impl App {
         match code {
             KeyCode::Enter => {
                 let options = v.rescan.clone();
+                let removed_by_apply = match &v.result {
+                    Some(Ok(done)) if !done.report.dry_run => done
+                        .report
+                        .items
+                        .iter()
+                        .filter(|item| item.outcome == ApplyOutcome::Removed)
+                        .map(|item| PathBuf::from(&item.path))
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 let progress = Arc::new(dwhy_core::scan::Progress::default());
                 self.roots = root_labels(&options.paths);
                 self.state = State::Scanning {
                     progress: progress.clone(),
                     stage: Stage::Walking,
                 };
-                self.scan_request = Some(ScanJob { options, progress });
+                self.scan_request = Some(ScanJob {
+                    options,
+                    progress,
+                    removed_by_apply,
+                });
             }
             KeyCode::Esc if v.can_go_back() => {
                 let placeholder = State::Scanning {
@@ -630,6 +672,21 @@ impl App {
             }
             _ => scroll_lines(&mut v.scroll, code, page),
         }
+    }
+}
+
+/// What the confirm dialog's ticks ask of core: `--max-tier review` with
+/// `--confirm` for each ticked review item.
+pub(crate) fn dialog_policy(plan: &Plan, confirmed: &BTreeSet<String>) -> Policy {
+    Policy {
+        max_tier: Tier::Review,
+        confirm: plan
+            .items
+            .iter()
+            .map(|i| &i.finding)
+            .filter(|f| f.tier == Tier::Review && confirmed.contains(&f.id))
+            .map(|f| f.id.clone())
+            .collect(),
     }
 }
 
@@ -955,7 +1012,7 @@ impl PlanView {
                     dry_run: dry_session || action == 'd',
                 };
             }
-            KeyCode::Char(' ') if c.actions_visible => {
+            KeyCode::Char(' ') if c.actions_visible && unmodified_action(key) => {
                 match items.get(c.selected).map(|i| &i.finding) {
                     Some(f) if f.tier == Tier::Review => {
                         if !c.confirmed.remove(&f.id) {
@@ -963,6 +1020,16 @@ impl PlanView {
                         }
                         c.layout = None;
                         c.actions_visible = false;
+                    }
+                    Some(f) if f.tier == Tier::Blocked => {
+                        return ConfirmKey::Message(
+                            "blocked items are never applied; nothing to confirm".into(),
+                        );
+                    }
+                    Some(f) if f.action.kind == ActionKind::Advice => {
+                        return ConfirmKey::Message(
+                            "advice only: nothing runs for this item".into(),
+                        );
                     }
                     Some(_) => {
                         return ConfirmKey::Message(

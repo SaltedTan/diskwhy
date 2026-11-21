@@ -25,8 +25,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    App, ApplyView, Browser, Confirm, FindingList, PlanState, PlanView, SizeMode, State, View,
-    sanitize,
+    App, ApplyView, Browser, Confirm, FindingList, PlanState, PlanView, RootsGone, SizeMode, State,
+    View, sanitize,
 };
 use crate::job::{self, ApplyStep, Mark, PermissionMark, Scanned, Stage};
 
@@ -43,7 +43,7 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
     let area = f.area();
     let fs_lines = match &app.state {
         State::Scanning { .. } => 1,
-        State::Plan(_) | State::RootsRemoved | State::Applying(_) => 0,
+        State::Plan(_) | State::RootsGone(_) | State::Applying(_) => 0,
         State::Browsing(b) if b.view != View::Tree || b.fs_offset.is_some() => 0,
         State::Browsing(b) => b.data.report.fs.len().clamp(1, MAX_FS_LINES),
     };
@@ -90,9 +90,16 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
     };
 
     match &mut app.state {
-        State::RootsRemoved => {
+        State::RootsGone(why) => {
+            let text = match why {
+                RootsGone::Removed => "  all scanned roots were removed",
+                RootsGone::Unavailable => "  all scanned roots are unavailable",
+                RootsGone::Mixed => {
+                    "  no scanned roots remain: some were removed, the others are unavailable"
+                }
+            };
             f.render_widget(title_line("rescan", "", tw), title);
-            f.render_widget(Paragraph::new("  all scanned roots were removed"), list);
+            f.render_widget(Paragraph::new(wrap(text, width).join("\n")), list);
             f.render_widget(Paragraph::new(Span::styled(" q quit", dim)), keys);
         }
         State::Scanning { progress, stage } => {
@@ -460,8 +467,28 @@ fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: boo
         (head, action_height)
     } else {
         c.action_scroll = 0;
+        // Neighbors are shown from their header down: one cut at the top
+        // would show its action without the header and any copy label or
+        // withheld notice. The selected row starts at or after the window.
+        if let Some(cut) = layout
+            .rows
+            .iter()
+            .find(|r| r.lines.start < c.scroll && c.scroll < r.lines.end)
+        {
+            c.scroll = cut.lines.end;
+        }
         let end = (c.scroll + height).min(layout.lines.len());
         shown.extend_from_slice(&layout.lines[c.scroll..end]);
+        // A neighbor cut at the bottom keeps only its header when its copy
+        // label or withheld notice does not fit whole.
+        if let Some(cut) = layout
+            .rows
+            .iter()
+            .find(|r| r.lines.start < end && end < r.lines.end)
+            && end - cut.lines.start < 1 + cut.label_height
+        {
+            shown.truncate(head + cut.lines.start + 1 - c.scroll);
+        }
         (head + row.lines.start - c.scroll, action.len())
     };
     let header = &mut shown[selected];
@@ -474,6 +501,10 @@ fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: boo
         }
         Some(f) if f.tier == Tier::Review => {
             "review: not confirmed, so it is refused (Space confirms it)".into()
+        }
+        Some(f) if f.tier == Tier::Blocked => "blocked: never applied".into(),
+        Some(f) if f.action.kind == ActionKind::Advice => {
+            format!("{}: advice only, nothing runs", tier_name(f.tier))
         }
         Some(f) => format!("{}: no confirmation needed", tier_name(f.tier)),
         None => String::new(),
@@ -515,11 +546,14 @@ fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
         .iter()
         .filter(|i| i.finding.tier == Tier::Review && c.confirmed.contains(&i.finding.id))
         .count();
+    // What apply would run: core's tier policy for these ticks, and no
+    // advice-only item (apply skips those).
+    let policy = crate::app::dialog_policy(p, &c.confirmed);
     let going = plan::distinct_bytes(
         items
             .iter()
             .map(|i| &i.finding)
-            .filter(|f| f.tier != Tier::Review || c.confirmed.contains(&f.id))
+            .filter(|f| f.action.kind != ActionKind::Advice && policy.allows(f).is_ok())
             .map(|f| (f.path.as_str(), f.bytes)),
     );
     let mut summary = format!("{} item{}", items.len(), plural(items.len()));
