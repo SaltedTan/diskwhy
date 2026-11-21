@@ -22,7 +22,9 @@ use dwhy_core::report::{
 use dwhy_core::scan::Progress;
 use dwhy_core::{detect, growth, snapshot, system};
 use dwhy_tui::app::{App, DEFAULT_PLAN_FILE, PlanState, RootsGone, RowKind, SizeMode, State, View};
-use dwhy_tui::job::{self, Applied, ApplyFailed, BuiltPlan, Options, PermissionMark, Scanned};
+use dwhy_tui::job::{
+    self, Applied, ApplyFailed, BuiltPlan, Mark, Options, PermissionMark, Scanned,
+};
 use dwhy_tui::ui;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -226,7 +228,6 @@ fn tree_root_80x24() {
         };
     }
     b.rows.sort_by_key(|row| std::cmp::Reverse(row.size));
-    b.total = b.rows.iter().map(|row| row.size).sum::<u64>() + 4096;
     assert_eq!(labels(&app), ["big/", "mid/", "[files]"]);
     insta::assert_snapshot!(render(&mut app, 80, 24, Some(&root)));
 }
@@ -278,7 +279,12 @@ fn inside_a_directory_apparent_120x40() {
     render(&mut app, 120, 40, Some(&root));
     press(
         &mut app,
-        &[KeyCode::Char('a'), KeyCode::Down, KeyCode::Enter],
+        &[
+            KeyCode::Char('a'),
+            KeyCode::Home,
+            KeyCode::Down,
+            KeyCode::Enter,
+        ],
     );
     assert_eq!(app.mode, SizeMode::Apparent);
     assert_eq!(
@@ -302,7 +308,8 @@ fn navigation() {
     let f = fixture(false);
     let root = f.root();
     let mut app = app_with(scan(&[&root]));
-    press(&mut app, &[KeyCode::Char('a')]);
+    // The toggle keeps the selected entry; Home starts at the largest.
+    press(&mut app, &[KeyCode::Char('a'), KeyCode::Home]);
     assert_eq!(selected(&app), "big/");
     // Up at the top and Backspace at the only root stay put.
     press(&mut app, &[KeyCode::Up, KeyCode::Backspace]);
@@ -346,7 +353,7 @@ fn pages_move_by_the_rows_on_screen() {
         fs::write(d.join("f"), vec![0u8; (i + 1) * 8192]).unwrap();
     }
     let mut app = app_with(scan(&[t.path()]));
-    press(&mut app, &[KeyCode::Char('a')]);
+    press(&mut app, &[KeyCode::Char('a'), KeyCode::Home]);
     // 80×24 with one filesystem line leaves 20 list rows.
     let screen = render(&mut app, 80, 24, None);
     assert_eq!(app.viewport, 20);
@@ -396,7 +403,12 @@ fn unreadable_directories_are_listed_and_marked() {
     let mut app = app_with(scan(&[&root]));
     press(
         &mut app,
-        &[KeyCode::Char('a'), KeyCode::Down, KeyCode::Enter],
+        &[
+            KeyCode::Char('a'),
+            KeyCode::Home,
+            KeyCode::Down,
+            KeyCode::Enter,
+        ],
     );
     let b = app.browser().unwrap();
     let locked = b
@@ -426,6 +438,73 @@ fn unreadable_directories_are_listed_and_marked() {
         assert!(screen.contains("this directory: unreadable"), "{screen}");
         press(&mut app, &[KeyCode::Char('a')]);
     }
+}
+
+#[test]
+fn combined_diagnostics_leave_the_directory_name_visible_at_80x24() {
+    let t = tempfile::Builder::new()
+        .prefix("dwhy")
+        .rand_bytes(6)
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    let long = "a-rather-long-directory-name";
+    fs::create_dir(root.join("vendor")).unwrap();
+    fs::create_dir(root.join(long)).unwrap();
+    let mut data = scan(&[&root]);
+    pin_fs(&mut data, false);
+    let all = Mark {
+        permission: Some(PermissionMark::EntriesDenied(2)),
+        read_error: true,
+        skipped_mounts: 2,
+    };
+    for name in ["vendor", long] {
+        let id = data.tree.find(&root.join(name)).unwrap();
+        data.marks.insert(id, all);
+    }
+    let mut app = app_with(data);
+    let screen = render(&mut app, 80, 24, Some(&root));
+    let row = |name: &str| {
+        screen
+            .lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("no {name} row: {screen}"))
+    };
+    // The name stays whole when short, and keeps 16 columns when long; the
+    // diagnostics take the rest of the row and end in `…]`.
+    let vendor = row("vendor/  [2 entries unreadable, read error, 2 mount…]");
+    assert!(vendor.ends_with("…]\""), "{screen}");
+    assert!(row("a-rathe…ry-name/  [2 entries unreadable, read error").ends_with("…]\""));
+
+    while selected(&app) != "vendor/" {
+        press(&mut app, &[KeyCode::Down]);
+    }
+    press(&mut app, &[KeyCode::Enter]);
+    let screen = render(&mut app, 80, 24, Some(&root));
+    // The empty directory's message wraps instead of running off the row.
+    assert!(
+        screen
+            .contains("  2 entries unreadable, read error, 2 mounts skipped: its contents are not"),
+        "{screen}"
+    );
+    assert!(screen.contains("    counted"), "{screen}");
+    assert!(
+        screen.contains(" this directory: 2 entries unreadable, read error, 2 mounts skipped"),
+        "{screen}"
+    );
+
+    // Narrower, the status lines are cut at the end with `…`.
+    let screen = render(&mut app, 40, 24, Some(&root));
+    let status: Vec<_> = screen.lines().skip(21).take(2).collect();
+    assert!(status[0].starts_with("\" 0B allocated here"), "{screen}");
+    assert!(
+        status[1].starts_with("\" this directory: 2 entries"),
+        "{screen}"
+    );
+    assert!(
+        status[1].trim_end_matches(['"', ' ']).ends_with('…'),
+        "{screen}"
+    );
 }
 
 #[test]
@@ -471,7 +550,7 @@ fn several_roots_are_listed_together() {
     fs::write(b.path().join("x"), vec![1u8; 8192]).unwrap();
     let (ra, rb) = (a.root(), fs::canonicalize(b.path()).unwrap());
     let mut app = app_with(scan(&[&rb, &ra]));
-    press(&mut app, &[KeyCode::Char('a')]);
+    press(&mut app, &[KeyCode::Char('a'), KeyCode::Home]);
     let names = labels(&app);
     assert_eq!(names.len(), 2);
     assert_eq!(names[0], format!("{}/", ra.display()), "largest first");
@@ -1048,6 +1127,63 @@ fn compact_findings_only_open_when_a_row_fits() {
 }
 
 #[test]
+fn compact_findings_metadata_keeps_counts_and_failures_at_23x24() {
+    let finding = hand_finding("cargo-target", "/abc", 1024, Tier::Review);
+    let (_f, mut app) = findings_app(vec![finding], None);
+    let State::Browsing(b) = &mut app.state else {
+        unreachable!();
+    };
+    let run = b.data.report.detectors[0].clone();
+    for name in ["docker-volume", "docker-build-cache"] {
+        let mut failed = run.clone();
+        failed.name = name.into();
+        failed.error = Some("daemon did not answer".into());
+        b.data.report.detectors.push(failed);
+    }
+    press(&mut app, &[KeyCode::Tab]);
+    let screen = render(&mut app, 23, 24, None);
+    assert!(screen.contains("/abc"), "{screen}");
+    let title = screen.lines().next().unwrap();
+    assert!(title.contains(" all tiers 1/1 "), "{screen}");
+    assert!(!title.contains("findings"), "{screen}");
+    // No detector name fits beside the status: the count of failures does.
+    let status = screen.lines().nth(22).unwrap();
+    assert!(status.contains("1/1 · 2 failed"), "{screen}");
+
+    press(&mut app, &[KeyCode::Char(' ')]);
+    assert_eq!(marked(&app), ["/abc"]);
+    let screen = render(&mut app, 23, 24, None);
+    assert!(
+        screen.lines().next().unwrap().contains(" all tiers 1/1 "),
+        "{screen}"
+    );
+    // With more room the marks come back, shortened before the filter.
+    let screen = render(&mut app, 30, 24, None);
+    assert!(
+        screen
+            .lines()
+            .next()
+            .unwrap()
+            .contains(" all tiers · 1/1 · *1 "),
+        "{screen}"
+    );
+    let screen = render(&mut app, 80, 24, None);
+    let title = screen.lines().next().unwrap();
+    assert!(
+        title.contains("findings") && title.contains("all tiers · 1/1 · 1 marked 1.0K"),
+        "{screen}"
+    );
+    assert!(
+        screen
+            .lines()
+            .nth(22)
+            .unwrap()
+            .contains("docker-volume, docker-build-cache failed"),
+        "{screen}"
+    );
+}
+
+#[test]
 fn paging_moves_by_the_finding_rows_on_screen() {
     let findings = (1..=25)
         .map(|i| {
@@ -1101,7 +1237,7 @@ fn findings_list_80x24() {
     let screen = render(&mut app, 80, 24, None);
     // Figures are never cut; the long path is shortened in the middle.
     assert!(
-        screen.contains("rebuildable   812.0M          –  node-modules"),
+        screen.contains("rebuildable   812.0M           –  node-modules"),
         "{screen}"
     );
     assert!(screen.contains("…"), "{screen}");
@@ -1125,12 +1261,58 @@ fn findings_list_50x24() {
     let screen = render(&mut app, 50, 24, None);
     insta::assert_snapshot!(screen);
 
-    let screen = render(&mut app, 66, 24, None);
+    // Each column shows while a 4-column path still fits beside it: the
+    // detector from 49 columns, the growth from 61.
+    for (width, growth) in [(49, false), (60, false), (61, true), (66, true)] {
+        let screen = render(&mut app, width, 24, None);
+        let header = screen.lines().nth(1).unwrap();
+        let row = screen.lines().nth(2).unwrap();
+        assert!(header.contains("detector"), "{screen}");
+        assert_eq!(header.contains("growth"), growth, "{screen}");
+        assert!(row.contains("docker-build-cache"), "{screen}");
+        assert_eq!(row.contains("+120.0M/d"), growth, "{screen}");
+        assert_eq!(
+            header.find("path"),
+            row.rfind(" d").map(|i| i + 1),
+            "{screen}"
+        );
+    }
+    let screen = render(&mut app, 48, 24, None);
+    assert!(!screen.contains("detector"), "{screen}");
+}
+
+#[test]
+fn widest_growth_rate_fits_its_column() {
+    // Just under 1000 MiB a day, which `signed` rounds to `1000.0M`.
+    let rate = 1_048_544_000;
+    let path = format!("/home/me/projects/{}/target", "deep".repeat(20));
+    let findings = vec![
+        grows(
+            hand_finding("cargo-target", &path, 2 * GIB, Tier::Rebuildable),
+            rate,
+        ),
+        grows(
+            hand_finding("cargo-target", &format!("{path}2"), GIB, Tier::Rebuildable),
+            -rate,
+        ),
+    ];
+    let (_f, mut app) = findings_app(findings, Some(BASE));
+    press(&mut app, &[KeyCode::Tab]);
+    let screen = render(&mut app, 80, 24, None);
     let header = screen.lines().nth(1).unwrap();
-    let row = screen.lines().nth(2).unwrap();
-    assert!(header.contains("detector") && !header.contains("growth"));
-    assert!(row.contains("docker-build-cache") && !row.contains("/d"));
-    assert_eq!(header.find("path"), row.find("docker://build-cache"));
+    for (row, growth, tail) in [
+        (2, "+1000.0M/d", "/target\""),
+        (3, "-1000.0M/d", "/target2\""),
+    ] {
+        let row = screen.lines().nth(row).unwrap();
+        assert!(
+            row.contains(&format!("  {growth}  cargo-target")),
+            "{screen}"
+        );
+        // The path is shortened in the middle and its end is not cut.
+        assert!(row.contains('…') && row.ends_with(tail), "{screen}");
+        assert_eq!(header.find("path"), row.find("/home"), "{screen}");
+    }
 }
 
 #[test]
@@ -1487,6 +1669,82 @@ fn finding_escapes_stay_whole_at_layout_boundaries() {
             .any(|line| line.starts_with(r#""    \nnext"#)),
         "{detail}"
     );
+}
+
+#[test]
+fn several_escapes_in_one_grapheme_break_between_escapes() {
+    // One grapheme that needs three escapes, 24 columns in all.
+    let path = "/p/ｶﾞﾞ";
+    let escaped = r"/p/\u{ff76}\u{ff9e}\u{ff9e}";
+    let finding = hand_finding("cargo-target", path, GIB, Tier::Rebuildable);
+    let (_f, mut app) = findings_app(vec![finding], None);
+    press(&mut app, &[KeyCode::Tab]);
+    // The list shortens the path between escapes, not over all of them.
+    let list = render(&mut app, 41, 24, None);
+    assert!(
+        list.lines().nth(2).unwrap().contains(r"/p/…\u{ff9e}"),
+        "{list}"
+    );
+    assert!(
+        render(&mut app, 80, 24, None)
+            .lines()
+            .nth(2)
+            .unwrap()
+            .contains(escaped)
+    );
+
+    press(&mut app, &[KeyCode::Enter]);
+    let detail = render(&mut app, 23, 24, None);
+    // Wrapped at 23 columns, every escape is whole on some line.
+    let lines: Vec<_> = detail.lines().collect();
+    let count = |s: &str| lines.iter().map(|l| l.matches(s).count()).sum::<usize>();
+    assert!(count(r"\u{ff76}") > 0, "{detail}");
+    assert_eq!(count(r"\u{ff9e}"), 2 * count(r"\u{ff76}"), "{detail}");
+    assert_eq!(
+        count(r"\u{"),
+        count(r"\u{ff76}") + count(r"\u{ff9e}"),
+        "{detail}"
+    );
+    let body = lines[1..].join("\n");
+    assert!(body.contains(r"/p/\u{ff76}"), "{detail}");
+}
+
+#[test]
+fn redundant_variation_selectors_are_visible_in_paths() {
+    for (character, escape) in [
+        ('\u{fe0f}', r"\u{fe0f}"),
+        ('\u{fe0e}', r"\u{fe0e}"),
+        ('\u{fe00}', r"\u{fe00}"),
+        ('\u{e0100}', r"\u{e0100}"),
+    ] {
+        let path = format!("/p/app{character}/target");
+        let shown_path = format!("/p/app{escape}/target");
+        let mut finding = hand_finding("cargo-target", &path, GIB, Tier::Rebuildable);
+        finding.reason = format!("Cargo build output of /p/app{character}");
+        let (_f, mut app) = findings_app(vec![finding], None);
+        press(&mut app, &[KeyCode::Tab]);
+        let list = render(&mut app, 80, 24, None);
+        assert!(list.lines().nth(2).unwrap().contains(&shown_path), "{list}");
+
+        press(&mut app, &[KeyCode::Enter]);
+        let detail = render(&mut app, 80, 24, None);
+        let mut lines = detail.lines();
+        assert!(lines.next().unwrap().contains(&shown_path), "{detail}");
+        assert!(lines.nth(1).unwrap().contains(&shown_path), "{detail}");
+        assert!(
+            detail.contains(&format!("Cargo build output of /p/app{escape}")),
+            "{detail}"
+        );
+    }
+    // A selector that turns a text symbol into an emoji is part of how it
+    // looks, and stays.
+    let path = "/p/\u{2764}\u{fe0f}/target";
+    let finding = hand_finding("cargo-target", path, GIB, Tier::Rebuildable);
+    let (_f, mut app) = findings_app(vec![finding], None);
+    press(&mut app, &[KeyCode::Tab]);
+    let list = render(&mut app, 80, 24, None);
+    assert!(list.contains("\u{2764}\u{fe0f}"), "{list}");
+    assert!(!list.contains(r"\u{fe0f}"), "{list}");
 }
 
 #[test]
@@ -2713,6 +2971,30 @@ fn unusable_plan_banner_80x24() {
         None,
         PLAN_AT + plan::TTL_SECS + 600
     ));
+}
+
+#[test]
+fn unusable_plan_refusal_shows_in_a_one_row_list() {
+    let expired = PLAN_AT + plan::TTL_SECS + 600;
+    let file = PathBuf::from("/tmp/plans/dwhy-plan.json");
+    let imported = App::open_plan(hand_plan(), file, HOST, UID);
+    let (_f, built) = preview_app();
+    for mut app in [imported, built] {
+        let screen = render_at(&mut app, 80, 4, None, expired);
+        let row = screen.lines().nth(1).unwrap();
+        assert!(
+            row.starts_with("\" NOT USABLE: the plan expired"),
+            "{screen}"
+        );
+        assert!(row.contains('…') && row.contains("`dwhy plan`"), "{screen}");
+        // With rows to spare, the banner wraps whole above the plan.
+        let screen = render_at(&mut app, 80, 6, None, expired);
+        assert!(
+            screen.contains("make a new one with `dwhy plan`"),
+            "{screen}"
+        );
+        assert!(screen.contains("2 items, frees 3.3G"), "{screen}");
+    }
 }
 
 // ---------------------------------------------------------------------------

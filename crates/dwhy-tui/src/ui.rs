@@ -172,19 +172,6 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
             PlanState::None => {}
         },
         State::Browsing(b) if b.view == View::Findings => {
-            let filter = b.findings.filter.map_or("all tiers", tier_name);
-            let mut count = format!(
-                "{filter} · {}/{}",
-                b.findings.shown.len(),
-                b.data.report.findings.len()
-            );
-            if !b.marked.is_empty() {
-                count.push_str(&format!(
-                    " · {} marked {}",
-                    b.marked.len(),
-                    human(b.marked_bytes())
-                ));
-            }
             let failed: Vec<_> = b
                 .data
                 .report
@@ -192,7 +179,7 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
                 .iter()
                 .filter_map(|d| d.error.as_deref().map(|e| (d.name.as_str(), e)))
                 .collect();
-            f.render_widget(title_line("findings", &count, tw), title);
+            f.render_widget(findings_title(b, tw), title);
             let marks = Marks {
                 lossy: &b.lossy_paths,
                 marked: &b.marked,
@@ -267,8 +254,12 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
                 )));
             }
             f.render_widget(Paragraph::new(fsl), fs);
-            draw_list(f, b, list);
-            f.render_widget(Paragraph::new(status_text(b, app.mode)), status);
+            let total = b.total(app.mode);
+            draw_list(f, b, list, total);
+            f.render_widget(
+                Paragraph::new(status_text(b, app.mode, total, width)),
+                status,
+            );
             let other = match app.mode {
                 SizeMode::Allocated => "apparent",
                 SizeMode::Apparent => "allocated",
@@ -327,18 +318,31 @@ fn draw_plan(
         }),
         a.title,
     );
+    let list_h = a.list.height as usize;
     let banner: Vec<Line> = match v.unusable(now) {
-        Some(why) => wrap(&format!(" NOT USABLE: {why}"), width)
-            .into_iter()
-            .map(|l| {
-                let pad = width.saturating_sub(grapheme_width(&l));
-                Line::raw(format!("{l}{}", " ".repeat(pad)))
-                    .style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD))
-            })
-            .collect(),
+        Some(why) => {
+            let text = format!(" NOT USABLE: {why}");
+            if list_h > 1 {
+                wrap(&text, width)
+            } else {
+                // One row: the refusal, shortened, in place of the plan.
+                vec![middle_units(display_units(&text), width)]
+            }
+        }
+        .into_iter()
+        .map(|l| {
+            let pad = width.saturating_sub(grapheme_width(&l));
+            Line::raw(format!("{l}{}", " ".repeat(pad)))
+                .style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD))
+        })
+        .collect(),
         None => Vec::new(),
     };
-    let banner_h = banner.len().min((a.list.height as usize).saturating_sub(1)) as u16;
+    // Leave a row for the plan when there is one to spare.
+    let banner_h = banner
+        .len()
+        .min(list_h.saturating_sub(1).max(1))
+        .min(list_h) as u16;
     let [banner_area, body] =
         Layout::vertical([Constraint::Length(banner_h), Constraint::Min(0)]).areas(a.list);
     f.render_widget(Paragraph::new(banner), banner_area);
@@ -1030,7 +1034,36 @@ fn fs_text(fs: &[FsReport], width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn draw_list(f: &mut Frame, b: &mut Browser, area: Rect) {
+/// Columns a tree row keeps for the name before adding its diagnostics.
+const MIN_NAME_W: usize = 16;
+
+/// `  [text]` in at most `max` columns, with `text` cut at the end; empty
+/// when not even `  […]` fits.
+fn bracketed(text: &str, max: usize) -> String {
+    const FRAME: usize = "  []".len();
+    if max < FRAME + 1 {
+        return String::new();
+    }
+    format!("  [{}]", end(text, max - FRAME))
+}
+
+/// Shortens `s` to at most `max` columns by replacing its end with `…`,
+/// keeping the start (the parts that come first).
+fn end(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.into();
+    }
+    let Some(mut room) = max.checked_sub(1) else {
+        return String::new();
+    };
+    let kept: String = s
+        .graphemes(true)
+        .take_while(|g| take_columns(&mut room, g))
+        .collect();
+    format!("{}…", kept.trim_end_matches([' ', ',', '·']))
+}
+
+fn draw_list(f: &mut Frame, b: &mut Browser, area: Rect, total: u64) {
     let height = area.height as usize;
     let width = area.width as usize;
     let mut lines: Vec<Line> = Vec::new();
@@ -1039,7 +1072,7 @@ fn draw_list(f: &mut Frame, b: &mut Browser, area: Rect) {
             Some(m) => format!("  {}: its contents are not counted", mark_text(m)),
             None => "  (empty)".into(),
         };
-        lines.push(Line::raw(msg));
+        lines.extend(wrap(&msg, width).into_iter().map(Line::raw));
         f.render_widget(Paragraph::new(lines), area);
         return;
     }
@@ -1052,11 +1085,18 @@ fn draw_list(f: &mut Frame, b: &mut Browser, area: Rect) {
     b.offset = b.offset.min(b.rows.len().saturating_sub(height.max(1)));
     // "> " size bar pct "  "
     let fixed = 2 + 7 + 1 + BAR + 1 + 4 + 2;
+    let room = width.saturating_sub(fixed);
     for (i, row) in b.rows.iter().enumerate().skip(b.offset).take(height) {
-        let pct = percent(row.size, b.total);
-        let mark = row.mark.map(|m| format!("  [{}]", mark_text(m)));
+        let pct = percent(row.size, total);
+        let label = b.label(row);
+        // The name keeps a few columns; the diagnostics get the rest and
+        // are cut at the end when they do not fit.
+        let name_min = label.width().min(MIN_NAME_W);
+        let mark = row
+            .mark
+            .map(|m| bracketed(&mark_text(m), room.saturating_sub(name_min)));
         let mark_w = mark.as_deref().map_or(0, str::width);
-        let name = middle(&b.label(row), width.saturating_sub(fixed + mark_w));
+        let name = middle(&label, room.saturating_sub(mark_w));
         let sel = i == b.selected;
         let pct_text = match pct {
             0 if row.size > 0 => " <1%".to_string(),
@@ -1081,8 +1121,9 @@ fn draw_list(f: &mut Frame, b: &mut Browser, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// Width of the growth column: `+999.9M/d`.
-const GROWTH_W: usize = 9;
+/// Width of the growth column: the widest rate `signed` gives, which
+/// rounds 999.95M up to `1000.0M`, per day.
+const GROWTH_W: usize = "+1000.0M/d".len();
 /// Per-row marks in the findings list.
 struct Marks<'a> {
     /// Paths that may have been converted from invalid UTF-8.
@@ -1105,7 +1146,9 @@ fn draw_findings(
     failed: &[(&str, &str)],
     marks: Marks,
 ) -> usize {
-    const MIN_PATH_W: usize = 12;
+    // The detector and growth columns show whenever a path of this width
+    // still fits beside them, as in the compact layout.
+    const MIN_PATH_W: usize = "path".len();
     let Marks {
         lossy: lossy_paths,
         marked,
@@ -1150,7 +1193,7 @@ fn draw_findings(
         ("  ", TIER_W, 7)
     };
     let required_w = MARKER_W + tier_w + size_w + 2 * gap.len();
-    if width < required_w + "path".len() {
+    if width < required_w + MIN_PATH_W {
         let msg = middle("  Widen to view findings", width);
         f.render_widget(Paragraph::new(msg), area);
         return 0;
@@ -1228,6 +1271,40 @@ fn draw_findings(
     height
 }
 
+/// The findings title: the filter, the number shown out of the total and
+/// the marks. As the title narrows, `findings` and the word `marked` go
+/// first, then the marked bytes and count, before the filter and counts.
+fn findings_title(b: &Browser, tw: usize) -> Paragraph<'static> {
+    let filter = b.findings.filter.map_or("all tiers", tier_name);
+    let count = format!(
+        "{}/{}",
+        b.findings.shown.len(),
+        b.data.report.findings.len()
+    );
+    let mut rights = Vec::new();
+    let mut whole = 1;
+    if !b.marked.is_empty() {
+        let (n, bytes) = (b.marked.len(), human(b.marked_bytes()));
+        rights.push(format!("{filter} · {count} · {n} marked {bytes}"));
+        rights.push(format!("{filter} · {count} · *{n} {bytes}"));
+        rights.push(format!("{filter} · {count} · *{n}"));
+        whole = 2;
+    }
+    rights.push(format!("{filter} · {count}"));
+    rights.push(format!("{filter} {count}"));
+    rights.push(count);
+    // ` dwhy  ` + place + ` ` + ` right `, as in `title_with`.
+    const PLACE: &str = "findings";
+    let fits = |place: usize, right: &str| " dwhy  ".len() + place + 1 + right.width() + 2 <= tw;
+    let (place, right) = rights[..whole]
+        .iter()
+        .find(|r| fits(PLACE.len(), r))
+        .map(|r| (PLACE, r))
+        .or_else(|| rights.iter().find(|r| fits(0, r)).map(|r| ("", r)))
+        .unwrap_or(("", rights.last().unwrap()));
+    title_line(place, right, tw)
+}
+
 fn findings_status(b: &Browser, failed: &[(&str, &str)], width: usize) -> Line<'static> {
     let l = &b.findings;
     let growth = match &b.data.growth_base {
@@ -1249,15 +1326,27 @@ fn findings_status(b: &Browser, failed: &[(&str, &str)], width: usize) -> Line<'
         .join(", ");
     let overhead = " ·  failed".width();
     let min_names = first.width() + if failed.len() > 1 { " …".width() } else { 0 };
+    let short_date = || match &b.data.growth_base {
+        Some(at) => format!(" since {}", at.split('T').next().unwrap_or(at)),
+        None => format!(" {growth}"),
+    };
+    if short_date().width() + overhead + min_names > width {
+        // No detector name fits: say how many failed.
+        let n = format!("{} failed", failed.len());
+        let position = format!(" {}/{}", l.selected + 1, l.shown.len());
+        let line = [status, format!(" {growth}"), short_date(), position]
+            .into_iter()
+            .map(|prefix| format!("{prefix} · {n}"))
+            .find(|line| line.width() <= width)
+            .unwrap_or_else(|| format!(" {n}"));
+        return Line::raw(middle(&line, width));
+    }
     let prefix = if status.width() + overhead + min_names <= width {
         status
     } else if 1 + growth.width() + overhead + min_names <= width {
         format!(" {growth}")
     } else {
-        match &b.data.growth_base {
-            Some(at) => format!(" since {}", at.split('T').next().unwrap_or(at)),
-            None => format!(" {growth}"),
-        }
+        short_date()
     };
     let room = width.saturating_sub(prefix.width() + overhead);
     if names.width() > room {
@@ -1273,8 +1362,11 @@ fn findings_status(b: &Browser, failed: &[(&str, &str)], width: usize) -> Line<'
     Line::raw(middle(&format!("{prefix} · {names} failed"), width))
 }
 
+/// `s` split into the units layout keeps whole: graphemes, except that a
+/// grapheme needing escapes splits before each escape, so lines can break
+/// between escapes but never inside one.
 fn display_units(s: &str) -> impl DoubleEndedIterator<Item = Cow<'_, str>> + Clone {
-    s.graphemes(true).map(|g| {
+    s.graphemes(true).flat_map(|g| {
         const JOINER: char = '\u{200d}';
         let cells = cell_width(g);
         let escape_grapheme = cells == 0 || cells != g.width();
@@ -1286,7 +1378,7 @@ fn display_units(s: &str) -> impl DoubleEndedIterator<Item = Cow<'_, str>> + Clo
                     (width > 0).then_some(total + width)
                 })
                 .is_some_and(|unjoined| unjoined > cells);
-        let unicode_escape = |c| {
+        let unicode_escape = |c, prev: Option<char>| {
             escape_grapheme
                 || matches!(
                     c,
@@ -1300,23 +1392,50 @@ fn display_units(s: &str) -> impl DoubleEndedIterator<Item = Cow<'_, str>> + Clo
                         | '\u{e0020}'..='\u{e007f}'
                 )
                 || (c == JOINER && !emoji_joined)
+                || (is_variation_selector(c) && !changes_presentation(prev, c))
         };
-        if g.contains(|c: char| c.is_control() || c == '\\' || unicode_escape(c)) {
-            let mut escaped = String::new();
-            for c in g.chars() {
-                if c.is_control() || c == '\\' {
-                    escaped.extend(c.escape_default());
-                } else if unicode_escape(c) {
-                    escaped.extend(c.escape_unicode());
-                } else {
-                    escaped.push(c);
-                }
+        let escaped = |c: char, prev| {
+            if c.is_control() || c == '\\' {
+                Some(c.escape_default().collect::<String>())
+            } else if unicode_escape(c, prev) {
+                Some(c.escape_unicode().collect())
+            } else {
+                None
             }
-            Cow::Owned(escaped)
-        } else {
-            Cow::Borrowed(g)
+        };
+        let mut prev = None;
+        let mut units: Vec<Cow<'_, str>> = Vec::new();
+        for c in g.chars() {
+            match (escaped(c, prev), units.last_mut()) {
+                (Some(escape), _) => units.push(Cow::Owned(escape)),
+                // A character shown as itself stays with what precedes it,
+                // so a combining mark is never split from its base.
+                (None, Some(last)) => last.to_mut().push(c),
+                (None, None) => units.push(Cow::Owned(c.into())),
+            }
+            prev = Some(c);
         }
+        if units.len() == 1 && units[0] == g {
+            units[0] = Cow::Borrowed(g);
+        }
+        units
     })
+}
+
+fn is_variation_selector(c: char) -> bool {
+    matches!(c, '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}')
+}
+
+/// Whether the emoji or text presentation selector `selector` changes how
+/// `base` is drawn. Any other variation selector, or one that changes
+/// nothing (`app\u{fe0f}`), would leave a path looking like another.
+fn changes_presentation(base: Option<char>, selector: char) -> bool {
+    let Some(base) = base.filter(|_| matches!(selector, '\u{fe0e}' | '\u{fe0f}')) else {
+        return false;
+    };
+    let alone = base.to_string();
+    let selected = format!("{base}{selector}");
+    alone.width() != selected.width()
 }
 
 fn command_lines(
@@ -1514,9 +1633,9 @@ fn cell_width(g: &str) -> usize {
     }
 }
 
-fn status_text(b: &Browser, mode: SizeMode) -> Vec<Line<'static>> {
+fn status_text(b: &Browser, mode: SizeMode, total: u64, width: usize) -> Vec<Line<'static>> {
     let r = &b.data.report;
-    let mut parts = vec![format!(" {} {} here", human(b.total), mode.label())];
+    let mut parts = vec![format!(" {} {} here", human(total), mode.label())];
     if !b.rows.is_empty() {
         parts.push(format!("{}/{}", b.selected + 1, b.rows.len()));
     }
@@ -1542,9 +1661,10 @@ fn status_text(b: &Browser, mode: SizeMode) -> Vec<Line<'static>> {
     }
     let n = r.findings.len();
     parts.push(format!("{n} finding{}", if n == 1 { "" } else { "s" }));
-    let mut lines = vec![Line::raw(parts.join(" · "))];
+    let mut lines = vec![Line::raw(end(&parts.join(" · "), width))];
     if let Some(m) = b.mark() {
-        lines.push(Line::raw(format!(" this directory: {}", mark_text(m))));
+        let text = format!(" this directory: {}", mark_text(m));
+        lines.push(Line::raw(end(&text, width)));
     }
     lines
 }
