@@ -1394,15 +1394,14 @@ fn collect_hosts(input: &str, depth: usize, hosts: &mut Vec<String>) {
             continue;
         }
         let Some(program) = &program else {
-            program = Some(word.rsplit('/').next().unwrap_or(&word).to_string());
+            let name = word.rsplit('/').next().unwrap_or(&word);
+            if name != "busybox" {
+                program = Some(name.to_string());
+            }
             continue;
         };
-        if SHELLS.contains(&program.as_str())
-            && word.starts_with('-')
-            && !word.starts_with("--")
-            && word.contains('c')
-        {
-            script_next = true;
+        if SHELLS.contains(&program.as_str()) && word.starts_with('-') && !word.starts_with("--") {
+            script_next = word.contains('c');
             continue;
         }
         let (key, value) = word
@@ -1929,6 +1928,9 @@ mod tests {
                 &["minio"],
             ),
             ("busybox sh -c 'curl https://minio/wal/%f'", &["minio"]),
+            ("bash -u -c 'curl -T %p https://minio/wal/%f'", &["minio"]),
+            ("sh -p -c 'curl -T %p https://minio/wal/%f'", &["minio"]),
+            ("busybox wget -c https://store/wal/%f", &["store"]),
             // Quoted arguments of other programs are not scripts.
             (
                 "curl -T %p https://minio/wal/%f || { echo \"upload to https://backup failed\" >&2; exit 1; }",
