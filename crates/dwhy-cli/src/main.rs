@@ -342,7 +342,8 @@ fn main() -> ExitCode {
     match res {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
-            eprintln!("dwhy: error: {e}");
+            // Not eprintln!: it panics when the terminal has hung up (dwhy tui).
+            let _ = writeln!(std::io::stderr(), "dwhy: error: {e}");
             ExitCode::from(EXIT_ERROR)
         }
     }
