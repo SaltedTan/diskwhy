@@ -786,6 +786,10 @@ fn probed_finding() -> Finding {
                 unmatched_hosts: 2,
                 source: EvidenceSource::Psql,
                 notes: vec![],
+                archive_library: None,
+                ready_wal_files: None,
+                wal_on_other_mount: false,
+                historical_command: false,
             }),
         }),
     }
@@ -826,6 +830,36 @@ fn api_only_evidence_shape() {
     ev.source = EvidenceSource::ApiOnly;
     ev.notes = vec!["psql not used: psql failed".into()];
     insta::assert_json_snapshot!(ev);
+}
+
+#[test]
+fn optional_postgres_wal_fields_are_additive() {
+    let ev = probed_finding().evidence.unwrap().postgres_wal.unwrap();
+    let old = serde_json::to_value(&ev).unwrap();
+    // Unset, the newer fields are absent: v1 readers see the same shape.
+    for key in [
+        "archive_library",
+        "ready_wal_files",
+        "wal_on_other_mount",
+        "historical_command",
+    ] {
+        assert!(old.get(key).is_none(), "{key}");
+    }
+    // A report written before them still reads, with them unset.
+    let back: PostgresWal = serde_json::from_value(old).unwrap();
+    assert_eq!(back, ev);
+
+    let mut set = ev.clone();
+    set.archive_library = Some("basic_archive".into());
+    set.ready_wal_files = Some(481);
+    set.wal_on_other_mount = true;
+    set.historical_command = true;
+    let json = serde_json::to_value(&set).unwrap();
+    assert_eq!(json["archive_library"], "basic_archive");
+    assert_eq!(json["ready_wal_files"], 481);
+    assert_eq!(json["wal_on_other_mount"], true);
+    assert_eq!(json["historical_command"], true);
+    assert_eq!(serde_json::from_value::<PostgresWal>(json).unwrap(), set);
 }
 
 #[test]

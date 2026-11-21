@@ -9,7 +9,7 @@
 //! responses.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::Duration;
 
@@ -43,7 +43,10 @@ const WAL_RATIO: u64 = 4;
 const UNSET_PG_ENV: [&str; 3] = ["PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE"];
 
 /// The read-only queries, as one row. Fields are separated by
-/// [`FIELD_SEP`]; times are seconds since the epoch.
+/// [`FIELD_SEP`]; times are seconds since the epoch. `archive_library`
+/// is read with `missing_ok`, so servers before Postgres 15 give null.
+/// `pg_ls_archive_statusdir()` needs Postgres 12; older servers fail the
+/// query and get API-only evidence.
 pub const QUERY: &str = "SELECT \
 (SELECT coalesce(sum(size), 0) FROM pg_catalog.pg_ls_waldir()), \
 (SELECT sum(pg_catalog.pg_database_size(oid)) FROM pg_catalog.pg_database), \
@@ -53,8 +56,14 @@ extract(epoch FROM a.last_failed_time), \
 a.last_failed_wal, \
 pg_catalog.current_setting('archive_mode'), \
 pg_catalog.current_setting('archive_command'), \
-pg_catalog.current_setting('archive_timeout') \
+pg_catalog.current_setting('archive_timeout'), \
+pg_catalog.current_setting('archive_library', true), \
+pg_catalog.current_setting('data_directory'), \
+(SELECT count(*) FROM pg_catalog.pg_ls_archive_statusdir() WHERE name LIKE '%.ready') \
 FROM pg_catalog.pg_stat_archiver a";
+
+/// Columns in a row of [`QUERY`].
+const QUERY_COLUMNS: usize = 12;
 
 /// psql's field separator (`-F`): ASCII unit separator, which settings and
 /// WAL file names do not contain.
@@ -479,12 +488,71 @@ impl Inspects {
     }
 }
 
+/// `path` with `.`, `..` and repeated slashes resolved lexically, as
+/// Docker and Postgres would read it inside the container (`/..` is `/`).
+/// `None` unless it is absolute.
+fn normalize_path(path: &str) -> Option<PathBuf> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    Some(PathBuf::from(format!("/{}", parts.join("/"))))
+}
+
+/// Whether `volume` is the deepest of `insp`'s mounts (tmpfs included)
+/// that contains `path`, all compared after [`normalize_path`].
+fn volume_mounts_path(insp: &Inspect, volume: &str, path: &str) -> bool {
+    let Some(path) = normalize_path(path) else {
+        return false;
+    };
+    insp.mounts
+        .iter()
+        .map(|m| {
+            (
+                m.destination.as_str(),
+                m.kind == "volume" && m.name == volume,
+            )
+        })
+        .chain(
+            insp.host_config
+                .tmpfs
+                .iter()
+                .flat_map(|m| m.keys())
+                .map(|path| (path.as_str(), false)),
+        )
+        .filter_map(|(mount, is_volume)| Some((normalize_path(mount)?, is_volume)))
+        .filter(|(mount, _)| path.starts_with(mount))
+        .max_by_key(|(mount, _)| mount.components().count())
+        .is_some_and(|(_, is_volume)| is_volume)
+}
+
+/// Whether `dir`, a data or WAL directory inside the container, is an
+/// absolute path on another mount than `volume`. A path that is not
+/// absolute cannot be placed and does not count.
+fn on_other_mount(insp: &Inspect, volume: &str, dir: &str) -> bool {
+    normalize_path(dir).is_some() && !volume_mounts_path(insp, volume, dir)
+}
+
+/// The evidence for `volume` from the running containers with it at their
+/// `PGDATA`. The first whose psql answers wins; otherwise the first with
+/// API-only evidence. A container whose server keeps its data directory
+/// on another mount is skipped: its figures belong to that mount.
 fn probe_volume(
     volume: &str,
     listed: &[Listed],
     docker: &dyn Docker,
     cache: &mut Inspects,
 ) -> Option<PostgresWal> {
+    let mut fallback = None;
     for c in listed.iter().filter(|c| {
         c.state == "running"
             && c.mounts
@@ -499,38 +567,29 @@ fn probe_volume(
             continue;
         }
         let pgdata = insp.env("PGDATA").unwrap_or(DEFAULT_PGDATA);
-        let at_data_dir = insp
-            .mounts
-            .iter()
-            .map(|m| {
-                (
-                    m.destination.as_str(),
-                    m.kind == "volume" && m.name == volume,
-                )
-            })
-            .chain(
-                insp.host_config
-                    .tmpfs
-                    .iter()
-                    .flat_map(|m| m.keys())
-                    .map(|path| (path.as_str(), false)),
-            )
-            .filter(|(path, _)| path.starts_with('/') && Path::new(pgdata).starts_with(path))
-            .max_by_key(|(path, _)| Path::new(path).components().count())
-            .is_some_and(|(_, is_volume)| is_volume);
-        if at_data_dir {
-            return Some(gather(&insp, listed, docker, cache));
+        if !volume_mounts_path(&insp, volume, pgdata) {
+            continue;
+        }
+        match gather(volume, &insp, listed, docker, cache) {
+            Some(ev) if ev.source == EvidenceSource::Psql => return Some(ev),
+            Some(ev) => {
+                fallback.get_or_insert(ev);
+            }
+            None => {}
         }
     }
-    None
+    fallback
 }
 
+/// The evidence from one container, or `None` when its server's data
+/// directory is on another mount than `volume`.
 fn gather(
+    volume: &str,
     insp: &Inspect,
     listed: &[Listed],
     docker: &dyn Docker,
     cache: &mut Inspects,
-) -> PostgresWal {
+) -> Option<PostgresWal> {
     let mut ev = PostgresWal {
         container: insp.display_name(),
         wal_bytes: None,
@@ -546,6 +605,10 @@ fn gather(
         unmatched_hosts: 0,
         source: EvidenceSource::Psql,
         notes: Vec::new(),
+        archive_library: None,
+        ready_wal_files: None,
+        wal_on_other_mount: false,
+        historical_command: false,
     };
     let user = insp
         .env("POSTGRES_USER")
@@ -560,6 +623,13 @@ fn gather(
         .and_then(|out| parse_psql(&out).map_err(|_| PsqlError::Failed))
     {
         Ok(row) => {
+            if row
+                .data_directory
+                .as_deref()
+                .is_some_and(|dir| on_other_mount(insp, volume, dir))
+            {
+                return None;
+            }
             ev.wal_bytes = row.wal_bytes;
             ev.data_bytes = row.data_bytes;
             ev.failed_count = row.failed_count;
@@ -568,9 +638,16 @@ fn gather(
             ev.last_failed_wal = row.last_failed_wal;
             ev.archive_mode = row.archive_mode;
             ev.archive_timeout = row.archive_timeout;
+            ev.archive_library = row.archive_library.map(|lib| safe_word(&lib));
+            ev.ready_wal_files = row.ready_wal_files;
             row.archive_command
         }
         Err(error) => {
+            if command_data_directory(&insp.path, &insp.args)
+                .is_some_and(|dir| on_other_mount(insp, volume, &dir))
+            {
+                return None;
+            }
             ev.source = EvidenceSource::ApiOnly;
             let category = error.category();
             ev.notes.push(format!(
@@ -579,6 +656,16 @@ fn gather(
             api_only(insp, docker, &mut ev)
         }
     };
+    if insp
+        .env("POSTGRES_INITDB_WALDIR")
+        .is_some_and(|dir| on_other_mount(insp, volume, dir))
+    {
+        ev.wal_on_other_mount = true;
+        ev.notes.push(
+            "pg_wal is on another mount (POSTGRES_INITDB_WALDIR): wal_bytes is the cluster's WAL, not bytes in this volume"
+                .into(),
+        );
+    }
     if let Some(raw) = raw_command {
         let (program, hosts) = analyze_archive_command(&raw);
         for host in &hosts {
@@ -590,15 +677,23 @@ fn gather(
         }
         ev.archive_program = Some(program);
     }
-    ev
+    Some(ev)
 }
 
-/// Settings from the command line, failures from the log tail.
+/// Settings from the command line, failures from the log tail. The
+/// command to analyze is the command line's, or else the one the log
+/// names. A logged command the command line does not confirm (it sets
+/// none, an empty one or another one) marks the evidence
+/// [`historical_command`](PostgresWal::historical_command).
 fn api_only(insp: &Inspect, docker: &dyn Docker, ev: &mut PostgresWal) -> Option<String> {
     let mut settings = command_settings(&insp.path, &insp.args);
     ev.archive_mode = settings.remove("archive_mode");
     ev.archive_timeout = settings.remove("archive_timeout");
-    let command = settings.remove("archive_command");
+    let configured = settings.remove("archive_command");
+    let command = configured
+        .as_deref()
+        .and_then(configured_command)
+        .map(str::to_string);
     let path = format!(
         "/containers/{}/logs?stdout=1&stderr=1&timestamps=1&tail={LOG_TAIL}",
         insp.id
@@ -637,6 +732,22 @@ fn api_only(insp: &Inspect, docker: &dyn Docker, ev: &mut PostgresWal) -> Option
                     "failed_count counts failures in the last {LOG_TAIL} log lines only"
                 ));
             }
+            let unconfirmed = match (&configured, &command, &scan.failed_command) {
+                (None, _, Some(_)) => Some(
+                    "the failed archive command comes from the log tail only; the command line sets no archive_command, so the logged failures may be historical",
+                ),
+                (Some(_), None, _) if scan.failures > 0 || scan.failed_command.is_some() => Some(
+                    "the command line sets an empty archive_command: the logged failures are historical",
+                ),
+                (Some(_), Some(now), Some(logged)) if !command_matches(now, logged) => Some(
+                    "the failed archive command in the log tail differs from the command line's archive_command: the logged failures may predate a reconfiguration",
+                ),
+                _ => None,
+            };
+            if let Some(note) = unconfirmed {
+                ev.historical_command = true;
+                ev.notes.push(note.into());
+            }
             command.or(scan.failed_command)
         }
         Err(status) => {
@@ -661,15 +772,19 @@ pub struct PsqlRow {
     pub archive_mode: Option<String>,
     pub archive_command: Option<String>,
     pub archive_timeout: Option<String>,
+    pub archive_library: Option<String>,
+    pub data_directory: Option<String>,
+    /// `.ready` files in `pg_wal/archive_status`.
+    pub ready_wal_files: Option<u64>,
 }
 
 /// Parses psql's output for [`QUERY`] (`-A -t -F` [`FIELD_SEP`]).
 pub fn parse_psql(out: &str) -> Result<PsqlRow, String> {
     let row = out.trim_end_matches(['\n', '\r']);
     let fields: Vec<&str> = row.split(FIELD_SEP).collect();
-    if fields.len() != 9 {
+    if fields.len() != QUERY_COLUMNS {
         return Err(format!(
-            "unexpected psql output ({} fields, expected 9)",
+            "unexpected psql output ({} fields, expected {QUERY_COLUMNS})",
             fields.len()
         ));
     }
@@ -701,9 +816,18 @@ pub fn parse_psql(out: &str) -> Result<PsqlRow, String> {
         last_failed_at: time(fields[4])?,
         last_failed_wal: archive_file_name(fields[5]),
         archive_mode: archive_mode_value(fields[6]),
-        archive_command: text(fields[7]),
+        archive_command: configured_command(fields[7]).map(str::to_string),
         archive_timeout: archive_timeout_value(fields[8]),
+        archive_library: text(fields[9].trim()),
+        data_directory: text(fields[10]),
+        ready_wal_files: num(fields[11])?,
     })
+}
+
+/// `command` when it configures an archive command: not empty or blank,
+/// and not `(disabled)`, which Postgres shows when `archive_mode` is off.
+fn configured_command(command: &str) -> Option<&str> {
+    (!command.trim().is_empty() && command != "(disabled)").then_some(command)
 }
 
 fn archive_mode_value(value: &str) -> Option<String> {
@@ -881,44 +1005,110 @@ fn postgres_options<'a>(path: &str, args: &'a [String]) -> Option<&'a [String]> 
     }
 }
 
-/// `archive_mode`, `archive_timeout` and `archive_command` from the
-/// `-c name=value` and `--name=value` options of a container that starts
-/// `postgres` (see [`postgres_options`]; names with `-` read as `_`, as
-/// Postgres does). Other settings are not kept.
-pub fn command_settings(path: &str, args: &[String]) -> HashMap<String, String> {
-    let mut out = HashMap::new();
+/// Calls `put` with each `-c name=value` and `--name=value` option of a
+/// container that starts `postgres` (see [`postgres_options`]), the name
+/// lowercase with `-` read as `_`, as Postgres does.
+fn for_each_option(path: &str, args: &[String], mut put: impl FnMut(&str, &str)) {
     let Some(args) = postgres_options(path, args) else {
-        return out;
+        return;
     };
-    let mut put = |kv: &str| {
+    let mut setting = |kv: &str| {
         if let Some((k, v)) = kv.split_once('=') {
-            let key = k.trim().to_ascii_lowercase().replace('-', "_");
-            let value = match key.as_str() {
-                "archive_mode" => archive_mode_value(v),
-                "archive_timeout" => archive_timeout_value(v),
-                "archive_command" => Some(v.to_string()),
-                _ => return,
-            };
-            if let Some(value) = value {
-                out.insert(key, value);
-            } else {
-                out.remove(&key);
-            }
+            put(&k.trim().to_ascii_lowercase().replace('-', "_"), v);
         }
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "-c" {
             if let Some(kv) = it.next() {
-                put(kv);
+                setting(kv);
             }
         } else if let Some(kv) = a.strip_prefix("-c") {
-            put(kv);
+            setting(kv);
         } else if let Some(kv) = a.strip_prefix("--") {
-            put(kv);
+            setting(kv);
         }
     }
+}
+
+/// `archive_mode`, `archive_timeout` and `archive_command` from the
+/// `-c name=value` and `--name=value` options of a container that starts
+/// `postgres` (see [`postgres_options`]; names with `-` read as `_`, as
+/// Postgres does). Other settings are not kept.
+pub fn command_settings(path: &str, args: &[String]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for_each_option(path, args, |key, v| {
+        let value = match key {
+            "archive_mode" => archive_mode_value(v),
+            "archive_timeout" => archive_timeout_value(v),
+            "archive_command" => Some(v.to_string()),
+            _ => return,
+        };
+        if let Some(value) = value {
+            out.insert(key.to_string(), value);
+        } else {
+            out.remove(key);
+        }
+    });
     out
+}
+
+/// `data_directory` from the same options as [`command_settings`].
+fn command_data_directory(path: &str, args: &[String]) -> Option<String> {
+    let mut dir = None;
+    for_each_option(path, args, |key, v| {
+        if key == "data_directory" {
+            dir = Some(v.to_string());
+        }
+    });
+    dir
+}
+
+/// Whether `logged`, a command from a `The failed archive command was:`
+/// detail, is `template` as Postgres runs it: `%p`, `%f` and `%r` stand
+/// for a path or file name (one or more characters other than
+/// whitespace), `%%` for `%`, and anything else for itself. Commands too
+/// long to compare cheaply do not match.
+fn command_matches(template: &str, logged: &str) -> bool {
+    enum Unit {
+        Char(char),
+        Name,
+    }
+    let mut units = Vec::new();
+    let mut chars = template.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek()) {
+            ('%', Some('p' | 'f' | 'r')) => {
+                chars.next();
+                units.push(Unit::Name);
+            }
+            ('%', Some('%')) => {
+                chars.next();
+                units.push(Unit::Char('%'));
+            }
+            (c, _) => units.push(Unit::Char(c)),
+        }
+    }
+    let logged: Vec<char> = logged.trim().chars().collect();
+    if units.len().saturating_mul(logged.len() + 1) > 1 << 22 {
+        return false;
+    }
+    // at[j]: the units so far match logged[..j]. A name may continue at
+    // the next character (extending the run it matched) or end there.
+    let mut at = vec![false; logged.len() + 1];
+    at[0] = true;
+    for unit in &units {
+        let mut next = vec![false; logged.len() + 1];
+        for j in 1..=logged.len() {
+            let c = logged[j - 1];
+            next[j] = match unit {
+                Unit::Char(u) => at[j - 1] && *u == c,
+                Unit::Name => !c.is_whitespace() && (at[j - 1] || next[j - 1]),
+            };
+        }
+        at = next;
+    }
+    at[logged.len()]
 }
 
 /// What the log tail says about archiving.
@@ -1325,22 +1515,25 @@ fn archive_program(tokens: &[Token]) -> String {
         match token {
             Token::Redirect(_) => {}
             Token::Word(raw) if assignment_name(raw).is_some() => {}
-            Token::Word(raw) => {
-                let word = unquote(raw);
-                return if !word.is_empty()
-                    && word
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"_./+-".contains(&b))
-                {
-                    word
-                } else {
-                    "***".into()
-                };
-            }
+            Token::Word(raw) => return safe_word(&unquote(raw)),
             Token::Break => break,
         }
     }
     "***".into()
+}
+
+/// `word` when it is a plain name or path (ASCII letters, digits and
+/// `_./+-`), otherwise `***`.
+fn safe_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_./+-".contains(&b))
+    {
+        word.to_string()
+    } else {
+        "***".into()
+    }
 }
 
 fn analyze_archive_command(input: &str) -> (String, Vec<String>) {
@@ -1569,25 +1762,47 @@ pub fn failing(ev: &PostgresWal) -> bool {
     }
 }
 
-fn needs_archive_repair(ev: &PostgresWal) -> bool {
-    failing(ev)
-        || (ev.source == EvidenceSource::ApiOnly
-            && ev.archive_mode.as_deref() != Some("off")
-            && ev.failed_count.is_some_and(|n| n > 0)
-            && !dead_targets(ev).is_empty())
+/// Whether SQL evidence shows archiving on with nothing set to archive:
+/// no `archive_command` and no `archive_library`. Postgres then keeps WAL
+/// without trying to archive it.
+pub fn no_archiver(ev: &PostgresWal) -> bool {
+    ev.source == EvidenceSource::Psql
+        && archiving_on(ev)
+        && ev.archive_program.is_none()
+        && ev.archive_library.is_none()
 }
 
-/// WAL far larger than the data with archiving on.
+/// Whether the archiver needs repair to free this volume. Never when
+/// `pg_wal` is on another mount, nothing is set to archive, or (API-only)
+/// the logged failures are not confirmed as the configured command's.
+fn needs_archive_repair(ev: &PostgresWal) -> bool {
+    !ev.wal_on_other_mount
+        && !no_archiver(ev)
+        && (failing(ev)
+            || (ev.source == EvidenceSource::ApiOnly
+                && !ev.historical_command
+                && ev.archive_mode.as_deref() != Some("off")
+                && ev.failed_count.is_some_and(|n| n > 0)
+                && !dead_targets(ev).is_empty()))
+}
+
+/// WAL in this volume far larger than the data with archiving on.
 pub fn wal_heavy(ev: &PostgresWal) -> bool {
     match (ev.wal_bytes, ev.data_bytes) {
         (Some(w), Some(d)) => {
             ev.source == EvidenceSource::Psql
+                && !ev.wal_on_other_mount
                 && archiving_on(ev)
                 && w >= BIG_WAL
                 && w > d.saturating_mul(WAL_RATIO)
         }
         _ => false,
     }
+}
+
+/// Whether SQL evidence counts WAL files waiting to be archived.
+fn ready_backlog(ev: &PostgresWal) -> bool {
+    ev.ready_wal_files.is_some_and(|n| n > 0)
 }
 
 /// Matched containers that have stopped.
@@ -1608,9 +1823,14 @@ fn describe_target(t: &ArchiveTarget) -> String {
 /// The one-line diagnosis that leads the finding's reason.
 pub fn diagnosis(ev: &PostgresWal) -> String {
     let mut parts = Vec::new();
+    let wal = if ev.wal_on_other_mount {
+        "cluster pg_wal (on another mount)"
+    } else {
+        "pg_wal"
+    };
     match (ev.wal_bytes, ev.data_bytes) {
-        (Some(w), Some(d)) => parts.push(format!("pg_wal holds {} vs {} data", human(w), human(d))),
-        (Some(w), None) => parts.push(format!("pg_wal holds {}", human(w))),
+        (Some(w), Some(d)) => parts.push(format!("{wal} holds {} vs {} data", human(w), human(d))),
+        (Some(w), None) => parts.push(format!("{wal} holds {}", human(w))),
         _ => {}
     }
     let failure = ev.last_failed_at.as_deref();
@@ -1628,8 +1848,17 @@ pub fn diagnosis(ev: &PostgresWal) -> String {
             } else {
                 format!("observed {n} archive failures in the last {LOG_TAIL} log lines{last}")
             };
-            format!("{observed}; current archiver health unknown")
+            let historical = if ev.historical_command {
+                ", possibly historical (the logged archive command is not confirmed as configured)"
+            } else {
+                ""
+            };
+            format!("{observed}{historical}; current archiver health unknown")
         }
+        (EvidenceSource::Psql, _) if no_archiver(ev) => format!(
+            "archiving is {} but neither archive_command nor archive_library is set, so WAL is kept unarchived",
+            ev.archive_mode.as_deref().unwrap_or("on")
+        ),
         (EvidenceSource::Psql, Some(n)) if failing(ev) => format!(
             "archiving is failing, with {n} failures in total (last failure {}, last success {})",
             failure.unwrap_or("unknown"),
@@ -1650,6 +1879,22 @@ pub fn diagnosis(ev: &PostgresWal) -> String {
                 None => format!(
                     "{n} archive failures in total (last failure unknown, last success {success})"
                 ),
+            }
+        }
+        (EvidenceSource::Psql, _) if wal_heavy(ev) => {
+            let since = success.map_or_else(
+                || "nothing archived yet".to_string(),
+                |t| format!("nothing archived since {t}"),
+            );
+            match ev.ready_wal_files {
+                Some(r) if r > 0 => format!(
+                    "{r} WAL files wait to be archived and {since}; pg_stat_archiver does not count \
+                     archiver crashes (exit codes above 125, signals)"
+                ),
+                Some(_) => "the archiver reports no failure and no WAL files wait to be archived, \
+                     so something else holds WAL (replication slots, max_wal_size)"
+                    .into(),
+                None => format!("the archiver reports no failure; {since}"),
             }
         }
         (EvidenceSource::Psql, _) => "the archiver reports no failure".into(),
@@ -1690,7 +1935,9 @@ const ARCHIVED_WAL: &str = "once archived and no longer needed by replication sl
 pub fn advice(ev: &PostgresWal) -> Option<String> {
     if needs_archive_repair(ev) {
         let dead: Vec<&str> = dead_targets(ev).iter().map(|t| t.host.as_str()).collect();
-        Some(if dead.is_empty() && ev.unmatched_hosts > 0 {
+        Some(if dead.is_empty() && ev.archive_program.is_none() {
+            format!("repair the configured archiver so archiving succeeds; {ARCHIVED_WAL}")
+        } else if dead.is_empty() && ev.unmatched_hosts > 0 {
             let unmatched = match ev.unmatched_hosts {
                 1 => "1 host matches no container".into(),
                 n => format!("{n} hosts match no container"),
@@ -1704,6 +1951,19 @@ pub fn advice(ev: &PostgresWal) -> Option<String> {
                 dead.join(", ")
             )
         })
+    } else if wal_heavy(ev) && no_archiver(ev) {
+        Some(format!(
+            "set archive_command or archive_library, or turn archive_mode off if WAL need not \
+             be archived; {ARCHIVED_WAL}"
+        ))
+    } else if wal_heavy(ev) && ready_backlog(ev) {
+        Some(
+            "check for a crashing or slow archiver (exits above 125 and signals are not counted \
+             in pg_stat_archiver), then what else holds WAL back (pg_replication_slots, \
+             max_wal_size); once nothing needs it, WAL is freed or recycled at the next \
+             checkpoint (do not remove the volume: it holds the database)"
+                .into(),
+        )
     } else if wal_heavy(ev) {
         Some(
             "check what holds WAL back (pg_replication_slots, max_wal_size, a slow archiver); \
@@ -1744,6 +2004,12 @@ pub fn headline(ev: &PostgresWal) -> String {
     }
     if let Some(t) = &ev.archive_timeout {
         bits.push(format!("archive_timeout {t}"));
+    }
+    if let Some(l) = &ev.archive_library {
+        bits.push(format!("archive_library {l}"));
+    }
+    if let Some(r) = ev.ready_wal_files.filter(|r| *r > 0) {
+        bits.push(format!("{r} WAL files ready to archive"));
     }
     if let Some(a) = &ev.last_archived_at {
         bits.push(format!("last archived {a}"));
@@ -2210,19 +2476,166 @@ mod tests {
     fn psql_rows() {
         let sep = FIELD_SEP;
         let out = format!(
-            "31138512896{sep}55574528{sep}151{sep}1794040000{sep}1794700000{sep}000000010000000000000097{sep}on{sep}curl http://s3test:9000/%f{sep}10s\n"
+            "31138512896{sep}55574528{sep}151{sep}1794040000{sep}1794700000{sep}000000010000000000000097{sep}on{sep}curl http://s3test:9000/%f{sep}10s{sep}{sep}/var/lib/postgresql/data{sep}1850\n"
         );
         let r = parse_psql(&out).unwrap();
         assert_eq!(r.wal_bytes, Some(31_138_512_896));
         assert_eq!(r.failed_count, Some(151));
         assert_eq!(r.last_archived_at.as_deref(), Some("2026-11-07T08:26:40Z"));
         assert_eq!(r.archive_timeout.as_deref(), Some("10s"));
-        let empty = format!("0{sep}100{sep}0{sep}{sep}{sep}{sep}off{sep}{sep}0\n");
-        let r = parse_psql(&empty).unwrap();
-        assert_eq!(r.last_archived_at, None);
-        assert_eq!(r.archive_command, None);
+        assert_eq!(r.archive_library, None);
+        assert_eq!(
+            r.data_directory.as_deref(),
+            Some("/var/lib/postgresql/data")
+        );
+        assert_eq!(r.ready_wal_files, Some(1850));
+        // Postgres before 15 gives null for archive_library; archive_mode
+        // off shows archive_command as "(disabled)".
+        for command in ["", "  ", "(disabled)"] {
+            let empty = format!(
+                "0{sep}100{sep}0{sep}{sep}{sep}{sep}off{sep}{command}{sep}0{sep}{sep}/d{sep}\n"
+            );
+            let r = parse_psql(&empty).unwrap();
+            assert_eq!(r.last_archived_at, None);
+            assert_eq!(r.archive_command, None, "{command:?}");
+            assert_eq!(r.ready_wal_files, None);
+        }
+        let library = format!(
+            "0{sep}100{sep}0{sep}{sep}{sep}{sep}on{sep}{sep}0{sep}basic_archive{sep}/d{sep}0\n"
+        );
+        assert_eq!(
+            parse_psql(&library).unwrap().archive_library.as_deref(),
+            Some("basic_archive")
+        );
         assert!(parse_psql("ERROR\n").is_err());
-        assert!(parse_psql(&format!("x{}", format!("{sep}").repeat(8))).is_err());
+        assert!(parse_psql(&format!("x{}", format!("{sep}").repeat(11))).is_err());
+        // The nine columns of older diskwhy queries are refused.
+        assert!(parse_psql(&format!("0{}", format!("{sep}").repeat(8))).is_err());
+    }
+
+    #[test]
+    fn paths_normalize_lexically() {
+        for (path, expected) in [
+            ("/var/lib/postgresql/data", Some("/var/lib/postgresql/data")),
+            (
+                "/var/lib/postgresql/old/../live",
+                Some("/var/lib/postgresql/live"),
+            ),
+            ("//var/./lib//pg/", Some("/var/lib/pg")),
+            ("/..", Some("/")),
+            ("/../../srv", Some("/srv")),
+            ("/", Some("/")),
+            ("var/lib", None),
+            ("./data", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                normalize_path(path),
+                expected.map(PathBuf::from),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_directory_from_the_command_line() {
+        for (path, args, expected) in [
+            (
+                "",
+                &["postgres", "-c", "data_directory=/srv/other"][..],
+                Some("/srv/other"),
+            ),
+            (
+                "docker-entrypoint.sh",
+                &["--data-directory=/srv/x"],
+                Some("/srv/x"),
+            ),
+            (
+                "",
+                &["postgres", "-cDATA_DIRECTORY=/a", "-c", "data_directory=/b"],
+                Some("/b"),
+            ),
+            ("", &["postgres", "-c", "archive_mode=on"], None),
+            ("sh", &["-c", "data_directory=/srv/other"], None),
+        ] {
+            assert_eq!(
+                command_data_directory(path, &strings(args)).as_deref(),
+                expected,
+                "{path} {args:?}"
+            );
+        }
+        // command_settings still keeps only the archive settings.
+        assert!(
+            command_settings(
+                "",
+                &strings(&["postgres", "-c", "data_directory=/srv/other"])
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn logged_commands_match_their_template() {
+        let wal = "000000010000000000000097";
+        for (template, logged, expected) in [
+            (
+                "aws --endpoint-url http://s3test:9000 s3 cp %p s3://wal/%f",
+                format!("aws --endpoint-url http://s3test:9000 s3 cp pg_wal/{wal} s3://wal/{wal}"),
+                true,
+            ),
+            (
+                "cp %p /archive/%f",
+                format!("cp pg_wal/{wal} /archive/{wal}"),
+                true,
+            ),
+            (
+                "cp %p /archive/%f",
+                format!("cp pg_wal/{wal}.partial /archive/{wal}.partial"),
+                true,
+            ),
+            ("  cp %p /a/%f  ", format!("cp pg_wal/{wal} /a/{wal}"), true),
+            (
+                "printf '100%%' %p",
+                format!("printf '100%' pg_wal/{wal}"),
+                true,
+            ),
+            ("printf '%s' %p", format!("printf '%s' pg_wal/{wal}"), true),
+            // %r is not expanded by archive_command; it stays as written.
+            ("x %r %p", format!("x %r pg_wal/{wal}"), true),
+            (
+                "cp %p /a/%f\n  && sync",
+                format!("cp pg_wal/{wal} /a/{wal}\n  && sync"),
+                true,
+            ),
+            // Reconfigured since.
+            (
+                "cp %p /new/%f",
+                format!("cp pg_wal/{wal} /old/{wal}"),
+                false,
+            ),
+            (
+                "curl -T %p https://live/%f",
+                format!("curl -T pg_wal/{wal} https://retired/{wal}"),
+                false,
+            ),
+            // A placeholder stands for one word, never for whitespace.
+            (
+                "cp %p /a/%f",
+                format!("cp pg_wal/{wal} extra /a/{wal}"),
+                false,
+            ),
+            ("cp %p /a/%f", "cp  /a/x".to_string(), false),
+            ("cp %p", "cp pg_wal/x tail".to_string(), false),
+            ("", "cp x".to_string(), false),
+        ] {
+            assert_eq!(
+                command_matches(template, &logged),
+                expected,
+                "{template} / {logged}"
+            );
+        }
+        let long = "x".repeat(1 << 13);
+        assert!(!command_matches(&long, &long));
     }
 
     #[test]

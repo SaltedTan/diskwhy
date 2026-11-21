@@ -1021,6 +1021,10 @@ mod tests {
                 unmatched_hosts: 0,
                 source: EvidenceSource::Psql,
                 notes: vec![],
+                archive_library: None,
+                ready_wal_files: None,
+                wal_on_other_mount: false,
+                historical_command: false,
             }),
         });
         let mut out = Vec::new();
@@ -1096,6 +1100,10 @@ mod tests {
                 unmatched_hosts: 0,
                 source: EvidenceSource::ApiOnly,
                 notes: vec![note.into()],
+                archive_library: None,
+                ready_wal_files: None,
+                wal_on_other_mount: false,
+                historical_command: false,
             }),
         });
         let text = render(&explain_report(f, vec![]));
