@@ -529,7 +529,8 @@ pub struct Plan {
     /// reason is visible, never applied.
     pub blocked: Vec<Finding>,
     /// What removing every item is expected to free, each byte counted once
-    /// (an item inside another item adds nothing).
+    /// (an item inside another item in the scan's tree adds nothing; see
+    /// [`crate::plan::distinct_bytes_in_tree`]).
     pub bytes: u64,
 }
 
