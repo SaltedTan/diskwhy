@@ -2,9 +2,9 @@
 source: crates/dwhy-tui/tests/tui.rs
 expression: screen
 ---
-" dwhy  findings                  all tiers · 1/1  "
-"   tier            size  path                     "
-">  regenerable     4.0G  docker://build-cache     "
+" dwhy  findings                   all tiers · 1/1 "
+"   tier            size  detector            path "
+">  regenerable     4.0G  docker-build-cache  do…he"
 "                                                  "
 "                                                  "
 "                                                  "

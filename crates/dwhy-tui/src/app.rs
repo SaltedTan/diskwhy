@@ -111,7 +111,6 @@ pub struct Browser {
     pub view: View,
     pub place: Place,
     pub rows: Vec<Row>,
-    pub total: u64,
     pub selected: usize,
     /// First row on screen.
     pub offset: usize,
@@ -407,7 +406,6 @@ impl App {
             view: View::Tree,
             place,
             rows: Vec::new(),
-            total: 0,
             selected: 0,
             offset: 0,
             fs_offset: None,
@@ -935,10 +933,19 @@ impl Browser {
 
     fn refresh_rows(&mut self, mode: SizeMode) {
         self.rows = rows(&self.data, self.place, mode);
-        self.total = match self.place {
-            Place::Roots => self.rows.iter().map(|r| r.size).sum(),
-            Place::Dir(id) => size(&self.data.tree.node(id).total, mode),
-        };
+    }
+
+    /// The bytes in the current view: the rows, plus the directory's own
+    /// blocks in allocated mode. Inside a directory that is its total.
+    /// `mode` must be the one the rows were made for.
+    pub fn total(&self, mode: SizeMode) -> u64 {
+        let rows: u64 = self.rows.iter().map(|r| r.size).sum();
+        match (self.place, mode) {
+            (Place::Dir(id), SizeMode::Allocated) => {
+                rows + self.data.tree.node(id).directory_allocated
+            }
+            _ => rows,
+        }
     }
 }
 

@@ -1,8 +1,8 @@
 ---
 source: crates/dwhy-tui/tests/tui.rs
-expression: "render(&mut app, 80, 24, None)"
+expression: "render_at(&mut app, 80, 24, None, PLAN_AT)"
 ---
-" dwhy  plan preview                                             2 items · 3.3G  "
+" dwhy  plan preview                                              2 items · 3.3G "
 "2 items, frees 3.3G, 1 blocked                                                  "
 "  created 2026-11-19T09:00:00Z · expires 2026-11-19T10:00:00Z                   "
 "  host testhost · uid 1000                                                      "
