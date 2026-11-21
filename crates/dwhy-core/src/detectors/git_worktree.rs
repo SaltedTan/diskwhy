@@ -5,7 +5,10 @@
 //! a scanned worktree's `.git` file points to (`gitdir: <repo>/.git/worktrees/
 //! <name>`), even when the repository itself is outside the scan. For each
 //! one, diskwhy runs `git --no-optional-locks -C <repo> worktree list
-//! --porcelain` and looks at every linked worktree (never the main one):
+//! --porcelain -z` (without `-z` on git before 2.36) and looks at every
+//! linked worktree (never the main one).
+//! Paths are kept as raw bytes from git's output and git's metadata files,
+//! so a worktree whose name is not valid UTF-8 is measured exactly:
 //!
 //! - **stale**: the worktree is in the scan and nothing in it was written for
 //!   [`STALE_DAYS`] days. Action: `git -C <repo> worktree remove <path>`,
@@ -22,6 +25,8 @@
 //! Bare repositories are not looked at yet.
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::detect::{Candidate, DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
@@ -80,6 +85,57 @@ pub fn parse_porcelain(out: &str) -> Vec<WorktreeEntry> {
             "bare" => e.bare = true,
             "locked" => e.locked = Some(val.to_string()),
             "prunable" => e.prunable = Some(val.to_string()),
+            _ => {}
+        }
+    }
+    entries.extend(cur);
+    entries
+}
+
+/// Parses `git worktree list --porcelain -z` output: fields end with NUL
+/// and a record ends with an empty field. The `worktree` path keeps its raw
+/// bytes, so a name that is not valid UTF-8 survives; the other fields are
+/// text. The first entry is the main worktree.
+pub fn parse_porcelain_z(out: &[u8]) -> Vec<WorktreeEntry> {
+    parse_porcelain_delimited(out, b'\0')
+}
+
+/// Parses porcelain output whose fields end with `delim`: NUL for `-z`, a
+/// newline for git before 2.36, which has no `-z` and prints paths
+/// unquoted, so their raw bytes survive there too.
+fn parse_porcelain_delimited(out: &[u8], delim: u8) -> Vec<WorktreeEntry> {
+    let text = |v: &[u8]| String::from_utf8_lossy(v).into_owned();
+    let mut entries = Vec::new();
+    let mut cur: Option<WorktreeEntry> = None;
+    for field in out.split(|&b| b == delim) {
+        if field.is_empty() {
+            entries.extend(cur.take());
+            continue;
+        }
+        let (key, val) = match field.iter().position(|&b| b == b' ') {
+            Some(i) => (&field[..i], &field[i + 1..]),
+            None => (field, &b""[..]),
+        };
+        if key == b"worktree" {
+            entries.extend(cur.take());
+            cur = Some(WorktreeEntry {
+                path: PathBuf::from(OsStr::from_bytes(val)),
+                ..WorktreeEntry::default()
+            });
+            continue;
+        }
+        let Some(e) = cur.as_mut() else {
+            continue;
+        };
+        match key {
+            b"HEAD" => e.head = Some(text(val)),
+            b"branch" => {
+                e.branch = Some(text(val.strip_prefix(b"refs/heads/").unwrap_or(val)));
+            }
+            b"detached" => e.detached = true,
+            b"bare" => e.bare = true,
+            b"locked" => e.locked = Some(text(val)),
+            b"prunable" => e.prunable = Some(text(val)),
             _ => {}
         }
     }
@@ -149,8 +205,8 @@ fn repos_with_worktrees(tree: &ScanTree) -> BTreeSet<PathBuf> {
 /// `gitdir: <repo>/.git/worktrees/<name>` (a submodule's points elsewhere).
 fn linked_repo(dir: &Path) -> Option<PathBuf> {
     let head = read_head(&dir.join(".git"), 4096)?;
-    let text = String::from_utf8_lossy(&head);
-    let gitdir = resolve(dir, text.trim().strip_prefix("gitdir:")?.trim());
+    let to = head.trim_ascii().strip_prefix(b"gitdir:")?.trim_ascii();
+    let gitdir = resolve(dir, Path::new(OsStr::from_bytes(to)));
     let worktrees = gitdir.parent()?;
     let dot_git = worktrees.parent()?;
     if worktrees.file_name()? != "worktrees" || dot_git.file_name()? != ".git" {
@@ -164,7 +220,7 @@ fn linked_repo(dir: &Path) -> Option<PathBuf> {
 
 /// `path` resolved against `base` when relative, with `.` and `..`
 /// removed lexically.
-fn resolve(base: &Path, path: &str) -> PathBuf {
+fn resolve(base: &Path, path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in base.join(path).components() {
         match c {
@@ -178,9 +234,16 @@ fn resolve(base: &Path, path: &str) -> PathBuf {
     out
 }
 
+/// `git worktree list --porcelain -z`, or without `-z` when git refuses it
+/// (git before 2.36).
 fn list(git: &str, repo: &Path) -> Result<Vec<WorktreeEntry>, String> {
-    let out = crate::gitcmd::run(git, repo, &["worktree", "list", "--porcelain"])?;
-    Ok(parse_porcelain(&out))
+    match crate::gitcmd::run_bytes(git, repo, &["worktree", "list", "--porcelain", "-z"]) {
+        Ok(out) => Ok(parse_porcelain_z(&out)),
+        Err(_) => {
+            let out = crate::gitcmd::run_bytes(git, repo, &["worktree", "list", "--porcelain"])?;
+            Ok(parse_porcelain_delimited(&out, b'\n'))
+        }
+    }
 }
 
 fn git_action(git: &str, repo: &Path, args: &[&str]) -> Action {
@@ -349,7 +412,7 @@ fn admin_bytes(tree: &ScanTree, admin: NodeId, missing: &[&WorktreeEntry]) -> u6
         .filter(|&&c| {
             let entry = tree.path(c);
             read_head(&entry.join("gitdir"), 4096).is_some_and(|b| {
-                let target = resolve(&entry, String::from_utf8_lossy(&b).trim());
+                let target = resolve(&entry, Path::new(OsStr::from_bytes(b.trim_ascii())));
                 missing
                     .iter()
                     .any(|e| target.parent() == Some(e.path.as_path()))

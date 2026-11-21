@@ -200,6 +200,12 @@ impl Candidate {
         Self { path, finding }
     }
 
+    /// The exact path the finding measures, which `finding.path` spells
+    /// lossily when it is not valid UTF-8.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn reported(finding: Finding) -> Self {
         Self::new(PathBuf::from(&finding.path), finding)
     }

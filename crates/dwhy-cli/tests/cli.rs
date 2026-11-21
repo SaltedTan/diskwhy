@@ -683,6 +683,60 @@ fn diff_reports_growth_since_a_snapshot() {
 }
 
 #[test]
+fn diff_rescans_a_non_utf8_root_as_given() {
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt;
+
+    let (_t, root) = cargo_fixture();
+    let app = Path::new(&root).join("app");
+    let raw = Path::new(&root).join(OsStr::from_bytes(b"app\xff"));
+    if let Err(e) = fs::rename(&app, &raw) {
+        eprintln!("skipped: the filesystem refuses {raw:?}: {e}");
+        return;
+    }
+    // A real directory spelled the way `app\xff` is shown, of another size.
+    let sibling = Path::new(&root).join("app\u{FFFD}");
+    fs::create_dir_all(sibling.join("x/y")).unwrap();
+    fs::write(sibling.join("x/y/other"), vec![5u8; 1 << 20]).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let run = |args: &[OsString]| {
+        Command::new(env!("CARGO_BIN_EXE_dwhy"))
+            .args(args)
+            .env("XDG_STATE_HOME", state.path())
+            .output()
+            .unwrap()
+    };
+    let with = |head: &[&str]| -> Vec<OsString> {
+        let mut v: Vec<OsString> = head.iter().map(OsString::from).collect();
+        v.push(raw.clone().into_os_string());
+        v.extend(
+            ["-q", "--json", "--detectors", "cargo-target"]
+                .iter()
+                .map(OsString::from),
+        );
+        v
+    };
+    let saved = |out: &Output| {
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let path = json_of(out)["snapshot"]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        dwhy_core::snapshot::load(Path::new(&path)).unwrap()
+    };
+
+    let scan = with(&["scan", "--snapshot"]);
+    let before = saved(&run(&scan));
+    let diff = with(&["diff", "--snapshot", "--min-change", "0"]);
+    let after = saved(&run(&diff));
+    assert_eq!(after.scan.roots, before.scan.roots);
+    // The same tree, not the lookalike next to it.
+    assert_eq!(after.scan.totals.apparent, before.scan.totals.apparent);
+    assert_eq!(after.scan.totals.files, before.scan.totals.files);
+    assert!(before.scan.totals.apparent >= 3 << 20);
+}
+
+#[test]
 fn scan_shows_growth_from_a_snapshot_an_hour_old() {
     let (_t, root) = cargo_fixture();
     let target = format!("{root}/app/target");
@@ -2376,6 +2430,34 @@ fn apply_never_runs_a_lossy_path_or_command() {
         !state.path().join("diskwhy/audit.jsonl").exists(),
         "dry runs write nothing"
     );
+
+    // A real run of both plans, with a real directory spelled exactly as
+    // the lossy path: it is never removed, and the command never runs.
+    let real = Path::new(&lossy);
+    fs::create_dir_all(real.join("debug")).unwrap();
+    fs::write(real.join("debug/keep"), "keep").unwrap();
+    for name in ["path.json", "argv.json"] {
+        let file = dir.path().join(name);
+        let out = run(&[
+            "apply",
+            file.to_str().unwrap(),
+            "--yes",
+            "--max-tier",
+            "rebuildable",
+            "--json",
+            "-q",
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{name}: {out:?}");
+        let r = json_of(&out);
+        assert_eq!(r["items"][0]["outcome"], "skipped", "{name}: {r}");
+        let detail = r["items"][0]["detail"].as_str().unwrap();
+        assert!(
+            detail.starts_with("blocked by path-not-utf8: "),
+            "{name}: {detail}"
+        );
+        assert_eq!(fs::read_to_string(real.join("debug/keep")).unwrap(), "keep");
+        assert!(renamed.join("target/debug/app").exists());
+    }
 }
 
 #[test]

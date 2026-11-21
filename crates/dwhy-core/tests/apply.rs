@@ -1302,7 +1302,8 @@ fn a_lossy_path_or_command_is_never_applied() {
         }
     }
     // A fresh finding that names a lossy path, as if a detector had
-    // slipped past `detect::block_lossy`, matching its plan item.
+    // slipped past `detect::block_lossy`, while its plan item is clean: only
+    // the fresh-side check can block it.
     let mut fresh = found.clone();
     let guard = GuardResult {
         name: "locked".into(),
@@ -1315,23 +1316,30 @@ fn a_lossy_path_or_command_is_never_applied() {
         .unwrap()
         .guards
         .push(guard.clone());
-    for f in fresh
+    fresh
         .iter_mut()
-        .chain(plan.items.iter_mut().map(|i| &mut i.finding))
-    {
-        if f.detector == "cargo-target" {
-            f.action = Action {
-                kind: ActionKind::Command,
-                text: format!("cargo clean --target-dir {lossy}"),
-                argv: Some(vec![
-                    "cargo".into(),
-                    "clean".into(),
-                    "--target-dir".into(),
-                    lossy.clone(),
-                ]),
-            };
-        }
-    }
+        .find(|f| f.detector == "cargo-target")
+        .unwrap()
+        .action = Action {
+        kind: ActionKind::Command,
+        text: format!("cargo clean --target-dir {lossy}"),
+        argv: Some(vec![
+            "cargo".into(),
+            "clean".into(),
+            "--target-dir".into(),
+            lossy.clone(),
+        ]),
+    };
+    let planned = plan
+        .items
+        .iter()
+        .find(|i| i.finding.detector == "cargo-target")
+        .unwrap();
+    assert_eq!(
+        planned.finding.path, found[1].path,
+        "the plan item is clean"
+    );
+    assert_eq!(planned.finding.action, found[1].action);
     let checks = evaluate(&b, &plan, fresh, &policy(Tier::Review, &[&found[2].id]));
     for d in ["user-cache", "cargo-target"] {
         let c = checks.iter().find(|c| c.item.detector == d).unwrap();
@@ -1390,6 +1398,50 @@ fn a_lossy_path_or_command_is_never_applied() {
             .any(|g| g.name == "path-not-utf8")
     );
     assert!(b.join("scratch/file").exists());
+
+    // The same for a path removal: a real directory whose name holds
+    // U+FFFD is left alone, since diskwhy cannot tell it from a lossy one.
+    let real = b.join("scratch\u{FFFD}");
+    write(&real.join("file"), "keep");
+    let mut check = stale.clone();
+    check.item.path = real.to_string_lossy().into_owned();
+    // Its own identity, so only the lossy check stands in the way.
+    let md = fs::symlink_metadata(&real).unwrap();
+    check.inode = Some((
+        std::os::unix::fs::MetadataExt::dev(&md),
+        std::os::unix::fs::MetadataExt::ino(&md),
+    ));
+    check.item.action = Action {
+        kind: ActionKind::RemovePath,
+        text: format!("remove {}", check.item.path),
+        argv: None,
+    };
+    let mut checks = vec![check];
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |_| {},
+    );
+    assert_eq!(checks[0].item.outcome, ApplyOutcome::Skipped);
+    assert!(
+        checks[0]
+            .item
+            .detail
+            .starts_with("blocked by path-not-utf8"),
+        "{}",
+        checks[0].item.detail
+    );
+    assert!(
+        checks[0]
+            .item
+            .guards
+            .iter()
+            .any(|g| g.name == "path-not-utf8")
+    );
+    assert_eq!(fs::read_to_string(real.join("file")).unwrap(), "keep");
 }
 
 /// `scratch` (review) holding `scratch/target` (a path removal), which holds

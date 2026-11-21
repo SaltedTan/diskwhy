@@ -6,9 +6,16 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Runs `git --no-optional-locks -c core.fsmonitor=false -C <dir> <args>`
-/// and returns its stdout.
+/// and returns its stdout as text, with bytes that are not valid UTF-8
+/// replaced by U+FFFD. Use [`run_bytes`] when the output names paths.
 /// The error is the first line of stderr.
 pub(crate) fn run(git: &str, dir: &Path, args: &[&str]) -> Result<String, String> {
+    run_bytes(git, dir, args).map(|out| String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Like [`run`], returning stdout's raw bytes, so a path that is not valid
+/// UTF-8 survives exactly.
+pub(crate) fn run_bytes(git: &str, dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let out = Command::new(git)
         .arg("--no-optional-locks")
         .args(["-c", "core.fsmonitor=false"])
@@ -36,5 +43,5 @@ pub(crate) fn run(git: &str, dir: &Path, args: &[&str]) -> Result<String, String
             .trim()
             .to_string());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(out.stdout)
 }

@@ -1,12 +1,16 @@
 //! `git-worktree` on temp git repositories. Needs `git` on PATH.
 
+use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dwhy_core::detect::{self, DetectContext, Detector};
-use dwhy_core::detectors::{GitWorktree, STALE_DAYS, WorktreeEntry, parse_porcelain};
+use dwhy_core::detectors::{
+    GitWorktree, STALE_DAYS, WorktreeEntry, parse_porcelain, parse_porcelain_z,
+};
 use dwhy_core::mounts::MountTable;
 use dwhy_core::report::{ActionKind, DockerSocket, Finding, GuardStatus, Tier, ToolStatus};
 use dwhy_core::scan::{self, Progress, ScanOptions};
@@ -62,7 +66,7 @@ fn ctx_with(git: Option<&str>, off_path: Option<&str>) -> DetectContext {
 
 /// Runs git in `dir` with no user or system config, ignoring any repository
 /// the caller's environment points at.
-fn git(dir: &Path, args: &[&str]) {
+fn git<S: AsRef<OsStr> + std::fmt::Debug>(dir: &Path, args: &[S]) {
     let st = Command::new("git")
         .args([
             "-c",
@@ -415,9 +419,6 @@ fn run_includes_git_worktree() {
 
 #[test]
 fn a_worktree_whose_main_repository_is_not_utf8_is_blocked() {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
-
     let (_t, root) = tmp();
     let r = root.join(OsStr::from_bytes(b"repo\xff"));
     if let Err(e) = fs::create_dir(&r) {
@@ -457,4 +458,222 @@ fn a_worktree_whose_main_repository_is_not_utf8_is_blocked() {
         "{:?}",
         f.recovery
     );
+}
+
+#[test]
+fn parses_porcelain_z_output_with_raw_path_bytes() {
+    let out = b"worktree /src/repo\0HEAD 1111111111111111111111111111111111111111\0branch refs/heads/main\0\0\
+worktree /src/wt\xff\0HEAD 2222222222222222222222222222222222222222\0detached\0locked\0\0\
+worktree /src/wt-b\0HEAD 3333333333333333333333333333333333333333\0branch refs/heads/feat/x\0\
+locked moved to\nUSB\0prunable gitdir file points to non-existent location\0\0";
+    let e = parse_porcelain_z(out);
+    assert_eq!(e.len(), 3);
+    assert_eq!(e[0].path, PathBuf::from("/src/repo"));
+    assert_eq!(e[0].branch.as_deref(), Some("main"));
+    assert_eq!(
+        e[1],
+        WorktreeEntry {
+            path: PathBuf::from(OsStr::from_bytes(b"/src/wt\xff")),
+            head: Some("2222222222222222222222222222222222222222".into()),
+            detached: true,
+            locked: Some(String::new()),
+            ..WorktreeEntry::default()
+        }
+    );
+    assert_eq!(e[2].branch.as_deref(), Some("feat/x"));
+    // With -z, a reason may hold a newline.
+    assert_eq!(e[2].locked.as_deref(), Some("moved to\nUSB"));
+    assert!(e[2].prunable.is_some());
+    assert!(parse_porcelain_z(b"worktree /x/bare.git\0bare\0\0")[0].bare);
+}
+
+/// `root/<name>` as raw bytes, or `None` (after saying so) when the
+/// filesystem refuses a name that is not valid UTF-8.
+fn non_utf8_dir(root: &Path, name: &[u8]) -> Option<PathBuf> {
+    let p = root.join(OsStr::from_bytes(name));
+    match fs::create_dir(&p) {
+        Ok(()) => {
+            fs::remove_dir(&p).unwrap();
+            Some(p)
+        }
+        Err(e) => {
+            eprintln!("skipped: the filesystem refuses {p:?}: {e}");
+            None
+        }
+    }
+}
+
+/// Adds worktree `wt` of `repo` on new branch `branch`, with `mb` MiB inside.
+fn worktree_at(repo: &Path, wt: &Path, branch: &str, mb: usize) {
+    git(
+        repo,
+        &[
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("-q"),
+            OsStr::new("-b"),
+            OsStr::new(branch),
+            wt.as_os_str(),
+        ],
+    );
+    if mb > 0 {
+        write(&wt.join("build/out.bin"), mb * MB);
+    }
+}
+
+fn candidates(tree: &ScanTree) -> Vec<dwhy_core::detect::Candidate> {
+    let mut c = GitWorktree
+        .detect_candidates(tree, &ctx(Some("git")))
+        .unwrap();
+    c.sort_by(|a, b| a.path().cmp(b.path()));
+    c
+}
+
+#[test]
+fn a_stale_worktree_whose_name_is_not_utf8_is_found_and_blocked() {
+    let (_t, root) = tmp();
+    let Some(wt) = non_utf8_dir(&root, b"wt\xff") else {
+        return;
+    };
+    let r = repo(&root);
+    worktree_at(&r, &wt, "wt-raw", 2);
+    age_tree(&wt, 30);
+
+    let tree = scan_tree(&root);
+    let want = tree.node(tree.find(&wt).unwrap()).freeable();
+    let found = candidates(&tree);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path(), wt.as_path());
+    assert_eq!(found[0].finding.bytes, want);
+    assert!(want >= 2 << 20);
+
+    let only = vec!["git-worktree".to_string()];
+    let (found, _) = detect::run_with(
+        &tree,
+        &ctx(Some("git")),
+        &dwhy_core::detectors::registry(),
+        Some(&only),
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    let f = &found[0];
+    assert_eq!(f.path, wt.to_string_lossy());
+    assert_eq!(f.bytes, want);
+    assert_eq!(f.tier, Tier::Blocked);
+    assert_eq!(f.action.argv, None);
+    let g = f.guards.iter().find(|g| g.name == "path-not-utf8").unwrap();
+    assert_eq!(g.status, GuardStatus::Block);
+}
+
+#[test]
+fn a_non_utf8_worktree_is_not_confused_with_its_lossy_sibling() {
+    let (_t, root) = tmp();
+    let Some(wt) = non_utf8_dir(&root, b"wt\xff") else {
+        return;
+    };
+    let r = repo(&root);
+    worktree_at(&r, &wt, "wt-raw", 2);
+    // A real directory spelled the way `wt\xff` is shown, much bigger.
+    let sibling = root.join("wt\u{FFFD}");
+    write(&sibling.join("big.bin"), 6 * MB);
+    age_tree(&wt, 30);
+    age_tree(&sibling, 30);
+
+    let tree = scan_tree(&root);
+    let want = tree.node(tree.find(&wt).unwrap()).freeable();
+    let other = tree.node(tree.find(&sibling).unwrap()).freeable();
+    assert!(other > want + (3 << 20), "{other} vs {want}");
+    let found = candidates(&tree);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path(), wt.as_path());
+    assert_ne!(found[0].path(), sibling.as_path());
+    assert_eq!(found[0].finding.bytes, want);
+}
+
+#[test]
+fn non_utf8_worktrees_through_git_files_and_prune_accounting() {
+    let (_t, root) = tmp();
+    let wts = root.join("wts");
+    fs::create_dir_all(&wts).unwrap();
+    let Some(wt) = non_utf8_dir(&wts, b"wt\xff") else {
+        return;
+    };
+    let r = repo(&root);
+    worktree_at(&r, &wt, "wt-raw", 2);
+    age_tree(&wt, 30);
+    // Two worktrees whose names differ only in bytes that are not UTF-8:
+    // shown alike, but only `gone\xff` is gone.
+    let gone = root.join(OsStr::from_bytes(b"gone\xff"));
+    let kept = root.join(OsStr::from_bytes(b"gone\xfe"));
+    worktree_at(&r, &gone, "gone-a", 0);
+    worktree_at(&r, &kept, "gone-b", 0);
+    fs::remove_dir_all(&gone).unwrap();
+
+    // Scanning only the worktree finds its repository through its `.git`
+    // file, which names `.git/worktrees/wt\xff`.
+    let found = candidates(&scan_tree(&wts));
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path(), wt.as_path());
+
+    // From the root, prune frees only `gone\xff`'s bookkeeping.
+    let tree = scan_tree(&root);
+    let admin = r.join(".git/worktrees");
+    let entry = fs::read_dir(&admin)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|e| {
+            fs::read(e.join("gitdir")).unwrap().trim_ascii()
+                == gone.join(".git").as_os_str().as_bytes()
+        })
+        .unwrap();
+    let want = tree.node(tree.find(&entry).unwrap()).freeable();
+    let found = candidates(&tree);
+    let paths: Vec<&Path> = found.iter().map(|c| c.path()).collect();
+    assert_eq!(paths, [admin.as_path(), wt.as_path()]);
+    let p = &found[0].finding;
+    assert_eq!(p.bytes, want);
+    assert!(p.reason.starts_with("1 worktree of"), "{}", p.reason);
+}
+
+/// Git before 2.36 has no `worktree list -z`: it exits 129 with
+/// "unknown switch". The detector falls back to newline-separated porcelain,
+/// which such git prints with paths unquoted, so raw bytes still survive.
+#[test]
+fn git_without_worktree_list_z_still_finds_worktrees() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_t, root) = tmp();
+    let Some(wt) = non_utf8_dir(&root, b"wt\xff") else {
+        return;
+    };
+    let r = repo(&root);
+    worktree_at(&r, &wt, "wt-raw", 2);
+    let sibling = root.join("wt\u{FFFD}");
+    write(&sibling.join("big.bin"), 6 * MB);
+    age_tree(&wt, 30);
+    age_tree(&sibling, 30);
+
+    let (_bin_t, bin) = tmp();
+    let old_git = bin.join("old-git");
+    fs::write(
+        &old_git,
+        "#!/bin/sh\n\
+         for a in \"$@\"; do\n\
+         \x20 if [ \"$a\" = -z ]; then echo \"error: unknown switch \\`z'\" >&2; exit 129; fi\n\
+         done\n\
+         exec git \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&old_git, fs::Permissions::from_mode(0o755)).unwrap();
+    let old_git = old_git.to_str().unwrap();
+
+    let tree = scan_tree(&root);
+    let want = tree.node(tree.find(&wt).unwrap()).freeable();
+    let mut found = GitWorktree
+        .detect_candidates(&tree, &ctx_with(None, Some(old_git)))
+        .unwrap();
+    found.sort_by(|a, b| a.path().cmp(b.path()));
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path(), wt.as_path());
+    assert_eq!(found[0].finding.bytes, want);
+    assert_eq!(found[0].finding.tier, Tier::Review);
 }
