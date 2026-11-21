@@ -21,7 +21,9 @@ pub use docker::{
     DockerVolume, docker_presence, object_id,
 };
 pub(crate) use docker::{container_name, image_label, image_named, short_id};
-pub use git_worktree::{GitWorktree, STALE_DAYS, WorktreeEntry, parse_porcelain};
+pub use git_worktree::{
+    GitWorktree, STALE_DAYS, WorktreeEntry, parse_porcelain, parse_porcelain_z,
+};
 pub use node_modules::NodeModules;
 pub use stale_tree::{SCRATCH_LOCATIONS, SCRATCH_MARKER, SCRATCH_STALE_DAYS, StaleTree};
 pub use tool_versions::ToolVersions;

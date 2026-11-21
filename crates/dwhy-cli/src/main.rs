@@ -472,32 +472,40 @@ fn run_diff(args: DiffArgs) -> Result<u8> {
     let host = system::hostname();
     let uid = system::euid();
     // With PATH, compare with a snapshot of those roots; without, with the
-    // newest of any roots, and rescan its roots.
+    // newest of any roots, and rescan its roots. Given roots are rescanned
+    // as given, byte for byte; only the snapshot lookup uses their text.
     let given = if args.paths.is_empty() {
         None
     } else {
         let one_fs = !args.cross_filesystems;
-        let roots: Vec<String> = scan::prepare_roots(&args.paths, one_fs)?
+        let roots = scan::prepare_roots(&args.paths, one_fs)?;
+        let names: Vec<String> = roots
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
-        Some((roots, one_fs))
+        Some((roots, names, one_fs))
     };
     let found = snapshot::find(
         &dir,
         &since,
         &host,
         uid,
-        given.as_ref().map(|(r, x)| (r.as_slice(), *x)),
+        given.as_ref().map(|(_, n, x)| (n.as_slice(), *x)),
         now_secs(),
     )?;
-    let (roots, one_fs) = given.unwrap_or_else(|| {
-        (
-            found.snapshot.scan.roots.clone(),
+    let (roots, one_fs) = match given {
+        Some((roots, _, one_fs)) => (roots, one_fs),
+        None => (
+            found
+                .snapshot
+                .scan
+                .roots
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
             found.snapshot.scan.one_filesystem,
-        )
-    });
-    let roots: Vec<PathBuf> = roots.iter().map(PathBuf::from).collect();
+        ),
+    };
 
     let mounts = MountTable::read().unwrap_or_default();
     // The snapshot records directories from the tree; no list is needed.
