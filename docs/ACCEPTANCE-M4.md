@@ -7,13 +7,15 @@ The [M4 criterion](DESIGN.md#mvp-milestones) is that the TUI is usable over ssh 
 3. A `--dry-run` session removes nothing.
 4. The TUI is dry-run on the real machine.
 
+A fifth check, [over ssh](#5-over-ssh), ran on head `a786d6c` (branch `m4-hangup`) on 2026-11-21. It found that the TUI never exited once its terminal hung up, and that branch fixes it.
+
 Every apply ran on temp fixtures. On the real machine the TUI ran only with `--dry-run`.
 
 ## Terminal
 
 Each session ran in a real terminal: a detached tmux 3.6 session sized `-x 80 -y 24`, driven with `tmux send-keys` and recorded with `tmux capture-pane`. That is a real pty, not ratatui's TestBackend. The screens below are verbatim captures.
 
-`ssh localhost` isn't set up on this machine (no key for the maintainer's own account), so these checks didn't go over ssh. The maintainer's own check over ssh is recorded under [Maintainer ssh check](#maintainer-ssh-check).
+Checks 1–4 ran in tmux directly. Check 5 ran the same kind of session over ssh.
 
 ## Fixtures
 
@@ -158,12 +160,59 @@ would remove     9.1G
 
 The command wraps across lines at 80 columns, so it carries the "preview — do not copy" label (M4b's copy rule). `du -sB1 target` read 9,735,245,824 bytes both before and after. `~/.local/state/diskwhy/audit.jsonl` still doesn't exist.
 
+## 5. Over ssh
+
+The machine's own sshd has no key for the maintainer's account, so a throwaway sshd ran as that user for the check. It listened on 127.0.0.1:2222 only, accepted only a temporary key, and was stopped afterwards:
+
+```text
+Port 2222
+ListenAddress 127.0.0.1
+HostKey <tmp>/host_key
+AuthorizedKeysFile <tmp>/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+UsePAM no
+AllowUsers <maintainer>
+AcceptEnv TERM
+StrictModes no
+```
+
+(`StrictModes no` because the key files live under `/tmp`.) OpenSSH 10.2p1, tmux 3.6. Each session was `ssh -t` into an interactive `bash` in a detached tmux pane sized 80×24, so sshd allocated the pty. Inside it, `TERM=tmux-256color` and `stty size` read `24 80`. A script sent the keys and checked the `tmux capture-pane` text, exit codes, `du` and the audit logs. The real-machine session used the settings from check 4 (`--dry-run`, a missing Docker socket, `PATH` with only `git` and `cargo`). Applies ran on fixtures from the script above.
+
+All 33 checks passed on `a786d6c` (static musl binary, 4,003,136 bytes):
+
+| Group | What was checked |
+|---|---|
+| Real-machine dry run (17) | The tree, `a` (apparent), `f` (filesystems), Tab (findings), Enter (detail), Space (mark), `p` (plan preview) and `x` (the dialog, with "preview — do not copy"). Resizing to 80×8 over ssh shows "enlarge the terminal to confirm" and `y` does nothing; back at 80×24 the dialog returns. `y` gives "would remove 1 item … no audit line written". Enter rescans. `q` leaves the alternate screen, shows the cursor, exits 0 and restores canonical mode. `target` read 10,299,240,448 bytes before and after, and `~/.local/state/diskwhy/audit.jsonl` doesn't exist. |
+| Fixture apply (5) | Mark all three findings, `p`, `x`, tick the review item, `y`: "removed 3 items, freed about 6.0M". The rescan shows no findings, the exit code is 0, both `Cargo.toml` files remain, and the audit log has 6 lines. |
+| Ctrl-C (1) | Ctrl-C on the tree quits like `q`, with the terminal restored. |
+| Hangup, idle (4) | The TUI exits within 3 s when the ssh client is killed (`kill -9`), when the tmux window running ssh is closed, and when a local tmux window running it without ssh is closed. Exit code 129. |
+| Hangup mid-apply (5) | The fixture's `PATH` gets a fake `cargo` whose `clean` sleeps 4 s, then removes the target. The ssh client is killed while the first item's `cargo clean` runs. That command finishes and no other item runs. The audit log has the item's start and end and an end for each skipped item (4 lines). The TUI exits 129. |
+
+The resize check, over ssh:
+
+```text
+ DRY RUN  dwhy  dry run this plan?                               1 item · 9.6G
+ enlarge the terminal to confirm
+
+
+
+
+
+ Esc back · q quit
+```
+
+### The hangup bug
+
+The same script against the merged M4d binary (head `b5150c0`, before the fix) failed all six exit checks under the two hangup rows. The TUI stayed alive in every hangup case, reparented to init with its pty deleted. It ran at 100% of one core and ignored SIGTERM. strace showed SIGHUP arriving, after which `read(0)` returned 0 in an endless loop. crossterm 0.29's default (mio) event source only stops reading on `WouldBlock`, so `event::poll` never returned and the TUI never got back to the signal check. The bug dated back to M4a. Removal stayed safe: the apply worker reads the same stop flag, so the item in progress finished, the rest were skipped and the audit was complete (the three mid-apply file checks passed). Only the main thread was stuck.
+
+The fix switches crossterm to its `use-dev-tty` event source, which stops reading on EOF. It also adds a quiet exit. Once the terminal is gone, ratatui's `Terminal` drop tried to show the cursor and `eprintln!`ed the failure, which panics with stderr closed (exit 101). The TUI now shows the cursor itself and forgets the `Terminal` if that fails. The TUI's audit-error print and the CLI's final error print use `writeln!` for the same reason.
+
+The script reads screen text, so it can't judge how a particular terminal app draws the bars, box lines or colours.
+
 ## What these checks never did
 
-- No apply ran outside `/tmp/dwhy-m4d.*` fixtures. The real-machine session was `--dry-run`, in which `y` is also a dry run.
+- No apply ran outside `/tmp/dwhy-m4d.*` fixtures. The real-machine sessions were `--dry-run`, in which `y` is also a dry run.
 - No Docker detector or probe reached the machine's daemon. `DOCKER_HOST` named a missing socket and no `docker` CLI was on `PATH`.
-- Nothing ran with sudo.
-
-## Maintainer ssh check
-
-Pending. The maintainer runs `dwhy tui --dry-run` over ssh in an 80×24 terminal and records the result here.
+- Nothing ran with sudo. The throwaway sshd ran as the maintainer's own user and accepted connections only from 127.0.0.1.
