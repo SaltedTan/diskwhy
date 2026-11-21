@@ -455,15 +455,19 @@ impl PlanJob {
 }
 
 /// Why the rescan in `result` could not have found a filesystem finding at
-/// `path`: the path or an ancestor could not be listed, a scan error was
-/// recorded at or above it, or it lies at or below a mount point the walk
-/// did not enter. `None` when the walk covered it (or it is a pseudo-path
-/// such as `docker://…`).
+/// `path`: within the walk of the deepest root above it, the path or an
+/// ancestor could not be listed, a scan error was recorded at or above it,
+/// or it lies at or below a mount point that walk did not enter. `None`
+/// when the walk covered it (or it is under no root, such as a pseudo-path
+/// like `docker://…`).
 fn not_covered(result: &ScanResult, path: &Path) -> Option<String> {
-    if !path.is_absolute() {
-        return None;
-    }
-    let above = |p: &Path| path.starts_with(p);
+    let root = result
+        .roots
+        .iter()
+        .map(|r| r.path.as_path())
+        .filter(|r| path.starts_with(r))
+        .max_by_key(|r| r.components().count())?;
+    let above = |p: &Path| p.starts_with(root) && path.starts_with(p);
     if let Some(u) = result
         .unreadable
         .iter()
@@ -476,6 +480,7 @@ fn not_covered(result: &ScanResult, path: &Path) -> Option<String> {
     }
     if let Some(u) = result.unreadable.iter().find(|u| {
         u.reason == UnreadableReason::EntriesDenied
+            && u.path.starts_with(root)
             && path
                 .parent()
                 .is_some_and(|parent| parent.starts_with(&u.path))
@@ -494,7 +499,11 @@ fn not_covered(result: &ScanResult, path: &Path) -> Option<String> {
     if result.error_count > result.errors.len() as u64 {
         return Some("the rescan hit errors that were not all recorded".into());
     }
-    if let Some(skip) = result.skipped_mounts.iter().find(|s| above(&s.path)) {
+    if let Some(skip) = result
+        .skipped_mounts
+        .iter()
+        .find(|s| s.path != root && above(&s.path))
+    {
         return Some(format!(
             "the rescan did not enter the mount point {}",
             skip.path.to_string_lossy()
@@ -787,7 +796,7 @@ mod tests {
     use std::sync::Arc;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use dwhy_core::report::SkipReason;
+    use dwhy_core::report::{SkipReason, Totals};
     use dwhy_core::scan::{SkippedRecord, UnreadableRecord};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -859,6 +868,44 @@ mod tests {
         assert_eq!(why("fine/target"), None);
         assert_eq!(why("failedish/target"), None, "by component, not text");
         assert_eq!(not_covered(&result, Path::new("docker://volume/v")), None);
+        assert_eq!(not_covered(&result, Path::new("/elsewhere/target")), None);
+
+        // `mounted` scanned as its own root: the outer walk's records do
+        // not cover what the inner walk saw, but the inner walk's do.
+        result.roots.push(scan::RootResult {
+            path: root.join("mounted"),
+            dev: dev + 1,
+            totals: Totals::default(),
+        });
+        result.skipped_mounts.push(SkippedRecord {
+            path: root.join("mounted/sub"),
+            parent_dev: dev + 1,
+            fstype: Some("ext4".into()),
+            reason: SkipReason::OtherFilesystem,
+        });
+        result
+            .unreadable
+            .push(unreadable(root.clone(), UnreadableReason::EntriesDenied));
+        result.errors.push((root.clone(), "I/O error".into()));
+        result.error_count = 2;
+        let why = |rel: &str| not_covered(&result, &root.join(rel));
+        assert_eq!(why("mounted/proj/target"), None);
+        assert_eq!(why("mounted/target"), None);
+        assert_eq!(
+            why("mounted/sub/target").as_deref(),
+            Some(format!("the rescan did not enter the mount point {r}/mounted/sub").as_str())
+        );
+        assert_eq!(
+            why("fine/target").as_deref(),
+            Some(format!("the rescan could not read every entry in {r}").as_str())
+        );
+        result.unreadable.pop();
+        let why = |rel: &str| not_covered(&result, &root.join(rel));
+        assert_eq!(
+            why("fine/target").as_deref(),
+            Some(format!("the rescan hit an error at {r}: I/O error").as_str())
+        );
+        result.errors.pop();
 
         // Errors past the recorded ones could be anywhere.
         result.error_count = 2;
