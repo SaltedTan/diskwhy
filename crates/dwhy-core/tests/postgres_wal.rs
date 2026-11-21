@@ -206,7 +206,7 @@ fn failing_archiver_with_an_exited_target() {
     assert!(
         f.action
             .text
-            .starts_with("restore the archive target s3test; WAL is freed at the next checkpoint"),
+            .starts_with("restore the archive target s3test; once archived and no longer needed by replication slots, WAL is freed or recycled at the next checkpoint"),
         "{}",
         f.action.text
     );
@@ -490,7 +490,11 @@ fn archive_settings_only_export_modes_and_durations() {
         ("OFF", "0", Some("off"), Some("0")),
         ("on; SECRET=mode", "10s; SECRET=timeout", None, None),
         ("", "-10s", None, None),
-        ("off", "10. ms", Some("off"), None),
+        ("off", "10. ms", Some("off"), Some("10. ms")),
+        ("on", "+60s", Some("on"), Some("+60s")),
+        ("on", "1e2s", Some("on"), Some("1e2s")),
+        ("on", "1073741824s", Some("on"), None),
+        ("on", "10 sec", Some("on"), None),
     ] {
         let mut fake = Fake::recorded("psql-failing.txt");
         let mut row: Vec<_> = fake.psql.as_ref().unwrap().split(sep).collect();
@@ -1306,9 +1310,10 @@ fn curl_operands_only_name_hosts_backed_by_docker() {
     fields[7] = "curl --proxy-user 'https://SECRET' -T %p https://minio/wal/%f";
     fake.psql = Ok(fields.join(&postgres_wal::FIELD_SEP.to_string()));
 
+    // The proxy credential names no host; only the destination counts.
     let f = probe(&fake);
     assert!(evidence(&f).targets.is_empty());
-    assert_eq!(evidence(&f).unmatched_hosts, 2);
+    assert_eq!(evidence(&f).unmatched_hosts, 1);
     assert!(!f.reason.contains("minio"));
     let json = serde_json::to_string(&f).unwrap();
     assert!(!json.contains("SECRET"));
@@ -1316,7 +1321,7 @@ fn curl_operands_only_name_hosts_backed_by_docker() {
 
     fake.edit_listed(S3, |c| c["Names"] = serde_json::json!(["/MINIO"]));
     let f = probe(&fake);
-    assert_eq!(evidence(&f).unmatched_hosts, 1);
+    assert_eq!(evidence(&f).unmatched_hosts, 0);
     assert_eq!(
         evidence(&f).targets,
         [ArchiveTarget {
@@ -1403,7 +1408,7 @@ fn every_archive_command_source_exports_only_program_and_hosts() {
         ),
         (
             "PGPASSWORD=$(printf '%s' 'https://SECRET') /usr/local/bin/archive-wal %p",
-            "***",
+            "/usr/local/bin/archive-wal",
             "",
             0,
         ),
@@ -1421,7 +1426,7 @@ fn every_archive_command_source_exports_only_program_and_hosts() {
         ),
         (
             "PGPASSWORD=SECRET curl --user ${VAR} https://minio/wal/%f",
-            "***",
+            "curl",
             "",
             0,
         ),
@@ -1591,4 +1596,247 @@ fn disabled_archiving_keeps_history_without_repair_advice() {
     assert_eq!(evidence(&f).targets[0].state, "exited");
     assert!(!f.reason.contains("(target"), "{}", f.reason);
     assert_eq!(f.action, volume_finding(VOLUME).action);
+}
+
+#[test]
+fn archive_command_shell_forms_find_the_destination() {
+    for (command, program, unmatched) in [
+        (
+            "curl -T %p https://s3test:9000/wal/%f # old https://retired/wal/ $(SECRET)",
+            "curl",
+            0,
+        ),
+        ("sh -c 'curl -T %p https://s3test:9000/wal/%f'", "sh", 0),
+        (
+            "bash -lc \"curl -T %p https://s3test:9000/wal/%f\"",
+            "bash",
+            0,
+        ),
+        (
+            "2>/dev/null curl -T %p https://s3test:9000/wal/%f",
+            "curl",
+            0,
+        ),
+        (
+            "PGPASSWORD=$(cat /run/secrets/SECRET) archive-wal %p",
+            "archive-wal",
+            0,
+        ),
+        ("curl --url=https://s3test:9000/wal/%f -T %p", "curl", 0),
+        ("curl --url https://s3test:9000/wal/%f -T %p", "curl", 0),
+        (
+            "curl --referer https://old-archive -T %p https://s3test:9000/wal/%f",
+            "curl",
+            0,
+        ),
+        (
+            "curl --proxy-user https://SECRET -T %p https://s3test:9000/wal/%f",
+            "curl",
+            0,
+        ),
+    ] {
+        let mut fake = Fake::recorded("psql-failing.txt");
+        let output = fake.psql.as_ref().unwrap();
+        let mut fields: Vec<_> = output.split(postgres_wal::FIELD_SEP).collect();
+        fields[7] = command;
+        fake.psql = Ok(fields.join(&postgres_wal::FIELD_SEP.to_string()));
+        let f = probe(&fake);
+        let ev = evidence(&f);
+        assert_eq!(ev.archive_program.as_deref(), Some(program), "{command}");
+        let hosts: Vec<_> = ev.targets.iter().map(|t| t.host.as_str()).collect();
+        let expected: &[&str] = if command.contains("s3test") {
+            &["s3test"]
+        } else {
+            &[]
+        };
+        assert_eq!(hosts, expected, "{command}");
+        assert_eq!(ev.unmatched_hosts, unmatched, "{command}");
+        assert!(!serde_json::to_string(&f).unwrap().contains("SECRET"));
+    }
+}
+
+#[test]
+fn shell_wrapper_arguments_are_not_postgres_settings() {
+    let mut fake = Fake::recorded("psql-failing.txt");
+    fake.psql = Err(PsqlError::Failed);
+    fake.edit(&format!("/containers/{PG}/json"), |v| {
+        v["Args"] = serde_json::json!([
+            "bash",
+            "-c",
+            "archive_command=curl https://SECRET:9000/%f exec docker-entrypoint.sh postgres -c archive_mode=on"
+        ]);
+    });
+    let f = probe(&fake);
+    let ev = evidence(&f);
+    assert_eq!(ev.source, EvidenceSource::ApiOnly);
+    assert_eq!(ev.archive_mode, None);
+    assert_eq!(ev.archive_timeout, None);
+    // The command comes from the log tail instead.
+    assert_eq!(ev.archive_program.as_deref(), Some("aws"));
+    assert_eq!(ev.unmatched_hosts, 0);
+    assert!(!serde_json::to_string(&f).unwrap().contains("SECRET"));
+
+    // The official entrypoint's `Cmd` options are still read.
+    fake.edit(&format!("/containers/{PG}/json"), |v| {
+        v["Args"] = serde_json::json!(["-c", "archive_mode=always", "-c", "archive_timeout=1min"]);
+    });
+    let ev = evidence(&probe(&fake)).clone();
+    assert_eq!(ev.archive_mode.as_deref(), Some("always"));
+    assert_eq!(ev.archive_timeout.as_deref(), Some("1min"));
+}
+
+/// Splits `sql` at top-level commas between `SELECT` and its last
+/// top-level `FROM`.
+fn select_list(sql: &str) -> Vec<String> {
+    let body = sql.strip_prefix("SELECT ").expect("one SELECT");
+    let mut items = vec![String::new()];
+    let (mut depth, mut quoted) = (0, false);
+    let mut from = None;
+    for (i, c) in body.char_indices() {
+        match c {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => depth -= 1,
+            ',' if !quoted && depth == 0 => {
+                items.push(String::new());
+                continue;
+            }
+            _ => {}
+        }
+        if !quoted && depth == 0 && body[i..].starts_with(" FROM ") {
+            from = Some(i);
+        }
+        items.last_mut().unwrap().push(c);
+    }
+    let from = from.expect("a top-level FROM");
+    let tail = &body[from..];
+    let last = items.last_mut().unwrap();
+    last.truncate(last.len() - tail.len());
+    items.iter().map(|s| s.trim().to_string()).collect()
+}
+
+#[test]
+fn the_psql_query_only_reads_inside_a_read_only_transaction() {
+    let argv = postgres_wal::psql_argv("docker", "/run/docker.sock", PG, postgres_wal::QUERY);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let psql = argv.iter().position(|a| *a == "psql").unwrap();
+    // psql's own commands: exactly BEGIN READ ONLY, the query, COMMIT, in
+    // that order, stopping at the first error.
+    let commands: Vec<&str> = argv[psql..]
+        .windows(2)
+        .filter(|w| w[0] == "-c")
+        .map(|w| w[1])
+        .collect();
+    assert_eq!(commands, ["BEGIN READ ONLY", postgres_wal::QUERY, "COMMIT"]);
+    assert!(
+        argv[psql..]
+            .windows(2)
+            .any(|w| w == ["-v", "ON_ERROR_STOP=1"])
+    );
+    // Session defaults read-only too, with a statement timeout and only
+    // pg_catalog on the search path.
+    let options = argv[..psql]
+        .windows(2)
+        .find_map(|w| {
+            (w[0] == "-e")
+                .then(|| w[1].strip_prefix("PGOPTIONS="))
+                .flatten()
+        })
+        .expect("PGOPTIONS");
+    let options: Vec<&str> = options
+        .split(" -c ")
+        .map(|o| o.trim_start_matches("-c "))
+        .collect();
+    for want in [
+        "default_transaction_read_only=on",
+        "statement_timeout=10s",
+        "search_path=pg_catalog",
+    ] {
+        assert!(options.contains(&want), "{want} in {options:?}");
+    }
+
+    let sql = postgres_wal::QUERY;
+    // One statement.
+    assert!(!sql.contains(';'));
+    // Nine columns, in the order parse_psql reads them.
+    let columns = select_list(sql);
+    let expected = [
+        "pg_catalog.pg_ls_waldir()",
+        "pg_catalog.pg_database_size(oid)",
+        "a.failed_count",
+        "a.last_archived_time",
+        "a.last_failed_time",
+        "a.last_failed_wal",
+        "pg_catalog.current_setting('archive_mode')",
+        "pg_catalog.current_setting('archive_command')",
+        "pg_catalog.current_setting('archive_timeout')",
+    ];
+    assert_eq!(columns.len(), expected.len(), "{columns:?}");
+    for (column, want) in columns.iter().zip(expected) {
+        assert!(column.contains(want), "{column} should read {want}");
+    }
+    assert!(sql.ends_with(" FROM pg_catalog.pg_stat_archiver a"));
+    // Every catalog object is schema-qualified, and only these are used.
+    let words: Vec<&str> = sql
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    for w in &words {
+        if w.contains("pg_") && *w != "pg_catalog" {
+            let name = w
+                .strip_prefix("pg_catalog.")
+                .unwrap_or_else(|| panic!("{w} is not schema-qualified"));
+            assert!(
+                matches!(
+                    name,
+                    "pg_ls_waldir"
+                        | "pg_database_size"
+                        | "pg_database"
+                        | "pg_stat_archiver"
+                        | "current_setting"
+                ),
+                "{w}"
+            );
+        }
+    }
+    assert!(words.contains(&"pg_catalog.current_setting"));
+    // Nothing that writes, changes settings or locks.
+    for w in &words {
+        let upper = w.to_ascii_uppercase();
+        assert!(
+            !matches!(
+                upper.as_str(),
+                "INSERT"
+                    | "UPDATE"
+                    | "DELETE"
+                    | "MERGE"
+                    | "CREATE"
+                    | "DROP"
+                    | "ALTER"
+                    | "TRUNCATE"
+                    | "GRANT"
+                    | "REVOKE"
+                    | "COPY"
+                    | "SET"
+                    | "RESET"
+                    | "VACUUM"
+                    | "ANALYZE"
+                    | "CHECKPOINT"
+                    | "CALL"
+                    | "DO"
+                    | "LOCK"
+                    | "COMMENT"
+                    | "REINDEX"
+                    | "CLUSTER"
+                    | "REFRESH"
+                    | "NOTIFY"
+                    | "LISTEN"
+                    | "INTO"
+                    | "FOR"
+            ) && !upper.contains("SET_CONFIG")
+                && !upper.contains("PG_SWITCH_WAL")
+                && !upper.starts_with("LO_"),
+            "{w}"
+        );
+    }
 }
