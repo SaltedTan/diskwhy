@@ -55,21 +55,29 @@ impl Selection {
         self.tier
             .or_else(|| self.select.is_empty().then_some(DEFAULT_TIER))
     }
-
-    fn named(&self, f: &Finding) -> bool {
-        self.select.is_empty() || self.select.iter().any(|s| matches(f, s))
-    }
 }
 
-/// Whether `entry` (a `--select` value) names `f`: its id, its path as
-/// written, or a relative path that resolves to it (resolved the way scan
-/// roots are: parent canonicalized, a final symlink not followed).
-fn matches(f: &Finding, entry: &str) -> bool {
-    if f.id == entry || f.path == entry {
-        return true;
+/// A `--select` value, with the path it resolves to (the way scan roots are
+/// resolved: parent canonicalized, a final symlink not followed). Each entry
+/// is resolved once, so a rename while selecting cannot drop a finding that
+/// an earlier check matched.
+struct Entry<'a> {
+    text: &'a str,
+    resolved: Option<PathBuf>,
+}
+
+impl Entry<'_> {
+    /// Whether this entry names `f`: its id, its path as written, or a path
+    /// that resolves to it.
+    fn matches(&self, f: &Finding) -> bool {
+        f.id == self.text
+            || f.path == self.text
+            || (f.path.starts_with('/')
+                && self
+                    .resolved
+                    .as_deref()
+                    .is_some_and(|p| p == Path::new(&f.path)))
     }
-    f.path.starts_with('/')
-        && crate::scan::absolute_nofollow(Path::new(entry)).is_ok_and(|p| p == Path::new(&f.path))
 }
 
 /// Whether a finding that `--select` named ended up in the plan's `blocked`
@@ -88,18 +96,44 @@ pub fn select(
     findings: Vec<Finding>,
     sel: &Selection,
 ) -> Result<(Vec<Finding>, Vec<Finding>), String> {
-    if let Some(bad) = sel
+    select_with(findings, sel, |entry| {
+        crate::scan::absolute_nofollow(Path::new(entry)).ok()
+    })
+}
+
+/// [`select`], resolving each `--select` path with `resolve`, once.
+fn select_with(
+    findings: Vec<Finding>,
+    sel: &Selection,
+    mut resolve: impl FnMut(&str) -> Option<PathBuf>,
+) -> Result<(Vec<Finding>, Vec<Finding>), String> {
+    let entries: Vec<Entry> = sel
         .select
         .iter()
-        .find(|s| !findings.iter().any(|f| matches(f, s)))
+        .map(|text| Entry {
+            text,
+            resolved: resolve(text),
+        })
+        .collect();
+    // Which findings the entries name, decided once for every check below.
+    let named: Vec<bool> = findings
+        .iter()
+        .map(|f| entries.is_empty() || entries.iter().any(|e| e.matches(f)))
+        .collect();
+    if let Some(bad) = entries
+        .iter()
+        .find(|e| !findings.iter().any(|f| e.matches(f)))
     {
         return Err(format!(
-            "--select {bad}: no finding has that id or path (`dwhy scan` lists them)"
+            "--select {}: no finding has that id or path (`dwhy scan` lists them)",
+            bad.text
         ));
     }
     if let Some(f) = findings
         .iter()
-        .find(|f| f.action.kind == ActionKind::Advice && sel.select.iter().any(|s| matches(f, s)))
+        .zip(&named)
+        .find(|(f, named)| !entries.is_empty() && **named && f.action.kind == ActionKind::Advice)
+        .map(|(f, _)| f)
     {
         return Err(format!(
             "--select {}: {} has no removal action, only advice: {}",
@@ -111,7 +145,9 @@ pub fn select(
     let mut blocked = Vec::new();
     for f in findings
         .into_iter()
-        .filter(|f| sel.named(f) && f.action.kind != ActionKind::Advice)
+        .zip(named)
+        .filter(|(f, named)| *named && f.action.kind != ActionKind::Advice)
+        .map(|(f, _)| f)
     {
         if f.tier == Tier::Blocked {
             if !sel.select.is_empty() {
@@ -146,12 +182,20 @@ pub fn build(
     );
     let mut items = Vec::new();
     let mut blocked = Vec::new();
-    for mut f in already_blocked.into_iter().chain(picked) {
+    let already_blocked = already_blocked.into_iter().map(|f| (f, true));
+    for (mut f, detector_blocked) in already_blocked.chain(picked.into_iter().map(|f| (f, false))) {
         let fingerprint = (f.tier != Tier::Blocked).then(|| fingerprint(&f, tree, ctx));
+        // A finding a detector already blocked is never applied, so only its
+        // own root is checked: a change below it says nothing about it.
+        let nested = if detector_blocked {
+            &[][..]
+        } else {
+            nested_roots(&roots, &f.path)
+        };
         let changed = changed_removal_root(
             &f.path,
-            measured_inode(&f.path, f.file_identity, tree),
-            nested_roots(&roots, &f.path),
+            measured(&f.path, f.file_identity, tree),
+            nested,
             |_| false,
         );
         f.file_identity = None;
@@ -215,10 +259,28 @@ pub fn distinct_bytes<'a>(items: impl IntoIterator<Item = (&'a str, u64)>) -> u6
         .sum()
 }
 
+/// What the scan measured at a filesystem root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Measured {
+    /// Nothing: the path is not in the scan.
+    Unknown,
+    /// The walk recorded a node there, and the detector then measured a
+    /// different file at the same path.
+    Conflict,
+    /// `(st_dev, st_ino)`.
+    Inode(u64, u64),
+}
+
+impl From<Option<(u64, u64)>> for Measured {
+    fn from(inode: Option<(u64, u64)>) -> Measured {
+        inode.map_or(Measured::Unknown, |(dev, ino)| Measured::Inode(dev, ino))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MeasuredRoot {
-    path: PathBuf,
-    inode: Option<(u64, u64)>,
+    pub(crate) path: PathBuf,
+    pub(crate) inode: Measured,
 }
 
 pub(crate) fn measured_roots<'a>(
@@ -229,14 +291,14 @@ pub(crate) fn measured_roots<'a>(
         .filter(|(path, _)| path.starts_with('/'))
         .map(|(path, file)| MeasuredRoot {
             path: PathBuf::from(path),
-            inode: measured_inode(path, file, tree),
+            inode: measured(path, file, tree),
         })
         .collect();
     roots.extend(tree.ids().filter_map(|id| {
         let node = tree.node(id);
         (node.is_dir && node.markers.contains(Markers::DOT_GIT)).then(|| MeasuredRoot {
             path: tree.path(id),
-            inode: Some((node.dev, node.ino)),
+            inode: Measured::Inode(node.dev, node.ino),
         })
     }));
     roots.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.inode.cmp(&b.inode)));
@@ -252,7 +314,7 @@ pub(crate) fn nested_roots<'a>(roots: &'a [MeasuredRoot], path: &str) -> &'a [Me
 
 pub(crate) fn changed_removal_root(
     path: &str,
-    inode: Option<(u64, u64)>,
+    inode: Measured,
     nested: &[MeasuredRoot],
     expected_absent: impl Fn(&Path) -> bool,
 ) -> Option<String> {
@@ -268,38 +330,61 @@ pub(crate) fn changed_removal_root(
 pub(crate) fn changed_since_scan(f: &Finding, tree: &ScanTree) -> Option<String> {
     changed_root(
         Path::new(&f.path),
-        measured_inode(&f.path, f.file_identity, tree),
+        measured(&f.path, f.file_identity, tree),
         false,
     )
 }
 
-fn measured_inode(path: &str, file: Option<FileIdentity>, tree: &ScanTree) -> Option<(u64, u64)> {
+pub(crate) fn measured(path: &str, file: Option<FileIdentity>, tree: &ScanTree) -> Measured {
     if !path.starts_with('/') {
-        return None;
+        return Measured::Unknown;
     }
     let node = tree.find(Path::new(path)).map(|id| tree.node(id));
-    root_identity(file, node).map(|id| (id.dev, id.ino))
+    match root_identity(file, node) {
+        Ok(id) => id.map(|id| (id.dev, id.ino)).into(),
+        Err(Conflict) => Measured::Conflict,
+    }
 }
 
-fn root_identity(file: Option<FileIdentity>, node: Option<&TreeNode>) -> Option<FileIdentity> {
-    file.or_else(|| {
-        node.map(|n| FileIdentity {
+/// The walk and a detector measured different files at one path.
+struct Conflict;
+
+/// The identity of a root: the walk's node when it recorded one, else the
+/// detector's measurement of a file the walk does not keep. Both present
+/// and naming different files is a [`Conflict`]: the path changed between
+/// the walk and detection.
+fn root_identity(
+    file: Option<FileIdentity>,
+    node: Option<&TreeNode>,
+) -> Result<Option<FileIdentity>, Conflict> {
+    match (file, node) {
+        (Some(f), Some(n)) if (f.dev, f.ino) != (n.dev, n.ino) => Err(Conflict),
+        (_, Some(n)) => Ok(Some(FileIdentity {
             dev: n.dev,
             ino: n.ino,
             mtime: n.newest_mtime,
-        })
-    })
+        })),
+        (file, None) => Ok(file),
+    }
 }
 
-fn changed_root(path: &Path, inode: Option<(u64, u64)>, expected_absent: bool) -> Option<String> {
+pub(crate) fn changed_root(path: &Path, inode: Measured, expected_absent: bool) -> Option<String> {
     if !path.is_absolute() {
         return None;
     }
     let display = path.display();
-    let Some(inode) = inode else {
-        return Some(format!(
-            "{display} is not in the scan, so its device/inode are not known"
-        ));
+    let inode = match inode {
+        Measured::Inode(dev, ino) => (dev, ino),
+        Measured::Unknown => {
+            return Some(format!(
+                "{display} is not in the scan, so its device/inode are not known"
+            ));
+        }
+        Measured::Conflict => {
+            return Some(format!(
+                "{display} changed between the walk and detection (device/inode differ)"
+            ));
+        }
     };
     match stat_nofollow(path) {
         Err(Errno::NOENT) if expected_absent => None,
@@ -366,7 +451,7 @@ pub fn fingerprint(f: &Finding, tree: &ScanTree, ctx: &DetectContext) -> Fingerp
     if f.path.starts_with('/') {
         let p = Path::new(&f.path);
         let node = tree.find(p).map(|id| tree.node(id));
-        if let Some(id) = root_identity(f.file_identity, node) {
+        if let Ok(Some(id)) = root_identity(f.file_identity, node) {
             fp.dev = Some(id.dev);
             fp.inode = Some(id.ino);
             fp.newest_mtime = Some(id.mtime);
@@ -457,7 +542,7 @@ pub fn parse(text: &str) -> Result<Plan, String> {
         if !ids.insert(&item.finding.id) {
             return Err(format!(
                 "duplicate finding ID in plan items: {}",
-                item.finding.id
+                crate::detect::escape_controls(&item.finding.id)
             ));
         }
     }
@@ -479,7 +564,11 @@ impl std::fmt::Display for Unusable {
         match self {
             Unusable::Expired(s) | Unusable::Elsewhere(s) => f.write_str(s),
             Unusable::LossyRoot(root) => {
-                write!(f, "plan root {root} is not valid UTF-8; nothing applied")
+                write!(
+                    f,
+                    "plan root {} is not valid UTF-8; nothing applied",
+                    crate::detect::escape_controls(root)
+                )
             }
         }
     }
@@ -491,7 +580,7 @@ pub fn usable(plan: &Plan, host: &str, uid: u32, now: i64) -> Result<(), Unusabl
     if plan.host != host {
         return Err(Unusable::Elsewhere(format!(
             "the plan was made on {}, not {host}",
-            plan.host
+            crate::detect::escape_controls(&plan.host)
         )));
     }
     if plan.uid != uid {
@@ -538,6 +627,106 @@ fn parse_time(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finding(path: &str) -> Finding {
+        Finding {
+            file_identity: None,
+            id: crate::detect::finding_id("stale-tree", path),
+            detector: "stale-tree".into(),
+            probe: None,
+            evidence: None,
+            path: path.into(),
+            bytes: 1,
+            nested_bytes: None,
+            last_modified: None,
+            growth: None,
+            tier: Tier::Review,
+            reason: String::new(),
+            guards: Vec::new(),
+            action: crate::report::Action {
+                kind: ActionKind::RemovePath,
+                text: String::new(),
+                argv: None,
+            },
+            recovery: crate::report::Recovery {
+                cost: String::new(),
+                how: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_select_path_is_resolved_once_for_checking_and_picking() {
+        // The path resolves to the finding only the first time, as if it
+        // were renamed right after: the finding the check matched is still
+        // the one picked, so the live check sees it.
+        let sel = Selection {
+            tier: None,
+            select: vec!["scratch".into()],
+        };
+        let mut calls = 0;
+        let (picked, blocked) = select_with(vec![finding("/b/scratch")], &sel, |entry| {
+            assert_eq!(entry, "scratch");
+            calls += 1;
+            (calls == 1).then(|| PathBuf::from("/b/scratch"))
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(picked.len(), 1);
+        assert!(blocked.is_empty());
+
+        // Resolving to nothing is an error, also checked once.
+        let mut calls = 0;
+        let err = select_with(vec![finding("/b/scratch")], &sel, |_| {
+            calls += 1;
+            None
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(err.contains("--select scratch: no finding"), "{err}");
+    }
+
+    #[test]
+    fn a_duplicate_id_error_escapes_terminal_controls() {
+        let mut item = PlanItem {
+            finding: finding("/b/scratch"),
+            fingerprint: Fingerprint {
+                dev: None,
+                inode: None,
+                newest_mtime: None,
+                size_bucket: 0,
+                git: None,
+                docker_id: None,
+            },
+        };
+        item.finding.id = "f_dup\n\u{1b}[31mred\\".into();
+        let plan = Plan {
+            schema: SCHEMA.into(),
+            tool: Tool::current(),
+            host: "h".into(),
+            uid: 1000,
+            created_at: rfc3339(0),
+            expires_at: rfc3339(TTL_SECS),
+            scan: PlanScan {
+                roots: vec!["/b".into()],
+                one_filesystem: true,
+                detectors: None,
+            },
+            selection: PlanSelection {
+                tier: None,
+                select: Vec::new(),
+            },
+            items: vec![item.clone(), item],
+            blocked: Vec::new(),
+            bytes: 0,
+        };
+        let err = parse(&to_json(&plan).unwrap()).unwrap_err();
+        assert_eq!(
+            err,
+            r"duplicate finding ID in plan items: f_dup\n\u{1b}[31mred\\"
+        );
+        assert!(!err.contains(char::is_control), "{err:?}");
+    }
 
     #[test]
     fn size_buckets_are_monotonic_quarter_octaves() {

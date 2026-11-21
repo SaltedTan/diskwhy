@@ -848,3 +848,138 @@ fn tool_caches_get_no_git_guards() {
     assert_eq!(f[0].tier, Tier::Regenerable, "{:?}", f[0].guards);
     assert!(f[0].guards.iter().all(|r| !r.name.starts_with("git-")));
 }
+
+fn stale(path: &Path) -> Finding {
+    let mut f = finding(&path.to_string_lossy(), Tier::Review);
+    f.id = dwhy_core::detect::finding_id("stale-tree", &f.path);
+    f
+}
+
+fn mentions(f: &Finding, path: &Path) -> bool {
+    serde_json::to_string(&f.guards)
+        .unwrap()
+        .contains(path.to_str().unwrap())
+}
+
+#[test]
+fn a_root_changed_since_the_walk_is_not_read_by_the_git_guards() {
+    let (_t, b) = base();
+    let (_o, other) = base();
+    let scratch = b.join("scratch");
+    pushed_repo(&scratch, "app");
+    let tree = scan_tree(&b);
+    // The root becomes a symlink to a tree whose repository is dirty.
+    let dirty = pushed_repo(&other.join("tree"), "app");
+    write(&dirty.join("notes.txt"), "untracked");
+    fs::rename(&scratch, b.join("scratch.old")).unwrap();
+    std::os::unix::fs::symlink(other.join("tree"), &scratch).unwrap();
+
+    let mut f = vec![stale(&scratch)];
+    guard::check(&mut f, &tree, &ctx(), &Processes::default());
+    assert_eq!(f[0].tier, Tier::Blocked);
+    let changed = get(&f[0].guards, "changed-since-scan");
+    assert_eq!(changed.status, GuardStatus::Block);
+    assert!(changed.detail.contains("is a symlink now"), "{changed:?}");
+    for name in ["git-dirty", "git-unpublished", "git-linked-worktrees"] {
+        assert!(
+            f[0].guards.iter().all(|g| g.name != name),
+            "{:?}",
+            f[0].guards
+        );
+    }
+    assert!(!mentions(&f[0], &other));
+}
+
+#[test]
+fn a_repository_replaced_inside_a_stable_root_blocks_without_being_read() {
+    let (_t, b) = base();
+    let (_o, other) = base();
+    let scratch = b.join("scratch");
+    let app = pushed_repo(&scratch, "app");
+    let tree = scan_tree(&b);
+    // A clean, pushed repository takes its place: reading it would pass.
+    let clean = pushed_repo(&other, "app");
+    fs::rename(&app, b.join("app.old")).unwrap();
+    fs::rename(&clean, &app).unwrap();
+    let (tier, g) = {
+        let mut f = vec![stale(&scratch)];
+        guard::check(&mut f, &tree, &ctx(), &Processes::default());
+        let f = f.pop().unwrap();
+        (f.tier, f.guards)
+    };
+    assert_eq!(tier, Tier::Blocked);
+    for name in ["git-dirty", "git-unpublished"] {
+        let r = get(&g, name);
+        assert_eq!(r.status, GuardStatus::Block, "{r:?}");
+        assert_eq!(
+            r.detail,
+            format!(
+                "could not check: {0}: {0} was replaced after the scan (device/inode differ)",
+                app.display()
+            )
+        );
+    }
+    assert!(g.iter().all(|r| r.name != "changed-since-scan"), "{g:?}");
+}
+
+#[test]
+fn a_stable_work_trees_git_file_is_not_followed_into_a_changed_root() {
+    let (_t, b) = base();
+    let (_o, other) = base();
+    let scratch = b.join("scratch");
+    let main = scratch.join("main");
+    let sibling = b.join("sibling");
+    let meta = b.join("meta");
+    let bare = meta.join("repo.git");
+    fs::create_dir_all(&main).unwrap();
+    git(&main, &["init", "-q"]);
+    commit(&main, "README");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            sibling.to_str().unwrap(),
+        ],
+    );
+    fs::create_dir_all(&bare).unwrap();
+    git(&bare, &["init", "-q", "--bare"]);
+    let tree = scan_tree(&b);
+    let run = || {
+        let mut f = vec![stale(&scratch), stale(&meta)];
+        guard::check(&mut f, &tree, &ctx(), &Processes::default());
+        f
+    };
+    // Unchanged, the sibling uses scratch's repository, not meta's.
+    let before = run();
+    assert_eq!(before[1].tier, Tier::Review, "{:?}", before[1].guards);
+
+    // scratch becomes a symlink to a tree whose admin dir for the sibling
+    // names meta's repository as its common dir.
+    let admin = other.join("tree/main/.git/worktrees/sibling");
+    write(&admin.join("commondir"), &format!("{}\n", bare.display()));
+    write(&admin.join("HEAD"), "ref: refs/heads/main\n");
+    fs::rename(&scratch, b.join("scratch.old")).unwrap();
+    std::os::unix::fs::symlink(other.join("tree"), &scratch).unwrap();
+
+    let after = run();
+    assert!(
+        get(&after[0].guards, "changed-since-scan")
+            .detail
+            .contains("is a symlink now")
+    );
+    // meta cannot be cleared: the sibling's git directory is in a root that
+    // changed, so which one it uses is not known. It is not read from the
+    // replacement either.
+    let g = get(&after[1].guards, "git-linked-worktrees");
+    assert_eq!(g.status, GuardStatus::Block);
+    assert!(
+        g.detail
+            .starts_with("could not check: work trees changed since the scan")
+            && g.detail.contains(sibling.to_str().unwrap()),
+        "{g:?}"
+    );
+    assert!(!after.iter().any(|f| mentions(f, &other)));
+}

@@ -15,7 +15,9 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::detect::{DetectContext, PATH_NOT_UTF8, add_lossy_guard, lossy_argv, lossy_detail};
+use crate::detect::{
+    DetectContext, PATH_NOT_UTF8, add_lossy_guard, escape_controls, lossy_argv, lossy_detail,
+};
 use crate::guard::{self, Processes};
 use crate::mounts::MountTable;
 use crate::plan::{
@@ -144,10 +146,21 @@ pub fn evaluate(
             )
         })
         .collect();
-    let mut guarded: Vec<Finding> = checks
+    // Every filesystem root goes to the guards, so a skipped item still
+    // protects Git metadata it depends on. Other items (Docker's) are
+    // guarded only when ready: their guards protect nothing else.
+    let batch: Vec<usize> = (0..checks.len())
+        .filter(|&i| checks[i].ready() || Path::new(&checks[i].item.path).is_absolute())
+        .collect();
+    let mut guarded: Vec<Finding> = batch
         .iter()
-        .zip(&plan.items)
-        .map(|(c, p)| c.fresh.as_ref().unwrap_or(&p.finding).clone())
+        .map(|&i| {
+            checks[i]
+                .fresh
+                .as_ref()
+                .unwrap_or(&plan.items[i].finding)
+                .clone()
+        })
         .collect();
     guard::check(&mut guarded, tree, ctx, procs);
     let roots = measured_roots(
@@ -159,9 +172,13 @@ pub fn evaluate(
             )
         }),
     );
-    for (c, f) in checks.iter_mut().zip(guarded).filter(|(c, _)| c.ready()) {
+    for (i, f) in batch.into_iter().zip(guarded) {
+        let c = &mut checks[i];
+        if !c.ready() {
+            continue;
+        }
         let nested = nested_roots(&roots, &f.path);
-        if let Some(detail) = changed_removal_root(&f.path, c.inode, nested, |_| false) {
+        if let Some(detail) = changed_removal_root(&f.path, c.inode.into(), nested, |_| false) {
             (c.item.outcome, c.item.detail) = c.skip_changed(detail);
             continue;
         }
@@ -229,9 +246,12 @@ fn decide(
         c
     };
     if f.path != planned.path || f.detector != planned.detector {
+        // The planned fields come from the plan file: escaped, since this
+        // detail is shown on terminals.
         return skip(format!(
             "changed: planned {} {} does not match the live finding",
-            planned.detector, planned.path
+            escape_controls(&planned.detector),
+            escape_controls(&planned.path)
         ));
     }
     if f.tier == Tier::Blocked {
@@ -473,6 +493,16 @@ pub fn execute_until(
                 && (c.item.action.kind == ActionKind::RemovePath || removal_path_absent(path))
             {
                 removed_paths.insert(path.to_path_buf());
+                // The checked descendants went with it. One that is back
+                // (`removal_path_absent` fails) is not recorded, and one
+                // that reappears later still blocks an enclosing item.
+                removed_paths.extend(
+                    c.nested
+                        .iter()
+                        .map(|root| &root.path)
+                        .filter(|p| removal_path_absent(p))
+                        .cloned(),
+                );
             }
             c.item.outcome = outcome;
             c.item.detail = detail;
@@ -496,7 +526,7 @@ fn run(
         add_lossy_guard(&mut item.guards, detail);
         return (ApplyOutcome::Skipped, outcome);
     }
-    if let Some(detail) = changed_removal_root(&item.path, c.inode, &c.nested, |path| {
+    if let Some(detail) = changed_removal_root(&item.path, c.inode.into(), &c.nested, |path| {
         removed_paths.contains(path)
     }) {
         return c.skip_changed(detail);

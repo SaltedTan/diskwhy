@@ -598,6 +598,56 @@ fn an_already_blocked_selected_root_is_checked_against_the_walk() {
 }
 
 #[test]
+fn a_detector_blocked_selection_checks_only_its_own_root() {
+    let (_t, b) = base();
+    let cache = dir(&b.join("cache"));
+    let target = dir(&cache.join("target"));
+    let mut outer = finding("user-cache", &cache, 8192, Tier::Blocked);
+    let detector_block = GuardResult {
+        name: "recent-write".into(),
+        status: GuardStatus::Block,
+        detail: "written recently".into(),
+    };
+    outer.guards.push(detector_block.clone());
+    let inner = finding("cargo-target", &target, 4096, Tier::Rebuildable);
+    let sel = Selection {
+        tier: None,
+        select: vec![outer.id.clone(), inner.id.clone()],
+    };
+    let tree = scan_tree(&b);
+    replace_same_contents(&target);
+
+    let p = build_from(&tree, &b, vec![outer.clone(), inner.clone()], &sel);
+    assert!(p.items.is_empty(), "{:?}", p.items);
+    let blocked = |id: &str| p.blocked.iter().find(|f| f.id == id).unwrap();
+    // The selected child that changed is blocked for it...
+    assert!(
+        changed_guard(blocked(&inner.id)).is_some_and(|g| g.contains("was replaced")),
+        "{:?}",
+        blocked(&inner.id).guards
+    );
+    // ...and the cache the detector blocked keeps only its own reasons.
+    assert_eq!(blocked(&outer.id).guards, [detector_block]);
+    assert!(plan::selected_blocked(&p));
+
+    // Its own root is still checked.
+    replace_same_contents(&cache);
+    let p = build_from(&tree, &b, vec![outer.clone()], &sel_of(&outer));
+    assert!(
+        changed_guard(&p.blocked[0]).is_some_and(|g| g.contains("was replaced")),
+        "{:?}",
+        p.blocked[0].guards
+    );
+}
+
+fn sel_of(f: &Finding) -> Selection {
+    Selection {
+        tier: None,
+        select: vec![f.id.clone()],
+    }
+}
+
+#[test]
 fn a_finding_outside_the_walk_is_blocked() {
     let (_t, b) = base();
     let scanned = dir(&b.join("scanned"));

@@ -1391,3 +1391,210 @@ fn a_lossy_path_or_command_is_never_applied() {
     );
     assert!(b.join("scratch/file").exists());
 }
+
+/// `scratch` (review) holding `scratch/target` (a path removal), which holds
+/// `target/checkout`, a clean git checkout the identity checks track.
+fn checkout_in_a_removed_child(b: &Path) -> (PathBuf, PathBuf, Policy, Plan, Vec<Check>) {
+    let scratch = b.join("scratch");
+    let target = scratch.join("target");
+    let checkout = target.join("checkout");
+    fs::create_dir_all(&checkout).unwrap();
+    git(&checkout, &["init", "-q"]);
+    write(&scratch.join("notes"), "n");
+    let outer = finding("stale-tree", &scratch, Tier::Review);
+    let inner = finding("cargo-target", &target, Tier::Rebuildable);
+    let pol = policy(Tier::Rebuildable, &[&outer.id]);
+    let found = vec![outer, inner];
+    let plan = make_plan(b, found.clone());
+    assert_eq!(plan.items.len(), 2, "{:?}", plan.blocked);
+    let checks = evaluate(b, &plan, found, &pol);
+    assert!(checks.iter().all(Check::ready), "{:?}", outcomes(&checks));
+    (scratch, checkout, pol, plan, checks)
+}
+
+#[test]
+fn checked_descendants_removed_with_a_child_do_not_block_the_parent() {
+    let (_t, b) = base();
+    let (scratch, checkout, pol, plan, mut checks) = checkout_in_a_removed_child(&b);
+    let (_s, state) = base();
+    let mut audit = Audit::open(&state.join("a.jsonl")).unwrap();
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |item| {
+            if Path::new(&item.path) == scratch {
+                assert!(!checkout.exists(), "the child runs first");
+            }
+        },
+    );
+    let r = apply::report(&plan, &checks, &pol, false, &env());
+    assert!(
+        r.items.iter().all(|i| i.outcome == ApplyOutcome::Removed),
+        "{:?}",
+        r.items
+    );
+    assert_eq!(apply::exit_code(&r), 0);
+    assert!(!scratch.exists());
+}
+
+#[test]
+fn a_checked_descendant_that_reappears_after_its_childs_removal_blocks_the_parent() {
+    let (_t, b) = base();
+    let (scratch, checkout, pol, plan, mut checks) = checkout_in_a_removed_child(&b);
+    let (_s, state) = base();
+    let mut audit = Audit::open(&state.join("a.jsonl")).unwrap();
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |item| {
+            if Path::new(&item.path) == scratch {
+                assert!(!checkout.exists());
+                fs::create_dir_all(&checkout).unwrap();
+            }
+        },
+    );
+    let r = apply::report(&plan, &checks, &pol, false, &env());
+    assert_eq!(apply::exit_code(&r), 2);
+    let parent = r
+        .items
+        .iter()
+        .find(|i| Path::new(&i.path) == scratch)
+        .unwrap();
+    assert_eq!(parent.outcome, ApplyOutcome::Skipped);
+    assert!(
+        parent.guards.iter().any(|g| g.name == "changed-since-scan"
+            && g.status == GuardStatus::Block
+            && g.detail.contains("reappeared after removal")),
+        "{:?}",
+        parent.guards
+    );
+    assert!(checkout.is_dir() && scratch.join("notes").is_file());
+}
+
+fn docker_volume(name: &str) -> Finding {
+    let path = format!("docker://volume/{name}");
+    Finding {
+        file_identity: None,
+        id: finding_id("docker-volume", &path),
+        detector: "docker-volume".into(),
+        probe: None,
+        evidence: None,
+        path,
+        bytes: 4096,
+        nested_bytes: None,
+        last_modified: None,
+        growth: None,
+        tier: Tier::Review,
+        reason: String::new(),
+        guards: Vec::new(),
+        action: Action {
+            kind: ActionKind::Command,
+            text: format!("docker volume rm {name}"),
+            argv: Some(vec![
+                "docker".into(),
+                "volume".into(),
+                "rm".into(),
+                name.into(),
+            ]),
+        },
+        recovery: Recovery {
+            cost: String::new(),
+            how: None,
+        },
+    }
+}
+
+#[test]
+fn skipped_docker_items_make_no_docker_api_reads() {
+    use std::os::unix::net::UnixListener;
+    let (_t, b) = base();
+    let mut found = fixture(&b);
+    found.retain(|f| f.detector == "user-cache");
+    let mut plan = make_plan(&b, found.clone());
+    assert_eq!(plan.items.len(), 1);
+    // Planned volumes: one gone since, one a review item nobody confirmed.
+    let gone = docker_volume("gone");
+    let unconfirmed = docker_volume("unconfirmed");
+    for f in [&gone, &unconfirmed] {
+        plan.items.push(dwhy_core::report::PlanItem {
+            finding: f.clone(),
+            fingerprint: dwhy_core::report::Fingerprint {
+                dev: None,
+                inode: None,
+                newest_mtime: None,
+                size_bucket: plan::size_bucket(f.bytes),
+                git: None,
+                docker_id: Some(format!("{}@1", f.path)),
+            },
+        });
+    }
+    found.push(unconfirmed.clone());
+
+    // A socket nobody answers: any GET connects to it and then times out.
+    let (_d, dir) = base();
+    let socket = dir.join("docker.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let ctx = DetectContext {
+        docker: Source::socket(&socket, std::time::Duration::from_millis(200)),
+        ..ctx()
+    };
+    let checks = apply::evaluate(
+        &plan,
+        found,
+        &scan_tree(&b),
+        &ctx,
+        &Processes::default(),
+        &Policy::default(),
+    );
+    let outcome = |f: &Finding| {
+        checks
+            .iter()
+            .find(|c| c.item.id == f.id)
+            .unwrap()
+            .item
+            .outcome
+    };
+    assert_eq!(outcome(&gone), ApplyOutcome::Skipped);
+    assert_eq!(outcome(&unconfirmed), ApplyOutcome::Refused);
+    assert!(checks.iter().any(Check::ready), "{:?}", outcomes(&checks));
+    assert!(
+        listener
+            .accept()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock),
+        "a skipped Docker item read the Docker API"
+    );
+
+    // The socket does see a read when a volume's guard runs.
+    let mut volume = vec![docker_volume("ready")];
+    dwhy_core::guard::check(&mut volume, &scan_tree(&b), &ctx, &Processes::default());
+    assert!(listener.accept().is_ok());
+}
+
+#[test]
+fn a_mismatched_plan_item_is_reported_with_terminal_controls_escaped() {
+    let (_t, b) = base();
+    let mut found = fixture(&b);
+    found.retain(|f| f.detector == "user-cache");
+    let mut plan = make_plan(&b, found.clone());
+    let planned = &mut plan.items[0].finding;
+    planned.detector = "user-cache\u{1b}[2J".into();
+    planned.path = format!("{}\n\u{1b}[31mok\\", planned.path);
+    let checks = evaluate(&b, &plan, found, &Policy::default());
+    let item = &checks[0].item;
+    assert_eq!(item.outcome, ApplyOutcome::Skipped);
+    assert_eq!(
+        item.detail,
+        format!(
+            r"changed: planned user-cache\u{{1b}}[2J {}\n\u{{1b}}[31mok\\ does not match the live finding",
+            b.join("cache").display()
+        )
+    );
+    assert!(!item.detail.contains(char::is_control));
+}
