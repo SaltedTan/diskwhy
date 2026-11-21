@@ -16,7 +16,7 @@ pub mod app;
 pub mod job;
 pub mod ui;
 
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::panic;
 use std::path::Path;
 use std::sync::Arc;
@@ -112,10 +112,18 @@ fn run_terminal(
         let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         term.clear()?;
         let rx = start_scan()?;
-        event_loop(&mut term, app, &rx, signal, event::poll, event::read)
+        let result = event_loop(&mut term, app, &rx, signal, event::poll, event::read);
+        // After a hangup the terminal is gone. Terminal's drop would then
+        // fail to show the cursor and eprintln! about it, and printing to a
+        // closed terminal panics.
+        if term.show_cursor().is_err() {
+            std::mem::forget(term);
+        }
+        result
     })();
     for error in &app.audit_errors {
-        eprintln!("dwhy: error: {}", error.escape_debug());
+        // Not eprintln!: it panics when the terminal has hung up.
+        let _ = writeln!(io::stderr(), "dwhy: error: {}", error.escape_debug());
     }
     if !app.audit_errors.is_empty() {
         return result.map(|()| 1);

@@ -12,7 +12,9 @@ publish = false
 dwhy-core = { path = "crates/dwhy-core" }
 dwhy-tui = { path = "crates/dwhy-tui" }
 clap = { version = "4.6", features = ["derive"] }
-crossterm = "0.29"
+# use-dev-tty: the default (mio) event source spins forever on EOF once the
+# terminal hangs up, so event::poll never returns and dwhy can't exit.
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
 signal-hook = { version = "0.4", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
 unicode-segmentation = "1.13"
