@@ -753,6 +753,36 @@ pub struct Plan {
     /// (an item inside another item in the scan's tree adds nothing; see
     /// [`crate::plan::distinct_bytes_in_tree`]).
     pub bytes: u64,
+    /// Goal progress for `dwhy plan --free SIZE`. Absent when `--free` was not used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<PlanGoal>,
+}
+
+/// How far a `dwhy plan --free SIZE` plan gets towards its target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanGoal {
+    /// The `--free` target.
+    pub target_bytes: u64,
+    /// What the plan's items are expected to free: the same as `Plan::bytes`.
+    pub planned_bytes: u64,
+    /// True when `planned_bytes >= target_bytes`.
+    pub met: bool,
+    /// `target_bytes - planned_bytes`, or 0 when the target is met.
+    pub shortfall_bytes: u64,
+    /// Removable findings in tiers above the plan's tier ceiling, which the
+    /// plan did not consider. Absent when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub higher_tiers: Vec<HigherTierAvailable>,
+}
+
+/// Removable findings in one tier above a `--free` plan's tier ceiling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HigherTierAvailable {
+    pub tier: Tier,
+    pub count: u64,
+    /// Own bytes across removable findings in this tier (`bytes - nested_bytes`),
+    /// before pre-removal guards (which run on selected tiers only).
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -772,6 +802,9 @@ pub struct PlanSelection {
     pub tier: Option<Tier>,
     /// Finding ids or paths given with `--select`.
     pub select: Vec<String>,
+    /// Target bytes requested via `--free`. Absent when `--free` was not used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_target: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

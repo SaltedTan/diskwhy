@@ -13,6 +13,7 @@ are bytes, and "allocated" (`st_blocks * 512`) is what removal frees. `dwhy COMM
 2. `dwhy explain ID|PATH --json`: evidence, full guards, growth, action, recovery cost.
 3. `dwhy plan PATH -o plan.json`: selects by `--tier` (default `regenerable`) or
    `--select ID|PATH,…`, runs the guards, records fingerprints. Removes nothing.
+   `--free SIZE` plans the cheapest findings first until SIZE; `goal` says if it fell short.
 4. `dwhy apply plan.json --dry-run --json`: what would run, and `would_free`.
 5. `dwhy apply plan.json --yes --json`: rescans, re-checks, removes what the policy
    allows. A plan expires within an hour; make a fresh one rather than editing it.

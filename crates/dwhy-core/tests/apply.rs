@@ -276,6 +276,7 @@ fn make_plan_from_tree(b: &Path, findings: Vec<Finding>, tree: &ScanTree) -> Pla
         &Selection {
             tier: Some(Tier::Review),
             select: vec![],
+            free: None,
         },
         tree,
         &ctx(),

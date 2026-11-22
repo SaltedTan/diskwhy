@@ -446,7 +446,11 @@ impl PlanJob {
         }
         let plan = plan::build(
             findings,
-            &Selection { tier: None, select },
+            &Selection {
+                tier: None,
+                select,
+                free: None,
+            },
             &result.tree,
             &ctx,
             &read_processes(),

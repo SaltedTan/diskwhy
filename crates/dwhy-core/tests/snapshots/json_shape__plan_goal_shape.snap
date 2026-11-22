@@ -1,0 +1,117 @@
+---
+source: crates/dwhy-core/tests/json_shape.rs
+expression: plan
+---
+{
+  "schema": "diskwhy/v1",
+  "tool": {
+    "name": "diskwhy",
+    "version": "0.0.1"
+  },
+  "host": "pc-ubuntu",
+  "uid": 1000,
+  "created_at": "2026-11-16T04:00:00Z",
+  "expires_at": "2026-11-16T05:00:00Z",
+  "scan": {
+    "roots": [
+      "/home/me"
+    ],
+    "one_filesystem": true,
+    "detectors": null
+  },
+  "selection": {
+    "tier": "rebuildable",
+    "select": [],
+    "free_target": 32212254720
+  },
+  "items": [
+    {
+      "finding": {
+        "id": "f_c2b7afdaa165",
+        "detector": "cargo-target",
+        "probe": null,
+        "path": "/home/me/x/target",
+        "bytes": 9663676416,
+        "nested_bytes": null,
+        "last_modified": "2026-11-02T10:00:00Z",
+        "growth": null,
+        "tier": "rebuildable",
+        "reason": "a reason",
+        "guards": [
+          {
+            "name": "in-use-cwd",
+            "status": "pass",
+            "detail": "no process has its working directory in it"
+          }
+        ],
+        "action": {
+          "kind": "command",
+          "text": "cargo clean --manifest-path /home/me/x/Cargo.toml --target-dir /home/me/x/target",
+          "argv": [
+            "cargo",
+            "clean",
+            "--manifest-path",
+            "/home/me/x/Cargo.toml",
+            "--target-dir",
+            "/home/me/x/target"
+          ]
+        },
+        "recovery": {
+          "cost": "rebuild",
+          "how": "cargo build"
+        }
+      },
+      "fingerprint": {
+        "dev": 66311,
+        "inode": 3698100,
+        "newest_mtime": 1794100000,
+        "size_bucket": 133,
+        "git": null,
+        "docker_id": null
+      }
+    }
+  ],
+  "blocked": [
+    {
+      "id": "f_1122334455aa",
+      "detector": "git-worktree",
+      "probe": null,
+      "path": "/home/me/.t3/worktrees/app/wip",
+      "bytes": 9663676416,
+      "nested_bytes": null,
+      "last_modified": "2026-11-02T10:00:00Z",
+      "growth": null,
+      "tier": "blocked",
+      "reason": "a reason",
+      "guards": [
+        {
+          "name": "in-use-cwd",
+          "status": "pass",
+          "detail": "no process has its working directory in it"
+        }
+      ],
+      "action": {
+        "kind": "command",
+        "text": "git -C /home/me/app worktree remove /home/me/.t3/worktrees/app/wip"
+      },
+      "recovery": {
+        "cost": "rebuild",
+        "how": "cargo build"
+      }
+    }
+  ],
+  "bytes": 9663676416,
+  "goal": {
+    "target_bytes": 32212254720,
+    "planned_bytes": 9663676416,
+    "met": false,
+    "shortfall_bytes": 22548578304,
+    "higher_tiers": [
+      {
+        "tier": "review",
+        "count": 2,
+        "bytes": 12884901888
+      }
+    ]
+  }
+}

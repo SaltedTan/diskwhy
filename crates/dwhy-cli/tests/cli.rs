@@ -4360,3 +4360,179 @@ fn diff_notes_the_snapshot_directory_threshold() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains(&format!("note: {note}\n")), "{text}");
 }
+
+// ---------------------------------------------------------------------------
+// plan --free: goal-based selection
+// ---------------------------------------------------------------------------
+
+/// The [`Home`] fixture (3 MiB pip cache, regenerable; 2 MiB scratch dir,
+/// review) plus a 1 MiB Go build cache (regenerable) and a 1 MiB cargo
+/// target dir (rebuildable).
+fn goal_home() -> Home {
+    let h = Home::new();
+    let go = h.home().join(".cache/go-build/blob");
+    fs::create_dir_all(go.parent().unwrap()).unwrap();
+    fs::write(&go, vec![7u8; 1 << 20]).unwrap();
+    age_tree(&h.home().join(".cache"), 3 * 86_400);
+    let app = h.home().join("app");
+    fs::create_dir_all(app.join("target/debug")).unwrap();
+    fs::write(app.join("Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+    fs::write(app.join("target/CACHEDIR.TAG"), CARGO_TAG).unwrap();
+    fs::write(app.join("target/debug/app"), vec![1u8; 1 << 20]).unwrap();
+    h
+}
+
+/// `dwhy plan HOME --free …` on [`goal_home`], offline, with only the
+/// detectors the fixture feeds.
+fn free_plan(h: &Home, extra: &[&str]) -> Output {
+    let home = h.home();
+    let mut args = vec![
+        "plan",
+        home.to_str().unwrap(),
+        "-q",
+        "--detectors",
+        "user-cache,stale-tree,cargo-target",
+    ];
+    args.extend(extra);
+    Command::new(env!("CARGO_BIN_EXE_dwhy"))
+        .args(&args)
+        .env_clear()
+        .env("HOME", h.home())
+        .env("PATH", h.base.join("bin"))
+        .env("XDG_STATE_HOME", h.base.join("state"))
+        .env("DOCKER_HOST", "unix:///nonexistent")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run dwhy")
+}
+
+fn item_paths_of(v: &Value) -> Vec<String> {
+    v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["finding"]["path"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn plan_free_stops_once_the_target_is_met() {
+    let h = goal_home();
+    let pip = h.home().join(".cache/pip").to_str().unwrap().to_string();
+    let out = free_plan(&h, &["--free", "2M", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["selection"]["free_target"], 2 << 20);
+    assert_eq!(v["selection"]["tier"], "regenerable");
+    assert_eq!(item_paths_of(&v), [pip], "the go cache is not needed");
+    let g = &v["goal"];
+    assert_eq!(g["target_bytes"], 2 << 20);
+    assert_eq!(g["planned_bytes"], v["bytes"]);
+    assert_eq!(g["met"], true);
+    assert_eq!(g["shortfall_bytes"], 0);
+
+    let out = free_plan(&h, &["--free", "2M"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("(tier ≤ regenerable, target 2.0M)")
+            && s.contains("  goal: met (planned 3.0M of 2.0M target)"),
+        "{s}"
+    );
+    assert!(!s.contains("not selected"), "{s}");
+
+    // Without --free, neither field appears.
+    let v = json_of(&free_plan(&h, &["--json"]));
+    assert!(v["selection"].get("free_target").is_none(), "{v}");
+    assert!(v.get("goal").is_none(), "{v}");
+}
+
+#[test]
+fn plan_free_reports_a_shortfall_and_what_higher_tiers_hold() {
+    let h = goal_home();
+    let out = free_plan(&h, &["--free", "10M", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a short plan is still a plan: {out:?}"
+    );
+    let v = json_of(&out);
+    assert_eq!(v["items"].as_array().unwrap().len(), 2, "both caches");
+    let planned = v["bytes"].as_u64().unwrap();
+    let g = &v["goal"];
+    assert_eq!(g["met"], false);
+    assert_eq!(g["planned_bytes"], planned);
+    assert_eq!(g["shortfall_bytes"], (10 << 20) - planned);
+    let tiers = g["higher_tiers"].as_array().unwrap();
+    assert_eq!(tiers.len(), 2, "{g}");
+    assert_eq!(tiers[0]["tier"], "rebuildable");
+    assert_eq!(tiers[0]["count"], 1);
+    assert!(tiers[0]["bytes"].as_u64().unwrap() >= 1 << 20, "{g}");
+    assert_eq!(tiers[1]["tier"], "review");
+    assert_eq!(tiers[1]["count"], 1);
+    assert!(tiers[1]["bytes"].as_u64().unwrap() >= 2 << 20, "{g}");
+
+    let out = free_plan(&h, &["--free", "10M"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("(tier ≤ regenerable, target 10.0M)"), "{s}");
+    assert!(
+        s.contains("  goal: short by 6.0M (planned 4.0M of 10.0M target)"),
+        "{s}"
+    );
+    assert!(
+        s.contains("  higher tiers (unverified, not selected): rebuildable 1.0M (1 finding), review 2.0M (1 finding)"),
+        "{s}"
+    );
+    assert!(
+        !s.contains("--tier or --select"),
+        "no coaching to escalate: {s}"
+    );
+}
+
+#[test]
+fn a_free_plan_applies_end_to_end() {
+    let h = goal_home();
+    let file = h.plan_file("free.json");
+    let target = h.home().join("app/target").to_str().unwrap().to_string();
+    let out = free_plan(
+        &h,
+        &["--tier", "rebuildable", "--free", "4500K", "-o", &file],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let plan: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    let paths = item_paths_of(&plan);
+    assert_eq!(paths.len(), 3, "both caches, then the target: {paths:?}");
+    assert!(paths.contains(&target), "{paths:?}");
+    assert_eq!(plan["goal"]["met"], true);
+    assert_eq!(plan["goal"]["higher_tiers"][0]["tier"], "review", "{plan}");
+
+    let out = h.dwhy(&[
+        "apply",
+        &file,
+        "--dry-run",
+        "--json",
+        "--max-tier",
+        "rebuildable",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let r = json_of(&out);
+    let items = r["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    assert!(items.iter().all(|i| i["outcome"] == "would_remove"), "{r}");
+    assert_eq!(r["would_free"], plan["bytes"]);
+    assert!(Path::new(&target).exists(), "a dry run removes nothing");
+}
+
+#[test]
+fn plan_free_rejects_zero_and_select() {
+    let h = goal_home();
+    for extra in [&["--free", "0"][..], &["--free", "10M", "--select", "foo"]] {
+        let out = free_plan(&h, extra);
+        assert_eq!(out.status.code(), Some(1), "{extra:?}: {out:?}");
+        let out = free_plan(&h, &[extra, &["--json"]].concat());
+        assert_eq!(out.status.code(), Some(1), "{extra:?}: {out:?}");
+        let v = error_report(&out, "usage");
+        assert!(v["message"].as_str().unwrap().contains("--free"), "{v}");
+    }
+}

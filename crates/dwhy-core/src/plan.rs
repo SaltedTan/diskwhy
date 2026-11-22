@@ -7,6 +7,12 @@
 //! they block, or one a detector already marked `blocked` that `--select`
 //! names, goes to the plan's `blocked` list instead of its items.
 //!
+//! With a goal (`--free SIZE`), the plan keeps only as many of the eligible
+//! findings within the tier ceiling as it takes to reach the target: the
+//! cheapest tier first and, within a tier, the finding that adds the most
+//! bytes not already planned. [`PlanGoal`] records how close it got and what
+//! the tiers above the ceiling hold.
+//!
 //! See [`Fingerprint`] for the saved fields and the safety rules in
 //! `docs/DESIGN.md` for the live identity checks.
 //!
@@ -24,8 +30,9 @@ use rustix::io::Errno;
 use crate::detect::{DetectContext, is_lossy, rfc3339};
 use crate::guard::{self, Processes};
 use crate::report::{
-    ActionKind, FileIdentity, Finding, Fingerprint, GitFingerprint, GuardResult, GuardStatus, Plan,
-    PlanItem, PlanScan, PlanSelection, SCHEMA, Tier, Tool, check_schema,
+    ActionKind, FileIdentity, Finding, Fingerprint, GitFingerprint, GuardResult, GuardStatus,
+    HigherTierAvailable, Plan, PlanGoal, PlanItem, PlanScan, PlanSelection, SCHEMA, Tier, Tool,
+    check_schema,
 };
 use crate::tree::{Markers, NodeId, ScanTree, TreeNode};
 
@@ -46,6 +53,10 @@ pub struct Selection {
     pub tier: Option<Tier>,
     /// `--select`: finding ids or paths.
     pub select: Vec<String>,
+    /// `--free`: plan the cheapest findings within the tier ceiling until at
+    /// least this many bytes are planned. Must be above 0, and cannot be
+    /// combined with `select`.
+    pub free: Option<u64>,
 }
 
 impl Selection {
@@ -174,6 +185,17 @@ pub fn build(
     host: String,
     scan: PlanScan,
 ) -> Result<Plan, String> {
+    match sel.free {
+        Some(0) => return Err("--free must be greater than 0".into()),
+        Some(_) if !sel.select.is_empty() => {
+            return Err("--free cannot be combined with --select".into());
+        }
+        _ => {}
+    }
+    let higher_tiers = sel
+        .free
+        .map(|_| higher_tiers(&findings, sel.ceiling()))
+        .unwrap_or_default();
     let (mut picked, already_blocked) = select(findings, sel)?;
     guard::check(&mut picked, tree, ctx, procs);
     let roots = measured_roots(
@@ -213,6 +235,9 @@ pub fn build(
         }
         blocked.push(f);
     }
+    if let Some(target) = sel.free {
+        items = toward_goal(items, target, tree);
+    }
     let largest = |a: &Finding, b: &Finding| b.bytes.cmp(&a.bytes).then_with(|| a.id.cmp(&b.id));
     items.sort_by(|a, b| largest(&a.finding, &b.finding));
     blocked.sort_by(largest);
@@ -222,6 +247,13 @@ pub fn build(
             .iter()
             .map(|i| (i.finding.path.as_str(), i.finding.bytes)),
     );
+    let goal = sel.free.map(|target| PlanGoal {
+        target_bytes: target,
+        planned_bytes: bytes,
+        met: bytes >= target,
+        shortfall_bytes: target.saturating_sub(bytes),
+        higher_tiers,
+    });
     Ok(Plan {
         schema: SCHEMA.into(),
         tool: Tool::current(),
@@ -233,11 +265,96 @@ pub fn build(
         selection: PlanSelection {
             tier: sel.ceiling(),
             select: sel.select.clone(),
+            free_target: sel.free,
         },
         items,
         blocked,
         bytes,
+        goal,
     })
+}
+
+/// The removable findings in each tier above `ceiling`, which a `--free`
+/// plan does not consider. Guards have not run on them.
+fn higher_tiers(findings: &[Finding], ceiling: Option<Tier>) -> Vec<HigherTierAvailable> {
+    let Some(ceiling) = ceiling else {
+        return Vec::new();
+    };
+    [Tier::Rebuildable, Tier::Review]
+        .into_iter()
+        .filter(|&tier| tier > ceiling)
+        .filter_map(|tier| {
+            let in_tier = findings
+                .iter()
+                .filter(|f| f.tier == tier && f.is_reclaimable());
+            let (count, bytes) = in_tier.fold((0, 0u64), |(n, b), f| {
+                (n + 1, b.saturating_add(f.own_bytes()))
+            });
+            (count > 0).then_some(HigherTierAvailable { tier, count, bytes })
+        })
+        .collect()
+}
+
+/// The items a `--free target` plan keeps: tier by tier, cheapest first,
+/// the item that adds the most bytes to those already chosen (counted as
+/// [`distinct_bytes_in_tree`] counts them; ties go to the larger finding,
+/// then the smaller id), until the chosen items reach `target`. An item
+/// that adds nothing (inside a chosen item, or empty) is never chosen.
+fn toward_goal(items: Vec<PlanItem>, target: u64, tree: &ScanTree) -> Vec<PlanItem> {
+    let paths: Vec<&str> = items.iter().map(|i| i.finding.path.as_str()).collect();
+    let n = items.len();
+    let inside = inside_matrix(tree, &paths);
+    let within = |i: usize, j: usize| inside[i * n + j];
+    let mut chosen = vec![false; n];
+    // Whether a chosen item lies inside another chosen item, so its bytes
+    // are already counted in that one's.
+    let mut covered = vec![false; n];
+    let mut planned = 0u64;
+    // What adding item `x` adds to the distinct bytes of the chosen items:
+    // its own bytes unless a chosen item holds it, less the bytes of the
+    // uncovered chosen items it holds.
+    let gain = |x: usize, chosen: &[bool], covered: &[bool]| -> u64 {
+        let held = (0..n).any(|j| chosen[j] && within(x, j));
+        let own = if held { 0 } else { items[x].finding.bytes };
+        let absorbed: u64 = (0..n)
+            .filter(|&m| chosen[m] && !covered[m] && within(m, x))
+            .map(|m| items[m].finding.bytes)
+            .sum();
+        own.saturating_sub(absorbed)
+    };
+    'tiers: for tier in [Tier::Regenerable, Tier::Rebuildable, Tier::Review] {
+        loop {
+            if planned >= target {
+                break 'tiers;
+            }
+            let best = (0..n)
+                .filter(|&x| !chosen[x] && items[x].finding.tier == tier)
+                .map(|x| (x, gain(x, &chosen, &covered)))
+                .filter(|&(_, g)| g > 0)
+                .max_by(|&(a, ga), &(b, gb)| {
+                    let (fa, fb) = (&items[a].finding, &items[b].finding);
+                    ga.cmp(&gb)
+                        .then_with(|| fa.bytes.cmp(&fb.bytes))
+                        .then_with(|| fb.id.cmp(&fa.id))
+                });
+            let Some((x, g)) = best else {
+                continue 'tiers;
+            };
+            for m in 0..n {
+                if chosen[m] && within(m, x) {
+                    covered[m] = true;
+                }
+            }
+            covered[x] = (0..n).any(|j| chosen[j] && within(x, j));
+            chosen[x] = true;
+            planned = planned.saturating_add(g);
+        }
+    }
+    items
+        .into_iter()
+        .zip(chosen)
+        .filter_map(|(item, chosen)| chosen.then_some(item))
+        .collect()
 }
 
 /// The sum of `(path, bytes)` pairs, leaving out any pair whose absolute
@@ -269,31 +386,45 @@ pub fn distinct_bytes_in_tree<'a>(
     tree: &ScanTree,
     items: impl IntoIterator<Item = (&'a str, u64)>,
 ) -> u64 {
-    let items: Vec<(&Path, u64, Option<NodeId>)> = items
-        .into_iter()
-        .map(|(p, b)| {
-            let p = Path::new(p);
+    let (paths, bytes): (Vec<&str>, Vec<u64>) = items.into_iter().unzip();
+    let n = paths.len();
+    let inside = inside_matrix(tree, &paths);
+    (0..n)
+        .filter(|&i| !(0..n).any(|j| inside[i * n + j]))
+        .map(|i| bytes[i])
+        .sum()
+}
+
+/// For paths `p` and `o` of `paths`, whether [`distinct_bytes_in_tree`]
+/// counts `p` as inside `o`: at index `p * paths.len() + o`.
+fn inside_matrix(tree: &ScanTree, paths: &[&str]) -> Vec<bool> {
+    let located: Vec<(&Path, Option<NodeId>)> = paths
+        .iter()
+        .map(|p| {
+            let p = Path::new(*p);
             let at = p
                 .is_absolute()
                 .then(|| p.ancestors().find_map(|a| tree.find(a)))
                 .flatten();
-            (p, b, at)
+            (p, at)
         })
         .collect();
-    let inside = |inner: Option<NodeId>, outer: Option<NodeId>| match (inner, outer) {
+    let in_tree = |inner: Option<NodeId>, outer: Option<NodeId>| match (inner, outer) {
         (Some(i), Some(o)) => tree.is_within(i, o),
         _ => true,
     };
-    items
+    located
         .iter()
-        .filter(|(p, _, at)| {
-            !p.is_absolute()
-                || !items.iter().any(|(o, _, o_at)| {
-                    o.is_absolute() && o != p && p.starts_with(o) && inside(*at, *o_at)
-                })
+        .flat_map(|&(p, at)| {
+            located.iter().map(move |&(o, o_at)| {
+                p.is_absolute()
+                    && o.is_absolute()
+                    && o != p
+                    && p.starts_with(o)
+                    && in_tree(at, o_at)
+            })
         })
-        .map(|(_, b, _)| b)
-        .sum()
+        .collect()
 }
 
 /// The device of the root of `tree` whose walk holds `path` (the node at
@@ -780,6 +911,7 @@ mod tests {
         let sel = Selection {
             tier: None,
             select: vec!["scratch".into()],
+            free: None,
         };
         let mut calls = 0;
         let (picked, blocked) = select_with(vec![finding("/b/scratch")], &sel, |entry| {
@@ -833,10 +965,12 @@ mod tests {
             selection: PlanSelection {
                 tier: None,
                 select: Vec::new(),
+                free_target: None,
             },
             items: vec![item.clone(), item],
             blocked: Vec::new(),
             bytes: 0,
+            goal: None,
         };
         let err = parse(&to_json(&plan).unwrap()).unwrap_err();
         assert_eq!(
