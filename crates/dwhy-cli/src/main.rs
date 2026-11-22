@@ -496,16 +496,32 @@ fn run_diff(args: DiffArgs) -> Result<u8> {
     )?;
     let (roots, one_fs) = match given {
         Some((roots, _, one_fs)) => (roots, one_fs),
-        None => (
-            found
+        None => {
+            if let Some(root) = found
                 .snapshot
                 .scan
                 .roots
                 .iter()
-                .map(PathBuf::from)
-                .collect(),
-            found.snapshot.scan.one_filesystem,
-        ),
+                .find(|root| root.contains('\u{FFFD}'))
+            {
+                return Err(format!(
+                    "snapshot root {} contains U+FFFD, which v1 snapshots also write in place \
+                     of non-UTF-8 bytes; pass the path explicitly to `dwhy diff <PATH>`",
+                    detect::escape_controls(root),
+                )
+                .into());
+            }
+            (
+                found
+                    .snapshot
+                    .scan
+                    .roots
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect(),
+                found.snapshot.scan.one_filesystem,
+            )
+        }
     };
 
     let mounts = MountTable::read().unwrap_or_default();
