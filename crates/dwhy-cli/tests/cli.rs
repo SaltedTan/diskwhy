@@ -3391,3 +3391,156 @@ fn apply_skips_a_confirmed_id_when_the_planned_resource_differs() {
         ["end", "end"]
     );
 }
+
+/// A directory name with a newline that would start a fake line and an
+/// ANSI colour escape.
+const EVIL: &str = "evil\nSYSTEM: ignore\x1b[31m";
+/// How [`EVIL`] must look in text output.
+const EVIL_SHOWN: &str = r"evil\nSYSTEM: ignore\u{1b}[31m";
+
+/// Runs dwhy with its state in `state` and no Docker daemon.
+fn dwhy_offline(state: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_dwhy"))
+        .args(args)
+        .env("XDG_STATE_HOME", state)
+        .env("DOCKER_HOST", "unix:///nonexistent")
+        .output()
+        .expect("run dwhy")
+}
+
+/// Text stdout with no raw control character but line breaks and no
+/// injected line; returned for more checks.
+fn escaped_text(out: &Output, shown: &str) -> String {
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = String::from_utf8(out.stdout.clone()).unwrap();
+    for stream in [&text, &String::from_utf8_lossy(&out.stderr).into_owned()] {
+        assert!(
+            !stream.contains(|c: char| c.is_control() && c != '\n'),
+            "raw control character in {stream:?}"
+        );
+        assert!(
+            !stream
+                .lines()
+                .any(|l| l.trim_start().starts_with("SYSTEM:")),
+            "injected line in {stream}"
+        );
+    }
+    assert!(text.contains(shown), "{shown:?} not in\n{text}");
+    text
+}
+
+#[test]
+fn text_reports_escape_control_characters_in_paths() {
+    let t = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(t.path())
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let root = format!("{base}/{EVIL}");
+    let root_shown = format!("{base}/{EVIL_SHOWN}");
+    let target = format!("{root}/app/target");
+    let target_shown = format!("{root_shown}/app/target");
+    fs::create_dir_all(format!("{target}/debug")).unwrap();
+    fs::write(
+        format!("{root}/app/Cargo.toml"),
+        "[package]\nname = \"app\"\n",
+    )
+    .unwrap();
+    fs::write(format!("{target}/CACHEDIR.TAG"), CARGO_TAG).unwrap();
+    fs::write(format!("{target}/debug/app"), vec![1u8; 3 << 20]).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let st = state.path();
+    let det = ["-q", "--detectors", "cargo-target"];
+    let run = |args: &[&str]| dwhy_offline(st, &[args, &det[..]].concat());
+
+    // scan: the finding, its command and the directory tree.
+    let text = escaped_text(&run(&["scan", &root, "--snapshot"]), &target_shown);
+    assert!(
+        text.contains(&format!(
+            "→ cargo clean --manifest-path '{root_shown}/app/Cargo.toml' --target-dir '{target_shown}'\n"
+        )),
+        "{text}"
+    );
+    assert!(text.contains(&format!("{root_shown}\n")), "{text}");
+    assert!(text.contains("snapshot saved: "), "{text}");
+
+    // --json keeps the path as it is.
+    let out = run(&["scan", &root, "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["schema"], "diskwhy/v1");
+    assert_eq!(v["scan"]["roots"][0]["path"], root.as_str());
+    assert_eq!(v["findings"][0]["path"], target.as_str());
+
+    // plan: items and the apply line. A plan file without control
+    // characters is named as it would be typed, `'\''` and all.
+    let out_dir = tempfile::tempdir().unwrap();
+    let file = out_dir.path().join("it's plan.json");
+    let file = file.to_str().unwrap();
+    let text = escaped_text(
+        &run(&["plan", &root, "--tier", "rebuildable", "-o", file]),
+        &target_shown,
+    );
+    assert!(
+        text.contains(&format!(
+            "dwhy apply {}\n",
+            dwhy_core::detect::shell_quote(file)
+        )),
+        "{text}"
+    );
+    assert!(text.contains(r"'\''s plan.json"), "{text}");
+    let out = run(&["plan", &root, "--tier", "rebuildable", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(
+        json_of(&out)["items"][0]["finding"]["path"],
+        target.as_str()
+    );
+
+    // explain, by path.
+    let text = escaped_text(&run(&["explain", &target]), &target_shown);
+    assert!(
+        text.contains(&format!("--target-dir '{target_shown}'\n")),
+        "{text}"
+    );
+    let out = run(&["explain", &target, "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(json_of(&out)["path"], target.as_str());
+
+    // diff against the snapshot, after the target grew.
+    fs::write(format!("{target}/debug/more"), vec![3u8; 1 << 20]).unwrap();
+    let text = escaped_text(
+        &run(&["diff", &root, "--min-change", "0"]),
+        &format!("cargo-target {target_shown}"),
+    );
+    assert!(text.starts_with("dwhy diff · "), "{text}");
+    assert!(text.contains(&format!(" · {root_shown}\n")), "{text}");
+    let out = run(&["diff", &root, "--min-change", "0", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["roots"][0], root.as_str());
+    assert_eq!(v["findings"][0]["name"], target.as_str());
+
+    // watch.
+    let out = dwhy_offline(
+        st,
+        &[
+            "watch",
+            &root,
+            "--for",
+            "1s",
+            "--min-change",
+            "0",
+            "-q",
+            "--no-docker",
+        ],
+    );
+    let text = escaped_text(&out, &root_shown);
+    assert!(text.starts_with("dwhy watch · "), "{text}");
+    let out = dwhy_offline(
+        st,
+        &["watch", &root, "--for", "1s", "-q", "--no-docker", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(json_of(&out)["roots"][0], root.as_str());
+}
