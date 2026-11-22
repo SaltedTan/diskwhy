@@ -150,6 +150,8 @@ pub struct Mark {
     pub permission: Option<PermissionMark>,
     pub read_error: bool,
     pub skipped_mounts: usize,
+    /// Btrfs snapshot or read-only subvolumes the walk did not enter.
+    pub skipped_snapshots: usize,
 }
 
 /// A finished scan. The report supplies filesystem figures and scan diagnostics.
@@ -808,7 +810,11 @@ fn coverage_marks(result: &ScanResult) -> HashMap<NodeId, Mark> {
     }
     for skip in &result.skipped_mounts {
         if let Some(id) = skip.path.parent().and_then(|parent| tree.find(parent)) {
-            marks.entry(id).or_default().skipped_mounts += 1;
+            let mark = marks.entry(id).or_default();
+            match skip.reason {
+                SkipReason::BtrfsSnapshot => mark.skipped_snapshots += 1,
+                _ => mark.skipped_mounts += 1,
+            }
         }
     }
     marks
@@ -1038,5 +1044,58 @@ mod tests {
         );
         assert!(inside.contains("2 mounts skipped in scan"), "{inside}");
         assert!(!inside.contains("(empty)"), "{inside}");
+    }
+
+    #[test]
+    fn browser_tells_skipped_btrfs_snapshots_from_skipped_mounts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let snaps = root.join("snaps");
+        fs::create_dir(&snaps).unwrap();
+        let mounts = MountTable::default();
+        let opts = ScanOptions {
+            threads: 2,
+            ..ScanOptions::default()
+        };
+        let mut result = scan::scan(&[root], &opts, &mounts, &Progress::default()).unwrap();
+        let dev = result.roots[0].dev;
+        let skipped = |name: &str, reason| SkippedRecord {
+            path: snaps.join(name),
+            parent_dev: dev,
+            fstype: Some("btrfs".into()),
+            reason,
+        };
+        result.skipped_mounts.extend([
+            skipped("@2026-11-01", SkipReason::BtrfsSnapshot),
+            skipped("@2026-11-02", SkipReason::BtrfsSnapshot),
+        ]);
+        let mut app = App::new(Vec::new(), Arc::new(Progress::default()));
+        app.finish(Scanned {
+            report: account::system_scan_report(&result, &mounts),
+            marks: coverage_marks(&result),
+            tree: result.tree.clone(),
+            growth_base: None,
+            plan_options: Options::default(),
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        assert!(!app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
+        term.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let screen = term.backend().to_string();
+        assert!(
+            screen.contains("snaps/  [2 btrfs snapshots skipped]"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("2 btrfs snapshots skipped in scan"),
+            "{screen}"
+        );
+        assert!(!screen.contains("mount"), "{screen}");
+
+        result
+            .skipped_mounts
+            .push(skipped("data", SkipReason::OtherFilesystem));
+        let id = result.tree.find(&snaps).unwrap();
+        let mark = coverage_marks(&result)[&id];
+        assert_eq!((mark.skipped_mounts, mark.skipped_snapshots), (1, 2));
     }
 }

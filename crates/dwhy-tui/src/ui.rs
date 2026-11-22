@@ -15,7 +15,9 @@ use dwhy_core::apply::{
 use dwhy_core::detect::{PATH_NOT_UTF8_RECOVERY_NOTE, is_lossy, rfc3339};
 use dwhy_core::plan;
 use dwhy_core::probes::postgres_wal;
-use dwhy_core::report::{ActionKind, ApplyOutcome, Finding, FsReport, GuardStatus, Plan, Tier};
+use dwhy_core::report::{
+    ActionKind, ApplyOutcome, Finding, FsReport, GuardStatus, Plan, SkipReason, Tier,
+};
 use dwhy_core::units::{human, signed, thousands};
 use ratatui::Frame;
 use ratatui::buffer::CellWidth;
@@ -1645,9 +1647,18 @@ fn status_text(b: &Browser, mode: SizeMode, total: u64, width: usize) -> Vec<Lin
     if !b.rows.is_empty() {
         parts.push(format!("{}/{}", b.selected + 1, b.rows.len()));
     }
-    let skipped = r.scan.skipped_mounts.len();
+    let snapshots = r
+        .scan
+        .skipped_mounts
+        .iter()
+        .filter(|m| m.reason == SkipReason::BtrfsSnapshot)
+        .count();
+    let skipped = r.scan.skipped_mounts.len() - snapshots;
     if skipped > 0 {
         parts.push(format!("{} in scan", skipped_mounts_text(skipped)));
+    }
+    if snapshots > 0 {
+        parts.push(format!("{} in scan", skipped_snapshots_text(snapshots)));
     }
     let errors = r.scan.error_count;
     if errors > 0 {
@@ -1693,12 +1704,23 @@ fn mark_text(m: Mark) -> String {
     if m.skipped_mounts > 0 {
         parts.push(skipped_mounts_text(m.skipped_mounts));
     }
+    if m.skipped_snapshots > 0 {
+        parts.push(skipped_snapshots_text(m.skipped_snapshots));
+    }
     parts.join(", ")
 }
 
 fn skipped_mounts_text(n: usize) -> String {
     format!(
         "{} mount{} skipped",
+        thousands(n as u64),
+        if n == 1 { "" } else { "s" }
+    )
+}
+
+fn skipped_snapshots_text(n: usize) -> String {
+    format!(
+        "{} btrfs snapshot{} skipped",
         thousands(n as u64),
         if n == 1 { "" } else { "s" }
     )

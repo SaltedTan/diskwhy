@@ -458,6 +458,7 @@ fn combined_diagnostics_leave_the_directory_name_visible_at_80x24() {
         permission: Some(PermissionMark::EntriesDenied(2)),
         read_error: true,
         skipped_mounts: 2,
+        skipped_snapshots: 0,
     };
     for name in ["vendor", long] {
         let id = data.tree.find(&root.join(name)).unwrap();

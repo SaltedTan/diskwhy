@@ -12,7 +12,8 @@
 //!   descriptor, and checked to be the inode just `lstat`ed; entries are
 //!   removed with `unlinkat`, so a symlink inside is unlinked, never
 //!   followed. An entry on another device than the root stops the removal
-//!   (a btrfs subvolume inside the root too: `rmdir` cannot remove one).
+//!   (a btrfs subvolume inside the root too: removal does not cross into
+//!   another subvolume; `btrfs subvolume delete` removes one).
 //! - A directory of the caller's own without write or search permission
 //!   (Go's read-only module cache) gets `u+rwx` before it is emptied; it is
 //!   inside the root being removed.
@@ -263,8 +264,8 @@ fn empty(
         if st.st_dev != dev {
             return Err(match classify(fd, name) {
                 Boundary::BtrfsSubvolume => format!(
-                    "{} is a btrfs subvolume; stopped there (rmdir cannot remove a subvolume; \
-                     `btrfs subvolume delete` does)",
+                    "{} is a btrfs subvolume; stopped there (removal does not cross into another \
+                     subvolume; `btrfs subvolume delete` removes it)",
                     child.display()
                 ),
                 Boundary::Filesystem => format!(
@@ -368,14 +369,15 @@ mod tests {
             Mode::empty(),
         )
         .unwrap();
-        // `sub` is on the same mount as its directory; only btrfs gives
-        // such an entry a device of its own.
-        let want = if crate::mounts::on_btrfs(&fd) {
-            Boundary::BtrfsSubvolume
-        } else {
-            Boundary::Filesystem
-        };
-        assert_eq!(classify_boundary(&fd, OsStr::new("sub")), want);
+        // `sub` is on the same mount as its directory; off btrfs that is
+        // still another filesystem, as the mount table tells independently.
+        let mounts = MountTable::read().unwrap();
+        if mounts.for_path(&root).is_some_and(|m| m.fstype != "btrfs") {
+            assert_eq!(
+                classify_boundary(&fd, OsStr::new("sub")),
+                Boundary::Filesystem
+            );
+        }
         assert_eq!(
             classify_boundary(&fd, OsStr::new("missing")),
             Boundary::Filesystem

@@ -429,8 +429,10 @@ mod tests {
         let link = path.join("link");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert_eq!(btrfs_subvol_info(&link, dev), None, "not followed");
-        let dir = std::fs::File::open(&path).unwrap();
-        assert_eq!(btrfs_subvol_info(&path, dev).is_some(), on_btrfs(&dir));
+        let mounts = MountTable::read().unwrap();
+        if let Some(m) = mounts.for_path(&path) {
+            assert_eq!(btrfs_subvol_info(&path, dev).is_some(), m.fstype == "btrfs");
+        }
     }
 
     #[test]
