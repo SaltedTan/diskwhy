@@ -100,6 +100,248 @@ fn hardlinks_are_attributed_to_the_smallest_path() {
     }
 }
 
+/// Size of `p` in bytes (`st_size`).
+fn apparent(p: &Path) -> u64 {
+    fs::symlink_metadata(p).unwrap().size()
+}
+
+#[test]
+fn hardlinks_go_to_the_smallest_path_component_by_component() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    // Two links. Bytewise "d-e/f" < "d/f", but paths compare by component
+    // and "d" < "d-e".
+    for d in ["d", "d-e"] {
+        fs::create_dir(r.join(d)).unwrap();
+    }
+    write_file(&r.join("d-e/f"), 40 << 10);
+    fs::hard_link(r.join("d-e/f"), r.join("d/f")).unwrap();
+    // Three links, nested: x/f2 < x/y/f < x/y/z/f3 ("f2" < "y").
+    fs::create_dir_all(r.join("x/y/z")).unwrap();
+    write_file(&r.join("x/y/z/f3"), 24 << 10);
+    write_file(&r.join("x/own"), 3000);
+    fs::hard_link(r.join("x/y/z/f3"), r.join("x/y/f")).unwrap();
+    fs::hard_link(r.join("x/y/z/f3"), r.join("x/f2")).unwrap();
+    // Non-UTF-8 directory names, which are the same once made lossy:
+    // 0x80 sorts before 0xff.
+    let (hi, lo) = (
+        r.join(OsStr::from_bytes(b"n\xffdir")),
+        r.join(OsStr::from_bytes(b"n\x80dir")),
+    );
+    fs::create_dir(&hi).unwrap();
+    fs::create_dir(&lo).unwrap();
+    write_file(&hi.join(OsStr::from_bytes(b"\xfe")), 16 << 10);
+    fs::hard_link(
+        hi.join(OsStr::from_bytes(b"\xfe")),
+        lo.join(OsStr::from_bytes(b"\xfe")),
+    )
+    .unwrap();
+
+    for threads in [1, 4, 16] {
+        let res = run(&[&r], &ScanOptions { threads, ..opts() });
+        let tree = &res.tree;
+        let id = |p: &Path| tree.find(p).unwrap();
+        let node = |p: &Path| tree.node(id(p));
+
+        let f = alloc(&r.join("d/f"));
+        assert_eq!(node(&r.join("d")).direct_allocated, f);
+        assert_eq!(node(&r.join("d")).direct_apparent, 40 << 10);
+        assert_eq!(node(&r.join("d")).total.files, 1);
+        assert_eq!(node(&r.join("d")).total.hardlinks_deduped, 1);
+        assert_eq!(node(&r.join("d-e")).direct_allocated, 0);
+        assert_eq!(node(&r.join("d-e")).total.files, 0);
+        // Each holds one of the two links: removing either frees nothing.
+        assert_eq!(node(&r.join("d")).shared, f);
+        assert_eq!(node(&r.join("d")).freeable(), alloc(&r.join("d")));
+        assert_eq!(node(&r.join("d-e")).shared, 0);
+
+        let f3 = alloc(&r.join("x/f2"));
+        let x = node(&r.join("x"));
+        assert_eq!(x.direct_allocated, f3 + alloc(&r.join("x/own")));
+        assert_eq!(x.direct_apparent, (24 << 10) + 3000);
+        assert_eq!(x.total.files, 2);
+        assert_eq!(x.total.hardlinks_deduped, 2);
+        assert_eq!(x.total.hardlink_bytes_deduped, 2 * f3);
+        // All three links lie under x: removing x frees the inode.
+        assert_eq!(x.shared, 0);
+        assert_eq!(x.freeable(), x.total.allocated);
+        for d in ["x/y", "x/y/z"] {
+            assert_eq!(node(&r.join(d)).direct_allocated, 0, "{d}");
+            assert_eq!(node(&r.join(d)).total.files, 0, "{d}");
+            assert_eq!(node(&r.join(d)).shared, 0, "{d}");
+        }
+
+        let e = alloc(&lo.join(OsStr::from_bytes(b"\xfe")));
+        assert_eq!(node(&lo).direct_allocated, e);
+        assert_eq!(node(&lo).direct_apparent, 16 << 10);
+        assert_eq!(node(&lo).shared, e);
+        assert_eq!(node(&hi).direct_allocated, 0);
+        assert_eq!(node(&hi).total.files, 0);
+
+        assert_eq!(node(&r).shared, 0, "every link is under the root");
+        assert_eq!(res.totals().files, 4);
+        assert_eq!(res.totals().hardlinks_deduped, 4);
+        // The directory inode, its entries and its subdirectories add up.
+        for i in tree.ids() {
+            let p = tree.path(i);
+            assert_eq!(tree.directory_allocated(i), alloc(&p), "{}", p.display());
+        }
+    }
+}
+
+#[test]
+fn hardlinked_file_root_is_attributed_by_its_whole_path() {
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    for d in ["a", "b", "z"] {
+        fs::create_dir(r.join(d)).unwrap();
+    }
+    write_file(&r.join("a/f"), 48 << 10);
+    fs::hard_link(r.join("a/f"), r.join("b/g")).unwrap();
+    fs::hard_link(r.join("a/f"), r.join("z/h")).unwrap();
+    let f = alloc(&r.join("a/f"));
+
+    // The file root's path, <r>/a/f, is the smallest.
+    let res = run(&[&r.join("a/f"), &r.join("b"), &r.join("z")], &opts());
+    let tree = &res.tree;
+    let froot = tree.find(&r.join("a/f")).unwrap();
+    let n = tree.node(froot);
+    assert!(!n.is_dir);
+    assert_eq!(tree.name(froot), r.join("a/f").as_os_str());
+    assert_eq!(n.direct_allocated, f);
+    assert_eq!(n.direct_apparent, 48 << 10);
+    assert_eq!(n.total.files, 1);
+    assert_eq!(n.total.hardlinks_deduped, 2);
+    // The other links are under other roots: nothing frees it alone.
+    assert_eq!(n.shared, f);
+    assert_eq!(n.freeable(), 0);
+    for d in ["b", "z"] {
+        let n = tree.node(tree.find(&r.join(d)).unwrap());
+        assert_eq!(n.total.files, 0, "{d}");
+        assert_eq!(n.direct_allocated, 0, "{d}");
+        assert_eq!(n.shared, 0, "{d}");
+    }
+    assert_eq!(res.totals().files, 1);
+    assert_eq!(res.totals().hardlinks_deduped, 2);
+    // Every root that reached the inode counts it on its device.
+    let dev = fs::metadata(&r).unwrap().dev();
+    for root in &res.roots {
+        assert_eq!(root.per_dev[&dev].files, 1, "{}", root.path.display());
+    }
+
+    // A directory link sorts before the file root: <r>/b/g < <r>/z/h.
+    let res = run(&[&r.join("z/h"), &r.join("b")], &opts());
+    let tree = &res.tree;
+    let b = tree.node(tree.find(&r.join("b")).unwrap());
+    assert_eq!(b.direct_allocated, f);
+    assert_eq!(b.total.files, 1);
+    assert_eq!(b.total.hardlinks_deduped, 1);
+    // a/f was not scanned.
+    assert_eq!(b.shared, f);
+    let h = tree.node(tree.find(&r.join("z/h")).unwrap());
+    assert_eq!(h.total.allocated, 0);
+    assert_eq!(h.direct_allocated, 0);
+    assert_eq!(h.direct_apparent, 0);
+
+    // On its own, with links outside the scan.
+    let res = run(&[&r.join("z/h")], &opts());
+    let n = res.tree.node(res.tree.roots()[0]);
+    assert_eq!(n.direct_allocated, f);
+    assert_eq!(n.direct_apparent, apparent(&r.join("z/h")));
+    assert_eq!(n.total.hardlinks_deduped, 0);
+    assert_eq!(n.shared, f);
+    assert_eq!(res.roots[0].totals, n.total.totals());
+}
+
+#[test]
+fn direct_bytes_are_the_entries_beside_the_subdirectories() {
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    fs::create_dir_all(r.join("s/t")).unwrap();
+    write_file(&r.join("one"), 5000);
+    write_file(&r.join("s/two"), 70 << 10);
+    symlink("one", r.join("ln")).unwrap();
+    let res = run(&[&r], &opts());
+    let tree = &res.tree;
+    let root = tree.node(tree.roots()[0]);
+    assert_eq!(
+        root.direct_allocated,
+        alloc(&r.join("one")) + alloc(&r.join("ln"))
+    );
+    assert_eq!(root.direct_apparent, 5000 + apparent(&r.join("ln")));
+    assert!(root.has_direct_files);
+    let tn = tree.node(tree.find(&r.join("s/t")).unwrap());
+    assert_eq!(tn.direct_allocated, 0);
+    assert!(!tn.has_direct_files);
+    assert_eq!(res.roots[0].totals, root.total.totals());
+}
+
+/// Peak resident set size of this process, in KiB.
+fn peak_rss_kib() -> u64 {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("VmHWM:"))
+                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+#[ignore = "memory/time benchmark; run by hand"]
+fn bench_large_hardlinked_tree() {
+    // A pnpm-like layout: a store and a project tree with one directory
+    // per package version on each side, the file inside hardlinked. Run
+    // with `cargo test --release -p dwhy-core --test scan -- --ignored
+    // --nocapture bench_large_hardlinked_tree`; BENCH_PACKAGES and
+    // BENCH_VERSIONS set the size.
+    let get = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (pkgs, versions) = (get("BENCH_PACKAGES", 200), get("BENCH_VERSIONS", 250));
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let made = std::time::Instant::now();
+    for p in 0..pkgs {
+        for v in 0..versions {
+            let store = r.join(format!("store/pkg-{p:04}/v{v:04}"));
+            let proj = r.join(format!("proj/nm-{p:04}/dep-{v:04}"));
+            fs::create_dir_all(&store).unwrap();
+            fs::create_dir_all(&proj).unwrap();
+            fs::write(store.join("index.js"), [b'x'; 100]).unwrap();
+            fs::hard_link(store.join("index.js"), proj.join("index.js")).unwrap();
+        }
+    }
+    let made = made.elapsed();
+    let before = peak_rss_kib();
+    let start = std::time::Instant::now();
+    let res = run(
+        &[&r],
+        &ScanOptions {
+            threads: 0,
+            ..opts()
+        },
+    );
+    let elapsed = start.elapsed();
+    let tot = res.totals();
+    assert_eq!(tot.hardlinks_deduped, (pkgs * versions) as u64);
+    eprintln!(
+        "bench: {} dirs, {} linked inodes (built in {made:.2?}): scan {elapsed:.3?}, \
+         peak RSS {} KiB (before scan {before} KiB), {} nodes x {} B",
+        tot.dirs,
+        tot.files,
+        peak_rss_kib(),
+        res.tree.len(),
+        std::mem::size_of::<dwhy_core::tree::TreeNode>(),
+    );
+}
+
 #[test]
 fn hardlinks_across_roots_are_counted_once() {
     let t = tempfile::tempdir().unwrap();
