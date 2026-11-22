@@ -79,7 +79,7 @@ The idea is to automate what was done by hand on pc-ubuntu on 2026-11-13: 36G fr
 ## CLI (MVP)
 
 ```
-dwhy [tui [PATH…]] [-x | --cross-filesystems]     # interactive TUI (default PATH: .)
+dwhy [tui [PATH…] [-x | --cross-filesystems]]     # interactive TUI (default PATH: .)
 dwhy scan [PATH…] [--json] [--snapshot] [-x | --cross-filesystems] # sizes + findings + unaccounted space (default PATH: .)
 dwhy diff [PATH…] [--since last|<snapshot>|7d|<time>] [--json]     # growth since a snapshot
 dwhy watch [PATH…] [--for 60s] [--json]           # live growth rate per directory/volume
@@ -131,7 +131,7 @@ The TUI restores the terminal on exit, including after a panic. Quitting does no
 
 ### JSON contract
 
-The [`diskwhy/v1` serde types](../crates/dwhy-core/src/report.rs) define the JSON contract (`uid` is the effective uid alongside `root`, and `fs[].unaccounted` is `null` unless `full_coverage` is true). The pinned shapes include a [WAL finding](../crates/dwhy-core/tests/snapshots/json_shape__postgres_wal_evidence_shape.snap), [API-only WAL evidence](../crates/dwhy-core/tests/snapshots/json_shape__api_only_evidence_shape.snap) and [explain reports](../crates/dwhy-core/tests/snapshots/json_shape__explain_report_shape.snap).
+The [`diskwhy/v1` serde types](../crates/dwhy-core/src/report.rs) define the JSON contract (in scan output, `uid` is the effective uid alongside `root`, while `dwhy doctor --json` reports both the real `uid` and `euid`; `fs[].unaccounted` is `null` unless `full_coverage` is true). The pinned shapes include a [WAL finding](../crates/dwhy-core/tests/snapshots/json_shape__postgres_wal_evidence_shape.snap), [API-only WAL evidence](../crates/dwhy-core/tests/snapshots/json_shape__api_only_evidence_shape.snap) and [explain reports](../crates/dwhy-core/tests/snapshots/json_shape__explain_report_shape.snap).
 
 The versioned CLI output is the contract for agents and the planned MCP server.
 
