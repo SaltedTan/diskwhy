@@ -17,7 +17,7 @@ jobs:
     name: validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -64,7 +64,7 @@ jobs:
             qemu: true
             extra_rustflags: "-C linker-flavor=ld.lld -C link-self-contained=yes -C target-feature=+crt-static"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -120,7 +120,7 @@ jobs:
           tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@${source_date_epoch}" \
             -C staging -cf - "dwhy-${version}-${TARGET}" | gzip -n > "dist/dwhy-${version}-${TARGET}.tar.gz"
           echo "PACKAGE=dist/dwhy-${version}-${TARGET}.tar.gz" >> "$GITHUB_ENV"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: ${{ env.PACKAGE }}
@@ -133,7 +133,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: dist
@@ -148,7 +148,7 @@ jobs:
             exit 1
           fi
           LC_ALL=C sha256sum "${files[@]}" > SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-checksums
           path: dist/SHA256SUMS

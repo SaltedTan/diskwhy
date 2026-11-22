@@ -21,7 +21,7 @@ jobs:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -54,7 +54,7 @@ jobs:
             qemu: true
             extra_rustflags: "-C linker-flavor=ld.lld -C link-self-contained=yes -C target-feature=+crt-static"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -89,7 +89,7 @@ jobs:
           DOCKER_HOST=unix:///nonexistent $run "$bin" --version
           DOCKER_HOST=unix:///nonexistent $run "$bin" doctor
           DOCKER_HOST=unix:///nonexistent $run "$bin" scan . --json -q --detectors cargo-target > /dev/null
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dwhy-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/dwhy
