@@ -1042,7 +1042,10 @@ mod tests {
 
         // A subdirectory of an ordinary mount still points at the mount.
         let text = render_fs_text(&partial_fs("/home", "/home/u/src"));
-        assert!(text.contains("scan /home to account for all of it"), "{text}");
+        assert!(
+            text.contains("scan /home to account for all of it"),
+            "{text}"
+        );
     }
 
     #[test]
