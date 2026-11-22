@@ -260,10 +260,16 @@ pub struct FsReport {
     pub used: u64,
     /// `statvfs`: f_bavail * f_frsize.
     pub avail: u64,
-    /// Allocated bytes the scan counted on this filesystem.
+    /// Allocated bytes the scan counted on this filesystem, across every
+    /// `st_dev` it has (btrfs subvolumes each have their own).
     pub scanned: u64,
-    /// True when a scan root was this filesystem's mount point, so `scanned`
-    /// can be compared with `used`.
+    /// True when the scan walked this filesystem whole, so `scanned` can be
+    /// compared with `used`: a scan root (or a mount entered with
+    /// `--cross-filesystems`) was the mount point of a mount showing the
+    /// whole filesystem (mountinfo root `/`, so not a subdirectory bind mount
+    /// or a btrfs subvolume other than the top level). Unless a scan root is
+    /// such a mount point, walks reaching the filesystem through more than one
+    /// mount make it false.
     pub full_coverage: bool,
     /// `used - scanned` (saturating), only when `full_coverage`.
     pub unaccounted: Option<u64>,
