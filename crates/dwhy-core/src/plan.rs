@@ -294,6 +294,62 @@ pub fn distinct_bytes_in_tree<'a>(
         .sum()
 }
 
+/// [`distinct_bytes`] for items of `plan`, without the scan's tree (as for
+/// a plan read from a file): an item is left out only when it also lies
+/// inside another item of the same scan. Each path belongs to the deepest
+/// of `plan.scan.roots` above it, and items under different roots do not
+/// nest: a root mounted below another root was scanned on its own, so its
+/// bytes are not in the outer root's. In a one-filesystem scan, items whose
+/// fingerprints record different devices do not nest either. Paths no root
+/// covers nest by path, and pseudo-paths (`docker://…`) never nest, as in
+/// [`distinct_bytes`]. Agrees with [`distinct_bytes_in_tree`], which
+/// `plan.bytes` comes from.
+pub fn distinct_bytes_in_plan<'a>(
+    plan: &Plan,
+    items: impl IntoIterator<Item = &'a PlanItem>,
+) -> u64 {
+    let roots: Vec<&Path> = plan.scan.roots.iter().map(Path::new).collect();
+    let owner = |p: &Path| {
+        roots
+            .iter()
+            .copied()
+            .filter(|r| p.starts_with(r))
+            .max_by_key(|r| r.as_os_str().len())
+    };
+    let items: Vec<(&Path, u64, Option<&Path>, Option<u64>)> = items
+        .into_iter()
+        .map(|i| {
+            let p = Path::new(&i.finding.path);
+            (p, i.finding.bytes, owner(p), i.fingerprint.dev)
+        })
+        .collect();
+    let same_scan = |(p_root, p_dev): (Option<&Path>, Option<u64>),
+                     (o_root, o_dev): (Option<&Path>, Option<u64>)| {
+        let roots_agree = match (p_root, o_root) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+        let devs_agree = match (p_dev, o_dev) {
+            (Some(a), Some(b)) if plan.scan.one_filesystem => a == b,
+            _ => true,
+        };
+        roots_agree && devs_agree
+    };
+    items
+        .iter()
+        .filter(|(p, _, root, dev)| {
+            !p.is_absolute()
+                || !items.iter().any(|(o, _, o_root, o_dev)| {
+                    o.is_absolute()
+                        && o != p
+                        && p.starts_with(o)
+                        && same_scan((*root, *dev), (*o_root, *o_dev))
+                })
+        })
+        .map(|(_, b, _, _)| b)
+        .sum()
+}
+
 /// What the scan measured at a filesystem root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Measured {

@@ -555,12 +555,13 @@ fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
     // What apply would run: core's tier policy for these ticks, and no
     // advice-only item (apply skips those).
     let policy = crate::app::dialog_policy(p, &c.confirmed);
-    let going = plan::distinct_bytes(
-        items
-            .iter()
-            .map(|i| &i.finding)
-            .filter(|f| f.action.kind != ActionKind::Advice && policy.allows(f).is_ok())
-            .map(|f| (f.path.as_str(), f.bytes)),
+    // Nested items count once, but a root mounted below another root
+    // counts on its own, as in `plan.bytes`, with or without a scan tree.
+    let going = plan::distinct_bytes_in_plan(
+        p,
+        items.iter().filter(|i| {
+            i.finding.action.kind != ActionKind::Advice && policy.allows(&i.finding).is_ok()
+        }),
     );
     let mut summary = format!("{} item{}", items.len(), plural(items.len()));
     if reviews > 0 {
@@ -748,9 +749,12 @@ fn results_lines(done: &job::Applied, width: usize) -> Vec<Line<'static>> {
         out.extend(wrap(s, width).into_iter().map(Line::raw));
     };
     out.extend(
-        wrap(&apply::summary(r), width)
-            .into_iter()
-            .map(|l| Line::styled(l, bold)),
+        wrap(
+            &apply::summary_with_would_free(r, r.dry_run.then_some(done.would_free)),
+            width,
+        )
+        .into_iter()
+        .map(|l| Line::styled(l, bold)),
     );
     push(
         &mut out,
