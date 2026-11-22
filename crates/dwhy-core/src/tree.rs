@@ -6,6 +6,7 @@
 //! not kept, so the tree costs memory per directory, not per file.
 
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::report::Totals;
@@ -103,32 +104,96 @@ impl Markers {
 pub type NodeId = u32;
 pub(crate) const NO_PARENT: NodeId = NodeId::MAX;
 
+/// A node's subtree totals, stored compactly. Byte counts are exact.
+/// Entry counts saturate at `u32::MAX` (over 4 billion entries in one
+/// subtree); [`crate::scan::RootResult::totals`] keeps exact counts per root.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NodeTotals {
+    pub allocated: u64,
+    pub apparent: u64,
+    pub hardlink_bytes_deduped: u64,
+    pub files: u32,
+    pub dirs: u32,
+    pub symlinks: u32,
+    pub other: u32,
+    pub hardlinks_deduped: u32,
+}
+
+impl NodeTotals {
+    /// The same figures as a [`Totals`].
+    pub fn totals(&self) -> Totals {
+        Totals {
+            allocated: self.allocated,
+            apparent: self.apparent,
+            files: self.files.into(),
+            dirs: self.dirs.into(),
+            symlinks: self.symlinks.into(),
+            other: self.other.into(),
+            hardlinks_deduped: self.hardlinks_deduped.into(),
+            hardlink_bytes_deduped: self.hardlink_bytes_deduped,
+        }
+    }
+
+    pub(crate) fn from_totals(t: &Totals) -> NodeTotals {
+        let c = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+        NodeTotals {
+            allocated: t.allocated,
+            apparent: t.apparent,
+            hardlink_bytes_deduped: t.hardlink_bytes_deduped,
+            files: c(t.files),
+            dirs: c(t.dirs),
+            symlinks: c(t.symlinks),
+            other: c(t.other),
+            hardlinks_deduped: c(t.hardlinks_deduped),
+        }
+    }
+
+    /// Adds `o`: bytes as [`Totals`] does, counts saturating.
+    pub(crate) fn add(&mut self, o: &NodeTotals) {
+        self.allocated += o.allocated;
+        self.apparent += o.apparent;
+        self.hardlink_bytes_deduped += o.hardlink_bytes_deduped;
+        self.files = self.files.saturating_add(o.files);
+        self.dirs = self.dirs.saturating_add(o.dirs);
+        self.symlinks = self.symlinks.saturating_add(o.symlinks);
+        self.other = self.other.saturating_add(o.other);
+        self.hardlinks_deduped = self.hardlinks_deduped.saturating_add(o.hardlinks_deduped);
+    }
+}
+
+/// One directory (or non-directory root). Kept small: a big scan holds one
+/// per directory, and its name lives in the [`ScanTree`]'s name arena.
 #[derive(Debug, Clone)]
 pub struct TreeNode {
-    pub(crate) parent: NodeId,
-    pub depth: u32,
-    pub is_dir: bool,
-    /// Last path component; the full path for a root.
-    pub(crate) name: Box<OsStr>,
-    /// The directory inode and its non-directory entries (hardlinked inodes
-    /// included where they are attributed to this directory).
-    pub own: Totals,
-    pub directory_allocated: u64,
-    pub has_direct_files: bool,
-    /// `own` plus all descendants.
-    pub total: Totals,
-    pub markers: Markers,
+    /// `st_dev` and `st_ino` of the directory (or non-directory root) the
+    /// walk measured. Roots use the initial `lstat`. Subdirectories use
+    /// the parent's `fstatat` result, also used to size the directory itself.
+    pub dev: u64,
+    pub ino: u64,
     /// Newest mtime (seconds since the epoch) of the directory and anything in it, recursively.
     pub newest_mtime: i64,
     /// Allocated bytes in `total` of hardlinked files that also have a link
     /// outside this subtree (or outside the scan), so removing it would not
     /// free them.
     pub shared: u64,
-    /// `st_dev` and `st_ino` of the directory (or non-directory root) the
-    /// walk measured. Roots use the initial `lstat`. Subdirectories use
-    /// the parent's `fstatat` result, also used to size the directory itself.
-    pub dev: u64,
-    pub ino: u64,
+    /// Allocated bytes of the non-directory entries directly in this
+    /// directory (hardlinked inodes included where they are attributed to
+    /// it), not counting the directory inode itself. For a non-directory
+    /// root, the root itself.
+    pub direct_allocated: u64,
+    /// Apparent bytes of the same entries.
+    pub direct_apparent: u64,
+    /// This node and all its descendants: the directory inode, its direct
+    /// entries, and every subdirectory's total.
+    pub total: NodeTotals,
+    pub(crate) parent: NodeId,
+    pub depth: u32,
+    /// Byte range of the name in [`ScanTree`]'s name arena.
+    pub(crate) name_start: u32,
+    pub(crate) name_len: u32,
+    pub markers: Markers,
+    pub is_dir: bool,
+    pub has_direct_files: bool,
 }
 
 impl TreeNode {
@@ -139,18 +204,42 @@ impl TreeNode {
     }
 }
 
+/// Appends `name` to a name arena and returns its `(start, len)`.
+///
+/// # Panics
+///
+/// If the arena would grow past 4 GiB, which takes hundreds of millions of
+/// names (and far more memory for the nodes holding them).
+pub(crate) fn push_name(arena: &mut Vec<u8>, name: &[u8]) -> (u32, u32) {
+    let fits = |n: usize| u32::try_from(n).expect("name arena exceeds 4 GiB");
+    let start = fits(arena.len());
+    let len = fits(name.len());
+    fits(arena.len() + name.len());
+    arena.extend_from_slice(name);
+    (start, len)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ScanTree {
     nodes: Vec<TreeNode>,
+    /// Every node's name, back to back; see [`TreeNode::name_start`].
+    names: Vec<u8>,
     /// Children of node `i` are `child_ids[child_start[i]..child_start[i + 1]]`, sorted by name.
     child_start: Vec<u32>,
     child_ids: Vec<NodeId>,
     roots: Vec<NodeId>,
 }
 
+/// The name of `node` in `names`.
+pub(crate) fn name_in<'a>(names: &'a [u8], node: &TreeNode) -> &'a OsStr {
+    let start = node.name_start as usize;
+    OsStr::from_bytes(&names[start..start + node.name_len as usize])
+}
+
 impl ScanTree {
-    /// Builds the child index. `nodes` must have every child after its parent.
-    pub(crate) fn new(nodes: Vec<TreeNode>, roots: Vec<NodeId>) -> ScanTree {
+    /// Builds the child index. `nodes` must have every child after its
+    /// parent; their names are in `names`.
+    pub(crate) fn new(nodes: Vec<TreeNode>, names: Vec<u8>, roots: Vec<NodeId>) -> ScanTree {
         let n = nodes.len();
         let mut counts = vec![0u32; n + 1];
         for node in &nodes {
@@ -171,12 +260,16 @@ impl ScanTree {
                 *slot += 1;
             }
         }
+        drop(fill);
         for i in 0..n {
             let (a, b) = (child_start[i] as usize, child_start[i + 1] as usize);
-            child_ids[a..b].sort_by(|x, y| nodes[*x as usize].name.cmp(&nodes[*y as usize].name));
+            child_ids[a..b].sort_by(|x, y| {
+                name_in(&names, &nodes[*x as usize]).cmp(name_in(&names, &nodes[*y as usize]))
+            });
         }
         ScanTree {
             nodes,
+            names,
             child_start,
             child_ids,
             roots,
@@ -220,7 +313,19 @@ impl ScanTree {
 
     /// Last path component (the full path for a root).
     pub fn name(&self, id: NodeId) -> &OsStr {
-        &self.nodes[id as usize].name
+        name_in(&self.names, &self.nodes[id as usize])
+    }
+
+    /// Allocated bytes of the directory inode itself (0 for a non-directory
+    /// root): `total.allocated` less the direct entries and the subdirectories.
+    pub fn directory_allocated(&self, id: NodeId) -> u64 {
+        let n = self.node(id);
+        let kids: u64 = self
+            .children(id)
+            .iter()
+            .map(|&c| self.node(c).total.allocated)
+            .sum();
+        n.total.allocated - n.direct_allocated - kids
     }
 
     pub fn child_named(&self, id: NodeId, name: &str) -> Option<NodeId> {
@@ -293,19 +398,21 @@ impl ScanTree {
 mod tests {
     use super::*;
 
-    fn node(parent: NodeId, name: &str, own: u64) -> TreeNode {
+    fn node(names: &mut Vec<u8>, parent: NodeId, name: &str, own: u64) -> TreeNode {
+        let (name_start, name_len) = push_name(names, name.as_bytes());
         TreeNode {
             parent,
             depth: 0,
             is_dir: true,
-            name: OsStr::new(name).into(),
-            own: Totals {
-                allocated: own,
-                ..Totals::default()
-            },
-            directory_allocated: own,
+            name_start,
+            name_len,
+            direct_allocated: 0,
+            direct_apparent: 0,
             has_direct_files: false,
-            total: Totals::default(),
+            total: NodeTotals {
+                allocated: own,
+                ..NodeTotals::default()
+            },
             markers: Markers::empty(),
             newest_mtime: 0,
             shared: 0,
@@ -317,13 +424,16 @@ mod tests {
     #[test]
     fn navigation() {
         // /r, /r/b, /r/a, /r/a/x
+        let mut names = Vec::new();
         let nodes = vec![
-            node(NO_PARENT, "/r", 1),
-            node(0, "b", 1),
-            node(0, "a", 1),
-            node(2, "x", 1),
+            node(&mut names, NO_PARENT, "/r", 1),
+            node(&mut names, 0, "b", 1),
+            node(&mut names, 0, "a", 1),
+            node(&mut names, 2, "x", 1),
         ];
-        let t = ScanTree::new(nodes, vec![0]);
+        let t = ScanTree::new(nodes, names, vec![0]);
+        assert_eq!(t.name(0), OsStr::new("/r"));
+        assert_eq!(t.name(3), OsStr::new("x"));
         assert_eq!(t.children(0), &[2, 1], "sorted by name");
         assert_eq!(t.children(3), &[] as &[NodeId]);
         assert_eq!(t.path(3), PathBuf::from("/r/a/x"));
@@ -334,6 +444,39 @@ mod tests {
         assert_eq!(t.child_named(0, "b"), Some(1));
         assert!(t.is_within(3, 0) && t.is_within(3, 2) && !t.is_within(3, 1));
         assert_eq!(t.parent(0), None);
+    }
+
+    #[test]
+    fn node_stays_small() {
+        // One per directory: a few million on a big disk.
+        assert!(
+            std::mem::size_of::<TreeNode>() <= 128,
+            "{}",
+            std::mem::size_of::<TreeNode>()
+        );
+    }
+
+    #[test]
+    fn node_totals_round_trip_and_saturate() {
+        let t = Totals {
+            allocated: 1 << 40,
+            apparent: 3 << 33,
+            files: 7,
+            dirs: 2,
+            symlinks: 1,
+            other: 4,
+            hardlinks_deduped: 5,
+            hardlink_bytes_deduped: 1 << 35,
+        };
+        assert_eq!(NodeTotals::from_totals(&t).totals(), t);
+        let mut big = NodeTotals::from_totals(&Totals {
+            files: u64::from(u32::MAX) + 9,
+            ..Totals::default()
+        });
+        assert_eq!(big.files, u32::MAX);
+        big.add(&NodeTotals::from_totals(&t));
+        assert_eq!(big.files, u32::MAX);
+        assert_eq!(big.allocated, 1 << 40);
     }
 
     #[test]

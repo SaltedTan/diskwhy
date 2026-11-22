@@ -59,7 +59,7 @@ pub fn build(
                 path: tree.path(id).to_string_lossy().into_owned(),
                 allocated: n.total.allocated,
                 apparent: n.total.apparent,
-                files: n.total.files,
+                files: n.total.files.into(),
             })
         })
         .collect();

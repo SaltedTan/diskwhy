@@ -955,7 +955,7 @@ fn explain_path(
             // in the walk, which can lie outside `abs`, and has no node for
             // a file: measure `abs` on its own then, as `du` would.
             let totals = if is_dir && result.totals().hardlinks_deduped == 0 {
-                Some(result.tree.node(node).total)
+                Some(result.tree.node(node).total.totals())
             } else {
                 match scan(abs) {
                     Ok(own) => Some(own.totals()),

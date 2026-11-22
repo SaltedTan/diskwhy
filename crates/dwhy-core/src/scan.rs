@@ -34,7 +34,7 @@ use rustix::io::Errno;
 
 use crate::mounts::{self, MountTable};
 pub use crate::report::{SkipReason, Totals, UnreadableReason};
-use crate::tree::{Markers, NO_PARENT, NodeId, ScanTree, TreeNode};
+use crate::tree::{self, Markers, NO_PARENT, NodeId, NodeTotals, ScanTree, TreeNode};
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -238,17 +238,102 @@ pub fn absolute_nofollow(p: &Path) -> io::Result<PathBuf> {
 
 const LINK_SHARDS: usize = 64;
 
+/// No further link in a [`Link`]'s list.
+const NO_MORE: u32 = u32::MAX;
+
+/// What kind of non-directory a [`Link`] is, as counted in [`Totals`].
+const KIND_FILE: u8 = 0;
+const KIND_SYMLINK: u8 = 1;
+const KIND_OTHER: u8 = 2;
+
 /// An inode with more than one link. It is counted once and attributed to
 /// its lexicographically smallest path, so per-directory sizes do not depend
 /// on which thread reached a link first.
+///
+/// Kept small and free of heap allocations: a pnpm or uv store has one per
+/// file. Each link seen is a (directory node, file name) pair; the first is
+/// stored inline, any others in [`LinkShard::extra`]. Paths are only built
+/// after the walk, and only for inodes with more than one link seen.
 struct Link {
-    path: PathBuf,
-    node: u32,
-    dev: u64,
-    leaf: Totals,
-    nlink: u64,
-    /// The node of every link seen.
-    locs: Vec<NodeId>,
+    allocated: u64,
+    apparent: u64,
+    /// Directory node of the first link seen.
+    first_node: NodeId,
+    /// That link's file name in [`LinkShard::names`]; empty for a
+    /// non-directory root, whose node name is its whole path.
+    first_name_start: u32,
+    first_name_len: u32,
+    /// Index of the latest other link seen in [`LinkShard::extra`], or
+    /// [`NO_MORE`].
+    more_head: u32,
+    /// `st_nlink`; Linux keeps it in 32 bits.
+    nlink: u32,
+    kind: u8,
+}
+
+impl Link {
+    /// The inode's counts, as one entry.
+    fn leaf(&self) -> Totals {
+        let mut t = Totals {
+            allocated: self.allocated,
+            apparent: self.apparent,
+            ..Totals::default()
+        };
+        match self.kind {
+            KIND_FILE => t.files = 1,
+            KIND_SYMLINK => t.symlinks = 1,
+            _ => t.other = 1,
+        }
+        t
+    }
+}
+
+/// A link to an inode already in a [`LinkShard`]'s map, after the first.
+struct ExtraLoc {
+    node: NodeId,
+    name_start: u32,
+    name_len: u32,
+    /// The previous one for the same inode, or [`NO_MORE`].
+    next: u32,
+}
+
+/// One shard of the hardlink table.
+#[derive(Default)]
+struct LinkShard {
+    map: HashMap<(u64, u64), Link>,
+    /// File names of the links seen, back to back.
+    names: Vec<u8>,
+    extra: Vec<ExtraLoc>,
+}
+
+/// A hardlinked entry found while listing a directory, kept until the
+/// directory has a node id.
+struct PendingLink {
+    key: (u64, u64),
+    allocated: u64,
+    apparent: u64,
+    nlink: u32,
+    kind: u8,
+    name_start: u32,
+    name_len: u32,
+}
+
+impl PendingLink {
+    fn new(st: &Stat, name: (u32, u32)) -> PendingLink {
+        PendingLink {
+            key: (st.st_dev, st.st_ino),
+            allocated: bytes(st),
+            apparent: st.st_size as u64,
+            nlink: u32::try_from(nlink(st)).unwrap_or(u32::MAX),
+            kind: match FileType::from_raw_mode(st.st_mode) {
+                FileType::RegularFile => KIND_FILE,
+                FileType::Symlink => KIND_SYMLINK,
+                _ => KIND_OTHER,
+            },
+            name_start: name.0,
+            name_len: name.1,
+        }
+    }
 }
 
 /// Looks up the id of the mount through which a path on a given device is
@@ -264,8 +349,9 @@ struct Shared<'a> {
     on_mount: Mutex<HashSet<(u64, u32)>>,
     dev_mounts: Mutex<HashMap<u64, u32>>,
     entered_mounts: Mutex<BTreeSet<u32>>,
-    nodes: Mutex<Vec<TreeNode>>,
-    links: Vec<Mutex<HashMap<(u64, u64), Link>>>,
+    /// The tree's nodes and their name arena.
+    nodes: Mutex<(Vec<TreeNode>, Vec<u8>)>,
+    links: Vec<Mutex<LinkShard>>,
     unreadable: Mutex<Vec<UnreadableRecord>>,
     skipped: Mutex<Vec<SkippedRecord>>,
     per_dev: Mutex<HashMap<u64, Totals>>,
@@ -304,37 +390,53 @@ impl<'a> Shared<'a> {
         }
     }
 
-    fn push_node(&self, node: TreeNode) -> NodeId {
-        let mut nodes = self.nodes.lock().unwrap();
-        let id = nodes.len() as u32;
+    /// Adds `node`, named `name`, and returns its id.
+    fn push_node(&self, mut node: TreeNode, name: &[u8]) -> NodeId {
+        let mut guard = self.nodes.lock().unwrap();
+        let (nodes, names) = &mut *guard;
+        let id = NodeId::try_from(nodes.len())
+            .ok()
+            .filter(|&id| id != NO_PARENT)
+            .expect("more than 4 billion directories");
+        (node.name_start, node.name_len) = tree::push_name(names, name);
         nodes.push(node);
         id
     }
 
-    fn add_link(&self, st: &Stat, path: PathBuf, node: u32) {
-        let key = (st.st_dev, st.st_ino);
+    /// Records a link to a hardlinked inode: the entry `name` in directory
+    /// `node` (for a non-directory root, the root node and an empty name).
+    fn add_link(&self, l: &PendingLink, node: NodeId, name: &[u8]) {
+        let key = l.key;
         let shard = ((key.1 ^ key.0.rotate_left(17)) as usize) % LINK_SHARDS;
-        let mut map = self.links[shard].lock().unwrap();
+        let mut guard = self.links[shard].lock().unwrap();
+        let LinkShard { map, names, extra } = &mut *guard;
+        let (name_start, name_len) = tree::push_name(names, name);
         match map.entry(key) {
             Entry::Vacant(v) => {
-                let mut locs = Vec::with_capacity(2);
-                locs.push(node);
                 v.insert(Link {
-                    path,
-                    node,
-                    dev: key.0,
-                    leaf: leaf_totals(st),
-                    nlink: nlink(st),
-                    locs,
+                    allocated: l.allocated,
+                    apparent: l.apparent,
+                    first_node: node,
+                    first_name_start: name_start,
+                    first_name_len: name_len,
+                    more_head: NO_MORE,
+                    nlink: l.nlink,
+                    kind: l.kind,
                 });
             }
             Entry::Occupied(mut o) => {
-                let l = o.get_mut();
-                l.locs.push(node);
-                if path < l.path {
-                    l.path = path;
-                    l.node = node;
-                }
+                let link = o.get_mut();
+                let idx = u32::try_from(extra.len())
+                    .ok()
+                    .filter(|&i| i != NO_MORE)
+                    .expect("more than 4 billion hardlinks in one shard");
+                extra.push(ExtraLoc {
+                    node,
+                    name_start,
+                    name_len,
+                    next: link.more_head,
+                });
+                link.more_head = idx;
             }
         }
     }
@@ -507,10 +609,9 @@ pub fn scan(
             path: root.clone(),
             source,
         })?;
-        let name: Box<OsStr> = root.as_os_str().into();
         shared.note_dev(root, st.st_dev);
         let id = if is_dir(&st) {
-            pool.install(|| walk_dir(&shared, root.clone(), &st, 0, NO_PARENT, name))
+            pool.install(|| walk_dir(&shared, root.clone(), &st, 0, NO_PARENT))
         } else {
             let linked = st.st_nlink > 1;
             let own = if linked {
@@ -519,23 +620,29 @@ pub fn scan(
                 leaf_totals(&st)
             };
             shared.add_dev(st.st_dev, own);
-            let id = shared.push_node(TreeNode {
-                parent: NO_PARENT,
-                depth: 0,
-                is_dir: false,
-                name,
-                own,
-                directory_allocated: 0,
-                has_direct_files: false,
-                total: Totals::default(),
-                markers: Markers::empty(),
-                newest_mtime: mtime(&st),
-                shared: 0,
-                dev: st.st_dev,
-                ino: st.st_ino,
-            });
+            let id = shared.push_node(
+                TreeNode {
+                    parent: NO_PARENT,
+                    depth: 0,
+                    is_dir: false,
+                    name_start: 0,
+                    name_len: 0,
+                    direct_allocated: own.allocated,
+                    direct_apparent: own.apparent,
+                    has_direct_files: false,
+                    total: NodeTotals::from_totals(&own),
+                    markers: Markers::empty(),
+                    newest_mtime: mtime(&st),
+                    shared: 0,
+                    dev: st.st_dev,
+                    ino: st.st_ino,
+                },
+                root.as_os_str().as_bytes(),
+            );
             if linked {
-                shared.add_link(&st, root.clone(), id);
+                // The node's name is the whole path: the link has no file
+                // name of its own.
+                shared.add_link(&PendingLink::new(&st, (0, 0)), id, b"");
             }
             id
         };
@@ -543,7 +650,7 @@ pub fn scan(
         root_nodes.push((root.clone(), st.st_dev, id, reached));
     }
 
-    let mut nodes = shared.nodes.into_inner().unwrap();
+    let (mut nodes, names) = shared.nodes.into_inner().unwrap();
     let mut per_dev: HashMap<u64, Totals> = HashMap::new();
     for (_, _, _, reached) in &root_nodes {
         for (d, t) in reached {
@@ -554,38 +661,101 @@ pub fn scan(
     // node and every ancestor strictly below the lowest common ancestor of
     // all its links, or every ancestor when some link was not scanned.
     let mut shared_delta = vec![0i64; nodes.len()];
+    // Scratch space reused across links.
+    let mut best = PathBuf::new();
+    let mut candidate = PathBuf::new();
+    let mut chain: Vec<NodeId> = Vec::new();
+    let mut in_roots: Vec<NodeId> = Vec::new();
+    // One shard at a time, each freed once it is done.
     for shard in shared.links {
-        for (_, l) in shard.into_inner().unwrap() {
-            let seen = l.locs.len() as u64;
-            let mut t = l.leaf;
-            t.hardlinks_deduped = seen - 1;
-            t.hardlink_bytes_deduped = (seen - 1) * l.leaf.allocated;
-            nodes[l.node as usize].own += t;
-            *per_dev.entry(l.dev).or_default() += t;
-            let mut in_roots: Vec<NodeId> = l.locs.iter().map(|&n| root_of(&nodes, n)).collect();
-            in_roots.sort_unstable();
-            in_roots.dedup();
-            for r in in_roots {
-                if let Some((_, _, _, reached)) = root_nodes.iter_mut().find(|x| x.2 == r) {
-                    *reached.entry(l.dev).or_default() += l.leaf;
+        let LinkShard {
+            map,
+            names: link_names,
+            extra,
+        } = shard.into_inner().unwrap();
+        let link_name =
+            |start: u32, len: u32| &link_names[start as usize..start as usize + len as usize];
+        for ((dev, _), l) in map {
+            let mut seen = 1u64;
+            let mut winner = l.first_node;
+            in_roots.clear();
+            in_roots.push(root_of(&nodes, l.first_node));
+            let mut lca = Some(l.first_node);
+            if l.more_head != NO_MORE {
+                fill_path(
+                    &nodes,
+                    &names,
+                    l.first_node,
+                    link_name(l.first_name_start, l.first_name_len),
+                    &mut best,
+                    &mut chain,
+                );
+                let mut i = l.more_head;
+                while i != NO_MORE {
+                    let e = &extra[i as usize];
+                    seen += 1;
+                    in_roots.push(root_of(&nodes, e.node));
+                    lca = lca.and_then(|a| common_ancestor(&nodes, a, e.node));
+                    fill_path(
+                        &nodes,
+                        &names,
+                        e.node,
+                        link_name(e.name_start, e.name_len),
+                        &mut candidate,
+                        &mut chain,
+                    );
+                    if candidate < best {
+                        std::mem::swap(&mut best, &mut candidate);
+                        winner = e.node;
+                    }
+                    i = e.next;
                 }
             }
-            let b = l.leaf.allocated as i64;
-            shared_delta[l.node as usize] += b;
-            if seen >= l.nlink
-                && let Some(lca) = l
-                    .locs
-                    .iter()
-                    .try_fold(l.node, |a, &b| common_ancestor(&nodes, a, b))
+            let leaf = l.leaf();
+            let mut t = leaf;
+            t.hardlinks_deduped = seen - 1;
+            t.hardlink_bytes_deduped = (seen - 1) * leaf.allocated;
+            let w = &mut nodes[winner as usize];
+            w.total.add(&NodeTotals::from_totals(&t));
+            w.direct_allocated += leaf.allocated;
+            w.direct_apparent += leaf.apparent;
+            *per_dev.entry(dev).or_default() += t;
+            in_roots.sort_unstable();
+            in_roots.dedup();
+            for &r in &in_roots {
+                if let Some((_, _, _, reached)) = root_nodes.iter_mut().find(|x| x.2 == r) {
+                    *reached.entry(dev).or_default() += leaf;
+                }
+            }
+            let b = leaf.allocated as i64;
+            shared_delta[winner as usize] += b;
+            if seen >= u64::from(l.nlink)
+                && let Some(lca) = lca
             {
                 shared_delta[lca as usize] -= b;
             }
         }
     }
+    drop((best, candidate, chain, in_roots));
 
-    // Subtree sums and newest mtimes: children always come after their parent.
-    for n in nodes.iter_mut() {
-        n.total = n.own;
+    // Each node's `total` holds its own entries so far. Sum them exactly
+    // per root (node counts saturate), then into subtree totals: children
+    // always come after their parent.
+    let mut root_totals = vec![Totals::default(); root_nodes.len()];
+    {
+        let mut root_index = vec![0u32; nodes.len()];
+        for i in 0..nodes.len() {
+            let p = nodes[i].parent;
+            root_index[i] = if p == NO_PARENT {
+                root_nodes
+                    .iter()
+                    .position(|r| r.2 as usize == i)
+                    .unwrap_or(0) as u32
+            } else {
+                root_index[p as usize]
+            };
+            root_totals[root_index[i] as usize] += nodes[i].total.totals();
+        }
     }
     for i in (0..nodes.len()).rev() {
         nodes[i].shared = shared_delta[i] as u64;
@@ -594,11 +764,12 @@ pub fn scan(
             let (t, m) = (nodes[i].total, nodes[i].newest_mtime);
             shared_delta[p as usize] += shared_delta[i];
             let parent = &mut nodes[p as usize];
-            parent.total += t;
+            parent.total.add(&t);
             parent.newest_mtime = parent.newest_mtime.max(m);
         }
     }
-    let tree = ScanTree::new(nodes, root_nodes.iter().map(|r| r.2).collect());
+    drop(shared_delta);
+    let tree = ScanTree::new(nodes, names, root_nodes.iter().map(|r| r.2).collect());
 
     let mut dirs: Vec<DirRecord> = tree
         .ids()
@@ -609,7 +780,7 @@ pub fn scan(
         .map(|i| DirRecord {
             path: tree.path(i),
             depth: tree.node(i).depth,
-            totals: tree.node(i).total,
+            totals: tree.node(i).total.totals(),
         })
         .collect();
     dirs.sort_by(|a, b| {
@@ -632,10 +803,11 @@ pub fn scan(
         min_dir_bytes: opts.min_dir_bytes,
         roots: root_nodes
             .into_iter()
-            .map(|(path, dev, id, reached)| RootResult {
+            .zip(root_totals)
+            .map(|((path, dev, _, reached), totals)| RootResult {
                 path,
                 dev,
-                totals: tree.node(id).total,
+                totals,
                 per_dev: reached,
             })
             .collect(),
@@ -658,6 +830,34 @@ fn root_of(nodes: &[TreeNode], mut n: NodeId) -> NodeId {
         n = nodes[n as usize].parent;
     }
     n
+}
+
+/// Writes the path of entry `file` in directory `node` into `buf` (just the
+/// node's path when `file` is empty), as [`ScanTree::path`] plus a join
+/// would build it. `chain` is scratch space.
+fn fill_path(
+    nodes: &[TreeNode],
+    names: &[u8],
+    mut node: NodeId,
+    file: &[u8],
+    buf: &mut PathBuf,
+    chain: &mut Vec<NodeId>,
+) {
+    buf.as_mut_os_string().clear();
+    chain.clear();
+    loop {
+        chain.push(node);
+        match nodes[node as usize].parent {
+            NO_PARENT => break,
+            p => node = p,
+        }
+    }
+    for &n in chain.iter().rev() {
+        buf.push(tree::name_in(names, &nodes[n as usize]));
+    }
+    if !file.is_empty() {
+        buf.push(OsStr::from_bytes(file));
+    }
 }
 
 /// The lowest node that is `a` or an ancestor of it and `b` or an ancestor of
@@ -694,14 +894,7 @@ thread_local! {
 }
 
 /// Walks one directory and, in parallel, its subdirectories. Returns its node id.
-fn walk_dir(
-    sh: &Shared<'_>,
-    path: PathBuf,
-    st: &Stat,
-    depth: u32,
-    parent: u32,
-    name: Box<OsStr>,
-) -> u32 {
+fn walk_dir(sh: &Shared<'_>, path: PathBuf, st: &Stat, depth: u32, parent: u32) -> u32 {
     let dev = st.st_dev;
     let directory_allocated = bytes(st);
     // Like GNU du (coreutils >= 9.2), a directory's st_size is not counted as
@@ -716,7 +909,9 @@ fn walk_dir(
     // Files bind-mounted from another filesystem (only when crossing).
     let mut foreign = Totals::default();
     let mut subdirs: Vec<(PathBuf, Stat)> = Vec::new();
-    let mut linked: Vec<(PathBuf, Stat)> = Vec::new();
+    // Hardlinked entries, and their names back to back.
+    let mut linked: Vec<PendingLink> = Vec::new();
+    let mut linked_names: Vec<u8> = Vec::new();
     match open_dir(&path) {
         Err(e) => {
             if is_perm(e) {
@@ -799,7 +994,8 @@ fn walk_dir(
                             foreign += t;
                         }
                     } else if cst.st_nlink > 1 {
-                        linked.push((path.join(OsStr::from_bytes(nb)), cst));
+                        let name = tree::push_name(&mut linked_names, nb);
+                        linked.push(PendingLink::new(&cst, name));
                     } else {
                         own += leaf_totals(&cst);
                     }
@@ -825,28 +1021,37 @@ fn walk_dir(
         .allocated
         .fetch_add(own.allocated, Ordering::Relaxed);
 
-    let id = sh.push_node(TreeNode {
-        parent,
-        depth,
-        is_dir: true,
-        name,
-        own,
-        directory_allocated,
-        has_direct_files,
-        total: Totals::default(),
-        markers,
-        newest_mtime,
-        shared: 0,
-        dev,
-        ino: st.st_ino,
-    });
-    for (p, m) in linked {
-        sh.add_link(&m, p, id);
+    // A root's name is its whole path; anything else, its last component.
+    let name = match parent {
+        NO_PARENT => path.as_os_str(),
+        _ => path.file_name().unwrap_or(path.as_os_str()),
+    };
+    let id = sh.push_node(
+        TreeNode {
+            parent,
+            depth,
+            is_dir: true,
+            name_start: 0,
+            name_len: 0,
+            direct_allocated: own.allocated - directory_allocated,
+            direct_apparent: own.apparent,
+            has_direct_files,
+            total: NodeTotals::from_totals(&own),
+            markers,
+            newest_mtime,
+            shared: 0,
+            dev,
+            ino: st.st_ino,
+        },
+        name.as_bytes(),
+    );
+    for l in &linked {
+        let start = l.name_start as usize;
+        sh.add_link(l, id, &linked_names[start..start + l.name_len as usize]);
     }
-    drop(path);
+    drop((linked, linked_names, path));
     subdirs.into_par_iter().for_each(|(p, m)| {
-        let name: Box<OsStr> = p.file_name().unwrap_or(p.as_os_str()).into();
-        walk_dir(sh, p, &m, depth + 1, id, name);
+        walk_dir(sh, p, &m, depth + 1, id);
     });
     id
 }

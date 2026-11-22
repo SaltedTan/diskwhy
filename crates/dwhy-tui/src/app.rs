@@ -941,9 +941,7 @@ impl Browser {
     pub fn total(&self, mode: SizeMode) -> u64 {
         let rows: u64 = self.rows.iter().map(|r| r.size).sum();
         match (self.place, mode) {
-            (Place::Dir(id), SizeMode::Allocated) => {
-                rows + self.data.tree.node(id).directory_allocated
-            }
+            (Place::Dir(id), SizeMode::Allocated) => rows + self.data.tree.directory_allocated(id),
             _ => rows,
         }
     }
@@ -1129,7 +1127,7 @@ fn unmodified_action(key: KeyEvent) -> bool {
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
-fn size(t: &dwhy_core::report::Totals, mode: SizeMode) -> u64 {
+fn size(t: &dwhy_core::tree::NodeTotals, mode: SizeMode) -> u64 {
     match mode {
         SizeMode::Allocated => t.allocated,
         SizeMode::Apparent => t.apparent,
@@ -1153,8 +1151,8 @@ fn rows(data: &Scanned, place: Place, mode: SizeMode) -> Vec<Row> {
                 v.push(Row {
                     kind: RowKind::Files,
                     size: match mode {
-                        SizeMode::Allocated => node.own.allocated - node.directory_allocated,
-                        SizeMode::Apparent => node.own.apparent,
+                        SizeMode::Allocated => node.direct_allocated,
+                        SizeMode::Apparent => node.direct_apparent,
                     },
                     mark: None,
                 });
