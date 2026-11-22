@@ -240,6 +240,12 @@ pub enum SkipReason {
     Virtual,
     /// A bind mount of the same filesystem; never entered, to avoid double counting.
     BindMount,
+    /// A btrfs subvolume, not mounted on its own, that is a snapshot or
+    /// read-only; never entered, even when crossing filesystems. A snapshot
+    /// shares its extents with its source, so walking both would count
+    /// them twice, and nothing in a read-only subvolume can be removed. A
+    /// scan root inside one is still scanned.
+    BtrfsSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -588,6 +594,15 @@ pub struct PlanItem {
     /// The finding as detected, with its guard results.
     pub finding: Finding,
     pub fingerprint: Fingerprint,
+    /// `st_dev` of the scan root whose walk measured the finding, present
+    /// only when it differs from `fingerprint.dev`: the finding lies in a
+    /// btrfs subvolume, not mounted on its own, below that root (or, when
+    /// crossing filesystems, on another filesystem). Lets
+    /// [`crate::plan::distinct_bytes_in_plan`] count a finding inside
+    /// another finding's subvolume once, as the walk did, from the plan
+    /// alone. Absent in plans written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_root_dev: Option<u64>,
 }
 
 /// What must not have changed between `plan` and `apply`.

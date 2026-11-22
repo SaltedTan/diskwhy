@@ -1762,6 +1762,7 @@ fn skipped_docker_items_make_no_docker_api_reads() {
                 git: None,
                 docker_id: Some(format!("{}@1", f.path)),
             },
+            scan_root_dev: None,
         });
     }
     found.push(unconfirmed.clone());

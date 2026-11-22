@@ -82,6 +82,7 @@ df -B1 --output=used /     # vs fs[0].used; fs[0].unaccounted should equal used 
 ```
 
 Expect differences of a few hundred KiB from files changing between runs. A bigger gap is a bug.
+On btrfs, `-x` also enters unmounted writable nested subvolumes (skipping snapshot and read-only ones), whereas `du -x` stops at every `st_dev` change, so `dwhy` counts more there.
 
 ## Workflow
 

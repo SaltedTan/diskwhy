@@ -458,6 +458,7 @@ fn combined_diagnostics_leave_the_directory_name_visible_at_80x24() {
         permission: Some(PermissionMark::EntriesDenied(2)),
         read_error: true,
         skipped_mounts: 2,
+        skipped_snapshots: 0,
     };
     for name in ["vendor", long] {
         let id = data.tree.find(&root.join(name)).unwrap();
@@ -2063,10 +2064,12 @@ fn hand_plan() -> Plan {
             PlanItem {
                 finding: cargo,
                 fingerprint: fingerprint(),
+                scan_root_dev: None,
             },
             PlanItem {
                 finding: trash,
                 fingerprint: fingerprint(),
+                scan_root_dev: None,
             },
         ],
         blocked: vec![blocked],
@@ -3309,6 +3312,7 @@ fn mounted_child_plan() -> Plan {
         .map(|finding| PlanItem {
             finding,
             fingerprint: fingerprint(),
+            scan_root_dev: None,
         })
         .collect();
     plan.blocked.clear();
@@ -3484,6 +3488,7 @@ fn confirm_dialog_never_splits_a_neighbors_withheld_notice() {
     plan.items.push(PlanItem {
         finding: venv,
         fingerprint: fingerprint(),
+        scan_root_dev: None,
     });
     let mut app = App::open_plan(plan, "/tmp/plans/dwhy-plan.json".into(), HOST, UID);
     app.clock = || PLAN_AT + 60;

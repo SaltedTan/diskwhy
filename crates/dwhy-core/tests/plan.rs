@@ -991,3 +991,134 @@ fn listing(p: &Path) -> Vec<(String, u64, i64)> {
     out.sort();
     out
 }
+
+/// A plan item at `path` holding `bytes`, measured on device `dev`, with
+/// the device of the scan root that measured it when that differs.
+fn item_on(p: &Plan, path: &str, bytes: u64, dev: u64, scan_root_dev: Option<u64>) -> PlanItem {
+    let mut i = p.items[0].clone();
+    i.finding.path = path.into();
+    i.finding.bytes = bytes;
+    i.fingerprint.dev = Some(dev);
+    i.scan_root_dev = scan_root_dev;
+    i
+}
+
+/// A hand-made plan of a one-filesystem scan of `roots`, with no items.
+fn plan_of(roots: &[&str]) -> Plan {
+    let (_t, b) = base();
+    let (mut p, _, _) = plan_with_mounted_child(&b);
+    p.scan.roots = roots.iter().map(|r| r.to_string()).collect();
+    p.scan.one_filesystem = true;
+    p
+}
+
+#[test]
+fn plan_bytes_without_a_tree_nest_items_in_btrfs_subvolumes_the_walk_entered() {
+    // A -x scan of /mnt/b (device 28) walked into unmounted btrfs
+    // subvolumes: sub (31) and, inside it, deeper (32).
+    let p = plan_of(&["/mnt/b"]);
+    let outer = item_on(&p, "/mnt/b/x", 1000, 28, None);
+    let sub = item_on(&p, "/mnt/b/x/sub", 300, 31, Some(28));
+    let deeper = item_on(&p, "/mnt/b/x/sub/deeper", 50, 32, Some(28));
+    let bytes = |items: &[&PlanItem]| plan::distinct_bytes_in_plan(&p, items.iter().copied());
+    assert_eq!(bytes(&[&outer, &sub]), 1000, "sub is inside outer");
+    assert_eq!(bytes(&[&sub, &deeper]), 300, "deeper is inside sub");
+    assert_eq!(bytes(&[&outer, &sub, &deeper]), 1000);
+    // Siblings still add up.
+    let other = item_on(&p, "/mnt/b/y", 20, 31, Some(28));
+    assert_eq!(bytes(&[&outer, &sub, &other]), 1020);
+
+    // A plan written before scan_root_dev existed falls back to the
+    // fingerprints' devices, which differ.
+    let mut old_sub = sub.clone();
+    old_sub.scan_root_dev = None;
+    assert_eq!(bytes(&[&outer, &old_sub]), 1300);
+}
+
+#[test]
+fn plan_bytes_without_a_tree_count_a_separately_mounted_child_on_its_own() {
+    // /mnt/b/mounted is mounted on its own (device 32), so the walk of
+    // /mnt/b stopped there; scanned as its own root or not at all, it
+    // records no scan root device of /mnt/b.
+    for roots in [&["/mnt/b", "/mnt/b/mounted"][..], &["/mnt/b"][..]] {
+        let p = plan_of(roots);
+        let outer = item_on(&p, "/mnt/b", 1000, 28, None);
+        let child = item_on(&p, "/mnt/b/mounted", 300, 32, None);
+        let inside_child = item_on(&p, "/mnt/b/mounted/x", 30, 32, None);
+        assert_eq!(
+            plan::distinct_bytes_in_plan(&p, [&outer, &child, &inside_child]),
+            1300,
+            "{roots:?}"
+        );
+    }
+}
+
+#[test]
+fn scan_root_dev_is_optional_in_plan_files() {
+    let (_t, b) = base();
+    let (mut p, outer, child) = plan_with_mounted_child(&b);
+    assert!(p.items.iter().all(|i| i.scan_root_dev.is_none()));
+    let text = plan::to_json(&p).unwrap();
+    assert!(!text.contains("scan_root_dev"), "omitted when absent");
+    item_at(&mut p, &child).scan_root_dev = Some(7);
+    let text = plan::to_json(&p).unwrap();
+    assert!(text.contains("\"scan_root_dev\": 7"), "{text}");
+    let back = plan::parse(&text).unwrap();
+    assert_eq!(back, p);
+    let outer = outer.to_string_lossy();
+    let read = back.items.iter().find(|i| i.finding.path == outer).unwrap();
+    assert_eq!(read.scan_root_dev, None);
+}
+
+#[test]
+fn plan_records_the_scan_root_device_of_an_item_on_another_device() {
+    use std::os::unix::fs::MetadataExt;
+    // A walk that crosses from /dev into a filesystem mounted below it
+    // stands in for a -x walk entering a btrfs subvolume: either way the
+    // tree holds a node on another device below the root.
+    let Some(mounted) = MountTable::read()
+        .unwrap()
+        .mounts
+        .iter()
+        .filter(|m| m.mount_point.parent() == Some(Path::new("/dev")) && !m.is_virtual())
+        .map(|m| m.mount_point.clone())
+        .find(|m| fs::read_dir(m).is_ok())
+    else {
+        eprintln!("skipped: no readable disk mount directly below /dev here");
+        return;
+    };
+    let root = Path::new("/dev");
+    let opts = ScanOptions {
+        one_filesystem: false,
+        min_dir_bytes: 0,
+        threads: 2,
+        ..ScanOptions::default()
+    };
+    let tree = scan::scan(
+        &[root.to_path_buf()],
+        &opts,
+        &MountTable::read().unwrap(),
+        &Progress::default(),
+    )
+    .unwrap()
+    .tree;
+    let found = vec![
+        finding("user-cache", root, 1000, Tier::Regenerable),
+        finding("user-cache", &mounted, 10, Tier::Regenerable),
+    ];
+    let mut p = build_from(&tree, root, found, &Selection::default());
+    assert_eq!(p.items.len(), 2, "{:?}", p.blocked);
+    assert_eq!(p.bytes, 1000, "the mount was walked from /dev");
+    let root_dev = fs::symlink_metadata(root).unwrap().dev();
+    assert_eq!(
+        item_at(&mut p, root).scan_root_dev,
+        None,
+        "on the root's device"
+    );
+    let inner = item_at(&mut p, &mounted);
+    assert_ne!(inner.fingerprint.dev, Some(root_dev));
+    assert_eq!(inner.scan_root_dev, Some(root_dev));
+    // Read back as a -x plan, the items still nest as the walk saw them.
+    p.scan.one_filesystem = true;
+    assert_eq!(plan::distinct_bytes_in_plan(&p, &p.items), p.bytes);
+}

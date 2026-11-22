@@ -203,9 +203,11 @@ pub fn build(
             add_changed_guard(&mut f.guards, detail);
             f.tier = Tier::Blocked;
         } else if let Some(fingerprint) = fingerprint {
+            let scan_root_dev = scan_root_dev(tree, &f.path, fingerprint.dev);
             items.push(PlanItem {
                 finding: f,
                 fingerprint,
+                scan_root_dev,
             });
             continue;
         }
@@ -294,14 +296,33 @@ pub fn distinct_bytes_in_tree<'a>(
         .sum()
 }
 
+/// The device of the root of `tree` whose walk holds `path` (the node at
+/// it, or at its nearest ancestor in the tree), when that differs from
+/// `dev`, the device recorded for the finding: [`PlanItem::scan_root_dev`].
+fn scan_root_dev(tree: &ScanTree, path: &str, dev: Option<u64>) -> Option<u64> {
+    let dev = dev?;
+    let p = Path::new(path);
+    if !p.is_absolute() {
+        return None;
+    }
+    let mut id = p.ancestors().find_map(|a| tree.find(a))?;
+    while let Some(parent) = tree.parent(id) {
+        id = parent;
+    }
+    Some(tree.node(id).dev).filter(|&root| root != dev)
+}
+
 /// [`distinct_bytes`] for items of `plan`, without the scan's tree (as for
 /// a plan read from a file): an item is left out only when it also lies
 /// inside another item of the same scan. Each path belongs to the deepest
 /// of `plan.scan.roots` above it, and items under different roots do not
 /// nest: a root mounted below another root was scanned on its own, so its
-/// bytes are not in the outer root's. In a one-filesystem scan, items whose
-/// fingerprints record different devices do not nest either. Paths no root
-/// covers nest by path, and pseudo-paths (`docker://…`) never nest, as in
+/// bytes are not in the outer root's. In a one-filesystem scan, items on
+/// different devices do not nest either. An item's device is that of the
+/// root whose walk measured it ([`PlanItem::scan_root_dev`]) when the plan
+/// records one, so items in btrfs subvolumes that walk entered nest in it;
+/// else the device its fingerprint records. Paths no root covers nest by
+/// path, and pseudo-paths (`docker://…`) never nest, as in
 /// [`distinct_bytes`]. Agrees with [`distinct_bytes_in_tree`], which
 /// `plan.bytes` comes from.
 pub fn distinct_bytes_in_plan<'a>(
@@ -320,7 +341,8 @@ pub fn distinct_bytes_in_plan<'a>(
         .into_iter()
         .map(|i| {
             let p = Path::new(&i.finding.path);
-            (p, i.finding.bytes, owner(p), i.fingerprint.dev)
+            let dev = i.scan_root_dev.or(i.fingerprint.dev);
+            (p, i.finding.bytes, owner(p), dev)
         })
         .collect();
     let same_scan = |(p_root, p_dev): (Option<&Path>, Option<u64>),
@@ -793,6 +815,7 @@ mod tests {
                 git: None,
                 docker_id: None,
             },
+            scan_root_dev: None,
         };
         item.finding.id = "f_dup\n\u{1b}[31mred\\".into();
         let plan = Plan {

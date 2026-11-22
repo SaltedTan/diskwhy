@@ -321,6 +321,7 @@ fn plan_sample() -> Plan {
                     git: None,
                     docker_id: None,
                 },
+                scan_root_dev: None,
             },
             PlanItem {
                 finding: plan_finding(
@@ -342,6 +343,7 @@ fn plan_sample() -> Plan {
                     git: None,
                     docker_id: Some("sha256:5bcecbbe34b6".into()),
                 },
+                scan_root_dev: None,
             },
         ],
         blocked: vec![plan_finding(
