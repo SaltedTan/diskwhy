@@ -70,6 +70,187 @@ pub struct ScanReport {
     /// The snapshot `--snapshot` saved; absent without `--snapshot`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<SavedSnapshot>,
+    /// Aggregate finding counts and reclaimable bytes across all detected
+    /// findings, before any tier filter or cap; populated by `--summary`
+    /// ([`ScanReport::summarize`]), absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings_summary: Option<FindingsSummary>,
+}
+
+/// Default cap on `scan.dirs` under `--summary`.
+pub const DEFAULT_SUMMARY_DIRS: usize = 25;
+/// Default cap on `findings` under `--summary` (`--max-findings` overrides it).
+pub const DEFAULT_SUMMARY_FINDINGS: usize = 20;
+/// Default deepest `scan.dirs` level kept under `--summary` (`--depth` overrides it).
+pub const DEFAULT_SUMMARY_DEPTH: u32 = 3;
+
+/// Finding counts and bytes over every finding a scan reported, so a capped
+/// or tier-filtered `findings` list still says what the whole scan found.
+///
+/// Bytes are each finding's own bytes: `bytes` less `nested_bytes`, so a
+/// byte held by a finding nested in another is counted once.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingsSummary {
+    /// Findings the scan reported, before any tier filter or cap.
+    pub total: u64,
+    /// Findings left out of `findings` (by the tier filter or the cap).
+    pub omitted: u64,
+    /// What the findings' actions can free: findings that are neither
+    /// blocked nor advice-only.
+    pub reclaimable_bytes: u64,
+    pub by_tier: TierBreakdown,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierBreakdown {
+    pub regenerable: TierSummary,
+    pub rebuildable: TierSummary,
+    pub review: TierSummary,
+    pub blocked: TierSummary,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierSummary {
+    pub count: u64,
+    /// Own bytes of every finding in the tier.
+    pub bytes: u64,
+    /// Own bytes of the tier's findings that are not advice-only (always 0
+    /// for `blocked`).
+    pub reclaimable_bytes: u64,
+    /// Advice-only findings in the tier (e.g. an in-use volume), which are
+    /// not counted in `reclaimable_bytes`. Absent when 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub advice_count: u64,
+}
+
+/// Caps applied by [`ScanReport::summarize`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SummaryLimits {
+    /// Most findings kept in `findings`.
+    pub max_findings: usize,
+    /// Most directories kept in `scan.dirs`, roots included.
+    pub max_dirs: usize,
+    /// Deepest directory level kept in `scan.dirs` (roots are 0).
+    pub max_depth: u32,
+}
+
+impl Default for SummaryLimits {
+    fn default() -> Self {
+        SummaryLimits {
+            max_findings: DEFAULT_SUMMARY_FINDINGS,
+            max_dirs: DEFAULT_SUMMARY_DIRS,
+            max_depth: DEFAULT_SUMMARY_DEPTH,
+        }
+    }
+}
+
+impl TierBreakdown {
+    pub fn get(&self, tier: Tier) -> &TierSummary {
+        match tier {
+            Tier::Regenerable => &self.regenerable,
+            Tier::Rebuildable => &self.rebuildable,
+            Tier::Review => &self.review,
+            Tier::Blocked => &self.blocked,
+        }
+    }
+
+    fn get_mut(&mut self, tier: Tier) -> &mut TierSummary {
+        match tier {
+            Tier::Regenerable => &mut self.regenerable,
+            Tier::Rebuildable => &mut self.rebuildable,
+            Tier::Review => &mut self.review,
+            Tier::Blocked => &mut self.blocked,
+        }
+    }
+}
+
+impl Finding {
+    /// `bytes` less those held by findings inside it, which are counted on
+    /// their own.
+    pub fn own_bytes(&self) -> u64 {
+        self.bytes.saturating_sub(self.nested_bytes.unwrap_or(0))
+    }
+
+    /// True when acting on the finding frees its bytes: it is not blocked
+    /// and its action is not advice-only.
+    pub fn is_reclaimable(&self) -> bool {
+        self.tier != Tier::Blocked && self.action.kind != ActionKind::Advice
+    }
+
+    /// True for an advice-only finding that is not blocked.
+    pub fn is_advice(&self) -> bool {
+        self.tier != Tier::Blocked && self.action.kind == ActionKind::Advice
+    }
+}
+
+impl FindingsSummary {
+    /// Counts and bytes over `findings`; `omitted` is 0.
+    pub fn from_findings(findings: &[Finding]) -> Self {
+        let mut s = FindingsSummary {
+            total: findings.len() as u64,
+            ..Default::default()
+        };
+        for f in findings {
+            let own = f.own_bytes();
+            let t = s.by_tier.get_mut(f.tier);
+            t.count += 1;
+            t.bytes += own;
+            if f.is_reclaimable() {
+                t.reclaimable_bytes += own;
+                s.reclaimable_bytes += own;
+            }
+            if f.is_advice() {
+                t.advice_count += 1;
+            }
+        }
+        s
+    }
+}
+
+impl ScanReport {
+    /// Keeps only findings in `tiers`.
+    pub fn filter_tiers(&mut self, tiers: &[Tier]) {
+        self.findings.retain(|f| tiers.contains(&f.tier));
+    }
+
+    /// Compacts the report for agents (`scan --summary`): records a
+    /// [`FindingsSummary`] over every finding, then keeps only findings in
+    /// `tiers` (all when `None`), at most `limits.max_findings` of them,
+    /// largest first. `scan.dirs` keeps the roots, then the largest
+    /// directories at most `limits.max_depth` deep, `limits.max_dirs` in
+    /// all, and `scan.dirs_omitted` says how many were dropped.
+    ///
+    /// A directory is at least as large as any directory below it and sorts
+    /// before it on ties, so every kept directory's parent is kept too.
+    pub fn summarize(&mut self, tiers: Option<&[Tier]>, limits: SummaryLimits) {
+        let mut summary = FindingsSummary::from_findings(&self.findings);
+        if let Some(tiers) = tiers {
+            self.filter_tiers(tiers);
+        }
+        self.findings.truncate(limits.max_findings);
+        summary.omitted = summary.total.saturating_sub(self.findings.len() as u64);
+        self.findings_summary = Some(summary);
+
+        let dirs = std::mem::take(&mut self.scan.dirs);
+        let orig_len = dirs.len();
+        let (roots, rest): (Vec<DirEntry>, Vec<DirEntry>) =
+            dirs.into_iter().partition(|d| d.depth == 0);
+        let mut kept: Vec<DirEntry> = roots.into_iter().take(limits.max_dirs).collect();
+        let room = limits.max_dirs - kept.len();
+        kept.extend(
+            rest.into_iter()
+                .filter(|d| d.depth <= limits.max_depth)
+                .take(room),
+        );
+        // Largest first, as `scan.dirs` always is.
+        kept.sort_by(|a, b| {
+            b.allocated
+                .cmp(&a.allocated)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        self.scan.dirs_omitted = Some((orig_len - kept.len()) as u64);
+        self.scan.dirs = kept;
+    }
 }
 
 /// Where `scan --snapshot` saved its snapshot.
@@ -139,6 +320,10 @@ pub struct ScanSummary {
     /// Errors other than permission problems (e.g. I/O errors), capped.
     pub errors: Vec<ScanErrorEntry>,
     pub error_count: u64,
+    /// Directories at least `min_dir_bytes` left out of `dirs` by
+    /// `--summary`; absent without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirs_omitted: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1148,4 +1333,207 @@ pub enum DetectorAvailability {
     Unavailable,
     /// Listed in the design but not built yet.
     NotImplemented,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finding(
+        path: &str,
+        bytes: u64,
+        nested: Option<u64>,
+        tier: Tier,
+        kind: ActionKind,
+    ) -> Finding {
+        Finding {
+            file_identity: None,
+            id: format!("f_{path}"),
+            detector: "test".into(),
+            probe: None,
+            evidence: None,
+            path: path.into(),
+            bytes,
+            nested_bytes: nested,
+            last_modified: None,
+            growth: None,
+            tier,
+            reason: String::new(),
+            guards: vec![],
+            action: Action {
+                kind,
+                text: String::new(),
+                argv: None,
+            },
+            recovery: Recovery {
+                cost: String::new(),
+                how: None,
+            },
+        }
+    }
+
+    fn dir(path: &str, depth: u32, allocated: u64) -> DirEntry {
+        DirEntry {
+            path: path.into(),
+            depth,
+            allocated,
+            apparent: allocated,
+            files: 0,
+        }
+    }
+
+    fn report(findings: Vec<Finding>, dirs: Vec<DirEntry>) -> ScanReport {
+        ScanReport {
+            schema: SCHEMA.into(),
+            tool: Tool::current(),
+            host: "h".into(),
+            uid: 1000,
+            root: false,
+            generated_at: String::new(),
+            scan: ScanSummary {
+                roots: vec![],
+                one_filesystem: true,
+                elapsed_ms: 0,
+                totals: Totals::default(),
+                dirs,
+                min_dir_bytes: 0,
+                unreadable: Unreadable::default(),
+                skipped_mounts: vec![],
+                errors: vec![],
+                error_count: 0,
+                dirs_omitted: None,
+            },
+            fs: vec![],
+            findings,
+            detectors: vec![],
+            docker: None,
+            snapshot: None,
+            findings_summary: None,
+        }
+    }
+
+    #[test]
+    fn nested_bytes_are_counted_once() {
+        let s = FindingsSummary::from_findings(&[
+            finding("/a", 100, Some(30), Tier::Rebuildable, ActionKind::Command),
+            finding("/a/b", 30, None, Tier::Regenerable, ActionKind::RemovePath),
+        ]);
+        assert_eq!(s.total, 2);
+        assert_eq!(s.reclaimable_bytes, 100);
+        assert_eq!(s.by_tier.rebuildable.bytes, 70);
+        assert_eq!(s.by_tier.regenerable.bytes, 30);
+    }
+
+    #[test]
+    fn advice_only_findings_are_counted_but_not_reclaimable() {
+        let s = FindingsSummary::from_findings(&[
+            finding("/v", 500, None, Tier::Review, ActionKind::Advice),
+            finding("/w", 50, None, Tier::Review, ActionKind::RemovePath),
+        ]);
+        let review = &s.by_tier.review;
+        assert_eq!(review.count, 2);
+        assert_eq!(review.bytes, 550);
+        assert_eq!(review.reclaimable_bytes, 50);
+        assert_eq!(review.advice_count, 1);
+        assert_eq!(s.reclaimable_bytes, 50);
+    }
+
+    #[test]
+    fn blocked_findings_have_bytes_but_nothing_reclaimable() {
+        let s = FindingsSummary::from_findings(&[
+            finding("/t", 70, None, Tier::Blocked, ActionKind::RemovePath),
+            finding("/u", 30, None, Tier::Blocked, ActionKind::Advice),
+        ]);
+        let blocked = &s.by_tier.blocked;
+        assert_eq!(blocked.count, 2);
+        assert_eq!(blocked.bytes, 100);
+        assert_eq!(blocked.reclaimable_bytes, 0);
+        // A blocked advice finding counts as blocked, not as advice.
+        assert_eq!(blocked.advice_count, 0);
+        assert_eq!(s.reclaimable_bytes, 0);
+    }
+
+    #[test]
+    fn summarize_caps_dirs_by_depth_and_count_keeping_roots() {
+        let dirs = vec![
+            dir("/r", 0, 1000),
+            dir("/r/a", 1, 600),
+            dir("/r/a/b", 2, 500),
+            dir("/r/a/b/c", 3, 450),
+            dir("/s", 0, 400),
+            dir("/r/x", 1, 300),
+            dir("/r/y", 1, 200),
+        ];
+        let mut r = report(vec![], dirs.clone());
+        r.summarize(
+            None,
+            SummaryLimits {
+                max_findings: 10,
+                max_dirs: 4,
+                max_depth: 2,
+            },
+        );
+        let kept: Vec<&str> = r.scan.dirs.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(kept, ["/r", "/r/a", "/r/a/b", "/s"]);
+        assert_eq!(r.scan.dirs_omitted, Some(3));
+
+        // Roots win over larger deeper directories.
+        let mut r = report(vec![], dirs);
+        r.summarize(
+            None,
+            SummaryLimits {
+                max_findings: 10,
+                max_dirs: 2,
+                max_depth: 5,
+            },
+        );
+        let kept: Vec<&str> = r.scan.dirs.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(kept, ["/r", "/s"]);
+        assert_eq!(r.scan.dirs_omitted, Some(5));
+    }
+
+    #[test]
+    fn summarize_counts_every_finding_before_the_tier_filter_and_cap() {
+        let mut r = report(
+            vec![
+                finding("/a", 400, None, Tier::Review, ActionKind::RemovePath),
+                finding("/b", 300, None, Tier::Rebuildable, ActionKind::Command),
+                finding("/c", 200, None, Tier::Rebuildable, ActionKind::Command),
+                finding("/d", 100, None, Tier::Regenerable, ActionKind::RemovePath),
+            ],
+            vec![],
+        );
+        r.summarize(
+            Some(&[Tier::Rebuildable, Tier::Regenerable]),
+            SummaryLimits {
+                max_findings: 2,
+                max_dirs: 10,
+                max_depth: 3,
+            },
+        );
+        let kept: Vec<&str> = r.findings.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(kept, ["/b", "/c"]);
+        let s = r.findings_summary.as_ref().unwrap();
+        assert_eq!(s.total, 4);
+        assert_eq!(s.omitted, 2);
+        assert_eq!(s.reclaimable_bytes, 1000);
+        assert_eq!(s.by_tier.review.count, 1);
+        assert_eq!(r.scan.dirs_omitted, Some(0));
+    }
+
+    #[test]
+    fn filter_tiers_keeps_only_those_tiers() {
+        let mut r = report(
+            vec![
+                finding("/a", 3, None, Tier::Review, ActionKind::RemovePath),
+                finding("/b", 2, None, Tier::Blocked, ActionKind::RemovePath),
+                finding("/c", 1, None, Tier::Review, ActionKind::RemovePath),
+            ],
+            vec![],
+        );
+        r.filter_tiers(&[Tier::Review]);
+        let kept: Vec<&str> = r.findings.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(kept, ["/a", "/c"]);
+        assert!(r.findings_summary.is_none());
+    }
 }

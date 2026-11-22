@@ -193,18 +193,33 @@ pub(crate) mod tests {
 
     /// A script that writes its PID to `pid_file`, then sleeps 30 s.
     pub(crate) fn sleeper(dir: &Path, pid_file: &Path) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let script = dir.join("sleeper");
-        std::fs::write(
+        write_script(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\necho $$ > '{}.tmp'\nmv '{0}.tmp' '{0}'\nexec sleep 30\n",
                 pid_file.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         script
+    }
+
+    /// Writes an executable script at `path`.
+    ///
+    /// A child `sh` writes it, so this process never holds the file open for
+    /// writing. Otherwise a child forked by another test thread could inherit
+    /// that descriptor until its own exec, and running the script would fail
+    /// with ETXTBSY ("Text file busy").
+    pub(crate) fn write_script(path: &Path, body: &str) {
+        use std::io::Write;
+        let mut sh = Command::new("sh")
+            .args(["-c", "cat > \"$1\" && chmod 700 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        sh.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
+        assert!(sh.wait().unwrap().success());
     }
 
     pub(crate) fn read_pid(pid_file: &Path) -> Option<u32> {
@@ -238,16 +253,13 @@ pub(crate) mod tests {
 
     #[test]
     fn a_cancelled_token_starts_nothing() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("ran");
         let script = dir.path().join("touch");
-        std::fs::write(
+        write_script(
             &script,
-            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        );
         let cancel = Cancel::default();
         cancel.cancel();
         let result = output(&mut Command::new(&script), &cancel, None, u64::MAX);

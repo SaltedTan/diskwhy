@@ -3544,3 +3544,397 @@ fn text_reports_escape_control_characters_in_paths() {
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert_eq!(json_of(&out)["roots"][0], root.as_str());
 }
+
+// ---------------------------------------------------------------------------
+// Agent-friendly scan output: --summary, --tier, quiet progress under --json.
+// ---------------------------------------------------------------------------
+
+/// `n` crates `cNN`, each with a cargo target of just over 1 MiB
+/// (`cNN/target/debug/out`, larger for higher `NN`): `n` rebuildable
+/// cargo-target findings and `3n + 1` directories across depths 0 to 3.
+fn many_targets_fixture(n: usize) -> (tempfile::TempDir, String) {
+    let t = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    for i in 0..n {
+        let c = root.join(format!("c{i:02}"));
+        fs::create_dir_all(c.join("target/debug")).unwrap();
+        fs::write(c.join("Cargo.toml"), "[package]\n").unwrap();
+        fs::write(c.join("target/CACHEDIR.TAG"), CARGO_TAG).unwrap();
+        fs::write(c.join("target/debug/out"), vec![1u8; (1 << 20) + i * 8192]).unwrap();
+    }
+    let root = root.to_str().unwrap().to_string();
+    (t, root)
+}
+
+#[test]
+fn scan_json_without_summary_has_no_summary_fields() {
+    let (_t, root) = cargo_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let out = dwhy_offline(
+        state.path(),
+        &["scan", &root, "--json", "--detectors", "cargo-target"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v.get("findings_summary"), None, "{v}");
+    assert_eq!(v["scan"].get("dirs_omitted"), None, "{v}");
+}
+
+#[test]
+fn scan_summary_caps_dirs_and_findings_and_counts_everything() {
+    let (_t, root) = many_targets_fixture(25);
+    let state = tempfile::tempdir().unwrap();
+    let scan = |extra: &[&str]| {
+        let mut args = vec![
+            "scan",
+            &root,
+            "--json",
+            "--min-size",
+            "0",
+            "--detectors",
+            "cargo-target",
+        ];
+        args.extend(extra);
+        let out = dwhy_offline(state.path(), &args);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        json_of(&out)
+    };
+
+    let full = scan(&[]);
+    let all_dirs = full["scan"]["dirs"].as_array().unwrap().len();
+    assert!(all_dirs > 30, "{all_dirs}");
+    assert_eq!(full["findings"].as_array().unwrap().len(), 25);
+
+    let v = scan(&["--summary"]);
+    let dirs = v["scan"]["dirs"].as_array().unwrap();
+    assert!(dirs.len() <= 25, "{}", dirs.len());
+    assert_eq!(dirs[0]["path"], root.as_str());
+    assert_eq!(dirs[0]["depth"], 0);
+    assert!(dirs.iter().all(|d| d["depth"].as_u64().unwrap() <= 3));
+    let sizes: Vec<u64> = dirs
+        .iter()
+        .map(|d| d["allocated"].as_u64().unwrap())
+        .collect();
+    assert!(sizes.windows(2).all(|w| w[0] >= w[1]), "{sizes:?}");
+    assert_eq!(
+        v["scan"]["dirs_omitted"].as_u64().unwrap(),
+        (all_dirs - dirs.len()) as u64
+    );
+    assert!(v["scan"]["dirs_omitted"].as_u64().unwrap() > 0);
+    assert_eq!(v["findings"].as_array().unwrap().len(), 20);
+    let s = &v["findings_summary"];
+    assert_eq!(s["total"], 25);
+    assert_eq!(s["omitted"], 5);
+    assert_eq!(s["by_tier"]["rebuildable"]["count"], 25);
+    assert_eq!(s["by_tier"]["regenerable"]["count"], 0);
+    let total: u64 = full["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["bytes"].as_u64().unwrap())
+        .sum();
+    assert_eq!(s["reclaimable_bytes"], total);
+    assert_eq!(s["by_tier"]["rebuildable"]["bytes"], total);
+    // The largest findings are the ones kept.
+    assert_eq!(v["findings"][0]["path"], full["findings"][0]["path"]);
+
+    let v = scan(&["--summary", "--max-findings", "5"]);
+    assert_eq!(v["findings"].as_array().unwrap().len(), 5);
+    assert_eq!(v["findings_summary"]["total"], 25);
+    assert_eq!(v["findings_summary"]["omitted"], 20);
+
+    // --depth limits the directories kept.
+    let v = scan(&["--summary", "--depth", "1"]);
+    let dirs = v["scan"]["dirs"].as_array().unwrap();
+    assert!(dirs.iter().all(|d| d["depth"].as_u64().unwrap() <= 1));
+    assert_eq!(dirs.len(), 25);
+
+    // Text output counts every finding, not only the ones kept.
+    let out = dwhy_offline(
+        state.path(),
+        &[
+            "scan",
+            &root,
+            "--summary",
+            "--min-size",
+            "0",
+            "--max-findings",
+            "5",
+            "--detectors",
+            "cargo-target",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("findings: 25 ("), "{text}");
+    assert!(
+        text.contains("  … 20 more (--json without --summary lists them)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("more directories left out by --summary"),
+        "{text}"
+    );
+}
+
+#[test]
+fn scan_summary_snapshot_keeps_every_finding() {
+    let (_t, root) = many_targets_fixture(25);
+    let state = tempfile::tempdir().unwrap();
+    let out = dwhy_offline(
+        state.path(),
+        &[
+            "scan",
+            &root,
+            "--json",
+            "--summary",
+            "--tier",
+            "regenerable",
+            "--snapshot",
+            "--detectors",
+            "cargo-target",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert!(v["findings"].as_array().unwrap().is_empty(), "{v}");
+    assert_eq!(v["findings_summary"]["total"], 25);
+    let path = v["snapshot"]["path"].as_str().unwrap();
+    assert!(path.starts_with(state.path().to_str().unwrap()), "{path}");
+    let snap = dwhy_core::snapshot::load(Path::new(path)).unwrap();
+    assert_eq!(snap.findings.len(), 25);
+}
+
+/// `cargo_fixture`-style crates `app` (3 MiB) and `lib` (1 MiB): rebuildable;
+/// `scratch/old` (2 MiB, untouched for 30 days): a review stale-tree
+/// finding; and when the filesystem takes the name, `bad\xff` (2 MiB), a
+/// crate whose path is not UTF-8: blocked.
+fn tiers_fixture() -> (tempfile::TempDir, String, bool) {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let t = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(t.path()).unwrap();
+    let make_crate = |c: &Path, size: usize| {
+        fs::create_dir_all(c.join("target/debug")).unwrap();
+        fs::write(c.join("Cargo.toml"), "[package]\n").unwrap();
+        fs::write(c.join("target/CACHEDIR.TAG"), CARGO_TAG).unwrap();
+        fs::write(c.join("target/debug/out"), vec![1u8; size]).unwrap();
+    };
+    make_crate(&root.join("app"), 3 << 20);
+    make_crate(&root.join("lib"), 1 << 20);
+    let scratch = root.join("scratch");
+    fs::create_dir_all(scratch.join("old")).unwrap();
+    fs::write(scratch.join(".dwhy-scratch"), "").unwrap();
+    fs::write(scratch.join("old/blob"), vec![7u8; 2 << 20]).unwrap();
+    age_tree(&scratch.join("old"), 30 * 86_400);
+    let bad = root.join(OsStr::from_bytes(b"bad\xff"));
+    let blocked = match fs::create_dir(&bad) {
+        Ok(()) => {
+            make_crate(&bad, 2 << 20);
+            true
+        }
+        Err(e) => {
+            eprintln!("no blocked finding: the filesystem refuses {bad:?}: {e}");
+            false
+        }
+    };
+    let root = root.to_str().unwrap().to_string();
+    (t, root, blocked)
+}
+
+#[test]
+fn scan_tier_filters_findings_in_json_and_text() {
+    let (_t, root, blocked) = tiers_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let scan = |extra: &[&str]| {
+        let mut args = vec![
+            "scan",
+            &root,
+            "--json",
+            "--detectors",
+            "cargo-target,stale-tree",
+        ];
+        args.extend(extra);
+        let out = dwhy_offline(state.path(), &args);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        json_of(&out)
+    };
+    let tiers_of = |v: &Value| -> Vec<String> {
+        v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["tier"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let all = scan(&[]);
+    let mut every = tiers_of(&all);
+    every.sort();
+    let mut want = vec!["rebuildable", "rebuildable", "review"];
+    if blocked {
+        want.insert(0, "blocked");
+    }
+    assert_eq!(every, want, "{all}");
+
+    assert_eq!(
+        tiers_of(&scan(&["--tier", "rebuildable"])),
+        ["rebuildable", "rebuildable"]
+    );
+    let review = scan(&["--tier", "review"]);
+    assert_eq!(tiers_of(&review), ["review"]);
+    assert_eq!(
+        review["findings"][0]["path"],
+        format!("{root}/scratch/old").as_str()
+    );
+    let mut both = tiers_of(&scan(&["--tier", "rebuildable,review"]));
+    both.sort();
+    assert_eq!(both, ["rebuildable", "rebuildable", "review"]);
+    let none = scan(&["--tier", "regenerable"]);
+    assert!(tiers_of(&none).is_empty(), "{none}");
+    assert_eq!(none.get("findings_summary"), None);
+    if blocked {
+        assert_eq!(tiers_of(&scan(&["--tier", "blocked"])), ["blocked"]);
+    }
+
+    // With --summary the totals still cover every tier.
+    let v = scan(&["--tier", "rebuildable", "--summary"]);
+    assert_eq!(tiers_of(&v), ["rebuildable", "rebuildable"]);
+    let s = &v["findings_summary"];
+    assert_eq!(s["total"], want.len());
+    assert_eq!(s["omitted"], want.len() - 2);
+    assert_eq!(s["by_tier"]["rebuildable"]["count"], 2);
+    assert_eq!(s["by_tier"]["review"]["count"], 1);
+    assert_eq!(s["by_tier"]["blocked"]["count"], u64::from(blocked));
+    if blocked {
+        assert_eq!(s["by_tier"]["blocked"]["reclaimable_bytes"], 0);
+        assert!(s["by_tier"]["blocked"]["bytes"].as_u64().unwrap() >= 2 << 20);
+    }
+
+    // Text output lists only the tiers asked for.
+    let out = dwhy_offline(
+        state.path(),
+        &[
+            "scan",
+            &root,
+            "--tier",
+            "review",
+            "--detectors",
+            "cargo-target,stale-tree",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("findings: 1 ("), "{text}");
+    assert!(text.contains(&format!("{root}/scratch/old")), "{text}");
+    assert!(!text.contains(&format!("{root}/app/target")), "{text}");
+
+    // With --summary, findings left out by --tier are counted, and the hint
+    // names --tier as a reason they are missing.
+    let out = dwhy_offline(
+        state.path(),
+        &[
+            "scan",
+            &root,
+            "--summary",
+            "--tier",
+            "review",
+            "--detectors",
+            "cargo-target,stale-tree",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains(&format!(
+            "  … {} more (--json without --summary or --tier lists them)",
+            want.len() - 1
+        )),
+        "{text}"
+    );
+
+    // Unknown tiers are usage errors.
+    let out = dwhy_offline(state.path(), &["scan", &root, "--tier", "cheap"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+}
+
+/// Runs dwhy with stdout and stderr on a new pseudo-terminal and returns
+/// everything it wrote there, line endings as written (`\n`, not `\r\n`).
+fn dwhy_on_pty(state: &Path, args: &[&str]) -> (Option<i32>, String) {
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("openpt");
+    grantpt(&master).unwrap();
+    unlockpt(&master).unwrap();
+    let name = ptsname(&master, Vec::new()).unwrap();
+    let slave = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(rustix::fs::OFlags::NOCTTY.bits() as i32)
+        .open(name.to_str().unwrap())
+        .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dwhy"))
+        .args(args)
+        .env("XDG_STATE_HOME", state)
+        .env("DOCKER_HOST", "unix:///nonexistent")
+        .stdin(std::process::Stdio::null())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave)
+        .spawn()
+        .expect("run dwhy");
+    // The child holds the only copies of the terminal side now, so reading
+    // ends (EIO) once it exits.
+    let mut master = fs::File::from(master);
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = master.read_to_end(&mut buf);
+        buf
+    });
+    let status = child.wait().unwrap();
+    let out = reader.join().unwrap();
+    let out = String::from_utf8(out).unwrap().replace("\r\n", "\n");
+    (status.code(), out)
+}
+
+#[test]
+fn json_output_on_a_terminal_has_no_progress_lines() {
+    let (_t, root) = cargo_fixture();
+    let state = tempfile::tempdir().unwrap();
+
+    // Control: without --json, stderr on a terminal shows progress.
+    let (code, out) = dwhy_on_pty(state.path(), &["scan", &root, "--no-detectors"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert!(out.contains("\x1b[2K"), "{out:?}");
+
+    for args in [
+        vec!["scan", root.as_str(), "--json", "--no-detectors"],
+        vec![
+            "scan",
+            root.as_str(),
+            "--json",
+            "--summary",
+            "--detectors",
+            "cargo-target",
+        ],
+        vec![
+            "watch",
+            root.as_str(),
+            "--for",
+            "1s",
+            "--no-docker",
+            "--json",
+        ],
+    ] {
+        let (code, out) = dwhy_on_pty(state.path(), &args);
+        assert_eq!(code, Some(0), "{args:?}: {out}");
+        assert!(!out.contains('\x1b'), "{args:?}: {out:?}");
+        assert!(!out.contains("scanning…"), "{args:?}: {out:?}");
+        assert!(!out.contains("watching…"), "{args:?}: {out:?}");
+        let v: Value =
+            serde_json::from_str(&out).unwrap_or_else(|e| panic!("{args:?}: {e}: {out:?}"));
+        assert_eq!(v["schema"], "diskwhy/v1");
+    }
+}

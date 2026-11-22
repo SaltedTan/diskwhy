@@ -22,8 +22,9 @@ use dwhy_core::guard::Processes;
 use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection};
 use dwhy_core::report::{
-    ActionKind, ExplainReport, ExplainResolved, ExplainSize, ExplainVia, Plan, PlanScan,
-    SavedSnapshot, SnapshotFinding, Tier, Totals,
+    ActionKind, DEFAULT_SUMMARY_DEPTH, DEFAULT_SUMMARY_DIRS, DEFAULT_SUMMARY_FINDINGS,
+    ExplainReport, ExplainResolved, ExplainSize, ExplainVia, Plan, PlanScan, SavedSnapshot,
+    SnapshotFinding, SummaryLimits, Tier, Totals,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::tree::ScanTree;
@@ -88,8 +89,9 @@ struct ScanArgs {
     /// Smallest directory to report [default: 1% of the scanned total, at most 100M].
     #[arg(long, value_name = "SIZE", value_parser = units::parse_size)]
     min_size: Option<u64>,
-    /// Text output: how many levels of the directory tree to show.
-    #[arg(long, default_value_t = 3)]
+    /// Text output: how many levels of the directory tree to show; with --summary, also the
+    /// deepest level kept in the JSON `scan.dirs`.
+    #[arg(long, default_value_t = DEFAULT_SUMMARY_DEPTH)]
     depth: u32,
     /// Text output: largest children shown per directory.
     #[arg(long, default_value_t = 8)]
@@ -97,7 +99,7 @@ struct ScanArgs {
     /// Worker threads [default: one per CPU].
     #[arg(long, default_value_t = 0)]
     threads: usize,
-    /// No progress line on stderr.
+    /// No progress line on stderr (implied by --json).
     #[arg(short, long)]
     quiet: bool,
     /// Only measure; do not run detectors.
@@ -106,12 +108,42 @@ struct ScanArgs {
     /// Run only these detectors (comma-separated names, see `dwhy doctor`).
     #[arg(long, value_delimiter = ',', value_name = "NAME,…")]
     detectors: Option<Vec<String>>,
-    /// Text output: findings listed before "… N more".
-    #[arg(long, default_value_t = 20)]
+    /// Findings listed before "… N more" in text output; with --summary, also the most
+    /// findings kept in the JSON `findings`.
+    #[arg(long, default_value_t = DEFAULT_SUMMARY_FINDINGS)]
     max_findings: usize,
-    /// Save a snapshot for `dwhy diff` under ~/.local/state/diskwhy/snapshots (old ones are pruned).
+    /// Only report findings in these tiers (comma-separated: regenerable, rebuildable, review,
+    /// blocked).
+    #[arg(long, value_enum, value_delimiter = ',', value_name = "TIER,…")]
+    tier: Option<Vec<ScanTierArg>>,
+    /// Compact report for agents: keep the largest directories (--depth deep, 25 at most) and
+    /// --max-findings findings, and add `findings_summary` totals over every finding.
+    #[arg(long)]
+    summary: bool,
+    /// Save a snapshot for `dwhy diff` under ~/.local/state/diskwhy/snapshots (old ones are
+    /// pruned). It holds the whole scan, whatever --tier and --summary leave out.
     #[arg(long)]
     snapshot: bool,
+}
+
+/// Tiers `scan --tier` accepts: exactly these, `blocked` included.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum ScanTierArg {
+    Regenerable,
+    Rebuildable,
+    Review,
+    Blocked,
+}
+
+impl From<ScanTierArg> for Tier {
+    fn from(t: ScanTierArg) -> Tier {
+        match t {
+            ScanTierArg::Regenerable => Tier::Regenerable,
+            ScanTierArg::Rebuildable => Tier::Rebuildable,
+            ScanTierArg::Review => Tier::Review,
+            ScanTierArg::Blocked => Tier::Blocked,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -168,7 +200,7 @@ struct DiffArgs {
     /// Worker threads [default: one per CPU].
     #[arg(long, default_value_t = 0)]
     threads: usize,
-    /// No progress line on stderr.
+    /// No progress line on stderr (implied by --json).
     #[arg(short, long)]
     quiet: bool,
 }
@@ -202,7 +234,7 @@ struct WatchArgs {
     /// Worker threads [default: one per CPU].
     #[arg(long, default_value_t = 0)]
     threads: usize,
-    /// No progress line on stderr.
+    /// No progress line on stderr (implied by --json).
     #[arg(short, long)]
     quiet: bool,
 }
@@ -221,7 +253,7 @@ struct ExplainArgs {
     /// Worker threads [default: one per CPU].
     #[arg(long, default_value_t = 0)]
     threads: usize,
-    /// No progress line on stderr.
+    /// No progress line on stderr (implied by --json).
     #[arg(short, long)]
     quiet: bool,
 }
@@ -280,7 +312,7 @@ struct PlanArgs {
     /// Worker threads [default: one per CPU].
     #[arg(long, default_value_t = 0)]
     threads: usize,
-    /// No progress line on stderr.
+    /// No progress line on stderr (implied by --json).
     #[arg(short, long)]
     quiet: bool,
 }
@@ -307,7 +339,7 @@ struct ApplyArgs {
     /// Worker threads for the rescan [default: one per CPU].
     #[arg(long, default_value_t = 0)]
     threads: usize,
-    /// No progress line on stderr.
+    /// No progress line on stderr (implied by --json).
     #[arg(short, long)]
     quiet: bool,
 }
@@ -397,7 +429,7 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
         // Keep enough to pick a threshold after the scan.
         args.min_size.unwrap_or(1 << 20),
         args.threads,
-        args.quiet,
+        silent_progress(args.quiet, args.json),
         &mounts,
     )?;
 
@@ -436,12 +468,37 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
         }
     }
 
+    // Only now, so growth and the snapshot above saw every finding and directory.
+    let tiers: Option<Vec<Tier>> = args
+        .tier
+        .as_ref()
+        .map(|t| t.iter().copied().map(Tier::from).collect());
+    if args.summary {
+        report.summarize(
+            tiers.as_deref(),
+            SummaryLimits {
+                max_findings: args.max_findings,
+                max_dirs: DEFAULT_SUMMARY_DIRS,
+                max_depth: args.depth,
+            },
+        );
+    } else if let Some(tiers) = &tiers {
+        report.filter_tiers(tiers);
+    }
+
     let mut out = std::io::stdout().lock();
     if args.json {
         serde_json::to_writer_pretty(&mut out, &report)?;
         writeln!(out)?;
     } else {
-        human::render_scan(&mut out, &report, args.depth, args.top, args.max_findings)?;
+        human::render_scan(
+            &mut out,
+            &report,
+            args.depth,
+            args.top,
+            args.max_findings,
+            tiers.is_some(),
+        )?;
     }
     if let Some(e) = save_error {
         eprintln!(
@@ -538,7 +595,14 @@ fn run_diff(args: DiffArgs) -> Result<u8> {
 
     let mounts = MountTable::read().unwrap_or_default();
     // The snapshot records directories from the tree; no list is needed.
-    let result = measure(&roots, one_fs, u64::MAX, args.threads, args.quiet, &mounts)?;
+    let result = measure(
+        &roots,
+        one_fs,
+        u64::MAX,
+        args.threads,
+        silent_progress(args.quiet, args.json),
+        &mounts,
+    )?;
     let mut report = account::system_scan_report(&result, &mounts);
     let docker_snap = if args.no_detectors {
         None
@@ -603,7 +667,7 @@ fn run_watch(args: WatchArgs) -> Result<u8> {
             break;
         }
         let _status = status_line(
-            args.quiet,
+            silent_progress(args.quiet, args.json),
             &format!("watching… {}s left", left.as_secs_f64().ceil() as u64),
         );
         std::thread::sleep(left.min(Duration::from_secs(1)));
@@ -653,7 +717,7 @@ fn watch_sample(args: &WatchArgs, one_fs: bool) -> Result<WatchSample> {
         one_fs,
         u64::MAX,
         args.threads,
-        args.quiet,
+        silent_progress(args.quiet, args.json),
         &mounts,
     )?;
     if result.error_count > result.errors.len() as u64 {
@@ -670,7 +734,7 @@ fn watch_sample(args: &WatchArgs, one_fs: bool) -> Result<WatchSample> {
     let docker = if args.no_docker {
         Err("--no-docker given".to_string())
     } else {
-        let _status = status_line(args.quiet, "asking Docker…");
+        let _status = status_line(silent_progress(args.quiet, args.json), "asking Docker…");
         docker_now()
     };
     let snap = snapshot::build(&report, &result.tree, docker.as_deref().ok(), 0);
@@ -837,7 +901,7 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
         let one = std::slice::from_mut(f);
         probes::run(one, &ctx);
         detect::block_lossy(one);
-        let status = status_line(args.quiet, "checking guards…");
+        let status = status_line(silent_progress(args.quiet, args.json), "checking guards…");
         let processes = if is_docker {
             Processes::default()
         } else {
@@ -927,7 +991,7 @@ fn explain_path(
             true,
             u64::MAX,
             args.threads,
-            args.quiet,
+            silent_progress(args.quiet, args.json),
             &mounts,
         )
     };
@@ -1006,7 +1070,7 @@ fn run_plan(args: PlanArgs) -> Result<u8> {
         one_fs,
         u64::MAX,
         args.threads,
-        args.quiet,
+        silent_progress(args.quiet, args.json),
         &mounts,
     )?;
     let ctx = DetectContext::from_system();
@@ -1028,7 +1092,7 @@ fn run_plan(args: PlanArgs) -> Result<u8> {
             })
             .count()
     });
-    let status = status_line(args.quiet, "checking guards…");
+    let status = status_line(silent_progress(args.quiet, args.json), "checking guards…");
     let plan = plan::build(
         findings,
         &sel,
@@ -1103,7 +1167,12 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
         max_tier: args.max_tier.into(),
         confirm: args.confirm.clone(),
     };
-    let mut checks = survey(&plan, &policy, args.threads, args.quiet)?;
+    let mut checks = survey(
+        &plan,
+        &policy,
+        args.threads,
+        silent_progress(args.quiet, args.json),
+    )?;
     let ready: Vec<&Check> = checks.iter().filter(|c| c.ready()).collect();
     // Counts a root mounted below another root on its own, as `plan.bytes` does.
     let would_free = apply::total_bytes_for_checks(ready.iter().copied());
@@ -1140,7 +1209,12 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
             );
             return Ok(EXIT_REFUSED);
         }
-        let again = survey(&plan, &policy, args.threads, args.quiet)?;
+        let again = survey(
+            &plan,
+            &policy,
+            args.threads,
+            silent_progress(args.quiet, args.json),
+        )?;
         for (c, a) in checks.iter_mut().zip(again) {
             // Only what was shown may run; it must still be ready.
             if c.ready() {
@@ -1150,7 +1224,7 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
     }
     let mut audit = Audit::open_placed(Audit::default_path().as_deref())?;
     let mounts = MountTable::read().map_err(|e| format!("cannot read the mount table: {e}"))?;
-    let quiet = args.quiet;
+    let quiet = silent_progress(args.quiet, args.json);
     let mut status: Option<StatusLine> = None;
     let audit_errors = apply::execute(&plan, &mut checks, &mut audit, &mounts, &env, &mut |item| {
         drop(status.take());
@@ -1222,6 +1296,12 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// True when progress and status lines must stay off stderr: with
+/// `--quiet`, and with `--json`, whose readers want only the document.
+fn silent_progress(quiet: bool, json: bool) -> bool {
+    quiet || json
 }
 
 /// Shows `msg` on a terminal stderr until dropped.
@@ -1314,4 +1394,17 @@ fn run_doctor(json: bool) -> Result<u8> {
         human::render_doctor(&mut out, &report)?;
     }
     Ok(EXIT_OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::silent_progress;
+
+    #[test]
+    fn json_output_silences_progress() {
+        assert!(!silent_progress(false, false));
+        assert!(silent_progress(true, false));
+        assert!(silent_progress(false, true));
+        assert!(silent_progress(true, true));
+    }
 }
