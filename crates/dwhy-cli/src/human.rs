@@ -85,6 +85,17 @@ pub fn render_scan(
             "skipped     {other_fs} mount points of other filesystems (--cross-filesystems enters them)"
         )?;
     }
+    let snapshots = s
+        .skipped_mounts
+        .iter()
+        .filter(|m| m.reason == SkipReason::BtrfsSnapshot)
+        .count();
+    if snapshots > 0 {
+        writeln!(
+            w,
+            "skipped     {snapshots} btrfs snapshot or read-only subvolumes (their shared extents would count twice)"
+        )?;
+    }
     if s.error_count > 0 {
         writeln!(
             w,

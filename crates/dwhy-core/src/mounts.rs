@@ -208,6 +208,133 @@ pub fn mount_id(path: &Path, dev: u64) -> Option<u32> {
     u32::try_from(st.stx_mnt_id).ok()
 }
 
+/// `BTRFS_SUPER_MAGIC` (`linux/magic.h`), as `statfs` reports it.
+const BTRFS_SUPER_MAGIC: u32 = 0x9123_683e;
+
+/// Whether the open file `fd` is on btrfs.
+pub fn on_btrfs(fd: impl rustix::fd::AsFd) -> bool {
+    // The magic is 32 bits; `f_type`'s width varies by target.
+    rustix::fs::fstatfs(fd).is_ok_and(|s| s.f_type as u32 == BTRFS_SUPER_MAGIC)
+}
+
+/// What `BTRFS_IOC_GET_SUBVOL_INFO` reports about a btrfs subvolume, as far
+/// as a walk needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtrfsSubvolInfo {
+    /// `btrfs_root_item.flags`.
+    pub flags: u64,
+    /// UUID of the subvolume this one is a snapshot of; all zero for a
+    /// subvolume that is not a snapshot.
+    pub parent_uuid: [u8; 16],
+}
+
+impl BtrfsSubvolInfo {
+    /// `BTRFS_ROOT_SUBVOL_RDONLY` (`linux/btrfs_tree.h`). The ioctl copies
+    /// the root item's flags, so this is not `BTRFS_SUBVOL_RDONLY` (bit 1)
+    /// from `linux/btrfs.h`, which is for the subvolume-creation ioctls.
+    pub const ROOT_SUBVOL_RDONLY: u64 = 1 << 0;
+
+    pub fn is_snapshot(&self) -> bool {
+        self.parent_uuid != [0; 16]
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.flags & Self::ROOT_SUBVOL_RDONLY != 0
+    }
+
+    /// Whether a walk leaves this subvolume out: a snapshot shares its
+    /// extents with its source, so walking both counts them twice, and
+    /// nothing in a read-only subvolume can be removed.
+    pub fn skipped_by_walk(&self) -> bool {
+        self.is_snapshot() || self.is_read_only()
+    }
+}
+
+/// `struct btrfs_ioctl_timespec` (`linux/btrfs.h`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BtrfsIoctlTimespec {
+    sec: u64,
+    nsec: u32,
+}
+
+/// `struct btrfs_ioctl_get_subvol_info_args` (`linux/btrfs.h`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BtrfsIoctlGetSubvolInfoArgs {
+    treeid: u64,
+    name: [u8; 256],
+    parent_id: u64,
+    dirid: u64,
+    generation: u64,
+    flags: u64,
+    uuid: [u8; 16],
+    parent_uuid: [u8; 16],
+    received_uuid: [u8; 16],
+    ctransid: u64,
+    otransid: u64,
+    stransid: u64,
+    rtransid: u64,
+    ctime: BtrfsIoctlTimespec,
+    otime: BtrfsIoctlTimespec,
+    stime: BtrfsIoctlTimespec,
+    rtime: BtrfsIoctlTimespec,
+    reserved: [u64; 8],
+}
+
+// The sizes the kernel headers give (the ioctl number encodes the size).
+const _: () = assert!(std::mem::size_of::<BtrfsIoctlTimespec>() == 16);
+const _: () = assert!(std::mem::size_of::<BtrfsIoctlGetSubvolInfoArgs>() == 504);
+const _: () = assert!(std::mem::offset_of!(BtrfsIoctlGetSubvolInfoArgs, flags) == 288);
+const _: () = assert!(std::mem::offset_of!(BtrfsIoctlGetSubvolInfoArgs, parent_uuid) == 312);
+
+/// `BTRFS_IOC_GET_SUBVOL_INFO`: `_IOR(0x94, 60, struct btrfs_ioctl_get_subvol_info_args)`.
+const BTRFS_IOC_GET_SUBVOL_INFO: rustix::ioctl::Opcode =
+    rustix::ioctl::opcode::read::<BtrfsIoctlGetSubvolInfoArgs>(0x94, 60);
+
+/// What btrfs reports about the subvolume holding the directory `path`,
+/// provided `path` is on device `dev`. Needs no privileges (Linux 4.18+).
+/// `None` when `path` cannot be opened (it is gone, is not a directory, is
+/// a symlink, or is not readable), is no longer on `dev`, or is not on
+/// btrfs (or the kernel lacks the ioctl). Opens `path` read-only without
+/// following a symlink; the ioctl only reads.
+pub fn btrfs_subvol_info(path: &Path, dev: u64) -> Option<BtrfsSubvolInfo> {
+    use rustix::fs::{Mode, OFlags};
+    // Not O_PATH: ioctls fail on such descriptors.
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    // Checked on the open descriptor, so a swap after the caller's stat
+    // cannot make this describe another directory, and confirm the
+    // descriptor is on btrfs before issuing a btrfs ioctl.
+    if rustix::fs::fstat(&fd).ok()?.st_dev != dev || !on_btrfs(&fd) {
+        return None;
+    }
+    let args = get_subvol_info(&fd)?;
+    Some(BtrfsSubvolInfo {
+        flags: args.flags,
+        parent_uuid: args.parent_uuid,
+    })
+}
+
+#[allow(unsafe_code)]
+fn get_subvol_info(fd: &rustix::fd::OwnedFd) -> Option<BtrfsIoctlGetSubvolInfoArgs> {
+    // SAFETY: the caller checked `on_btrfs(fd)`, the opcode is
+    // BTRFS_IOC_GET_SUBVOL_INFO built from a `#[repr(C)]` struct whose size
+    // and field offsets match the kernel header (checked above), and the
+    // kernel fills the entire struct via `kzalloc` + `copy_to_user`.
+    unsafe {
+        rustix::ioctl::ioctl(
+            fd,
+            rustix::ioctl::Getter::<BTRFS_IOC_GET_SUBVOL_INFO, BtrfsIoctlGetSubvolInfoArgs>::new(),
+        )
+    }
+    .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +401,36 @@ mod tests {
         if root_dev != dev {
             assert_eq!(mount_id(&link, root_dev), None, "not followed");
         }
+    }
+
+    #[test]
+    fn subvolume_info_flags_snapshots_and_read_only_subvolumes() {
+        let info = |flags: u64, parent_uuid: [u8; 16]| BtrfsSubvolInfo { flags, parent_uuid };
+        let plain = info(0, [0; 16]);
+        assert!(!plain.is_snapshot() && !plain.is_read_only() && !plain.skipped_by_walk());
+        let snapshot = info(0, [7; 16]);
+        assert!(snapshot.is_snapshot() && snapshot.skipped_by_walk());
+        // BTRFS_ROOT_SUBVOL_RDONLY is bit 0 of the root item's flags.
+        let read_only = info(1, [0; 16]);
+        assert!(read_only.is_read_only() && read_only.skipped_by_walk());
+        // Bit 1 (BTRFS_SUBVOL_RDONLY of the creation ioctls) is not it.
+        assert!(!info(1 << 1, [0; 16]).skipped_by_walk());
+    }
+
+    #[test]
+    fn subvolume_info_needs_a_directory_on_the_given_device() {
+        let d = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(d.path()).unwrap();
+        let dev = std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(&path).unwrap());
+        assert_eq!(btrfs_subvol_info(&path, dev.wrapping_add(1)), None);
+        assert_eq!(btrfs_subvol_info(&path.join("missing"), dev), None);
+        std::fs::write(path.join("file"), "x").unwrap();
+        assert_eq!(btrfs_subvol_info(&path.join("file"), dev), None);
+        let link = path.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(btrfs_subvol_info(&link, dev), None, "not followed");
+        let dir = std::fs::File::open(&path).unwrap();
+        assert_eq!(btrfs_subvol_info(&path, dev).is_some(), on_btrfs(&dir));
     }
 
     #[test]

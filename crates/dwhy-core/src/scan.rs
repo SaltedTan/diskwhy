@@ -4,8 +4,10 @@
 //!   counted as a symlink (its own blocks), never descended into.
 //! * Stays on the root's filesystem by default (`-x`). Mount points are
 //!   recorded as skipped. A btrfs subvolume that is not mounted on its own
-//!   has its own `st_dev` but is part of the same filesystem, and is entered. Virtual filesystems (proc, sysfs, ...) are never
-//!   entered, even when crossing filesystems.
+//!   has its own `st_dev` but is part of the same filesystem, and is
+//!   entered, unless it is a snapshot or read-only (recorded as skipped,
+//!   even when crossing filesystems). Virtual filesystems (proc, sysfs, ...)
+//!   are never entered, even when crossing filesystems.
 //! * Counts each inode with more than one link once, keyed by (dev, inode).
 //! * Records directories it cannot list or whose entries it cannot stat,
 //!   instead of skipping them silently.
@@ -32,7 +34,7 @@ use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawDir, Stat};
 use rustix::io::Errno;
 
-use crate::mounts::{self, MountTable};
+use crate::mounts::{self, BtrfsSubvolInfo, MountTable};
 pub use crate::report::{SkipReason, Totals, UnreadableReason};
 use crate::tree::{self, Markers, NO_PARENT, NodeId, NodeTotals, ScanTree, TreeNode};
 
@@ -158,23 +160,29 @@ impl std::fmt::Display for ScanError {
 impl std::error::Error for ScanError {}
 
 /// Makes each root absolute without following a symlink in its last
-/// component, and drops roots already covered by another root.
+/// component, and drops roots already covered by another root. A root in a
+/// btrfs snapshot or read-only subvolume below another root is kept: the
+/// walk of the outer root skips that subvolume.
 pub fn prepare_roots(paths: &[PathBuf], one_filesystem: bool) -> Result<Vec<PathBuf>, ScanError> {
     prepare_roots_with(
         paths,
         one_filesystem,
         &|| MountTable::read().ok(),
         &mounts::mount_id,
+        &mounts::btrfs_subvol_info,
+        &|p| fs::symlink_metadata(p).ok().map(|m| m.dev()),
     )
 }
 
-/// [`prepare_roots`] with the mount table (read only when needed) and the
-/// mount id lookup supplied.
+/// [`prepare_roots`] with the mount table (read only when needed), the
+/// mount id and btrfs subvolume lookups, and `lstat`'s device supplied.
 fn prepare_roots_with(
     paths: &[PathBuf],
     one_filesystem: bool,
     read_mounts: &dyn Fn() -> Option<MountTable>,
     mount_id: &dyn Fn(&Path, u64) -> Option<u32>,
+    subvol_info: &dyn Fn(&Path, u64) -> Option<BtrfsSubvolInfo>,
+    dev_of: &dyn Fn(&Path) -> Option<u64>,
 ) -> Result<Vec<PathBuf>, ScanError> {
     let mut out: Vec<(PathBuf, u64)> = Vec::new();
     for p in paths {
@@ -188,6 +196,26 @@ fn prepare_roots_with(
         })?;
         out.push((abs, md.dev()));
     }
+    Ok(drop_covered(
+        out,
+        one_filesystem,
+        read_mounts,
+        mount_id,
+        subvol_info,
+        dev_of,
+    ))
+}
+
+/// The roots of `out` (absolute, each with its device) that no other root's
+/// walk reaches, shortest first.
+fn drop_covered(
+    mut out: Vec<(PathBuf, u64)>,
+    one_filesystem: bool,
+    read_mounts: &dyn Fn() -> Option<MountTable>,
+    mount_id: &dyn Fn(&Path, u64) -> Option<u32>,
+    subvol_info: &dyn Fn(&Path, u64) -> Option<BtrfsSubvolInfo>,
+    dev_of: &dyn Fn(&Path) -> Option<u64>,
+) -> Vec<PathBuf> {
     // Shorter paths first so that ancestors are kept and descendants dropped.
     out.sort_by_key(|a| a.0.as_os_str().len());
     let mut kept: Vec<(PathBuf, u64)> = Vec::new();
@@ -201,12 +229,20 @@ fn prepare_roots_with(
                         .get_or_insert_with(read_mounts)
                         .as_ref()
                         .is_some_and(|t| in_nested_subvolume(t, k, &p, dev, mount_id)))
+                && (*kdev == dev
+                    || !in_skipped_subvolume(
+                        table.get_or_insert_with(read_mounts).as_ref(),
+                        (k, *kdev),
+                        (&p, dev),
+                        subvol_info,
+                        dev_of,
+                    ))
         });
         if !covered {
             kept.push((p, dev));
         }
     }
-    Ok(kept.into_iter().map(|(p, _)| p).collect())
+    kept.into_iter().map(|(p, _)| p).collect()
 }
 
 /// Whether a one-filesystem walk from `outer` reaches `inner` (below it,
@@ -224,6 +260,46 @@ fn in_nested_subvolume(
             && outer.starts_with(&m.mount_point)
             && mount_id(inner, inner_dev) == Some(m.id)
     })
+}
+
+/// Whether `inner` (on `inner_dev`, below `outer` on `outer_dev`) lies in
+/// a btrfs subvolume below `outer` that a walk from `outer` skips
+/// ([`SkipReason::BtrfsSnapshot`]): one whose top directory, a device
+/// change on the way from `outer` that is not a mount point in `mounts`,
+/// is a snapshot or read-only. `dev_of` gives each directory's device.
+fn in_skipped_subvolume(
+    mounts: Option<&MountTable>,
+    (outer, outer_dev): (&Path, u64),
+    (inner, inner_dev): (&Path, u64),
+    subvol_info: &dyn Fn(&Path, u64) -> Option<BtrfsSubvolInfo>,
+    dev_of: &dyn Fn(&Path) -> Option<u64>,
+) -> bool {
+    if inner_dev == outer_dev {
+        return false;
+    }
+    // The ancestor just below the one being looked at, with its device.
+    let mut below: Option<(&Path, u64)> = None;
+    for a in inner.ancestors() {
+        let dev = if a == inner {
+            Some(inner_dev)
+        } else if a == outer {
+            Some(outer_dev)
+        } else {
+            dev_of(a)
+        };
+        if let (Some(dev), Some((top, top_dev))) = (dev, below)
+            && dev != top_dev
+            && !mounts.is_some_and(|t| t.at(top).is_some())
+            && subvol_info(top, top_dev).is_some_and(|i| i.skipped_by_walk())
+        {
+            return true;
+        }
+        if a == outer {
+            break;
+        }
+        below = dev.map(|d| (a, d));
+    }
+    false
 }
 
 pub fn absolute_nofollow(p: &Path) -> io::Result<PathBuf> {
@@ -340,13 +416,30 @@ impl PendingLink {
 /// reached ([`mounts::mount_id`] outside tests).
 type MountId<'a> = &'a (dyn Fn(&Path, u64) -> Option<u32> + Sync);
 
+/// Looks up what btrfs reports about the subvolume at a path on a given
+/// device ([`mounts::btrfs_subvol_info`] outside tests).
+type SubvolInfo<'a> = &'a (dyn Fn(&Path, u64) -> Option<BtrfsSubvolInfo> + Sync);
+
+/// What a walk does at a btrfs subvolume that is not mounted on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Subvolume {
+    /// A writable subvolume, not a snapshot (or one btrfs would not
+    /// describe, such as a directory this user cannot open): entered.
+    Enter,
+    /// A snapshot or read-only subvolume: skipped as
+    /// [`SkipReason::BtrfsSnapshot`].
+    Skip,
+}
+
 struct Shared<'a> {
     opts: &'a ScanOptions,
     mounts: &'a MountTable,
     mount_points: HashSet<&'a Path>,
     mount_id: MountId<'a>,
-    /// Devices found to be reached through a given btrfs mount.
-    on_mount: Mutex<HashSet<(u64, u32)>>,
+    subvol_info: SubvolInfo<'a>,
+    /// Devices found to be reached through a given btrfs mount: nested
+    /// subvolumes, and what the walk does at each.
+    on_mount: Mutex<HashMap<(u64, u32), Subvolume>>,
     dev_mounts: Mutex<HashMap<u64, u32>>,
     entered_mounts: Mutex<BTreeSet<u32>>,
     /// The tree's nodes and their name arena.
@@ -366,6 +459,7 @@ impl<'a> Shared<'a> {
         mounts: &'a MountTable,
         progress: &'a Progress,
         mount_id: MountId<'a>,
+        subvol_info: SubvolInfo<'a>,
     ) -> Self {
         Shared {
             opts,
@@ -376,6 +470,7 @@ impl<'a> Shared<'a> {
                 .map(|m| m.mount_point.as_path())
                 .collect(),
             mount_id,
+            subvol_info,
             on_mount: Mutex::default(),
             dev_mounts: Mutex::default(),
             entered_mounts: Mutex::default(),
@@ -456,7 +551,12 @@ impl<'a> Shared<'a> {
     }
 
     fn skip(&self, path: PathBuf, parent_dev: u64, reason: SkipReason) {
-        let fstype = self.mounts.at(&path).map(|m| m.fstype.clone());
+        let mount = match reason {
+            // Not a mount point: it is on the btrfs mount holding it.
+            SkipReason::BtrfsSnapshot => self.mounts.for_path(&path),
+            _ => self.mounts.at(&path),
+        };
+        let fstype = mount.map(|m| m.fstype.clone());
         self.skipped.lock().unwrap().push(SkippedRecord {
             path,
             parent_dev,
@@ -488,22 +588,27 @@ impl<'a> Shared<'a> {
     }
 
     /// Whether `path` (on `dev`) is a btrfs subvolume that is not mounted
-    /// on its own: it is reached through the btrfs mount holding it.
-    fn nested_subvolume(&self, path: &Path, dev: u64) -> bool {
+    /// on its own (it is reached through the btrfs mount holding it), and
+    /// if so, whether the walk enters it. Each subvolume is looked up once
+    /// per mount it is reached through.
+    fn nested_subvolume(&self, path: &Path, dev: u64) -> Option<Subvolume> {
         if self.mount_points.contains(path) {
-            return false;
+            return None;
         }
-        let Some(m) = self.mounts.for_path(path).filter(|m| m.fstype == "btrfs") else {
-            return false;
+        let m = self.mounts.for_path(path).filter(|m| m.fstype == "btrfs")?;
+        if let Some(&s) = self.on_mount.lock().unwrap().get(&(dev, m.id)) {
+            return Some(s);
+        }
+        if (self.mount_id)(path, dev) != Some(m.id) {
+            return None;
+        }
+        let s = if (self.subvol_info)(path, dev).is_some_and(|i| i.skipped_by_walk()) {
+            Subvolume::Skip
+        } else {
+            Subvolume::Enter
         };
-        if self.on_mount.lock().unwrap().contains(&(dev, m.id)) {
-            return true;
-        }
-        let on = (self.mount_id)(path, dev) == Some(m.id);
-        if on {
-            self.on_mount.lock().unwrap().insert((dev, m.id));
-        }
-        on
+        self.on_mount.lock().unwrap().insert((dev, m.id), s);
+        Some(s)
     }
 
     /// Decides whether to descend into `path` (on `dev`), found inside a
@@ -518,8 +623,14 @@ impl<'a> Shared<'a> {
         // A btrfs subvolume has its own st_dev but is the same filesystem.
         // Anything else on another device that the mount table does not
         // list (mounted after it was read) still counts as a boundary.
-        if other_dev && self.nested_subvolume(path, dev) {
-            return None;
+        // Snapshots and read-only subvolumes are left out, crossing
+        // filesystems or not: their extents are shared with what the walk
+        // counts elsewhere, and nothing in them can be removed.
+        if other_dev && let Some(s) = self.nested_subvolume(path, dev) {
+            return match s {
+                Subvolume::Enter => None,
+                Subvolume::Skip => Some(SkipReason::BtrfsSnapshot),
+            };
         }
         let is_virtual = self
             .mounts
@@ -591,7 +702,13 @@ pub fn scan(
     progress: &Progress,
 ) -> Result<ScanResult, ScanError> {
     let start = Instant::now();
-    let shared = Shared::new(opts, mounts, progress, &mounts::mount_id);
+    let shared = Shared::new(
+        opts,
+        mounts,
+        progress,
+        &mounts::mount_id,
+        &mounts::btrfs_subvol_info,
+    );
 
     let mut builder = rayon::ThreadPoolBuilder::new()
         .stack_size(16 << 20)
@@ -1072,18 +1189,39 @@ mod tests {
 ";
 
     /// What `statx` reports as the mount id: a subvolume that is not
-    /// mounted on its own (devices 31 and 32) is reached through the mount
+    /// mounted on its own (devices 31 to 35) is reached through the mount
     /// holding it; device 40 was mounted at /mnt/b/other after the table was
     /// read, so its mount id is new; 50 is on the ext4 mount.
     fn mount_id(p: &Path, dev: u64) -> Option<u32> {
         match dev {
-            31 | 32 if p.starts_with("/mnt/b/mounted") => Some(2),
-            31 | 32 if p.starts_with("/mnt/c") => Some(4),
-            31 | 32 => Some(1),
+            31..=35 if p.starts_with("/mnt/b/mounted") => Some(2),
+            31..=35 if p.starts_with("/mnt/c") => Some(4),
+            31..=35 => Some(1),
             40 => Some(9),
             50 => Some(3),
             _ => None,
         }
+    }
+
+    /// What `BTRFS_IOC_GET_SUBVOL_INFO` reports, by device: 31 and 32 are
+    /// writable subvolumes, 33 a snapshot, 34 read-only, and 35 one this
+    /// user cannot open. Nothing else is on btrfs.
+    fn subvol_info(_: &Path, dev: u64) -> Option<BtrfsSubvolInfo> {
+        let info = |flags, parent_uuid| Some(BtrfsSubvolInfo { flags, parent_uuid });
+        match dev {
+            27 | 28 | 31 | 32 => info(0, [0; 16]),
+            33 => info(0, [9; 16]),
+            34 => info(BtrfsSubvolInfo::ROOT_SUBVOL_RDONLY, [0; 16]),
+            _ => None,
+        }
+    }
+
+    fn shared<'a>(
+        opts: &'a ScanOptions,
+        mounts: &'a MountTable,
+        progress: &'a Progress,
+    ) -> Shared<'a> {
+        Shared::new(opts, mounts, progress, &mount_id, &subvol_info)
     }
 
     fn check(one_filesystem: bool, path: &str, dev: u64, parent_dev: u64) -> Option<SkipReason> {
@@ -1093,8 +1231,7 @@ mod tests {
         };
         let mounts = MountTable::parse(TABLE);
         let progress = Progress::default();
-        let sh = Shared::new(&opts, &mounts, &progress, &mount_id);
-        sh.crosses_boundary(Path::new(path), dev, parent_dev)
+        shared(&opts, &mounts, &progress).crosses_boundary(Path::new(path), dev, parent_dev)
     }
 
     #[test]
@@ -1102,6 +1239,69 @@ mod tests {
         assert_eq!(check(true, "/mnt/b/sub", 31, 28), None);
         assert_eq!(check(true, "/mnt/c/sub", 31, 28), None);
         assert_eq!(check(false, "/mnt/b/sub", 31, 28), None);
+    }
+
+    #[test]
+    fn nested_btrfs_snapshots_and_read_only_subvolumes_are_skipped() {
+        for one_filesystem in [true, false] {
+            assert_eq!(
+                check(one_filesystem, "/mnt/b/.snapshots/1/snapshot", 33, 28),
+                Some(SkipReason::BtrfsSnapshot)
+            );
+            assert_eq!(
+                check(one_filesystem, "/mnt/b/ro", 34, 28),
+                Some(SkipReason::BtrfsSnapshot)
+            );
+            // Nested in a writable subvolume, and reached through another mount.
+            assert_eq!(
+                check(one_filesystem, "/mnt/b/sub/snap", 33, 31),
+                Some(SkipReason::BtrfsSnapshot)
+            );
+            assert_eq!(
+                check(one_filesystem, "/mnt/c/snap", 33, 28),
+                Some(SkipReason::BtrfsSnapshot)
+            );
+        }
+    }
+
+    #[test]
+    fn nested_subvolume_btrfs_cannot_describe_is_entered() {
+        // As for a root-only directory: entering records it as unreadable
+        // instead of calling it a snapshot.
+        assert_eq!(check(true, "/mnt/b/private", 35, 28), None);
+    }
+
+    #[test]
+    fn a_skipped_snapshot_records_the_btrfs_mount_holding_it() {
+        let opts = ScanOptions::default();
+        let mounts = MountTable::parse(TABLE);
+        let progress = Progress::default();
+        let sh = shared(&opts, &mounts, &progress);
+        let path = Path::new("/mnt/b/snap");
+        let reason = sh.crosses_boundary(path, 33, 28).unwrap();
+        sh.skip(path.to_path_buf(), 28, reason);
+        // Something mounted since the table was read is not on /mnt/b's fs.
+        let other = Path::new("/mnt/b/other");
+        let reason = sh.crosses_boundary(other, 40, 28).unwrap();
+        sh.skip(other.to_path_buf(), 28, reason);
+        let skipped = sh.skipped.into_inner().unwrap();
+        assert_eq!(
+            skipped,
+            [
+                SkippedRecord {
+                    path: path.into(),
+                    parent_dev: 28,
+                    fstype: Some("btrfs".into()),
+                    reason: SkipReason::BtrfsSnapshot,
+                },
+                SkippedRecord {
+                    path: other.into(),
+                    parent_dev: 28,
+                    fstype: None,
+                    reason: SkipReason::OtherFilesystem,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1137,20 +1337,40 @@ mod tests {
     #[test]
     fn mount_ids_are_looked_up_once_per_device_and_mount() {
         static CALLS: AtomicUsize = AtomicUsize::new(0);
+        static INFO_CALLS: AtomicUsize = AtomicUsize::new(0);
         let counting = |p: &Path, dev: u64| {
             CALLS.fetch_add(1, Ordering::Relaxed);
             mount_id(p, dev)
         };
+        let counting_info = |p: &Path, dev: u64| {
+            INFO_CALLS.fetch_add(1, Ordering::Relaxed);
+            subvol_info(p, dev)
+        };
         let opts = ScanOptions::default();
         let mounts = MountTable::parse(TABLE);
         let progress = Progress::default();
-        let sh = Shared::new(&opts, &mounts, &progress, &counting);
+        let sh = Shared::new(&opts, &mounts, &progress, &counting, &counting_info);
         assert_eq!(sh.crosses_boundary(Path::new("/mnt/b/a"), 31, 28), None);
         assert_eq!(sh.crosses_boundary(Path::new("/mnt/b/a/b"), 32, 31), None);
         assert_eq!(sh.crosses_boundary(Path::new("/mnt/b/c"), 31, 28), None);
         // The same subvolume reached through the other mount.
         assert_eq!(sh.crosses_boundary(Path::new("/mnt/c/a"), 31, 28), None);
-        assert_eq!(CALLS.load(Ordering::Relaxed), 3, "31 and 32 on 1, 31 on 4");
+        let snap = Some(SkipReason::BtrfsSnapshot);
+        assert_eq!(sh.crosses_boundary(Path::new("/mnt/b/s"), 33, 28), snap);
+        assert_eq!(sh.crosses_boundary(Path::new("/mnt/b/s2"), 33, 28), snap);
+        // Not on btrfs, or not reached through the mount: never asked.
+        sh.crosses_boundary(Path::new("/mnt/e/x"), 50, 51);
+        sh.crosses_boundary(Path::new("/mnt/b/other"), 40, 28);
+        assert_eq!(
+            CALLS.load(Ordering::Relaxed),
+            5,
+            "31, 32 and 33 on 1, 31 on 4, 40"
+        );
+        assert_eq!(
+            INFO_CALLS.load(Ordering::Relaxed),
+            4,
+            "31, 32, 33 on 1, 31 on 4"
+        );
     }
 
     #[test]
@@ -1166,5 +1386,102 @@ mod tests {
         assert!(!covered("/mnt/b", "/mnt/b/mounted/x", 32));
         assert!(!covered("/mnt/b", "/mnt/b/other", 40));
         assert!(!covered("/mnt/e", "/mnt/e/x", 50));
+    }
+
+    #[test]
+    fn a_root_inside_a_skipped_subvolume_is_not_reached_from_above() {
+        let t = MountTable::parse(TABLE);
+        // Devices of directories between the roots: /mnt/b/snap is a
+        // snapshot (33), /mnt/b/sub a writable subvolume (31) holding a
+        // read-only one at /mnt/b/sub/ro (34), and /mnt/b/snap/sub a
+        // writable subvolume (32) inside the snapshot.
+        let dev_of = |p: &Path| -> Option<u64> {
+            Some(if p.starts_with("/mnt/b/snap/sub") {
+                32
+            } else if p.starts_with("/mnt/b/snap") {
+                33
+            } else if p.starts_with("/mnt/b/sub/ro") {
+                34
+            } else if p.starts_with("/mnt/b/sub") {
+                31
+            } else if p.starts_with("/mnt/b/mounted") {
+                33
+            } else {
+                28
+            })
+        };
+        let skipped = |outer: &str, inner: &str| {
+            let (outer, inner) = (Path::new(outer), Path::new(inner));
+            let devs = (dev_of(outer).unwrap(), dev_of(inner).unwrap());
+            in_skipped_subvolume(
+                Some(&t),
+                (outer, devs.0),
+                (inner, devs.1),
+                &subvol_info,
+                &dev_of,
+            )
+        };
+        // The snapshot itself, a directory in it, and a writable subvolume
+        // inside it are all left out of a walk from /mnt/b.
+        assert!(skipped("/mnt/b", "/mnt/b/snap"));
+        assert!(skipped("/mnt/b", "/mnt/b/snap/x/file"));
+        assert!(skipped("/mnt/b", "/mnt/b/snap/sub/x"));
+        assert!(skipped("/mnt/b", "/mnt/b/sub/ro/x"));
+        assert!(skipped("/mnt/b/sub", "/mnt/b/sub/ro"));
+        // A walk from inside the snapshot reaches what is below it.
+        assert!(!skipped("/mnt/b/snap", "/mnt/b/snap/x"));
+        assert!(!skipped("/mnt/b/snap", "/mnt/b/snap/sub/x"));
+        // Writable subvolumes are entered.
+        assert!(!skipped("/mnt/b", "/mnt/b/sub/x"));
+        // A snapshot mounted on its own is a mount point, not skipped as
+        // a snapshot (a one-filesystem walk stops there anyway).
+        assert!(!skipped("/mnt/b", "/mnt/b/mounted/x"));
+    }
+
+    #[test]
+    fn a_root_inside_a_skipped_subvolume_is_kept() {
+        // /mnt/b/snap is a snapshot (33), /mnt/b/sub a writable subvolume (31).
+        let dev_of = |p: &Path| -> Option<u64> {
+            Some(if p.starts_with("/mnt/b/snap") {
+                33
+            } else if p.starts_with("/mnt/b/sub") {
+                31
+            } else {
+                28
+            })
+        };
+        let keep = |paths: &[&str], one_filesystem: bool| -> Vec<PathBuf> {
+            let roots = paths
+                .iter()
+                .map(|p| (PathBuf::from(p), dev_of(Path::new(p)).unwrap()))
+                .collect();
+            drop_covered(
+                roots,
+                one_filesystem,
+                &|| Some(MountTable::parse(TABLE)),
+                &mount_id,
+                &subvol_info,
+                &dev_of,
+            )
+        };
+        let paths = |ps: &[&str]| ps.iter().map(PathBuf::from).collect::<Vec<_>>();
+        for one_filesystem in [true, false] {
+            assert_eq!(
+                keep(&["/mnt/b", "/mnt/b/snap"], one_filesystem),
+                paths(&["/mnt/b", "/mnt/b/snap"])
+            );
+            assert_eq!(
+                keep(&["/mnt/b/snap/x", "/mnt/b"], one_filesystem),
+                paths(&["/mnt/b", "/mnt/b/snap/x"])
+            );
+            assert_eq!(
+                keep(&["/mnt/b", "/mnt/b/sub/x"], one_filesystem),
+                paths(&["/mnt/b"])
+            );
+            assert_eq!(
+                keep(&["/mnt/b/snap", "/mnt/b/snap/x"], one_filesystem),
+                paths(&["/mnt/b/snap"])
+            );
+        }
     }
 }

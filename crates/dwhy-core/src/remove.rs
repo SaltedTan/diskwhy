@@ -11,7 +11,8 @@
 //! - Each directory is opened with `O_NOFOLLOW` relative to its parent's
 //!   descriptor, and checked to be the inode just `lstat`ed; entries are
 //!   removed with `unlinkat`, so a symlink inside is unlinked, never
-//!   followed. An entry on another device than the root stops the removal.
+//!   followed. An entry on another device than the root stops the removal
+//!   (a btrfs subvolume inside the root too: `rmdir` cannot remove one).
 //! - A directory of the caller's own without write or search permission
 //!   (Go's read-only module cache) gets `u+rwx` before it is emptied; it is
 //!   inside the root being removed.
@@ -79,7 +80,7 @@ pub fn remove_tree(
         }
         FileType::Directory => {
             let fd = open_dir_at(&parent, name, &st, path)?;
-            empty(&fd, st.st_dev, path, &mut done)?;
+            empty(&fd, st.st_dev, path, &mut done, &classify_boundary)?;
             drop(fd);
             rustix::fs::unlinkat(&parent, name, AtFlags::REMOVEDIR)
                 .map_err(|e| at(path, "cannot remove", e))?;
@@ -195,9 +196,52 @@ fn same_inode(fd: &impl AsFd, st: &Stat, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// What lies past an entry on another device than the root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Boundary {
+    /// Another filesystem (or one the kernel cannot tell apart from it).
+    Filesystem,
+    /// A btrfs subvolume that is not mounted on its own.
+    BtrfsSubvolume,
+}
+
+/// Tells what entry `name` of directory `dir` is, given that it is on
+/// another device than the root being removed ([`classify_boundary`]
+/// outside tests).
+type Classify = dyn Fn(&OwnedFd, &OsStr) -> Boundary;
+
+/// [`Classify`]: an entry reached through the same mount as its btrfs
+/// directory, though on another device, is a btrfs subvolume. Reads only.
+fn classify_boundary(dir: &OwnedFd, name: &OsStr) -> Boundary {
+    use rustix::fs::{Statx, StatxFlags, statx};
+    let mount = |st: Statx| (st.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(st.stx_mnt_id);
+    let here = statx(dir, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
+        .ok()
+        .and_then(mount);
+    let there = statx(
+        dir,
+        name,
+        AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT,
+        StatxFlags::MNT_ID,
+    )
+    .ok()
+    .and_then(mount);
+    if here.is_some() && here == there && crate::mounts::on_btrfs(dir) {
+        Boundary::BtrfsSubvolume
+    } else {
+        Boundary::Filesystem
+    }
+}
+
 /// Removes everything in the directory `fd` (at `path`), staying on device
-/// `dev`.
-fn empty(fd: &OwnedFd, dev: u64, path: &Path, done: &mut Removed) -> Result<(), String> {
+/// `dev`. `classify` words the error at an entry on another device.
+fn empty(
+    fd: &OwnedFd,
+    dev: u64,
+    path: &Path,
+    done: &mut Removed,
+    classify: &Classify,
+) -> Result<(), String> {
     let mut names: Vec<Vec<u8>> = Vec::new();
     let mut buf = vec![MaybeUninit::<u8>::uninit(); 32 << 10];
     let mut dir = RawDir::new(fd, &mut buf);
@@ -217,14 +261,21 @@ fn empty(fd: &OwnedFd, dev: u64, path: &Path, done: &mut Removed) -> Result<(), 
             Err(e) => return Err(at(&child, "cannot stat", e)),
         };
         if st.st_dev != dev {
-            return Err(format!(
-                "{} is on another filesystem; stopped there (nothing crosses a filesystem boundary)",
-                child.display()
-            ));
+            return Err(match classify(fd, name) {
+                Boundary::BtrfsSubvolume => format!(
+                    "{} is a btrfs subvolume; stopped there (rmdir cannot remove a subvolume; \
+                     `btrfs subvolume delete` does)",
+                    child.display()
+                ),
+                Boundary::Filesystem => format!(
+                    "{} is on another filesystem; stopped there (nothing crosses a filesystem boundary)",
+                    child.display()
+                ),
+            });
         }
         if FileType::from_raw_mode(st.st_mode) == FileType::Directory {
             let sub = open_dir_at(fd, name, &st, &child)?;
-            empty(&sub, dev, &child, done)?;
+            empty(&sub, dev, &child, done, classify)?;
             drop(sub);
             rustix::fs::unlinkat(fd, name, AtFlags::REMOVEDIR)
                 .map_err(|e| at(&child, "cannot remove", e))?;
@@ -261,8 +312,9 @@ mod tests {
     use super::*;
     use std::fs;
 
-    #[test]
-    fn emptying_stops_at_another_device() {
+    /// Empties a fixture root as if it were on another device than its
+    /// entries, with `classify` telling what that boundary is.
+    fn empty_across_a_boundary(classify: &Classify) -> String {
         let t = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(t.path()).unwrap().join("r");
         fs::create_dir_all(root.join("sub")).unwrap();
@@ -274,12 +326,60 @@ mod tests {
             Mode::empty(),
         )
         .unwrap();
-        // As if the root were on another device than its entries.
         let mut done = Removed::default();
-        let err = empty(&fd, st.st_dev.wrapping_add(1), &root, &mut done).unwrap_err();
-        assert!(err.contains("another filesystem"), "{err}");
+        let err = empty(&fd, st.st_dev.wrapping_add(1), &root, &mut done, classify).unwrap_err();
         assert!(root.join("sub/f").exists(), "nothing was removed");
         assert_eq!(done, Removed::default());
+        assert!(
+            err.starts_with(&root.join("sub").display().to_string()),
+            "{err}"
+        );
+        err
+    }
+
+    #[test]
+    fn emptying_stops_at_another_device() {
+        let err = empty_across_a_boundary(&|_, _| Boundary::Filesystem);
+        assert!(
+            err.contains("is on another filesystem; stopped there"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn emptying_stops_at_a_btrfs_subvolume_and_says_so() {
+        let err = empty_across_a_boundary(&|_, name| {
+            assert_eq!(name, "sub");
+            Boundary::BtrfsSubvolume
+        });
+        assert!(err.contains("is a btrfs subvolume; stopped there"), "{err}");
+        assert!(err.contains("btrfs subvolume delete"), "{err}");
+        assert!(!err.contains("another filesystem"), "{err}");
+    }
+
+    #[test]
+    fn a_boundary_off_btrfs_is_another_filesystem() {
+        let t = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(t.path()).unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        let fd = rustix::fs::open(
+            &root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .unwrap();
+        // `sub` is on the same mount as its directory; only btrfs gives
+        // such an entry a device of its own.
+        let want = if crate::mounts::on_btrfs(&fd) {
+            Boundary::BtrfsSubvolume
+        } else {
+            Boundary::Filesystem
+        };
+        assert_eq!(classify_boundary(&fd, OsStr::new("sub")), want);
+        assert_eq!(
+            classify_boundary(&fd, OsStr::new("missing")),
+            Boundary::Filesystem
+        );
     }
 
     #[test]

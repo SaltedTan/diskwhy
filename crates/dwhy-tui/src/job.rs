@@ -23,7 +23,7 @@ use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection};
 use dwhy_core::report::{
     ActionKind, ApplyItem, ApplyReport, DetectorRun, Finding, Plan, PlanScan, ScanReport,
-    UnreadableReason,
+    SkipReason, UnreadableReason,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions, ScanResult};
 use dwhy_core::system;
@@ -513,8 +513,12 @@ fn not_covered(result: &ScanResult, path: &Path) -> Option<String> {
         .iter()
         .find(|s| s.path != root && above(&s.path))
     {
+        let what = match skip.reason {
+            SkipReason::BtrfsSnapshot => "btrfs snapshot or read-only subvolume",
+            _ => "mount point",
+        };
         return Some(format!(
-            "the rescan did not enter the mount point {}",
+            "the rescan did not enter the {what} {}",
             skip.path.to_string_lossy()
         ));
     }
@@ -816,7 +820,7 @@ mod tests {
     use std::sync::Arc;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use dwhy_core::report::{SkipReason, Totals};
+    use dwhy_core::report::Totals;
     use dwhy_core::scan::{SkippedRecord, UnreadableRecord};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -865,8 +869,23 @@ mod tests {
             fstype: Some("ext4".into()),
             reason: SkipReason::OtherFilesystem,
         });
+        result.skipped_mounts.push(SkippedRecord {
+            path: root.join("snapshot"),
+            parent_dev: dev,
+            fstype: Some("btrfs".into()),
+            reason: SkipReason::BtrfsSnapshot,
+        });
         let why = |rel: &str| not_covered(&result, &root.join(rel));
         let r = root.to_string_lossy();
+        assert_eq!(
+            why("snapshot/target").as_deref(),
+            Some(
+                format!(
+                    "the rescan did not enter the btrfs snapshot or read-only subvolume {r}/snapshot"
+                )
+                .as_str()
+            )
+        );
         assert_eq!(
             why("denied/target").as_deref(),
             Some(format!("the rescan could not read {r}/denied").as_str())

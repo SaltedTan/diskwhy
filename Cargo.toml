@@ -28,7 +28,7 @@ insta = { version = "1.49", features = ["json", "redactions"] }
 tempfile = "3.27"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
