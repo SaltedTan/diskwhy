@@ -57,10 +57,9 @@ impl Policy {
             Tier::Blocked => Err("blocked items are never applied".into()),
             t if t <= self.max_tier => Ok(()),
             t => Err(format!(
-                "{} is above --max-tier {} (--max-tier {} allows it)",
+                "{} is above --max-tier {} (needs the user's approval)",
                 tier_name(t),
                 tier_name(self.max_tier),
-                tier_name(t)
             )),
         }
     }

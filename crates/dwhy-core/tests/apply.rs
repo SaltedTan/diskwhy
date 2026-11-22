@@ -335,7 +335,13 @@ fn default_policy_allows_regenerable_only() {
         .iter()
         .find(|c| c.item.detector == "cargo-target")
         .unwrap();
-    assert!(refused.item.detail.contains("above --max-tier regenerable"));
+    let detail = &refused.item.detail;
+    assert!(detail.contains("above --max-tier regenerable"), "{detail}");
+    // The refusal asks for the user's approval; it does not coach an agent to
+    // raise the ceiling itself.
+    assert!(detail.contains("needs the user's approval"), "{detail}");
+    assert!(!detail.contains("allows it"), "{detail}");
+    assert!(!detail.contains("--max-tier rebuildable"), "{detail}");
     let review = checks
         .iter()
         .find(|c| c.item.detector == "stale-tree")

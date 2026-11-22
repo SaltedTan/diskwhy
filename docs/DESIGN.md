@@ -87,6 +87,7 @@ dwhy explain <finding-id|path> [--json]           # evidence, guards, growth, re
 dwhy plan [PATH…] [--tier regenerable|rebuildable|review] [--select ID|PATH,…] [-o plan.json] [--json]
 dwhy apply plan.json [--max-tier regenerable] [--confirm ID,…] [--yes] [--dry-run] [--json]
 dwhy doctor                                       # available tools, detectors, probes and permissions
+dwhy guide                                        # version-matched quickstart for agents (stdout only)
 ```
 
 Exit codes: `0` ok · `1` error (clap usage errors map to 1 so they do not clash with 2) · `2` some items were skipped · `3` refused by policy.

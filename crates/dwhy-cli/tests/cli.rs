@@ -213,6 +213,156 @@ fn exit_codes() {
     assert_eq!(dwhy(&["--version"]).status.code(), Some(0));
 }
 
+fn help_of(args: &[&str]) -> String {
+    let out = dwhy(args);
+    assert_eq!(out.status.code(), Some(0), "{args:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn guide_is_a_short_version_matched_quickstart() {
+    let state = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_dwhy"))
+        .arg("guide")
+        .env("XDG_STATE_HOME", state.path())
+        .env("DOCKER_HOST", "unix:///definitely/not/here.sock")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let g = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        g.lines()
+            .next()
+            .unwrap()
+            .contains(env!("CARGO_PKG_VERSION")),
+        "{g}"
+    );
+    assert!(!g.contains("{version}"), "{g}");
+    for needle in [
+        "diskwhy/v1",
+        "--summary",
+        "dwhy tui --plan",
+        "guards: []",
+        "--max-tier regenerable",
+        "--confirm",
+        "100 MiB",
+        "audit_log",
+        "ErrorReport",
+        "untrusted",
+        "Exit codes",
+    ] {
+        assert!(g.contains(needle), "guide lacks {needle:?}:\n{g}");
+    }
+    for code in ["`0`", "`1`", "`2`", "`3`"] {
+        assert!(g.contains(code), "guide lacks exit code {code}");
+    }
+    let lines = g.lines().count();
+    assert!(lines <= 90, "guide has {lines} lines");
+    assert_eq!(
+        fs::read_dir(state.path()).unwrap().count(),
+        0,
+        "guide writes nothing"
+    );
+}
+
+#[test]
+fn help_states_the_workflow_tiers_and_exit_codes() {
+    let top = help_of(&["--help"]);
+    for needle in [
+        "dwhy scan",
+        "plan",
+        "-o FILE",
+        "apply FILE --yes",
+        "dwhy guide",
+    ] {
+        assert!(top.contains(needle), "--help lacks {needle:?}:\n{top}");
+    }
+    assert!(top.contains("Exit codes: 0 ok, 1 error, 2"), "{top}");
+    assert!(top.contains("3 refused by policy"), "{top}");
+
+    let scan = help_of(&["scan", "--help"]);
+    assert!(scan.contains("findings"), "{scan}");
+    assert!(scan.contains("detector guards only"), "{scan}");
+    assert!(scan.contains("Exit codes: 0 ok, 1 error."), "{scan}");
+
+    let plan = help_of(&["plan", "--help"]);
+    assert!(
+        plan.contains("2 a `--select` finding was blocked"),
+        "{plan}"
+    );
+
+    let apply = help_of(&["apply", "--help"]);
+    assert!(
+        apply.contains("Review items always need --confirm ID"),
+        "{apply}"
+    );
+    assert!(apply.contains("possible values: regenerable, rebuildable, review"));
+    assert!(apply.contains("3 refused by policy"), "{apply}");
+
+    let diff = help_of(&["diff", "--help"]);
+    assert!(diff.contains("100 MiB"), "{diff}");
+    assert!(diff.contains("Exit codes: 0 ok, 1 error."), "{diff}");
+
+    for cmd in ["watch", "explain", "doctor", "guide"] {
+        let h = help_of(&[cmd, "--help"]);
+        assert!(h.contains("Exit codes: 0 ok, 1 error."), "{cmd}: {h}");
+    }
+    assert!(help_of(&["guide", "--help"]).contains("quickstart"));
+}
+
+#[test]
+fn a_tier_refusal_asks_for_the_users_approval() {
+    let (_t, root) = cargo_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let plan = state.path().join("plan.json");
+    let plan_s = plan.to_str().unwrap();
+    let out = dwhy_in(
+        state.path(),
+        &[
+            "plan",
+            &root,
+            "-q",
+            "--detectors",
+            "cargo-target",
+            "--tier",
+            "rebuildable",
+            "-o",
+            plan_s,
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Default --max-tier regenerable: the rebuildable target is refused.
+    let out = dwhy_in(
+        state.path(),
+        &["apply", plan_s, "--dry-run", "--json", "-q"],
+    );
+    assert_eq!(out.status.code(), Some(3));
+    let r = json_of(&out);
+    assert_eq!(r["items"][0]["outcome"], "refused", "{r}");
+    let detail = r["items"][0]["detail"].as_str().unwrap();
+    assert!(detail.contains("needs the user's approval"), "{detail}");
+    assert!(!detail.contains("allows it"), "{detail}");
+    assert!(!detail.contains("--max-tier rebuildable"), "{detail}");
+
+    let out = dwhy_in(state.path(), &["apply", plan_s, "--dry-run", "-q"]);
+    assert_eq!(out.status.code(), Some(3));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("needs the user's approval"), "{text}");
+    assert!(!text.contains("allows it"), "{text}");
+    assert!(Path::new(&root).join("app/target/debug/app").exists());
+}
+
 #[test]
 fn tui_needs_a_terminal() {
     // Bare `dwhy` and `dwhy tui` open the TUI; here stdin and stdout are not

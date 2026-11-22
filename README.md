@@ -99,6 +99,9 @@ dwhy apply plan.json --yes     # unattended / agent run (refuses with exit 3 wit
 
 # 5. Check permissions, optional tools, detectors and probes
 dwhy doctor
+
+# 6. Quickstart for AI agents and scripts, matched to the installed version
+dwhy guide
 ```
 
 ## Usage
@@ -118,6 +121,7 @@ dwhy plan [PATH…] [--tier regenerable|rebuildable|review] [--select ID|PATH,�
           [-x | --cross-filesystems] [--detectors NAME,…]
 dwhy apply PLAN [--max-tier regenerable|rebuildable|review] [--confirm ID,…] [--yes] [--dry-run] [--json]
 dwhy doctor [--json]
+dwhy guide
 ```
 
 ### TUI
@@ -153,10 +157,11 @@ Both `dwhy` and `dwhy tui` open the current directory by default. Supply paths a
 - `watch` samples the roots and Docker twice, `--for` apart (default `60s`), and ranks live changes in bytes/minute (filtering under `--min-change`, default `1M`; `--no-docker` skips Docker). Writes nothing.
 - `explain` inspects a finding id (`f_…` resolved from saved snapshots), filesystem path, or Docker pseudo-path (`docker://volume/NAME`), showing evidence, guards, growth when available, action, and recovery cost. See the [Diff, Watch, Explain and Probe decisions](docs/DESIGN.md#decisions-taken).
 
-### Planning, applying and `doctor`
+### Planning, applying, `doctor` and `guide`
 
 - `plan` selects findings by `--tier` (default `regenerable`) and/or `--select ID|PATH,…`, runs pre-removal guards (active processes, git state, container mounts) and live filesystem identity checks, records fingerprints, and writes a plan file (`-o FILE`) or JSON (`--json`). A finding blocked by a guard goes to `blocked` and is never planned; `plan` exits `2` only when a finding named by `--select` is blocked (tier-only selections that get blocked keep exit `0`, so `dwhy plan -o p && dwhy apply p` works). Removes nothing.
 - `apply` rescans the plan's roots, re-runs detectors and guards, verifies every fingerprint and identity check, enforces `--max-tier` (default `regenerable`; `review` items require `--confirm ID`, `blocked` is never applied), asks `y/N` on a terminal (without `--yes` and with no terminal it refuses with exit `3`; `--dry-run` removes nothing and writes no audit entry), and writes start/end entries to `$XDG_STATE_HOME/diskwhy/audit.jsonl` (default `~/.local/state/diskwhy/audit.jsonl`). `apply --json` reports that path as `audit_log`, and a dry run's estimate as `would_free`.
+- `guide` prints a short quickstart for AI agents and automation, matched to the installed version: the safe workflow, risk tiers and authority rules, caveats, and exit codes. It writes nothing and needs no terminal or Docker.
 - `doctor` reports user/root status, which optional tools are on `PATH` (or installed in common off-`PATH` locations), Docker socket access, and the availability of every detector and probe.
 
 ### Exit codes
@@ -165,6 +170,7 @@ Both `dwhy` and `dwhy tui` open the current directory by default. Supply paths a
 
 ## Documentation
 
+- [skills/diskwhy/SKILL.md](skills/diskwhy/SKILL.md) — portable agent skill (Claude Code, Codex, OpenCode, Antigravity): copy the `skills/diskwhy` directory into your agent's skills directory; it defers to `dwhy guide` for version-matched flags
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, decisions, JSON contract (`diskwhy/v1`), safety rules, and milestones
 - [docs/COMMERCIAL.md](docs/COMMERCIAL.md) — licence rationale and commercial notes
 - [docs/ACCEPTANCE-M1.md](docs/ACCEPTANCE-M1.md) — 2026-11-13 `pc-ubuntu` cleanup checklist
