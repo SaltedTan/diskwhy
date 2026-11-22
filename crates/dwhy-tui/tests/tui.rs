@@ -3106,7 +3106,7 @@ fn hand_applied() -> Applied {
         item(
             trash,
             ApplyOutcome::Refused,
-            &format!("review items need a person's --confirm {}", trash.id),
+            "a review item needs the user's approval",
         ),
         item(
             &venv,

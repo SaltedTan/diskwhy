@@ -3,6 +3,7 @@
 //! Exit codes (docs/DESIGN.md): 0 ok, 1 error (including usage errors),
 //! 2 items skipped by a guard or changed fingerprint, 3 refused by policy.
 
+mod guide;
 mod human;
 
 use std::ffi::OsString;
@@ -41,7 +42,13 @@ pub const EXIT_REFUSED: u8 = 3;
     version,
     about = "Why is my disk filling up, and what is safe to remove?",
     long_about = None,
-    after_help = "Exit codes: 0 ok, 1 error, 2 items skipped by a guard, 3 refused by policy."
+    after_help = "\
+Workflow: `dwhy scan PATH` finds what is large and reclaimable, `dwhy plan PATH -o FILE`
+selects findings and checks guards, `dwhy apply FILE --yes` removes what the tier policy
+allows (default: regenerable only). Agents and scripts: run `dwhy guide` first.
+
+Exit codes: 0 ok, 1 error, 2 items skipped or a `--select` finding blocked by a guard,
+3 refused by policy."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -50,27 +57,50 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Measure disk usage: sizes, unreadable directories, and space df counts but the scan cannot see.
+    /// Measure disk usage and find what is reclaimable: sizes, findings, unreadable directories,
+    /// and space df counts but the scan cannot see.
+    #[command(after_help = "\
+`scan` runs detector guards only: an empty `guards` list on a finding does not mean the
+pre-removal git, process and container guards passed. `plan`, `apply` and `explain` run them.
+
+Exit codes: 0 ok, 1 error.")]
     Scan(ScanArgs),
     /// Select findings for removal and write a plan for `dwhy apply` (guards run, nothing is removed).
+    #[command(after_help = "\
+Exit codes: 0 ok, 1 error, 2 a `--select` finding was blocked by a guard (the plan is still
+written).")]
     Plan(PlanArgs),
     /// Carry out a plan: re-detect, re-run the guards, and remove what the tier policy allows.
+    #[command(after_help = "\
+Exit codes: 0 ok, 1 error or a failed removal, 2 items skipped by a guard or a changed
+fingerprint, 3 refused by policy (above --max-tier, no --confirm), no terminal and no --yes, or
+the plan is expired or from another host or user (make a fresh plan).")]
     Apply(ApplyArgs),
     /// Show what grew since a snapshot (`scan --snapshot`): rescans now and compares.
+    #[command(after_help = "\
+Snapshots record only directories of at least 100 MiB; smaller directories are not compared.
+
+Exit codes: 0 ok, 1 error.")]
     Diff(DiffArgs),
     /// Measure growth now: walks twice, --for apart, and reports bytes per minute (writes nothing).
+    #[command(after_help = "Exit codes: 0 ok, 1 error.")]
     Watch(WatchArgs),
     /// Explain one finding, by id or path: evidence, guards, growth, action and recovery cost.
+    #[command(after_help = "Exit codes: 0 ok, 1 error.")]
     Explain(ExplainArgs),
     /// Open the TUI (what bare `dwhy` does on the current directory): browse sizes and findings,
     /// mark findings, preview or save plans, and apply with confirmation.
     Tui(TuiArgs),
     /// Show permissions, optional tools on PATH, and which detectors and probes they enable.
+    #[command(after_help = "Exit codes: 0 ok, 1 error.")]
     Doctor {
         /// Print diskwhy/v1 JSON instead of text.
         #[arg(long)]
         json: bool,
     },
+    /// Print a concise quickstart for AI agents and automation (version-matched).
+    #[command(after_help = "Exit codes: 0 ok, 1 error.")]
+    Guide,
 }
 
 #[derive(Args, Debug)]
@@ -172,8 +202,9 @@ struct TuiArgs {
 struct DiffArgs {
     /// Directories to rescan [default: the roots of the snapshot compared with].
     paths: Vec<PathBuf>,
-    /// Snapshot to compare with: last, an id, a file, a duration (24h, 7d: the newest at
-    /// least that old) or an RFC 3339 time (the newest taken by then).
+    /// Snapshot to compare with (taken by `scan --snapshot`): last (the newest), an id, a file,
+    /// a duration (24h, 7d: the newest at least that old) or an RFC 3339 time (the newest
+    /// taken by then).
     #[arg(long, default_value = "last", value_name = "WHEN")]
     since: String,
     /// Also save the fresh scan as a snapshot.
@@ -182,10 +213,12 @@ struct DiffArgs {
     /// Print diskwhy/v1 JSON instead of text.
     #[arg(long)]
     json: bool,
-    /// Leave out directories, Docker objects and findings that changed by less than this.
+    /// Leave out directories, Docker objects and findings whose size changed by less than this
+    /// (either way).
     #[arg(long, value_name = "SIZE", value_parser = units::parse_size, default_value = "10M")]
     min_change: u64,
-    /// Descend into other filesystems mounted below the roots [without PATH: the snapshot's setting].
+    /// Descend into other filesystems mounted below the PATHs given (needs PATH; without PATH,
+    /// diff reuses the snapshot's roots and setting).
     #[arg(long, requires = "paths")]
     cross_filesystems: bool,
     /// Only measure; do not run detectors (findings are not compared).
@@ -321,10 +354,12 @@ struct PlanArgs {
 struct ApplyArgs {
     /// Plan file written by `dwhy plan -o`.
     plan: PathBuf,
-    /// Highest tier to remove (review items need --confirm instead).
+    /// Highest tier removed without per-item confirmation. Review items always need
+    /// --confirm ID, so `review` lets through no more than `rebuildable` (accepted for
+    /// compatibility).
     #[arg(long, value_enum, default_value = "regenerable")]
     max_tier: TierArg,
-    /// Review items a person confirmed, by id (comma-separated or repeated).
+    /// Review items the user confirmed, by id (comma-separated or repeated).
     #[arg(long, value_delimiter = ',', value_name = "ID,…")]
     confirm: Vec<String>,
     /// Remove without asking (required when there is no terminal).
@@ -367,7 +402,7 @@ fn main() -> ExitCode {
         Some(Command::Watch(a)) => a.json,
         Some(Command::Explain(a)) => a.json,
         Some(Command::Doctor { json }) => *json,
-        Some(Command::Tui(_)) | None => false,
+        Some(Command::Tui(_) | Command::Guide) | None => false,
     };
     let res = match cli.command {
         Some(Command::Scan(args)) => run_scan(args),
@@ -377,6 +412,7 @@ fn main() -> ExitCode {
         Some(Command::Watch(args)) => run_watch(args),
         Some(Command::Explain(args)) => run_explain(args),
         Some(Command::Doctor { json }) => run_doctor(json),
+        Some(Command::Guide) => guide::run(),
         Some(Command::Tui(args)) => run_tui(args),
         None => run_tui(TuiArgs {
             paths: Vec::new(),

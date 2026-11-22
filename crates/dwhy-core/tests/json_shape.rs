@@ -544,7 +544,7 @@ fn apply_report_shape() {
             ),
             apply_item(
                 ApplyOutcome::Refused,
-                "review items need a person's --confirm f_c2b7afdaa165",
+                "a review item needs the user's approval",
             ),
             apply_item(ApplyOutcome::WouldRemove, "ready"),
         ],
@@ -576,7 +576,7 @@ fn apply_report_dry_run_shape() {
             apply_item(ApplyOutcome::WouldRemove, "ready"),
             apply_item(
                 ApplyOutcome::Refused,
-                "review items need a person's --confirm f_c2b7afdaa165",
+                "a review item needs the user's approval",
             ),
         ],
         freed: 0,

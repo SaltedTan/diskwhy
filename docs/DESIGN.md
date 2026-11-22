@@ -87,6 +87,7 @@ dwhy explain <finding-id|path> [--json]           # evidence, guards, growth, re
 dwhy plan [PATH…] [--tier regenerable|rebuildable|review] [--select ID|PATH,…] [-o plan.json] [--json]
 dwhy apply plan.json [--max-tier regenerable] [--confirm ID,…] [--yes] [--dry-run] [--json]
 dwhy doctor                                       # available tools, detectors, probes and permissions
+dwhy guide                                        # version-matched quickstart for agents (stdout only)
 ```
 
 Exit codes: `0` ok · `1` error (clap usage errors map to 1 so they do not clash with 2) · `2` some items were skipped · `3` refused by policy.
@@ -183,7 +184,7 @@ Crates likely needed: `clap`, `ratatui`, `crossterm`, `serde`/`serde_json`, `ray
 | M4 | TUI: tree + findings, mark, plan preview, apply with confirmation | Usable over ssh at 80×24; the same plan file works in TUI and CLI (recorded checks: [ACCEPTANCE-M4.md](ACCEPTANCE-M4.md)) |
 | M5 | Release: musl static builds, README with the pc-ubuntu story, `cargo install` | First public tag |
 
-**After the MVP:** MCP server, Claude Code skill, `notify` alerts, systemd timer, root-only system detectors (snap, kernels, apt, journald vacuum), more probes (Docker logs, core dumps, other databases), TOML config for custom detectors and policy.
+**After the MVP:** MCP server, `notify` alerts, systemd timer, root-only system detectors (snap, kernels, apt, journald vacuum), more probes (Docker logs, core dumps, other databases), TOML config for custom detectors and policy.
 
 ## Non-goals (for now)
 
