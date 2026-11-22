@@ -525,7 +525,10 @@ fn scan_snapshot_writes_only_under_the_state_dir() {
     fs::write(&file, b"").unwrap();
     let out = run(&file, &["--json", "--snapshot"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(json_of(&out).get("snapshot").is_none());
+    // The scan report alone: no error report after it.
+    let v = json_of(&out);
+    assert!(v.get("snapshot").is_none());
+    assert!(v.get("kind").is_none(), "{v}");
     assert!(String::from_utf8_lossy(&out.stderr).contains("snapshot not saved"));
 }
 
@@ -2484,7 +2487,11 @@ fn explain_rejects_non_utf8_paths() {
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(1), "{out:?}");
-        assert!(out.stdout.is_empty());
+        let v = error_report(&out, "error");
+        assert_eq!(
+            v["message"],
+            "explain needs a UTF-8 path (diskwhy/v1 reports paths as UTF-8)"
+        );
         let text = String::from_utf8_lossy(&out.stderr);
         assert!(
             text.contains("explain needs a UTF-8 path (diskwhy/v1 reports paths as UTF-8)"),
@@ -2569,7 +2576,14 @@ fn explain_refuses_an_id_whose_saved_path_was_lossy() {
         ],
     );
     assert_eq!(out.status.code(), Some(1), "{out:?}");
-    assert!(out.stdout.is_empty());
+    let v = error_report(&out, "error");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("the saved path for {id} contains U+FFFD")),
+        "{v}"
+    );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains(&format!(
@@ -2828,10 +2842,17 @@ fn apply_refuses_a_plan_with_a_lossy_scan_root() {
         );
         assert_eq!(out.status.code(), Some(3), "{out:?}");
         assert_eq!(
-            String::from_utf8(out.stderr).unwrap(),
+            String::from_utf8_lossy(&out.stderr),
             format!("dwhy: refused: plan root {lossy} is not valid UTF-8; nothing applied\n")
         );
-        assert!(out.stdout.is_empty());
+        let v = json_of(&out);
+        assert_eq!(v["kind"], "refused", "{v}");
+        assert_eq!(v["exit_code"], 3, "{v}");
+        assert_eq!(
+            v["message"],
+            format!("plan root {lossy} is not valid UTF-8; nothing applied")
+        );
+        assert!(v.get("hint").is_none(), "{v}");
     }
     assert!(Path::new(&root).join("app/target/debug/app").exists());
     assert!(!state.path().join("diskwhy/audit.jsonl").exists());
@@ -3937,4 +3958,254 @@ fn json_output_on_a_terminal_has_no_progress_lines() {
             serde_json::from_str(&out).unwrap_or_else(|e| panic!("{args:?}: {e}: {out:?}"));
         assert_eq!(v["schema"], "diskwhy/v1");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Structured errors under --json, and apply report parity
+// ---------------------------------------------------------------------------
+
+/// The single `ErrorReport` on stdout of a failed `--json` command, checked
+/// against its exit code; stderr still has the text.
+fn error_report(out: &Output, kind: &str) -> Value {
+    // `json_of` parses exactly one document: anything after it fails.
+    let v = json_of(out);
+    assert_eq!(v["schema"], "diskwhy/v1", "{v}");
+    assert_eq!(v["tool"]["name"], "diskwhy", "{v}");
+    assert_eq!(v["kind"], kind, "{v}");
+    let code = out.status.code().unwrap();
+    assert_eq!(v["exit_code"], code, "{v}");
+    assert!(!v["message"].as_str().unwrap().is_empty(), "{v}");
+    assert!(!out.stderr.is_empty(), "{out:?}");
+    v
+}
+
+#[test]
+fn json_usage_and_runtime_errors_are_error_reports_on_stdout() {
+    let state = tempfile::tempdir().unwrap();
+    let st = state.path();
+
+    let out = dwhy_offline(st, &["scan", "--json", "--no-such-flag"]);
+    assert_eq!(out.status.code(), Some(1));
+    let v = error_report(&out, "usage");
+    assert_eq!(v["message"], "unexpected argument '--no-such-flag' found");
+    assert!(
+        v["hint"].as_str().unwrap().contains("-- --no-such-flag"),
+        "{v}"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("error: unexpected argument"), "{err}");
+
+    let out = dwhy_offline(st, &["scan", "--json", "--tier", "bogus"]);
+    assert_eq!(out.status.code(), Some(1));
+    let v = error_report(&out, "usage");
+    let message = v["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("invalid value 'bogus' for '--tier"),
+        "{v}"
+    );
+    assert!(message.contains("possible values"), "{v}");
+    assert!(!message.contains('\u{1b}'), "{v}");
+
+    let out = dwhy_offline(st, &["scan", ".", "--json", "--detectors", "nope"]);
+    assert_eq!(out.status.code(), Some(1));
+    let v = error_report(&out, "error");
+    assert!(v["message"].as_str().unwrap().contains("nope"), "{v}");
+    assert!(v.get("hint").is_none(), "{v}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("dwhy: error: {}\n", v["message"].as_str().unwrap())
+    );
+
+    let out = dwhy_offline(
+        st,
+        &["scan", "/definitely/not/here", "--json", "--no-detectors"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    let v = error_report(&out, "error");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("/definitely/not/here"),
+        "{v}"
+    );
+
+    // No snapshot in an empty state directory.
+    let out = dwhy_offline(st, &["diff", "--json", "--detectors", "cargo-target"]);
+    assert_eq!(out.status.code(), Some(1));
+    error_report(&out, "error");
+
+    // Without --json, or with it after `--` (a path then), stdout stays empty.
+    for args in [
+        &["scan", "--no-such-flag"][..],
+        &["scan", "--no-such-flag", "--", "--json"],
+        &["scan", "/definitely/not/here", "--no-detectors"],
+        &["scan", "--no-detectors", "--", "--json"],
+    ] {
+        let out = dwhy_offline(st, args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}: {out:?}");
+        assert!(!out.stderr.is_empty(), "{args:?}");
+    }
+
+    // --help and --version are not errors, --json or not.
+    for args in [&["scan", "--json", "--help"][..], &["--version", "--json"]] {
+        let out = dwhy_offline(st, args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        assert!(
+            serde_json::from_slice::<Value>(&out.stdout).is_err(),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn apply_refusals_and_errors_under_json_are_error_reports() {
+    let h = Home::new();
+    let pip = h.home().join(".cache/pip/http/blob");
+    let plan = h.plan("p.json", &[]);
+
+    let out = h.dwhy(&["apply", &plan, "--json"]);
+    assert_eq!(out.status.code(), Some(3));
+    let v = error_report(&out, "refused");
+    assert_eq!(v["message"], "no terminal to confirm on");
+    assert_eq!(
+        v["hint"],
+        "pass --yes to remove without asking, or --dry-run to preview"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "dwhy: refused: no terminal to confirm on; pass --yes to remove without asking, or --dry-run to preview\n"
+    );
+
+    let mut v: Value = serde_json::from_slice(&fs::read(&plan).unwrap()).unwrap();
+    v["created_at"] = "2026-01-01T00:00:00Z".into();
+    v["expires_at"] = "2026-01-01T01:00:00Z".into();
+    let expired = h.plan_file("expired.json");
+    fs::write(&expired, serde_json::to_vec(&v).unwrap()).unwrap();
+    for mode in ["--yes", "--dry-run"] {
+        let out = h.dwhy(&["apply", &expired, mode, "--json"]);
+        assert_eq!(out.status.code(), Some(3), "{mode}");
+        let v = error_report(&out, "refused");
+        let message = v["message"].as_str().unwrap();
+        assert!(message.contains("expired"), "{v}");
+        assert_eq!(v["hint"], "run `dwhy plan` to create a fresh plan");
+        // stderr is as it was: the refusal alone.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("dwhy: refused: {message}\n")
+        );
+    }
+
+    let out = h.dwhy(&[
+        "apply",
+        &plan,
+        "--yes",
+        "--json",
+        "--confirm",
+        "f_000000000000",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let v = error_report(&out, "error");
+    assert!(
+        v["message"].as_str().unwrap().contains("f_000000000000"),
+        "{v}"
+    );
+
+    let out = h.dwhy(&["apply", "/definitely/not/here.json", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    error_report(&out, "error");
+
+    assert!(pip.exists());
+    assert!(
+        !h.audit().exists(),
+        "refusing the whole plan writes nothing"
+    );
+}
+
+#[test]
+fn apply_json_has_would_free_on_a_dry_run_and_audit_log_on_a_real_one() {
+    let h = Home::new();
+    let pip = h.home().join(".cache/pip");
+    let plan = h.plan("p.json", &[]);
+    let planned: Value = serde_json::from_slice(&fs::read(&plan).unwrap()).unwrap();
+    let bytes = planned["items"][0]["finding"]["bytes"].as_u64().unwrap();
+    assert!(bytes > 0, "{planned}");
+
+    let out = h.dwhy(&["apply", &plan, "--dry-run", "--json", "-q"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let r = json_of(&out);
+    assert_eq!(r["dry_run"], true);
+    assert_eq!(r["items"][0]["outcome"], "would_remove");
+    assert_eq!(r["would_free"], bytes, "{r}");
+    assert_eq!(r["freed"], 0);
+    assert!(r.get("audit_log").is_none(), "{r}");
+    assert!(!h.audit().exists());
+
+    let out = h.dwhy(&["apply", &plan, "--yes", "--json", "-q"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let r = json_of(&out);
+    assert_eq!(r["dry_run"], false);
+    assert_eq!(r["items"][0]["outcome"], "removed");
+    assert_eq!(r["audit_log"], h.audit().to_str().unwrap(), "{r}");
+    assert!(h.audit().exists());
+    assert!(r.get("would_free").is_none(), "{r}");
+    assert!(!pip.exists());
+}
+
+#[test]
+fn a_report_already_on_stdout_is_never_followed_by_an_error_report() {
+    let (_t, root) = cargo_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let det = ["-q", "--detectors", "cargo-target"];
+    let out = dwhy_offline(
+        state.path(),
+        &[&["scan", &root, "--json", "--snapshot"][..], &det].concat(),
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let saved = json_of(&out)["snapshot"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A state "directory" that is a file: the snapshot cannot be saved.
+    let file = state.path().join("not-a-dir");
+    fs::write(&file, b"").unwrap();
+    for args in [
+        &["scan", &root, "--json", "--snapshot"][..],
+        &["diff", "--since", &saved, "--json", "--snapshot"],
+    ] {
+        let out = dwhy_offline(&file, &[args, &det].concat());
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        // One document, the command's own report.
+        let v = json_of(&out);
+        assert!(v.get("kind").is_none(), "{v}");
+        assert!(v.get("roots").is_some() || v.get("scan").is_some(), "{v}");
+        assert!(v.get("snapshot").is_none(), "{v}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("dwhy: error: snapshot not saved"), "{err}");
+    }
+}
+
+#[test]
+fn diff_notes_the_snapshot_directory_threshold() {
+    let (_t, root) = cargo_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let st = state.path();
+    let det = ["-q", "--detectors", "cargo-target"];
+    let note = "directories under 100.0M are not recorded in snapshots and are not compared";
+    let out = dwhy_offline(st, &[&["scan", &root, "--snapshot"][..], &det].concat());
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+
+    let out = dwhy_offline(st, &[&["diff", "--json"][..], &det].concat());
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json_of(&out);
+    assert_eq!(v["since"]["min_dir_bytes"], 100u64 << 20);
+    let notes = v["notes"].as_array().unwrap();
+    assert_eq!(notes.last().unwrap(), note, "{v}");
+
+    let out = dwhy_offline(st, &[&["diff"][..], &det].concat());
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(&format!("note: {note}\n")), "{text}");
 }

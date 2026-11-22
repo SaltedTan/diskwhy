@@ -654,9 +654,9 @@ pub fn exit_meaning(code: u8) -> &'static str {
 
 /// The one-line summary `dwhy apply` and the TUI show under a report:
 /// what was (or would be) removed and freed, then the counts of failed,
-/// refused and skipped items. For a dry run of a report read on its own,
-/// the bytes that would be freed nest items by path ([`total_bytes`]);
-/// [`summary_with_would_free`] takes the figure from the checks instead.
+/// refused and skipped items. A dry run's bytes are the report's
+/// `would_free`; for a report without one (an older file), items nest by
+/// path ([`total_bytes`]).
 pub fn summary(r: &ApplyReport) -> String {
     summary_with_would_free(r, None)
 }
@@ -685,7 +685,7 @@ pub fn summary_with_would_free(r: &ApplyReport, would_free: Option<u64>) -> Stri
     let plural = |n: usize| if n == 1 { "" } else { "s" };
     if r.dry_run {
         let n = count(ApplyOutcome::WouldRemove);
-        let bytes = would_free.unwrap_or_else(|| {
+        let bytes = would_free.or(r.would_free).unwrap_or_else(|| {
             total_bytes(
                 r.items
                     .iter()
@@ -759,6 +759,7 @@ pub fn report(
             .iter()
             .filter(|c| c.item.outcome == ApplyOutcome::Removed),
     );
+    let would_free = dry_run.then(|| total_bytes_for_checks(checks.iter().filter(|c| c.ready())));
     ApplyReport {
         schema: SCHEMA.into(),
         tool: Tool::current(),
@@ -771,6 +772,8 @@ pub fn report(
         confirm: policy.confirm.clone(),
         items,
         freed,
+        would_free,
+        audit_log: None,
     }
 }
 

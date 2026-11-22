@@ -849,6 +849,61 @@ pub struct ApplyReport {
     /// root mounted below another root counts on its own, as in `plan.bytes`;
     /// see [`crate::apply::total_bytes_for_checks`]).
     pub freed: u64,
+    /// Dry runs only: what the ready (`would_remove`) items would free,
+    /// nested as in `freed`. Absent when `dry_run` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub would_free: Option<u64>,
+    /// The audit log this apply appended to. Absent on dry runs, which
+    /// write none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_log: Option<String>,
+}
+
+/// Output on stdout of a command given `--json` that fails or refuses
+/// before it has a report to print. stderr still says the same in text,
+/// and the process exits with `exit_code`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorReport {
+    pub schema: String,
+    pub tool: Tool,
+    pub kind: ErrorKind,
+    /// What went wrong, unescaped (JSON escapes it).
+    pub message: String,
+    /// What to do about it, when there is something to suggest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// The process exit code: 1 for `usage` and `error`, 3 for `refused`.
+    pub exit_code: u8,
+}
+
+impl ErrorReport {
+    pub fn new(
+        kind: ErrorKind,
+        message: impl Into<String>,
+        hint: Option<String>,
+        exit_code: u8,
+    ) -> Self {
+        ErrorReport {
+            schema: SCHEMA.into(),
+            tool: Tool::current(),
+            kind,
+            message: message.into(),
+            hint,
+            exit_code,
+        }
+    }
+}
+
+/// What kind of failure an [`ErrorReport`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    /// The command line did not parse (unknown flag, bad value).
+    Usage,
+    /// The command ran and failed (missing path, bad plan file, no snapshot).
+    Error,
+    /// Policy refused to go on (stale plan, no terminal to confirm on).
+    Refused,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

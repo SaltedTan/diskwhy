@@ -1,0 +1,38 @@
+---
+source: crates/dwhy-core/tests/json_shape.rs
+expression: reports
+---
+[
+  {
+    "schema": "diskwhy/v1",
+    "tool": {
+      "name": "diskwhy",
+      "version": "0.0.1"
+    },
+    "kind": "usage",
+    "message": "unexpected argument '--no-such-flag' found",
+    "hint": "to pass '--no-such-flag' as a value, use '-- --no-such-flag'",
+    "exit_code": 1
+  },
+  {
+    "schema": "diskwhy/v1",
+    "tool": {
+      "name": "diskwhy",
+      "version": "0.0.1"
+    },
+    "kind": "error",
+    "message": "/definitely/not/here: No such file or directory (os error 2)",
+    "exit_code": 1
+  },
+  {
+    "schema": "diskwhy/v1",
+    "tool": {
+      "name": "diskwhy",
+      "version": "0.0.1"
+    },
+    "kind": "refused",
+    "message": "no terminal to confirm on",
+    "hint": "pass --yes to remove without asking, or --dry-run to preview",
+    "exit_code": 3
+  }
+]

@@ -746,7 +746,8 @@ impl ApplyJob {
                 isolate_commands: true,
             },
         );
-        let report = apply::report(&plan, &checks, &policy, false, env);
+        let mut report = apply::report(&plan, &checks, &policy, false, env);
+        report.audit_log = Some(audit.path().to_string_lossy().into_owned());
         let exit = apply::exit_code(&report);
         Ok(Applied {
             report,
