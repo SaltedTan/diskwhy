@@ -65,7 +65,7 @@ The idea is to automate what was done by hand on pc-ubuntu on 2026-11-13: 36G fr
 
 ## Main concepts
 
-- **Scan.** A parallel, single-filesystem (`-x`) walk. It counts each hardlink once by (dev, inode) and records allocated vs apparent bytes. Unreadable directories are recorded, not skipped silently.
+- **Scan.** A parallel, single-filesystem (`-x`) walk. A btrfs subvolume that is not mounted on its own has its own `st_dev` but is the same filesystem, so `-x` enters it. It counts each hardlink once by (dev, inode) and records allocated vs apparent bytes. Unreadable directories are recorded, not skipped silently.
 - **Detector.** Recognises one kind of reclaimable thing and turns it into a **finding**, e.g. `cargo-target`, `node-modules`, `venv`, `user-cache` (go/npm/uv/pip/HF/playwright), `git-worktree`, `stale-tree` (scratch dirs by age), `tool-versions`, `trash`, `docker-image`, `docker-build-cache`, `docker-container`, `docker-volume`, `journald`.
 - **Probe.** Adds evidence that explains why a finding is big or growing. See [Decisions taken](#decisions-taken).
 - **Guard.** A safety check with a pass, warn or block result. Examples include `git-unpublished`, `git-dirty`, `git-linked-worktrees`, `in-use-cwd`, `in-use-open`, `container-mount`, `recent-write`, `git-ignored-only` (not built yet), [`path-not-utf8`](#safety-rules-non-negotiable) and [`changed-since-scan`](#safety-rules-non-negotiable).

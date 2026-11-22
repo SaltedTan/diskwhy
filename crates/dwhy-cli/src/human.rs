@@ -701,13 +701,24 @@ fn render_fs(w: &mut impl Write, r: &ScanReport, fs: &FsReport) -> io::Result<()
                 .filter(|root| root.mount == fs.mount)
                 .map(|root| root.path.as_str())
                 .collect();
-            writeln!(
-                w,
-                "  scanned      {:>8}  under {} (part of this filesystem; scan {} to account for all of it)",
-                human(fs.scanned),
-                under.join(", "),
-                fs.mount
-            )?;
+            if under.contains(&fs.mount.as_str()) {
+                // The root is this mount point, but the mount shows only part of
+                // its filesystem (a subdirectory bind mount or a btrfs subvolume).
+                writeln!(
+                    w,
+                    "  scanned      {:>8}  under {} (this mount shows only part of its filesystem; scan where the whole filesystem is mounted to account for all of it)",
+                    human(fs.scanned),
+                    under.join(", "),
+                )?;
+            } else {
+                writeln!(
+                    w,
+                    "  scanned      {:>8}  under {} (part of this filesystem; scan {} to account for all of it)",
+                    human(fs.scanned),
+                    under.join(", "),
+                    fs.mount
+                )?;
+            }
         }
     }
     if fs.unaccounted_large && !fs.hints.is_empty() {
@@ -988,6 +999,53 @@ mod tests {
             docker: None,
             snapshot: None,
         }
+    }
+
+    fn partial_fs(mount: &str, root: &str) -> ScanReport {
+        let mut r = report(vec![]);
+        r.scan.roots = vec![RootReport {
+            path: root.into(),
+            mount: mount.into(),
+            totals: Totals::default(),
+        }];
+        r.fs = vec![FsReport {
+            mount: mount.into(),
+            fstype: "tmpfs".into(),
+            source: "tmpfs".into(),
+            size: 100 << 20,
+            used: 12 << 20,
+            avail: 88 << 20,
+            scanned: 8 << 20,
+            full_coverage: false,
+            unaccounted: None,
+            unaccounted_large: false,
+            hints: vec![],
+            deleted_open: DeletedOpen::default(),
+            rerun: None,
+        }];
+        r
+    }
+
+    fn render_fs_text(r: &ScanReport) -> String {
+        let mut out = Vec::new();
+        render_fs(&mut out, r, &r.fs[0]).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn partial_mount_scanned_at_its_mount_point_does_not_suggest_rescanning_it() {
+        // A subdirectory bind mount scanned at its own mount point: telling the
+        // user to "scan /mnt/b" again would be a no-op.
+        let text = render_fs_text(&partial_fs("/mnt/b", "/mnt/b"));
+        assert!(!text.contains("scan /mnt/b to account"), "{text}");
+        assert!(text.contains("only part of its filesystem"), "{text}");
+
+        // A subdirectory of an ordinary mount still points at the mount.
+        let text = render_fs_text(&partial_fs("/home", "/home/u/src"));
+        assert!(
+            text.contains("scan /home to account for all of it"),
+            "{text}"
+        );
     }
 
     #[test]

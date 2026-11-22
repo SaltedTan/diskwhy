@@ -2593,6 +2593,7 @@ fn marked_bytes_count_a_separately_mounted_root_on_its_own() {
             parent: 0,
             major: 0,
             minor: 0,
+            root: "/".into(),
             mount_point: child.clone(),
             fstype: "ext4".into(),
             source: "/dev/fixture".into(),

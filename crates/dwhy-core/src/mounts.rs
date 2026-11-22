@@ -9,6 +9,10 @@ pub struct Mount {
     pub parent: u32,
     pub major: u32,
     pub minor: u32,
+    /// The directory of the filesystem mounted here (`/` unless this is a
+    /// bind mount of a subdirectory or a btrfs subvolume other than the
+    /// top-level one).
+    pub root: PathBuf,
     pub mount_point: PathBuf,
     pub fstype: String,
     pub source: String,
@@ -21,6 +25,12 @@ impl Mount {
 
     pub fn is_virtual(&self) -> bool {
         is_virtual_fstype(&self.fstype)
+    }
+
+    /// Whether the whole filesystem is visible below this mount point, so
+    /// that a walk from it can account for everything `statvfs` counts.
+    pub fn is_whole_filesystem(&self) -> bool {
+        self.root == Path::new("/")
     }
 }
 
@@ -93,6 +103,10 @@ impl MountTable {
         self.mounts.iter().rev().find(|m| m.mount_point == path)
     }
 
+    pub fn by_id(&self, id: u32) -> Option<&Mount> {
+        self.mounts.iter().find(|m| m.id == id)
+    }
+
     /// Mounts stacked directly on `parent` (each hides whatever `parent` holds
     /// at that mount point).
     pub fn children_of<'a>(&'a self, parent: &'a Mount) -> impl Iterator<Item = &'a Mount> {
@@ -109,7 +123,7 @@ fn parse_line(line: &str) -> Option<Mount> {
     let id = pre.next()?.parse().ok()?;
     let parent = pre.next()?.parse().ok()?;
     let (major, minor) = pre.next()?.split_once(':')?;
-    let _root = pre.next()?;
+    let root = unescape(pre.next()?);
     let mount_point = unescape(pre.next()?);
     let mut post = post.split(' ');
     let fstype = post.next()?.to_string();
@@ -119,6 +133,7 @@ fn parse_line(line: &str) -> Option<Mount> {
         parent,
         major: major.parse().ok()?,
         minor: minor.parse().ok()?,
+        root: PathBuf::from(root),
         mount_point: PathBuf::from(mount_point),
         fstype,
         source,
@@ -168,6 +183,31 @@ pub fn statvfs(path: &Path) -> io::Result<FsStats> {
     })
 }
 
+/// The id (as in `/proc/self/mountinfo`) of the mount through which `path`
+/// is reached, provided `path` is on device `dev`. A btrfs subvolume that
+/// is not mounted on its own has its own `st_dev` but is reached through
+/// the mount holding it, so this is how a walk tells it apart from a
+/// filesystem mounted since the mount table was read. (`statfs` `f_fsid`
+/// cannot: btrfs mixes each subvolume's id into it.) `None` if `path` is
+/// gone, is no longer on `dev`, or the kernel cannot report mount ids.
+/// Never follows a symlink or triggers an automount, and opens nothing.
+pub fn mount_id(path: &Path, dev: u64) -> Option<u32> {
+    use rustix::fs::{AtFlags, StatxFlags};
+    let st = rustix::fs::statx(
+        rustix::fs::CWD,
+        path,
+        AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT,
+        StatxFlags::MNT_ID,
+    )
+    .ok()?;
+    if st.stx_mask & StatxFlags::MNT_ID.bits() == 0
+        || rustix::fs::makedev(st.stx_dev_major, st.stx_dev_minor) != dev
+    {
+        return None;
+    }
+    u32::try_from(st.stx_mnt_id).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +231,49 @@ mod tests {
         assert_eq!(t.mounts[4].mount_point, PathBuf::from("/mnt/with space"));
         assert!(t.mounts[1].is_virtual());
         assert!(!t.mounts[2].is_virtual());
+    }
+
+    #[test]
+    fn parses_mount_root() {
+        let t = MountTable::parse(concat!(
+            "22 1 259:7 / / rw - ext4 /dev/a rw\n",
+            "26 22 259:7 /home/x /mnt/x rw shared:1 - ext4 /dev/a rw\n",
+            "27 22 259:7 /sub\\040dir /mnt/y rw - ext4 /dev/a rw\n",
+            "28 1 0:27 /@ / rw - btrfs /dev/b rw,subvol=/@\n",
+        ));
+        let roots: Vec<&Path> = t.mounts.iter().map(|m| m.root.as_path()).collect();
+        assert_eq!(
+            roots,
+            [
+                Path::new("/"),
+                Path::new("/home/x"),
+                Path::new("/sub dir"),
+                Path::new("/@")
+            ]
+        );
+        let whole: Vec<bool> = t.mounts.iter().map(Mount::is_whole_filesystem).collect();
+        assert_eq!(whole, [true, false, false, false]);
+        assert_eq!(t.by_id(27).unwrap().mount_point, Path::new("/mnt/y"));
+        assert!(t.by_id(99).is_none());
+    }
+
+    #[test]
+    fn mount_id_matches_mountinfo_on_the_same_device_only() {
+        let d = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(d.path()).unwrap();
+        let dev = std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(&path).unwrap());
+        let table = MountTable::read().unwrap();
+        let expected = table.for_path(&path).map(|m| m.id);
+        assert!(expected.is_some());
+        assert_eq!(mount_id(&path, dev), expected);
+        assert_eq!(mount_id(&path, dev.wrapping_add(1)), None);
+        assert_eq!(mount_id(&path.join("missing"), dev), None);
+        let link = path.join("link");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let root_dev = std::os::unix::fs::MetadataExt::dev(&std::fs::metadata("/").unwrap());
+        if root_dev != dev {
+            assert_eq!(mount_id(&link, root_dev), None, "not followed");
+        }
     }
 
     #[test]

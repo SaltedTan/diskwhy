@@ -896,6 +896,7 @@ mod tests {
             path: root.join("mounted"),
             dev: dev + 1,
             totals: Totals::default(),
+            per_dev: Default::default(),
         });
         result.skipped_mounts.push(SkippedRecord {
             path: root.join("mounted/sub"),

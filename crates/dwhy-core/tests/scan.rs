@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use dwhy_core::account::{self, ReportEnv};
 use dwhy_core::mounts::{FsStats, MountTable};
-use dwhy_core::report::{HintKind, SkipReason, UnreadableReason};
-use dwhy_core::scan::{self, Progress, ScanOptions, ScanResult};
+use dwhy_core::report::{DeletedOpen, HintKind, SkipReason, Totals, UnreadableReason};
+use dwhy_core::scan::{self, Progress, ScanOptions, ScanResult, UnreadableRecord};
 use dwhy_core::system::DeletedOpenScan;
 
 fn opts() -> ScanOptions {
@@ -464,4 +464,400 @@ fn unreadable_dirs_become_hints() {
     assert_eq!(h[0].kind, HintKind::Unreadable);
     assert_eq!(h[0].path.as_deref(), Some(locked.to_str().unwrap()));
     assert_eq!(rep.scan.unreadable.count, 1);
+}
+
+/// The `major:minor` of the device holding `p`.
+fn dev_of(p: &Path) -> (u32, u32) {
+    let dev = fs::metadata(p).unwrap().dev();
+    (rustix::fs::major(dev), rustix::fs::minor(dev))
+}
+
+fn stats_used(used: u64) -> impl Fn(&Path) -> Option<FsStats> {
+    move |_: &Path| {
+        Some(FsStats {
+            size: 100 << 30,
+            used,
+            avail: 1 << 30,
+        })
+    }
+}
+
+fn scan_with(roots: &[PathBuf], mounts: &MountTable, one_filesystem: bool) -> ScanResult {
+    let o = ScanOptions {
+        one_filesystem,
+        ..opts()
+    };
+    scan::scan(roots, &o, mounts, &Progress::default()).unwrap()
+}
+
+#[test]
+fn subdirectory_bind_mount_is_not_full_coverage() {
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    write_file(&r.join("f"), 64 << 10);
+    let (ma, mi) = dev_of(&r);
+    let mounts = MountTable::parse(&format!(
+        "1 0 {ma}:{mi} /sub {} rw shared:1 - ext4 /dev/fake rw\n",
+        r.display()
+    ));
+    let res = scan_with(std::slice::from_ref(&r), &mounts, true);
+    let rep = account::build_scan_report(&res, &mounts, &env(false), &stats_used(50 << 30));
+    assert_eq!(rep.fs.len(), 1);
+    let f = &rep.fs[0];
+    assert!(!f.full_coverage);
+    assert_eq!(f.unaccounted, None);
+    assert!(f.hints.is_empty());
+    assert_eq!(f.rerun, None);
+}
+
+#[test]
+fn bind_mount_and_whole_filesystem_report_the_whole_mount() {
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let (whole, bind) = (r.join("whole"), r.join("bind"));
+    fs::create_dir_all(whole.join("sub")).unwrap();
+    fs::create_dir(&bind).unwrap();
+    write_file(&whole.join("f"), 64 << 10);
+    // What the bind mount shows is also under whole/sub: stand-ins for
+    // the same blocks, and one hardlinked inode seen through both.
+    write_file(&whole.join("sub/g"), 32 << 10);
+    write_file(&bind.join("g"), 32 << 10);
+    write_file(&whole.join("sub/h"), 16 << 10);
+    fs::hard_link(whole.join("sub/h"), bind.join("h")).unwrap();
+    let (ma, mi) = dev_of(&r);
+    let mounts = MountTable::parse(&format!(
+        "1 0 {ma}:{mi} / {} rw - ext4 /dev/fake rw\n2 1 {ma}:{mi} /sub {} rw - ext4 /dev/fake rw\n",
+        whole.display(),
+        bind.display()
+    ));
+    // The bind mount first, so the whole-filesystem root has to upgrade it.
+    let res = scan_with(&[bind.clone(), whole.clone()], &mounts, true);
+    // `df` counts each block once, and the whole-filesystem walk reached
+    // every one, including the inode the tree attributes to bind/h.
+    let scanned: u64 = ["", "f", "sub", "sub/g", "sub/h"]
+        .iter()
+        .map(|p| alloc(&whole.join(p)))
+        .sum();
+    assert!(res.totals().allocated > scanned);
+    let gib = 1u64 << 30;
+    let rep =
+        account::build_scan_report(&res, &mounts, &env(false), &stats_used(scanned + 5 * gib));
+    assert_eq!(rep.fs.len(), 1, "{:?}", rep.fs);
+    let f = &rep.fs[0];
+    assert_eq!(f.mount, whole.to_str().unwrap());
+    assert!(f.full_coverage);
+    assert_eq!(f.scanned, scanned);
+    assert_eq!(f.unaccounted, Some(5 * gib));
+    let rerun = f.rerun.as_deref().unwrap();
+    assert!(rerun.ends_with(whole.to_str().unwrap()), "{rerun}");
+}
+
+#[test]
+fn crossed_subdirectory_bind_mount_is_not_full_coverage() {
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let c = r.join("c");
+    fs::create_dir(&c).unwrap();
+    let (ma, mi) = dev_of(&r);
+    for (bind_root, want_full) in [("/sub", false), ("/", true)] {
+        let mounts = MountTable::parse(&format!(
+            "1 0 {ma}:{mi} / {} rw - ext4 /dev/fake rw\n2 1 0:99 {bind_root} {} rw - ext4 /dev/other rw\n",
+            r.display(),
+            c.display()
+        ));
+        let mut res = scan_with(std::slice::from_ref(&r), &mounts, false);
+        // Pretend `c` is the other device's mount point, entered while
+        // crossing filesystems.
+        let other = rustix::fs::makedev(0, 99);
+        res.per_dev.insert(
+            other,
+            Totals {
+                allocated: 1 << 20,
+                ..Totals::default()
+            },
+        );
+        res.dev_mounts.insert(other, 2);
+        res.entered_mounts.insert(2);
+        let rep = account::build_scan_report(&res, &mounts, &env(false), &stats_used(10 << 30));
+        assert_eq!(rep.fs.len(), 2, "{:?}", rep.fs);
+        assert!(rep.fs[0].full_coverage);
+        let f = &rep.fs[1];
+        assert_eq!(f.mount, c.to_str().unwrap());
+        assert_eq!(f.scanned, 1 << 20);
+        assert_eq!(f.full_coverage, want_full, "{bind_root}");
+        assert_eq!(f.unaccounted.is_some(), want_full, "{bind_root}");
+    }
+}
+
+#[test]
+fn root_hidden_from_the_whole_filesystem_root_is_counted_too() {
+    // btrfs top level at `r`, its subvolume `home` mounted over its own
+    // location at r/home: the walk of `r` stops at that mount point, so
+    // only the r/home root sees what is there, and `df` counts it once.
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let home = r.join("home");
+    fs::create_dir(&home).unwrap();
+    write_file(&r.join("f"), 64 << 10);
+    write_file(&home.join("g"), 32 << 10);
+    let (ma, mi) = dev_of(&r);
+    let mounts = MountTable::parse(&format!(
+        "1 0 {ma}:{mi} / {} rw - btrfs /dev/fake rw,subvol=/\n2 1 {ma}:{mi} /home {} rw - btrfs /dev/fake rw,subvol=/home\n",
+        r.display(),
+        home.display()
+    ));
+    let res = scan_with(&[r.clone(), home.clone()], &mounts, true);
+    let scanned: u64 = ["", "f", "home", "home/g"]
+        .iter()
+        .map(|p| alloc(&r.join(p)))
+        .sum();
+    let gib = 1u64 << 30;
+    let rep =
+        account::build_scan_report(&res, &mounts, &env(false), &stats_used(scanned + 5 * gib));
+    assert_eq!(rep.fs.len(), 1, "{:?}", rep.fs);
+    let f = &rep.fs[0];
+    assert!(f.full_coverage);
+    assert_eq!(f.scanned, scanned);
+    assert_eq!(f.unaccounted, Some(5 * gib));
+}
+
+#[test]
+fn roots_showing_the_same_hidden_part_are_counted_once() {
+    // As above, with subvolume `home` mounted again at r/h and its
+    // subdirectory x bind-mounted at r/x (copies stand in for the same
+    // blocks): all three show what the walk of `r` could not reach, and
+    // `df` counts it once.
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let (home, again, sub) = (r.join("home"), r.join("h"), r.join("x"));
+    for d in [home.join("x"), again.join("x"), sub.clone()] {
+        fs::create_dir_all(d).unwrap();
+    }
+    write_file(&r.join("f"), 64 << 10);
+    for d in [&home, &again] {
+        write_file(&d.join("g"), 32 << 10);
+        write_file(&d.join("x/k"), 16 << 10);
+    }
+    write_file(&sub.join("k"), 16 << 10);
+    let (ma, mi) = dev_of(&r);
+    let mounts = MountTable::parse(&format!(
+        "1 0 {ma}:{mi} / {} rw - btrfs /dev/fake rw,subvol=/\n\
+         2 1 {ma}:{mi} /home {} rw - btrfs /dev/fake rw,subvol=/home\n\
+         3 1 {ma}:{mi} /home {} rw - btrfs /dev/fake rw,subvol=/home\n\
+         4 1 {ma}:{mi} /home/x {} rw - btrfs /dev/fake rw,subvol=/home\n",
+        r.display(),
+        home.display(),
+        again.display(),
+        sub.display()
+    ));
+    let res = scan_with(&[r.clone(), home.clone(), again, sub], &mounts, true);
+    let scanned: u64 = ["", "f", "home", "home/g", "home/x", "home/x/k"]
+        .iter()
+        .map(|p| alloc(&r.join(p)))
+        .sum();
+    let gib = 1u64 << 30;
+    let rep =
+        account::build_scan_report(&res, &mounts, &env(false), &stats_used(scanned + 5 * gib));
+    assert_eq!(rep.fs.len(), 1, "{:?}", rep.fs);
+    let f = &rep.fs[0];
+    assert!(f.full_coverage);
+    assert_eq!(f.scanned, scanned);
+    assert_eq!(f.unaccounted, Some(5 * gib));
+}
+
+#[test]
+fn root_hidden_inside_another_hidden_root_is_counted_too() {
+    // btrfs top level at `r`, subvolume `home` mounted at r/home and its
+    // nested subvolume `home/x` mounted at r/home/x: the walk of `r` stops
+    // at r/home and the walk of r/home at r/home/x, so each part is seen by
+    // one root only, and `df` counts each once.
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let (home, x) = (r.join("home"), r.join("home/x"));
+    fs::create_dir_all(&x).unwrap();
+    write_file(&r.join("f"), 64 << 10);
+    write_file(&home.join("g"), 32 << 10);
+    write_file(&x.join("k"), 16 << 10);
+    let (ma, mi) = dev_of(&r);
+    let mounts = MountTable::parse(&format!(
+        "1 0 {ma}:{mi} / {} rw - btrfs /dev/fake rw,subvol=/\n\
+         2 1 {ma}:{mi} /home {} rw - btrfs /dev/fake rw,subvol=/home\n\
+         3 2 {ma}:{mi} /home/x {} rw - btrfs /dev/fake rw,subvol=/home/x\n",
+        r.display(),
+        home.display(),
+        x.display()
+    ));
+    let res = scan_with(&[r.clone(), home.clone(), x.clone()], &mounts, true);
+    let scanned: u64 = ["", "f", "home", "home/g", "home/x", "home/x/k"]
+        .iter()
+        .map(|p| alloc(&r.join(p)))
+        .sum();
+    let gib = 1u64 << 30;
+    let rep =
+        account::build_scan_report(&res, &mounts, &env(false), &stats_used(scanned + 5 * gib));
+    assert_eq!(rep.fs.len(), 1, "{:?}", rep.fs);
+    let f = &rep.fs[0];
+    assert!(f.full_coverage);
+    assert_eq!(f.scanned, scanned);
+    assert_eq!(f.unaccounted, Some(5 * gib));
+}
+
+#[test]
+fn root_the_whole_filesystem_root_reaches_elsewhere_is_not_counted_twice() {
+    // The same, but the subvolume lives at /@home and is mounted at
+    // r/home: the walk of `r` reaches it at r/@home (here a copy stands in
+    // for the same blocks), so the r/home root adds nothing new.
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let (home, at) = (r.join("home"), r.join("@home"));
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&at).unwrap();
+    write_file(&r.join("f"), 64 << 10);
+    write_file(&home.join("g"), 32 << 10);
+    write_file(&at.join("g"), 32 << 10);
+    let (ma, mi) = dev_of(&r);
+    let mounts = MountTable::parse(&format!(
+        "1 0 {ma}:{mi} / {} rw - btrfs /dev/fake rw,subvol=/\n2 1 {ma}:{mi} /@home {} rw - btrfs /dev/fake rw,subvol=/@home\n",
+        r.display(),
+        home.display()
+    ));
+    let res = scan_with(&[r.clone(), home.clone()], &mounts, true);
+    let scanned: u64 = ["", "f", "@home", "@home/g"]
+        .iter()
+        .map(|p| alloc(&r.join(p)))
+        .sum();
+    let gib = 1u64 << 30;
+    let rep =
+        account::build_scan_report(&res, &mounts, &env(false), &stats_used(scanned + 5 * gib));
+    assert_eq!(rep.fs.len(), 1, "{:?}", rep.fs);
+    let f = &rep.fs[0];
+    assert!(f.full_coverage);
+    assert_eq!(f.scanned, scanned);
+    assert_eq!(f.unaccounted, Some(5 * gib));
+}
+
+#[test]
+fn entered_whole_mount_is_not_full_coverage_when_reached_another_way_too() {
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    write_file(&r.join("f"), 64 << 10);
+    let top = r.join("top");
+    // The root is a subvolume or subdirectory of filesystem 0:27, whose
+    // whole mount at `top` the walk then enters: `df` counts the root's
+    // blocks once, but both walks reached them.
+    for (fstype, root_dir) in [("btrfs", "/@"), ("ext4", "/x")] {
+        let mounts = MountTable::parse(&format!(
+            "1 0 0:27 {root_dir} {} rw - {fstype} /dev/fake rw\n2 1 0:27 / {} rw - {fstype} /dev/fake rw\n",
+            r.display(),
+            top.display()
+        ));
+        let mut res = scan_with(std::slice::from_ref(&r), &mounts, false);
+        let other = rustix::fs::makedev(0, 28);
+        res.per_dev.insert(
+            other,
+            Totals {
+                allocated: 1 << 20,
+                ..Totals::default()
+            },
+        );
+        res.dev_mounts.insert(other, 2);
+        res.entered_mounts.insert(2);
+        let rep = account::build_scan_report(&res, &mounts, &env(false), &stats_used(10 << 30));
+        assert_eq!(rep.fs.len(), 1, "{:?}", rep.fs);
+        let f = &rep.fs[0];
+        assert!(!f.full_coverage, "{fstype}");
+        assert_eq!(f.unaccounted, None, "{fstype}");
+        assert!(f.hints.is_empty(), "{fstype}");
+    }
+}
+
+#[test]
+fn btrfs_subvolume_mounted_as_root_is_not_full_coverage() {
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let (ma, mi) = dev_of(&r);
+    let mounts = MountTable::parse(&format!(
+        "1 0 {ma}:{mi} /@ {} rw - btrfs /dev/fake rw,subvol=/@\n",
+        r.display()
+    ));
+    let res = scan_with(std::slice::from_ref(&r), &mounts, true);
+    let rep = account::build_scan_report(&res, &mounts, &env(false), &stats_used(50 << 30));
+    assert_eq!(rep.fs.len(), 1);
+    assert!(!rep.fs[0].full_coverage);
+    assert_eq!(rep.fs[0].unaccounted, None);
+    assert!(rep.fs[0].hints.is_empty());
+}
+
+#[test]
+fn btrfs_subvolume_devices_are_one_filesystem() {
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    // The mount table names the filesystem 0:27; its top-level subvolume
+    // is 0:28 and a nested subvolume 0:31, as btrfs reports in st_dev.
+    let mounts = MountTable::parse(&format!(
+        "1 0 0:27 / {} rw - btrfs /dev/fake rw,subvol=/\n",
+        r.display()
+    ));
+    let mut res = scan_with(std::slice::from_ref(&r), &mounts, true);
+    let (top, nested, elsewhere) = (
+        rustix::fs::makedev(0, 28),
+        rustix::fs::makedev(0, 31),
+        rustix::fs::makedev(0, 77),
+    );
+    let mb = |n: u64| Totals {
+        allocated: n << 20,
+        ..Totals::default()
+    };
+    res.roots[0].dev = top;
+    res.per_dev = [(top, mb(3)), (nested, mb(5))].into_iter().collect();
+    res.roots[0].per_dev = res.per_dev.clone();
+    res.dev_mounts = [(top, 1), (nested, 1)].into_iter().collect();
+    let unreadable = |p: PathBuf, dev| UnreadableRecord {
+        path: p,
+        dev,
+        reason: UnreadableReason::PermissionDenied,
+        entries_unknown: 0,
+        known_bytes: 4096,
+        owner_uid: 0,
+    };
+    res.unreadable = vec![
+        unreadable(r.join("a"), top),
+        unreadable(r.join("sub/b"), nested),
+    ];
+    let mut e = env(false);
+    e.deleted_open.processes_unreadable = 4;
+    for (dev, files, bytes) in [(top, 1, 1000), (nested, 2, 2000), (elsewhere, 7, 7000)] {
+        e.deleted_open.per_dev.insert(
+            dev,
+            DeletedOpen {
+                files,
+                bytes,
+                processes_unreadable: 0,
+            },
+        );
+    }
+    let used = 2u64 << 30;
+    let rep = account::build_scan_report(&res, &mounts, &e, &stats_used(used));
+    assert_eq!(rep.fs.len(), 1, "{:?}", rep.fs);
+    let f = &rep.fs[0];
+    assert_eq!(f.mount, r.to_str().unwrap());
+    assert!(f.full_coverage);
+    assert_eq!(f.scanned, 8 << 20);
+    assert_eq!(f.unaccounted, Some(used - (8 << 20)));
+    assert_eq!(
+        f.deleted_open,
+        DeletedOpen {
+            files: 3,
+            bytes: 3000,
+            processes_unreadable: 4,
+        }
+    );
+    let unread: u64 = f
+        .hints
+        .iter()
+        .filter(|h| h.kind == HintKind::Unreadable)
+        .map(|h| h.unreadable_dirs)
+        .sum();
+    assert_eq!(unread, 2, "{:?}", f.hints);
+    assert!(f.hints.iter().any(|h| h.kind == HintKind::DeletedOpen));
 }
