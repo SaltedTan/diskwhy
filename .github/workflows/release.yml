@@ -89,8 +89,8 @@ jobs:
           file "$bin" | grep -Eq 'static(-pie)? linked|statically linked'
           if [ "$QEMU" = "true" ]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends qemu-user-static
-            run=qemu-aarch64-static
+            sudo apt-get install -y --no-install-recommends qemu-user
+            run=qemu-aarch64
           else
             run=
           fi
