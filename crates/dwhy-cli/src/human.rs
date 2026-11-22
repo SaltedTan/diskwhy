@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use dwhy_core::apply::{self, action_kind_name, guard_status_name, tier_name};
+use dwhy_core::detect::escape_controls;
 use dwhy_core::explain;
 use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{
@@ -26,7 +27,7 @@ pub fn render_scan(
     writeln!(
         w,
         "dwhy scan · {} · uid {} · {} · {:.1}s",
-        r.host,
+        escape_controls(&r.host),
         r.uid,
         if s.one_filesystem {
             "one filesystem"
@@ -53,7 +54,12 @@ pub fn render_scan(
     writeln!(w)?;
     let u = &s.unreadable;
     if u.count > 0 {
-        let examples: Vec<&str> = u.dirs.iter().take(3).map(|d| d.path.as_str()).collect();
+        let examples: Vec<std::borrow::Cow<'_, str>> = u
+            .dirs
+            .iter()
+            .take(3)
+            .map(|d| escape_controls(&d.path))
+            .collect();
         writeln!(
             w,
             "unreadable  {} directories, contents unknown: {}{}",
@@ -101,8 +107,14 @@ pub fn render_scan(
             w,
             "errors      {} (first: {}: {})",
             thousands(s.error_count),
-            s.errors.first().map(|e| e.path.as_str()).unwrap_or("?"),
-            s.errors.first().map(|e| e.error.as_str()).unwrap_or("?")
+            s.errors
+                .first()
+                .map(|e| escape_controls(&e.path))
+                .unwrap_or("?".into()),
+            s.errors
+                .first()
+                .map(|e| escape_controls(&e.error))
+                .unwrap_or("?".into())
         )?;
     }
 
@@ -123,7 +135,12 @@ pub fn render_scan(
     )?;
     if let Some(snap) = &r.snapshot {
         writeln!(w)?;
-        write!(w, "snapshot saved: {} ({})", snap.id, snap.path)?;
+        write!(
+            w,
+            "snapshot saved: {} ({})",
+            escape_controls(&snap.id),
+            escape_controls(&snap.path)
+        )?;
         if snap.pruned > 0 {
             write!(
                 w,
@@ -140,20 +157,31 @@ pub fn render_scan(
 /// What grew since a snapshot: filesystems, then directories, Docker and
 /// findings, each fastest growth first; `top` entries per section.
 pub fn render_diff(w: &mut impl Write, d: &DiffReport, top: usize) -> io::Result<()> {
-    let base = d.since.id.as_deref().unwrap_or(&d.since.path);
+    let base = escape_controls(d.since.id.as_deref().unwrap_or(&d.since.path));
+    let roots = d
+        .roots
+        .iter()
+        .map(|r| escape_controls(r))
+        .collect::<Vec<_>>();
     writeln!(
         w,
         "dwhy diff · {} · since {} ({} ago) · {}",
-        d.host,
+        escape_controls(&d.host),
         base,
         age(d.elapsed_secs),
-        d.roots.join(" ")
+        roots.join(" ")
     )?;
     if !dwhy_core::snapshot::same_roots(&d.since.roots, &d.roots) {
+        let since_roots = d
+            .since
+            .roots
+            .iter()
+            .map(|r| escape_controls(r))
+            .collect::<Vec<_>>();
         writeln!(
             w,
             "  the snapshot covers {}; only paths in both are compared",
-            d.since.roots.join(" ")
+            since_roots.join(" ")
         )?;
     }
     let sections: [(&str, &[Change]); 4] = [
@@ -219,34 +247,45 @@ pub fn render_diff(w: &mut impl Write, d: &DiffReport, top: usize) -> io::Result
         writeln!(w)?;
     }
     for n in &d.notes {
-        writeln!(w, "note: {n}")?;
+        writeln!(w, "note: {}", escape_controls(n))?;
     }
     if let Some(snap) = &d.snapshot {
         writeln!(w)?;
-        writeln!(w, "snapshot saved: {} ({})", snap.id, snap.path)?;
+        writeln!(
+            w,
+            "snapshot saved: {} ({})",
+            escape_controls(&snap.id),
+            escape_controls(&snap.path)
+        )?;
     }
     Ok(())
 }
 
 fn label(kind: ChangeKind, name: &str, detector: Option<&str>) -> String {
+    let name = escape_controls(name);
     match kind {
-        ChangeKind::Fs | ChangeKind::Dir => name.to_string(),
+        ChangeKind::Fs | ChangeKind::Dir => name.into_owned(),
         ChangeKind::Image => format!("image {name}"),
         ChangeKind::Container => format!("container {name}"),
         ChangeKind::Volume => format!("volume {name}"),
         ChangeKind::BuildCache => "build cache".into(),
-        ChangeKind::Finding => format!("{} {name}", detector.unwrap_or("finding")),
+        ChangeKind::Finding => format!("{} {name}", escape_controls(detector.unwrap_or("finding"))),
     }
 }
 
 /// Growth over a watch window, per section, fastest first.
 pub fn render_watch(w: &mut impl Write, r: &WatchReport, top: usize) -> io::Result<()> {
+    let roots = r
+        .roots
+        .iter()
+        .map(|p| escape_controls(p))
+        .collect::<Vec<_>>();
     writeln!(
         w,
         "dwhy watch · {} · {:.1}s window · {}",
-        r.host,
+        escape_controls(&r.host),
         r.elapsed_ms as f64 / 1000.0,
-        r.roots.join(" ")
+        roots.join(" ")
     )?;
     let sections: [(&str, &[Rate]); 3] = [
         ("filesystems (df used)", &r.fs),
@@ -300,7 +339,7 @@ pub fn render_watch(w: &mut impl Write, r: &WatchReport, top: usize) -> io::Resu
         writeln!(w)?;
     }
     for n in &r.notes {
-        writeln!(w, "note: {n}")?;
+        writeln!(w, "note: {}", escape_controls(n))?;
     }
     Ok(())
 }
@@ -309,18 +348,25 @@ pub fn render_watch(w: &mut impl Write, r: &WatchReport, top: usize) -> io::Resu
 /// growth, the action and the cost of recovery. Without a finding, what is
 /// at the path and the findings inside it.
 pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
-    writeln!(w, "dwhy explain · {} · {}", r.host, r.path)?;
+    writeln!(
+        w,
+        "dwhy explain · {} · {}",
+        escape_controls(&r.host),
+        escape_controls(&r.path)
+    )?;
     if let Some(s) = &r.resolved.snapshot {
         writeln!(
             w,
             "  {} resolved through snapshot {} ({})",
-            r.query, s.id, s.created_at
+            escape_controls(&r.query),
+            escape_controls(&s.id),
+            escape_controls(&s.created_at)
         )?;
     }
     let Some(f) = &r.finding else {
         writeln!(w)?;
         if r.gone {
-            writeln!(w, "finding {} is gone", r.query)?;
+            writeln!(w, "finding {} is gone", escape_controls(&r.query))?;
         } else if r.resolved.via == dwhy_core::report::ExplainVia::Path {
             writeln!(w, "no detector claims this path")?;
         }
@@ -340,10 +386,10 @@ pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
                     w,
                     "  {:>8}  {:<13} {:<12} {}  {}",
                     human(i.bytes),
-                    i.detector,
+                    escape_controls(&i.detector),
                     tier_name(i.tier),
-                    i.path,
-                    i.id
+                    escape_controls(&i.path),
+                    escape_controls(&i.id)
                 )?;
             }
         }
@@ -354,22 +400,22 @@ pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
     writeln!(
         w,
         "finding {} · {} · {}",
-        f.id,
-        f.detector,
+        escape_controls(&f.id),
+        escape_controls(&f.detector),
         tier_name(f.tier)
     )?;
-    writeln!(w, "  {:>8}  {}", human(f.bytes), f.path)?;
+    writeln!(w, "  {:>8}  {}", human(f.bytes), escape_controls(&f.path))?;
     if let Some(t) = &f.last_modified {
-        writeln!(w, "  last written {t}")?;
+        writeln!(w, "  last written {}", escape_controls(t))?;
     }
-    writeln!(w, "  {}", f.reason)?;
+    writeln!(w, "  {}", escape_controls(&f.reason))?;
 
     if let Some(ev) = f.evidence.as_ref().and_then(|e| e.postgres_wal.as_ref()) {
         writeln!(w)?;
         writeln!(w, "evidence ({}):", postgres_wal::NAME)?;
-        writeln!(w, "  {}", postgres_wal::headline(ev))?;
+        writeln!(w, "  {}", escape_controls(&postgres_wal::headline(ev)))?;
         for n in &ev.notes {
-            writeln!(w, "  note: {n}")?;
+            writeln!(w, "  note: {}", escape_controls(n))?;
         }
     }
 
@@ -380,7 +426,12 @@ pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
         writeln!(w, "guards:")?;
         for g in &f.guards {
             let status = guard_status_name(g.status);
-            writeln!(w, "  {status:<5}  {:<20} {}", g.name, g.detail)?;
+            writeln!(
+                w,
+                "  {status:<5}  {:<20} {}",
+                escape_controls(&g.name),
+                escape_controls(&g.detail)
+            )?;
         }
     }
 
@@ -396,9 +447,9 @@ pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
             w,
             "growth: {}/day since {}",
             signed(g.bytes_per_day),
-            g.since
+            escape_controls(&g.since)
         )?,
-        (None, Some(reason)) => writeln!(w, "growth: unknown ({reason})")?,
+        (None, Some(reason)) => writeln!(w, "growth: unknown ({})", escape_controls(reason))?,
         (None, None) => writeln!(
             w,
             "growth: unknown (no eligible snapshot (one filesystem, at least an hour old) lists this finding)"
@@ -407,13 +458,13 @@ pub fn render_explain(w: &mut impl Write, r: &ExplainReport) -> io::Result<()> {
 
     writeln!(w)?;
     writeln!(w, "action ({}):", action_kind_name(f.action.kind))?;
-    writeln!(w, "  {}", f.action.text)?;
+    writeln!(w, "  {}", command(&f.action.text))?;
 
     writeln!(w)?;
     writeln!(w, "recovery:")?;
-    writeln!(w, "  cost: {}", f.recovery.cost)?;
+    writeln!(w, "  cost: {}", escape_controls(&f.recovery.cost))?;
     if let Some(how) = &f.recovery.how {
-        writeln!(w, "  how:  {how}")?;
+        writeln!(w, "  how:  {}", command(how))?;
     }
     let notes: Vec<String> = r
         .notes
@@ -429,7 +480,7 @@ fn render_notes(w: &mut impl Write, notes: &[String]) -> io::Result<()> {
         writeln!(w)?;
     }
     for n in notes {
-        writeln!(w, "note: {n}")?;
+        writeln!(w, "note: {}", escape_controls(n))?;
     }
     Ok(())
 }
@@ -455,7 +506,7 @@ pub fn render_plan(
             p.items.len(),
             if p.items.len() == 1 { "" } else { "s" },
             human(p.bytes),
-            p.expires_at
+            escape_controls(&p.expires_at)
         )?;
     }
     for tier in [Tier::Regenerable, Tier::Rebuildable, Tier::Review] {
@@ -470,13 +521,29 @@ pub fn render_plan(
         }
         writeln!(w, "  {}", tier_name(tier))?;
         for f in in_tier {
-            writeln!(w, "  {:>8}  {:<13} {}", human(f.bytes), f.detector, f.path)?;
-            writeln!(w, "  {:>8}  {:<13} {} → {}", "", "", f.id, f.action.text)?;
+            writeln!(
+                w,
+                "  {:>8}  {:<13} {}",
+                human(f.bytes),
+                escape_controls(&f.detector),
+                escape_controls(&f.path)
+            )?;
+            writeln!(
+                w,
+                "  {:>8}  {:<13} {} → {}",
+                "",
+                "",
+                escape_controls(&f.id),
+                command(&f.action.text)
+            )?;
             for g in f.guards.iter().filter(|g| g.status == GuardStatus::Warn) {
                 writeln!(
                     w,
                     "  {:>8}  {:<13} warning, {}: {}",
-                    "", "", g.name, g.detail
+                    "",
+                    "",
+                    escape_controls(&g.name),
+                    escape_controls(&g.detail)
                 )?;
             }
         }
@@ -484,12 +551,21 @@ pub fn render_plan(
     if !p.blocked.is_empty() {
         writeln!(w, "  blocked (not in the plan: a guard failed)")?;
         for f in &p.blocked {
-            writeln!(w, "  {:>8}  {:<13} {}", human(f.bytes), f.detector, f.path)?;
+            writeln!(
+                w,
+                "  {:>8}  {:<13} {}",
+                human(f.bytes),
+                escape_controls(&f.detector),
+                escape_controls(&f.path)
+            )?;
             for g in f.guards.iter().filter(|g| g.status == GuardStatus::Block) {
                 writeln!(
                     w,
                     "  {:>8}  {:<13} blocked by {}: {}",
-                    "", "", g.name, g.detail
+                    "",
+                    "",
+                    escape_controls(&g.name),
+                    escape_controls(&g.detail)
                 )?;
             }
         }
@@ -505,13 +581,17 @@ pub fn render_plan(
         )?;
     }
     match written {
-        Some(path) if !p.items.is_empty() => writeln!(
-            w,
-            "wrote {}; apply it within an hour: dwhy apply {}",
-            path.display(),
-            dwhy_core::detect::shell_quote(&path.to_string_lossy())
-        )?,
-        Some(path) => writeln!(w, "wrote {}", path.display())?,
+        Some(path) if !p.items.is_empty() => {
+            let path = path.to_string_lossy();
+            let apply = format!("dwhy apply {}", dwhy_core::detect::shell_quote(&path));
+            writeln!(
+                w,
+                "wrote {}; apply it within an hour: {}",
+                escape_controls(&path),
+                command(&apply)
+            )?
+        }
+        Some(path) => writeln!(w, "wrote {}", escape_controls(&path.to_string_lossy()))?,
         None => writeln!(w, "no plan file written (-o FILE writes one)")?,
     }
     Ok(())
@@ -536,14 +616,17 @@ pub fn render_apply(
             "  {:<12} {:>8}  {:<13} {}",
             apply::outcome_label(i.outcome),
             human(i.bytes),
-            escape_only_controls(&i.detector),
-            escape_only_controls(&i.path)
+            escape_controls(&i.detector),
+            escape_controls(&i.path)
         )?;
+        // `detail` is built in `dwhy-core` and already escapes a plan file's
+        // text, so escape only the control characters it may still hold.
         let note = match i.outcome {
-            ApplyOutcome::WouldRemove => format!("{} → {}", tier_name(i.tier), i.action.text),
-            _ => i.detail.clone(),
+            ApplyOutcome::WouldRemove => {
+                format!("{} → {}", tier_name(i.tier), command(&i.action.text))
+            }
+            _ => escape_only_controls(&i.detail).into_owned(),
         };
-        let note = escape_only_controls(&note);
         writeln!(w, "  {:<12} {:>8}  {:<13} {note}", "", "", "")?;
     }
     if items_only {
@@ -551,7 +634,7 @@ pub fn render_apply(
     }
     writeln!(w, "{}", apply::summary_with_would_free(r, would_free))?;
     if let Some(p) = audit {
-        writeln!(w, "audit log: {}", p.display())?;
+        writeln!(w, "audit log: {}", escape_controls(&p.to_string_lossy()))?;
     }
     Ok(())
 }
@@ -626,15 +709,21 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
                 break;
             }
             shown += 1;
-            write!(w, "  {:>8}  {:<13} {}", human(f.bytes), f.detector, f.path)?;
+            write!(
+                w,
+                "  {:>8}  {:<13} {}",
+                human(f.bytes),
+                escape_controls(&f.detector),
+                escape_controls(&f.path)
+            )?;
             match &f.growth {
                 Some(g) if g.bytes_per_day != 0 => {
                     writeln!(w, "  ({}/day)", signed(g.bytes_per_day))?
                 }
                 _ => writeln!(w)?,
             }
-            writeln!(w, "  {:>8}  {:<13} {}", "", "", f.reason)?;
-            writeln!(w, "  {:>8}  {:<13} → {}", "", "", f.action.text)?;
+            writeln!(w, "  {:>8}  {:<13} {}", "", "", escape_controls(&f.reason))?;
+            writeln!(w, "  {:>8}  {:<13} → {}", "", "", command(&f.action.text))?;
             if let Some(ev) = f.evidence.as_ref().and_then(|e| e.postgres_wal.as_ref()) {
                 writeln!(
                     w,
@@ -642,14 +731,17 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
                     "",
                     "",
                     postgres_wal::NAME,
-                    postgres_wal::summary(ev)
+                    escape_controls(&postgres_wal::summary(ev))
                 )?;
             }
             for g in f.guards.iter().filter(|g| g.status == GuardStatus::Block) {
                 writeln!(
                     w,
                     "  {:>8}  {:<13} blocked by {}: {}",
-                    "", "", g.name, g.detail
+                    "",
+                    "",
+                    escape_controls(&g.name),
+                    escape_controls(&g.detail)
                 )?;
             }
         }
@@ -661,18 +753,18 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
             r.findings.len() - shown
         )?;
     }
-    let unavailable: Vec<&str> = r
+    let unavailable: Vec<std::borrow::Cow<'_, str>> = r
         .detectors
         .iter()
         .filter(|d| !d.ran && d.status == DetectorAvailability::Unavailable)
-        .map(|d| d.name.as_str())
+        .map(|d| escape_controls(&d.name))
         .collect();
     for d in r.detectors.iter().filter(|d| d.error.is_some()) {
         writeln!(
             w,
             "  failed: {}: {}",
-            d.name,
-            d.error.as_deref().unwrap_or("")
+            escape_controls(&d.name),
+            d.error.as_deref().map(escape_controls).unwrap_or("".into())
         )?;
     }
     if !unavailable.is_empty() {
@@ -686,7 +778,13 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
 }
 
 fn render_fs(w: &mut impl Write, r: &ScanReport, fs: &FsReport) -> io::Result<()> {
-    writeln!(w, "filesystem {}  ({}, {})", fs.mount, fs.fstype, fs.source)?;
+    writeln!(
+        w,
+        "filesystem {}  ({}, {})",
+        escape_controls(&fs.mount),
+        escape_controls(&fs.fstype),
+        escape_controls(&fs.source)
+    )?;
     writeln!(
         w,
         "  df used      {:>8} of {} ({} available)",
@@ -719,29 +817,39 @@ fn render_fs(w: &mut impl Write, r: &ScanReport, fs: &FsReport) -> io::Result<()
                     w,
                     "  scanned      {:>8}  under {} (this mount shows only part of its filesystem; scan where the whole filesystem is mounted to account for all of it)",
                     human(fs.scanned),
-                    under.join(", "),
+                    escape_controls(&under.join(", ")),
                 )?;
             } else {
                 writeln!(
                     w,
                     "  scanned      {:>8}  under {} (part of this filesystem; scan {} to account for all of it)",
                     human(fs.scanned),
-                    under.join(", "),
-                    fs.mount
+                    escape_controls(&under.join(", ")),
+                    escape_controls(&fs.mount)
                 )?;
             }
         }
     }
     if fs.unaccounted_large && !fs.hints.is_empty() {
         writeln!(w, "  likely in:")?;
-        let width = fs
+        let hints = fs
             .hints
             .iter()
-            .filter_map(|h| h.path.as_ref().map(|p| p.len()))
+            .map(|h| {
+                (
+                    h,
+                    h.path.as_deref().map(escape_controls),
+                    escape_controls(&h.detail),
+                )
+            })
+            .collect::<Vec<_>>();
+        let width = hints
+            .iter()
+            .filter_map(|(_, p, _)| p.as_ref().map(|p| p.len()))
             .max()
             .unwrap_or(0)
             .min(28);
-        for h in fs.hints.iter().take(8) {
+        for (h, path, detail) in hints.iter().take(8) {
             let mut extra = Vec::new();
             if h.unreadable_dirs > 0 {
                 extra.push(format!(
@@ -758,9 +866,9 @@ fn render_fs(w: &mut impl Write, r: &ScanReport, fs: &FsReport) -> io::Result<()
             } else {
                 format!("  [{}]", extra.join(", "))
             };
-            match &h.path {
-                Some(p) => writeln!(w, "    {p:<width$}  {}{extra}", h.detail)?,
-                None => writeln!(w, "    {:<width$}  {}{extra}", "·", h.detail)?,
+            match path {
+                Some(p) => writeln!(w, "    {p:<width$}  {detail}{extra}")?,
+                None => writeln!(w, "    {:<width$}  {detail}{extra}", "·")?,
             }
         }
         if fs.hints.len() > 8 {
@@ -769,7 +877,7 @@ fn render_fs(w: &mut impl Write, r: &ScanReport, fs: &FsReport) -> io::Result<()
     }
     if let Some(cmd) = &fs.rerun {
         writeln!(w, "  rerun with sudo for a full count:")?;
-        writeln!(w, "    {cmd}")?;
+        writeln!(w, "    {}", command(cmd))?;
     }
     Ok(())
 }
@@ -795,10 +903,10 @@ fn render_tree(
     for root in roots {
         match by_path.get(root) {
             Some(d) => {
-                writeln!(w, "{:>8}  {}", human(d.allocated), d.path)?;
+                writeln!(w, "{:>8}  {}", human(d.allocated), escape_controls(&d.path))?;
                 walk(w, &children, d, "", 1, max_depth, top)?;
             }
-            None => writeln!(w, "{:>8}  {} (below threshold)", "", root)?,
+            None => writeln!(w, "{:>8}  {} (below threshold)", "", escape_controls(root))?,
         }
     }
     Ok(())
@@ -826,6 +934,7 @@ fn walk(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| k.path.clone());
+        let name = escape_controls(&name);
         writeln!(
             w,
             "{:>8}  {prefix}{}{name}",
@@ -851,7 +960,9 @@ pub fn render_doctor(w: &mut impl Write, d: &DoctorReport) -> io::Result<()> {
     writeln!(
         w,
         "dwhy doctor · {} · {} {}",
-        d.host, d.tool.name, d.tool.version
+        escape_controls(&d.host),
+        escape_controls(&d.tool.name),
+        escape_controls(&d.tool.version)
     )?;
     writeln!(w)?;
     writeln!(
@@ -865,7 +976,7 @@ pub fn render_doctor(w: &mut impl Write, d: &DoctorReport) -> io::Result<()> {
         w,
         "docker      group member: {} · socket {}: {}",
         if d.docker_group { "yes" } else { "no" },
-        d.docker_socket.path,
+        escape_controls(&d.docker_socket.path),
         match (d.docker_socket.exists, d.docker_socket.accessible) {
             (false, _) => "absent",
             (true, false) => "not accessible",
@@ -876,12 +987,17 @@ pub fn render_doctor(w: &mut impl Write, d: &DoctorReport) -> io::Result<()> {
     writeln!(w, "tools")?;
     for t in &d.tools {
         let loc = match (&t.path, &t.off_path) {
-            (Some(p), _) => p.clone(),
-            (None, Some(p)) => format!("not on PATH (found {p})"),
+            (Some(p), _) => escape_controls(p).into_owned(),
+            (None, Some(p)) => format!("not on PATH (found {})", escape_controls(p)),
             (None, None) => "not found".into(),
         };
-        writeln!(w, "  {:<11} {loc}", t.name)?;
-        writeln!(w, "  {:<11} enables {}", "", t.enables.join(", "))?;
+        writeln!(w, "  {:<11} {loc}", escape_controls(&t.name))?;
+        let enables = t
+            .enables
+            .iter()
+            .map(|e| escape_controls(e))
+            .collect::<Vec<_>>();
+        writeln!(w, "  {:<11} enables {}", "", enables.join(", "))?;
     }
     writeln!(w)?;
     writeln!(w, "detectors")?;
@@ -896,9 +1012,9 @@ pub fn render_doctor(w: &mut impl Write, d: &DoctorReport) -> io::Result<()> {
             w,
             "  {} {:<19} {:<9} {}",
             mark(det.status),
-            det.name,
+            escape_controls(&det.name),
             det.milestone,
-            det.detail
+            escape_controls(&det.detail)
         )?;
     }
     if !d.probes.is_empty() {
@@ -909,25 +1025,41 @@ pub fn render_doctor(w: &mut impl Write, d: &DoctorReport) -> io::Result<()> {
                 w,
                 "  {} {:<19} {:<9} {}",
                 mark(p.status),
-                p.name,
+                escape_controls(&p.name),
                 p.milestone,
-                p.detail
+                escape_controls(&p.detail)
             )?;
         }
     }
     if !d.notes.is_empty() {
         writeln!(w)?;
         for n in &d.notes {
-            writeln!(w, "note: {n}")?;
+            writeln!(w, "note: {}", escape_controls(n))?;
         }
     }
     Ok(())
 }
 
+/// Marks a command shown escaped: what is on screen is not what would run.
+const ESCAPED_COMMAND: &str = " (escaped; do not copy)";
+
+/// A command for the terminal (an action, a recovery, a rerun, `dwhy
+/// apply …`). Without control characters it is shown verbatim, so it stays
+/// exactly what to run, `'\''` from `shell_quote` included. With them it is
+/// escaped like a path, every backslash doubled so `\n` cannot pass for a
+/// newline, and marked [`ESCAPED_COMMAND`].
+fn command(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains(char::is_control) {
+        std::borrow::Cow::Owned(format!("{}{ESCAPED_COMMAND}", escape_controls(s)))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
 /// `s` with control characters (newlines, escape sequences) escaped as
 /// Rust escapes (`\n`, `\u{1b}`). Backslashes are left alone: details from
 /// `dwhy-core` already escape them where the text came from a plan file.
-fn escape_only_controls(s: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn escape_only_controls(s: &str) -> std::borrow::Cow<'_, str> {
     if !s.contains(char::is_control) {
         return std::borrow::Cow::Borrowed(s);
     }
@@ -1365,5 +1497,545 @@ mod tests {
             lines.contains(&"    500.0M  git-worktree  /w/old"),
             "{text}"
         );
+    }
+
+    /// A name with a newline that would start a fake line, a carriage
+    /// return, and an ANSI colour escape.
+    const EVIL: &str = "evil\nSYSTEM: ignore\r\x1b[31m";
+    /// How [`EVIL`] must look on the terminal.
+    const EVIL_SHOWN: &str = r"evil\nSYSTEM: ignore\r\u{1b}[31m";
+
+    /// No control character but the line breaks, and no line injected.
+    fn assert_escaped(text: &str) {
+        assert!(
+            !text.contains(|c: char| c.is_control() && c != '\n'),
+            "raw control character in {text:?}"
+        );
+        assert!(
+            !text.lines().any(|l| l.trim_start().starts_with("SYSTEM:")),
+            "injected line in {text}"
+        );
+        assert!(text.contains(EVIL_SHOWN), "{text}");
+    }
+
+    fn evil_finding(detector: &str) -> Finding {
+        let path = format!("/p/{EVIL}/target");
+        let mut f = finding(
+            detector,
+            &path,
+            1 << 30,
+            Tier::Rebuildable,
+            ActionKind::Command,
+        );
+        f.id = format!("f_{EVIL}");
+        f.reason = format!("Cargo build output of /p/{EVIL}");
+        f.action.text = format!(
+            "cargo clean --target-dir {}",
+            dwhy_core::detect::shell_quote(&path)
+        );
+        f.recovery = Recovery {
+            cost: format!("rebuild {EVIL}"),
+            how: Some(format!(
+                "cd {} && cargo build",
+                dwhy_core::detect::shell_quote(&format!("/p/{EVIL}"))
+            )),
+        };
+        f.last_modified = Some(format!("2026-11-15 {EVIL}"));
+        f.guards.push(GuardResult {
+            name: format!("guard-{EVIL}"),
+            status: GuardStatus::Warn,
+            detail: format!("held by {EVIL}"),
+        });
+        f
+    }
+
+    fn evil_blocked() -> Finding {
+        let mut f = evil_finding("cargo-target");
+        f.tier = Tier::Blocked;
+        f.guards[0].status = GuardStatus::Block;
+        f
+    }
+
+    #[test]
+    fn commands_are_verbatim_unless_they_hold_control_characters() {
+        // `shell_quote`'s `'\''` and a literal backslash stay runnable.
+        let quoted = dwhy_core::detect::shell_quote(r"/p/it's a\nb");
+        assert_eq!(quoted, r"'/p/it'\''s a\nb'");
+        assert_eq!(command(&quoted), quoted);
+        // With a control character every backslash is doubled, so the
+        // escaped newline is told apart from the literal `\n`, and the
+        // command is marked as not what would run.
+        let quoted = dwhy_core::detect::shell_quote("/p/it's a\\nb\nc\x1b[31m");
+        assert_eq!(
+            command(&quoted),
+            r"'/p/it'\\''s a\\nb\nc\u{1b}[31m' (escaped; do not copy)"
+        );
+    }
+
+    #[test]
+    fn scan_text_escapes_control_characters() {
+        let mut r = report(vec![evil_finding("cargo-target"), evil_blocked()]);
+        let root = format!("/p/{EVIL}");
+        r.host = format!("host-{EVIL}");
+        r.scan.roots = vec![RootReport {
+            path: root.clone(),
+            mount: "/".into(),
+            totals: Totals::default(),
+        }];
+        r.scan.dirs = vec![
+            DirEntry {
+                path: root.clone(),
+                depth: 0,
+                allocated: 2 << 30,
+                apparent: 2 << 30,
+                files: 1,
+            },
+            DirEntry {
+                path: format!("{root}/{EVIL}"),
+                depth: 1,
+                allocated: 1 << 30,
+                apparent: 1 << 30,
+                files: 1,
+            },
+        ];
+        r.scan.unreadable = Unreadable {
+            count: 1,
+            dirs: vec![UnreadableDir {
+                path: format!("/u/{EVIL}"),
+                reason: UnreadableReason::PermissionDenied,
+                entries_unknown: 0,
+                known_bytes: 0,
+                owner_uid: None,
+            }],
+            ..Unreadable::default()
+        };
+        r.scan.errors = vec![ScanErrorEntry {
+            path: format!("/e/{EVIL}"),
+            error: format!("read failed: {EVIL}"),
+        }];
+        r.scan.error_count = 1;
+        r.detectors.push(DetectorRun {
+            name: format!("det-{EVIL}"),
+            status: DetectorAvailability::Available,
+            detail: String::new(),
+            ran: true,
+            findings: 0,
+            elapsed_ms: 0,
+            error: Some(format!("failed: {EVIL}")),
+        });
+        r.fs = vec![FsReport {
+            mount: format!("/m/{EVIL}"),
+            fstype: format!("fs-{EVIL}"),
+            source: format!("/dev/{EVIL}"),
+            size: 100 << 30,
+            used: 90 << 30,
+            avail: 10 << 30,
+            scanned: 2 << 30,
+            full_coverage: true,
+            unaccounted: Some(88 << 30),
+            unaccounted_large: true,
+            hints: vec![Hint {
+                kind: HintKind::Logs,
+                path: Some(format!("/var/{EVIL}")),
+                detail: format!("logs of {EVIL}"),
+                unreadable_dirs: 0,
+                bytes: None,
+            }],
+            deleted_open: DeletedOpen::default(),
+            rerun: Some(format!(
+                "sudo dwhy scan {}",
+                dwhy_core::detect::shell_quote(&format!("/m/{EVIL}"))
+            )),
+        }];
+        r.snapshot = Some(SavedSnapshot {
+            id: format!("snap-{EVIL}"),
+            path: format!("/s/{EVIL}.json.gz"),
+            pruned: 0,
+        });
+        let mut out = Vec::new();
+        render_scan(&mut out, &r, 3, 10, 10).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_escaped(&text);
+        for shown in [
+            format!("dwhy scan · host-{EVIL_SHOWN} ·"),
+            format!("filesystem /m/{EVIL_SHOWN}  (fs-{EVIL_SHOWN}, /dev/{EVIL_SHOWN})"),
+            format!("/var/{EVIL_SHOWN}  logs of {EVIL_SHOWN}"),
+            format!("sudo dwhy scan '/m/{EVIL_SHOWN}' (escaped; do not copy)"),
+            format!("contents unknown: /u/{EVIL_SHOWN}"),
+            format!("(first: /e/{EVIL_SHOWN}: read failed: {EVIL_SHOWN})"),
+            format!("cargo-target  /p/{EVIL_SHOWN}/target"),
+            format!("Cargo build output of /p/{EVIL_SHOWN}"),
+            format!("→ cargo clean --target-dir '/p/{EVIL_SHOWN}/target' (escaped; do not copy)"),
+            format!("blocked by guard-{EVIL_SHOWN}: held by {EVIL_SHOWN}"),
+            format!("failed: det-{EVIL_SHOWN}: failed: {EVIL_SHOWN}"),
+            format!("/p/{EVIL_SHOWN}\n"),
+            format!("└─ {EVIL_SHOWN}\n"),
+            format!("snapshot saved: snap-{EVIL_SHOWN} (/s/{EVIL_SHOWN}.json.gz)"),
+        ] {
+            assert!(text.contains(&shown), "{shown:?} not in\n{text}");
+        }
+    }
+
+    fn plan_with(items: Vec<Finding>, blocked: Vec<Finding>) -> Plan {
+        Plan {
+            schema: SCHEMA.into(),
+            tool: Tool::current(),
+            host: "h".into(),
+            uid: 1000,
+            created_at: "2026-11-15T00:00:00Z".into(),
+            expires_at: "2026-11-15T01:00:00Z".into(),
+            scan: PlanScan {
+                roots: vec!["/p".into()],
+                one_filesystem: true,
+                detectors: None,
+            },
+            selection: PlanSelection {
+                tier: Some(Tier::Rebuildable),
+                select: vec![],
+            },
+            items: items
+                .into_iter()
+                .map(|finding| PlanItem {
+                    finding,
+                    fingerprint: Fingerprint {
+                        dev: None,
+                        inode: None,
+                        newest_mtime: None,
+                        size_bucket: 0,
+                        git: None,
+                        docker_id: None,
+                    },
+                    scan_root_dev: None,
+                })
+                .collect(),
+            blocked,
+            bytes: 1 << 30,
+        }
+    }
+
+    fn render_plan_text(p: &Plan, written: Option<&Path>) -> String {
+        let mut out = Vec::new();
+        render_plan(&mut out, p, written, 0).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn plan_text_escapes_control_characters() {
+        let p = plan_with(vec![evil_finding("cargo-target")], vec![evil_blocked()]);
+        let written = format!("/tmp/{EVIL}.json");
+        let text = render_plan_text(&p, Some(Path::new(&written)));
+        assert_escaped(&text);
+        for shown in [
+            format!("cargo-target  /p/{EVIL_SHOWN}/target"),
+            format!(
+                "f_{EVIL_SHOWN} → cargo clean --target-dir '/p/{EVIL_SHOWN}/target' (escaped; do not copy)"
+            ),
+            format!("warning, guard-{EVIL_SHOWN}: held by {EVIL_SHOWN}"),
+            format!("blocked by guard-{EVIL_SHOWN}: held by {EVIL_SHOWN}"),
+            format!(
+                "wrote /tmp/{EVIL_SHOWN}.json; apply it within an hour: dwhy apply '/tmp/{EVIL_SHOWN}.json' (escaped; do not copy)"
+            ),
+        ] {
+            assert!(text.contains(&shown), "{shown:?} not in\n{text}");
+        }
+    }
+
+    #[test]
+    fn plan_apply_line_stays_runnable_for_quotes_and_backslashes() {
+        let p = plan_with(vec![evil_finding("cargo-target")], vec![]);
+        let text = render_plan_text(&p, Some(Path::new(r"/tmp/it's a\nb.json")));
+        assert!(
+            text.contains(
+                r"wrote /tmp/it's a\\nb.json; apply it within an hour: dwhy apply '/tmp/it'\''s a\nb.json'"
+            ),
+            "{text}"
+        );
+        assert!(!text.ends_with("(escaped; do not copy)\n"), "{text}");
+
+        let empty = plan_with(vec![], vec![]);
+        let text = render_plan_text(&empty, Some(Path::new(&format!("/tmp/{EVIL}"))));
+        assert_escaped(&text);
+    }
+
+    #[test]
+    fn explain_text_escapes_control_characters() {
+        let mut f = evil_finding("cargo-target");
+        f.guards[0].status = GuardStatus::Block;
+        let mut r = explain_report(f, vec![format!("note about {EVIL}")]);
+        r.host = format!("host-{EVIL}");
+        r.query = format!("f_{EVIL}");
+        r.resolved = ExplainResolved {
+            via: ExplainVia::Id,
+            snapshot: Some(ExplainSnapshot {
+                id: format!("snap-{EVIL}"),
+                path: "/s".into(),
+                created_at: "2026-11-15T00:00:00Z".into(),
+            }),
+        };
+        let text = render(&r);
+        assert_escaped(&text);
+        for shown in [
+            format!("dwhy explain · host-{EVIL_SHOWN} · /p/{EVIL_SHOWN}/target"),
+            format!("f_{EVIL_SHOWN} resolved through snapshot snap-{EVIL_SHOWN}"),
+            format!("finding f_{EVIL_SHOWN} · cargo-target · rebuildable"),
+            format!("last written 2026-11-15 {EVIL_SHOWN}"),
+            format!("guard-{EVIL_SHOWN} held by {EVIL_SHOWN}"),
+            format!("  cargo clean --target-dir '/p/{EVIL_SHOWN}/target' (escaped; do not copy)"),
+            format!("cost: rebuild {EVIL_SHOWN}"),
+            format!("how:  cd '/p/{EVIL_SHOWN}' && cargo build (escaped; do not copy)"),
+            format!("note: note about {EVIL_SHOWN}"),
+        ] {
+            assert!(text.contains(&shown), "{shown:?} not in\n{text}");
+        }
+
+        // A path no detector claims, with findings inside it.
+        let mut r = explain_report(evil_finding("cargo-target"), vec![]);
+        r.finding = None;
+        r.path = format!("/p/{EVIL}");
+        r.inside = vec![FindingRef {
+            id: format!("f_{EVIL}"),
+            path: format!("/p/{EVIL}/target"),
+            detector: format!("det-{EVIL}"),
+            bytes: 1 << 30,
+            tier: Tier::Rebuildable,
+        }];
+        let text = render(&r);
+        assert_escaped(&text);
+        assert!(
+            text.contains(&format!(
+                "det-{EVIL_SHOWN} rebuildable  /p/{EVIL_SHOWN}/target  f_{EVIL_SHOWN}"
+            )),
+            "{text}"
+        );
+    }
+
+    fn change(kind: ChangeKind, name: &str, detector: Option<&str>) -> Change {
+        Change {
+            kind,
+            name: name.into(),
+            id: None,
+            detector: detector.map(Into::into),
+            before: Some(1 << 30),
+            after: Some(2 << 30),
+            change: 1 << 30,
+            at_least: false,
+            bytes_per_day: 1 << 30,
+        }
+    }
+
+    #[test]
+    fn diff_text_escapes_control_characters() {
+        let root = format!("/p/{EVIL}");
+        let d = DiffReport {
+            schema: SCHEMA.into(),
+            tool: Tool::current(),
+            host: format!("host-{EVIL}"),
+            uid: 1000,
+            generated_at: "2026-11-15T00:00:00Z".into(),
+            since: DiffBase {
+                id: Some(format!("snap-{EVIL}")),
+                path: "/s".into(),
+                created_at: "2026-11-14T00:00:00Z".into(),
+                roots: vec![format!("/q/{EVIL}")],
+                one_filesystem: true,
+                min_dir_bytes: 0,
+            },
+            roots: vec![root.clone()],
+            one_filesystem: true,
+            elapsed_secs: 86_400,
+            min_change: 0,
+            fs: vec![change(ChangeKind::Fs, &format!("/m/{EVIL}"), None)],
+            dirs: vec![change(ChangeKind::Dir, &format!("{root}/d"), None)],
+            docker_compared: true,
+            docker: vec![
+                change(ChangeKind::Image, &format!("img-{EVIL}"), None),
+                change(ChangeKind::Container, &format!("ctr-{EVIL}"), None),
+                change(ChangeKind::Volume, &format!("vol-{EVIL}"), None),
+            ],
+            findings: vec![change(
+                ChangeKind::Finding,
+                &format!("{root}/target"),
+                Some(&format!("det-{EVIL}")),
+            )],
+            notes: vec![format!("note about {EVIL}")],
+            snapshot: Some(SavedSnapshot {
+                id: format!("new-{EVIL}"),
+                path: format!("/s/{EVIL}"),
+                pruned: 0,
+            }),
+        };
+        let mut out = Vec::new();
+        render_diff(&mut out, &d, 10).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_escaped(&text);
+        for shown in [
+            format!(
+                "dwhy diff · host-{EVIL_SHOWN} · since snap-{EVIL_SHOWN} (1d 0h ago) · /p/{EVIL_SHOWN}"
+            ),
+            format!("the snapshot covers /q/{EVIL_SHOWN};"),
+            format!("/m/{EVIL_SHOWN}  ("),
+            format!("/p/{EVIL_SHOWN}/d  ("),
+            format!("image img-{EVIL_SHOWN}"),
+            format!("container ctr-{EVIL_SHOWN}"),
+            format!("volume vol-{EVIL_SHOWN}"),
+            format!("det-{EVIL_SHOWN} /p/{EVIL_SHOWN}/target"),
+            format!("note: note about {EVIL_SHOWN}"),
+            format!("snapshot saved: new-{EVIL_SHOWN} (/s/{EVIL_SHOWN})"),
+        ] {
+            assert!(text.contains(&shown), "{shown:?} not in\n{text}");
+        }
+    }
+
+    #[test]
+    fn watch_text_escapes_control_characters() {
+        let rate = |kind, name: String| Rate {
+            kind,
+            name,
+            id: None,
+            before: Some(1 << 20),
+            after: Some(2 << 20),
+            change: 1 << 20,
+            bytes_per_minute: 1 << 20,
+        };
+        let r = WatchReport {
+            schema: SCHEMA.into(),
+            tool: Tool::current(),
+            host: format!("host-{EVIL}"),
+            uid: 1000,
+            started_at: "2026-11-15T00:00:00Z".into(),
+            generated_at: "2026-11-15T00:01:00Z".into(),
+            roots: vec![format!("/p/{EVIL}")],
+            one_filesystem: true,
+            for_secs: 60,
+            elapsed_ms: 60_000,
+            min_change: 0,
+            fs: vec![rate(ChangeKind::Fs, format!("/m/{EVIL}"))],
+            dirs: vec![rate(ChangeKind::Dir, format!("/p/{EVIL}/d"))],
+            docker_compared: true,
+            docker: vec![rate(ChangeKind::Container, format!("ctr-{EVIL}"))],
+            notes: vec![format!("note about {EVIL}")],
+        };
+        let mut out = Vec::new();
+        render_watch(&mut out, &r, 10).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_escaped(&text);
+        for shown in [
+            format!("dwhy watch · host-{EVIL_SHOWN} · 60.0s window · /p/{EVIL_SHOWN}"),
+            format!("/m/{EVIL_SHOWN}  ("),
+            format!("/p/{EVIL_SHOWN}/d  ("),
+            format!("container ctr-{EVIL_SHOWN}"),
+            format!("note: note about {EVIL_SHOWN}"),
+        ] {
+            assert!(text.contains(&shown), "{shown:?} not in\n{text}");
+        }
+    }
+
+    #[test]
+    fn apply_text_escapes_control_characters_once() {
+        let f = evil_finding("cargo-target");
+        let item = |outcome, detail: &str| ApplyItem {
+            id: f.id.clone(),
+            detector: format!("det-{EVIL}"),
+            path: f.path.clone(),
+            tier: f.tier,
+            bytes: f.bytes,
+            action: f.action.clone(),
+            outcome,
+            detail: detail.into(),
+            guards: vec![],
+        };
+        // `dwhy-core` escapes plan text in a detail already (`\\n` for a
+        // planned literal `\n`); only raw control characters are left.
+        let detail = format!(r"changed: planned det /p/a\\nb, now {EVIL}");
+        let r = ApplyReport {
+            schema: SCHEMA.into(),
+            tool: Tool::current(),
+            host: "h".into(),
+            uid: 1000,
+            generated_at: "2026-11-15T00:00:00Z".into(),
+            plan_created_at: "2026-11-15T00:00:00Z".into(),
+            dry_run: true,
+            max_tier: Tier::Rebuildable,
+            confirm: vec![],
+            items: vec![
+                item(ApplyOutcome::WouldRemove, "ready"),
+                item(ApplyOutcome::Skipped, &detail),
+            ],
+            freed: 0,
+        };
+        let audit = format!("/a/{EVIL}.jsonl");
+        let mut out = Vec::new();
+        render_apply(&mut out, &r, Some(Path::new(&audit)), false, None).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_escaped(&text);
+        for shown in [
+            format!("det-{EVIL_SHOWN} /p/{EVIL_SHOWN}/target"),
+            format!(
+                "rebuildable → cargo clean --target-dir '/p/{EVIL_SHOWN}/target' (escaped; do not copy)"
+            ),
+            format!(r"changed: planned det /p/a\\nb, now {EVIL_SHOWN}"),
+            format!("audit log: /a/{EVIL_SHOWN}.jsonl"),
+        ] {
+            assert!(text.contains(&shown), "{shown:?} not in\n{text}");
+        }
+        assert!(!text.contains(r"/p/a\\\\nb"), "escaped twice:\n{text}");
+    }
+
+    #[test]
+    fn doctor_text_escapes_control_characters() {
+        let status = |name: String| DetectorStatus {
+            name,
+            milestone: "M1".into(),
+            status: DetectorAvailability::Available,
+            detail: format!("detail {EVIL}"),
+        };
+        let d = DoctorReport {
+            schema: SCHEMA.into(),
+            tool: Tool::current(),
+            host: format!("host-{EVIL}"),
+            uid: 1000,
+            euid: 1000,
+            root: false,
+            docker_group: false,
+            docker_socket: DockerSocket {
+                path: format!("/run/{EVIL}.sock"),
+                exists: false,
+                accessible: false,
+            },
+            tools: vec![
+                ToolStatus {
+                    name: format!("tool-{EVIL}"),
+                    path: Some(format!("/bin/{EVIL}")),
+                    off_path: None,
+                    enables: vec![format!("det-{EVIL}")],
+                },
+                ToolStatus {
+                    name: "other".into(),
+                    path: None,
+                    off_path: Some(format!("/opt/{EVIL}")),
+                    enables: vec![],
+                },
+            ],
+            detectors: vec![status(format!("det-{EVIL}"))],
+            probes: vec![status(format!("probe-{EVIL}"))],
+            notes: vec![format!("note about {EVIL}")],
+        };
+        let mut out = Vec::new();
+        render_doctor(&mut out, &d).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_escaped(&text);
+        for shown in [
+            format!("dwhy doctor · host-{EVIL_SHOWN} ·"),
+            format!("socket /run/{EVIL_SHOWN}.sock: absent"),
+            format!("tool-{EVIL_SHOWN} /bin/{EVIL_SHOWN}"),
+            format!("enables det-{EVIL_SHOWN}"),
+            format!("not on PATH (found /opt/{EVIL_SHOWN})"),
+            format!("det-{EVIL_SHOWN}"),
+            format!("probe-{EVIL_SHOWN}"),
+            format!("detail {EVIL_SHOWN}"),
+            format!("note: note about {EVIL_SHOWN}"),
+        ] {
+            assert!(text.contains(&shown), "{shown:?} not in\n{text}");
+        }
     }
 }

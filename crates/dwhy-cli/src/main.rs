@@ -343,7 +343,13 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             // Not eprintln!: it panics when the terminal has hung up (dwhy tui).
-            let _ = writeln!(std::io::stderr(), "dwhy: error: {e}");
+            // Errors can name paths; `dwhy-core` escapes its own, so escape
+            // only the control characters left.
+            let _ = writeln!(
+                std::io::stderr(),
+                "dwhy: error: {}",
+                human::escape_only_controls(&e.to_string())
+            );
             ExitCode::from(EXIT_ERROR)
         }
     }
@@ -438,7 +444,10 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
         human::render_scan(&mut out, &report, args.depth, args.top, args.max_findings)?;
     }
     if let Some(e) = save_error {
-        eprintln!("dwhy: error: snapshot not saved: {e}");
+        eprintln!(
+            "dwhy: error: snapshot not saved: {}",
+            human::escape_only_controls(&e.to_string())
+        );
         return Ok(EXIT_ERROR);
     }
     Ok(EXIT_OK)
@@ -451,7 +460,10 @@ fn save_snapshot(snap: &dwhy_core::report::Snapshot) -> std::result::Result<Save
     })?;
     let saved = snapshot::save(&dir, snap, now_secs())?;
     if let Some(e) = saved.prune_error {
-        eprintln!("dwhy: warning: old snapshots not pruned: {e}");
+        eprintln!(
+            "dwhy: warning: old snapshots not pruned: {}",
+            human::escape_only_controls(&e.to_string())
+        );
     }
     Ok(saved.snapshot)
 }
@@ -568,7 +580,10 @@ fn run_diff(args: DiffArgs) -> Result<u8> {
         human::render_diff(&mut out, &d, args.top)?;
     }
     if let Some(e) = save_error {
-        eprintln!("dwhy: error: snapshot not saved: {e}");
+        eprintln!(
+            "dwhy: error: snapshot not saved: {}",
+            human::escape_only_controls(&e.to_string())
+        );
         return Ok(EXIT_ERROR);
     }
     Ok(EXIT_OK)
@@ -1063,11 +1078,18 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
         .iter()
         .find(|c| !plan.items.iter().any(|i| i.finding.id == **c))
     {
-        return Err(format!("--confirm {bad}: not an item of this plan").into());
+        return Err(format!(
+            "--confirm {}: not an item of this plan",
+            detect::escape_controls(bad)
+        )
+        .into());
     }
     let env = apply::Env::from_system();
     if let Err(e) = plan::usable(&plan, &env.host, env.uid, now_secs()) {
-        eprintln!("dwhy: refused: {e}");
+        eprintln!(
+            "dwhy: refused: {}",
+            human::escape_only_controls(&e.to_string())
+        );
         return Ok(EXIT_REFUSED);
     }
     let ask = !args.yes && !args.dry_run;
@@ -1112,7 +1134,10 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
         }
         // Check again right before removing: time has passed at the prompt.
         if let Err(e) = plan::usable(&plan, &env.host, env.uid, now_secs()) {
-            eprintln!("dwhy: refused: {e}");
+            eprintln!(
+                "dwhy: refused: {}",
+                human::escape_only_controls(&e.to_string())
+            );
             return Ok(EXIT_REFUSED);
         }
         let again = survey(&plan, &policy, args.threads, args.quiet)?;
@@ -1129,7 +1154,13 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
     let mut status: Option<StatusLine> = None;
     let audit_errors = apply::execute(&plan, &mut checks, &mut audit, &mounts, &env, &mut |item| {
         drop(status.take());
-        status = status_line(quiet, &format!("removing {}…", item.path));
+        status = status_line(
+            quiet,
+            &format!(
+                "removing {}…",
+                dwhy_core::detect::escape_controls(&item.path)
+            ),
+        );
     });
     drop(status);
     for error in audit_errors {
@@ -1234,7 +1265,7 @@ fn measure(
         {
             eprintln!(
                 "dwhy: warning: {} is a symlink; counting the link itself (symlinks are never followed)",
-                p.display()
+                dwhy_core::detect::escape_controls(&p.to_string_lossy())
             );
         }
     }
