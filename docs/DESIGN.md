@@ -184,7 +184,7 @@ Crates likely needed: `clap`, `ratatui`, `crossterm`, `serde`/`serde_json`, `ray
 | M4 | TUI: tree + findings, mark, plan preview, apply with confirmation | Usable over ssh at 80×24; the same plan file works in TUI and CLI (recorded checks: [ACCEPTANCE-M4.md](ACCEPTANCE-M4.md)) |
 | M5 | Release: musl static builds, README with the pc-ubuntu story, `cargo install` | First public tag |
 
-**After the MVP:** MCP server, Claude Code skill, `notify` alerts, systemd timer, root-only system detectors (snap, kernels, apt, journald vacuum), more probes (Docker logs, core dumps, other databases), TOML config for custom detectors and policy.
+**After the MVP:** MCP server, `notify` alerts, systemd timer, root-only system detectors (snap, kernels, apt, journald vacuum), more probes (Docker logs, core dumps, other databases), TOML config for custom detectors and policy.
 
 ## Non-goals (for now)
 
