@@ -666,6 +666,43 @@ fn roots_showing_the_same_hidden_part_are_counted_once() {
 }
 
 #[test]
+fn root_hidden_inside_another_hidden_root_is_counted_too() {
+    // btrfs top level at `r`, subvolume `home` mounted at r/home and its
+    // nested subvolume `home/x` mounted at r/home/x: the walk of `r` stops
+    // at r/home and the walk of r/home at r/home/x, so each part is seen by
+    // one root only, and `df` counts each once.
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let (home, x) = (r.join("home"), r.join("home/x"));
+    fs::create_dir_all(&x).unwrap();
+    write_file(&r.join("f"), 64 << 10);
+    write_file(&home.join("g"), 32 << 10);
+    write_file(&x.join("k"), 16 << 10);
+    let (ma, mi) = dev_of(&r);
+    let mounts = MountTable::parse(&format!(
+        "1 0 {ma}:{mi} / {} rw - btrfs /dev/fake rw,subvol=/\n\
+         2 1 {ma}:{mi} /home {} rw - btrfs /dev/fake rw,subvol=/home\n\
+         3 2 {ma}:{mi} /home/x {} rw - btrfs /dev/fake rw,subvol=/home/x\n",
+        r.display(),
+        home.display(),
+        x.display()
+    ));
+    let res = scan_with(&[r.clone(), home.clone(), x.clone()], &mounts, true);
+    let scanned: u64 = ["", "f", "home", "home/g", "home/x", "home/x/k"]
+        .iter()
+        .map(|p| alloc(&r.join(p)))
+        .sum();
+    let gib = 1u64 << 30;
+    let rep =
+        account::build_scan_report(&res, &mounts, &env(false), &stats_used(scanned + 5 * gib));
+    assert_eq!(rep.fs.len(), 1, "{:?}", rep.fs);
+    let f = &rep.fs[0];
+    assert!(f.full_coverage);
+    assert_eq!(f.scanned, scanned);
+    assert_eq!(f.unaccounted, Some(5 * gib));
+}
+
+#[test]
 fn root_the_whole_filesystem_root_reaches_elsewhere_is_not_counted_twice() {
     // The same, but the subvolume lives at /@home and is mounted at
     // r/home: the walk of `r` reaches it at r/@home (here a copy stands in

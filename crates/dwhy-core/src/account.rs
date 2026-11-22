@@ -411,25 +411,30 @@ fn fs_groups(result: &ScanResult, mounts: &MountTable) -> Vec<FsGroup> {
     groups
 }
 
-/// Where the part of the filesystem that `other`, a root on the same
-/// filesystem as `whole` (a root at a whole-filesystem mount), shows lies
-/// below `whole`, if a mount point the walk of `whole` did not enter hides it.
-fn hidden_from(
-    result: &ScanResult,
-    mounts: &MountTable,
-    whole: &Path,
-    other: &Path,
-) -> Option<PathBuf> {
-    let m = mounts.for_path(other)?;
-    let below = other.strip_prefix(&m.mount_point).ok()?;
-    let at = whole
-        .join(m.root.strip_prefix("/").unwrap_or(&m.root))
-        .join(below);
-    result
+/// Where the part of the filesystem that `root` shows lies below `whole`,
+/// a root at a whole-filesystem mount of the same filesystem.
+fn location(mounts: &MountTable, whole: &Path, root: &Path) -> Option<PathBuf> {
+    let m = mounts.for_path(root)?;
+    let below = root.strip_prefix(&m.mount_point).ok()?;
+    Some(
+        whole
+            .join(m.root.strip_prefix("/").unwrap_or(&m.root))
+            .join(below),
+    )
+}
+
+/// Whether the walk of root `path`, at location `at`, reached location
+/// `other`: it lies at or below `at`, with no mount point the walk did not
+/// enter on the way.
+fn reached_by(result: &ScanResult, path: &Path, at: &Path, other: &Path) -> bool {
+    let Ok(rest) = other.strip_prefix(at) else {
+        return false;
+    };
+    let pos = path.join(rest);
+    !result
         .skipped_mounts
         .iter()
-        .any(|s| s.path != whole && s.path.starts_with(whole) && at.starts_with(&s.path))
-        .then_some(at)
+        .any(|s| s.path != path && s.path.starts_with(path) && pos.starts_with(&s.path))
 }
 
 /// The mount through which the scan reached `dev`: as the walk recorded
@@ -542,35 +547,32 @@ pub fn build_scan_report(
                     .map(|t| t.allocated)
                     .sum()
             };
-            // The whole-filesystem root's walk reached what other roots on
-            // the filesystem show, except where a mount point it did not
-            // enter hides it; adding the rest would count it twice.
+            // With a whole-filesystem root, count it, then each other root
+            // (outer ones first) unless a root already counted reached what
+            // it shows: adding that would count it twice.
             let scanned = match whole_root {
                 None => on_devs(&result.per_dev),
                 Some(w) => {
                     let whole = &result.roots[w].path;
-                    let mut hidden: Vec<(PathBuf, usize)> = roots
+                    let mut others: Vec<(PathBuf, usize)> = roots
                         .iter()
                         .filter(|&&i| i != w)
-                        .filter_map(|&i| {
-                            Some((
-                                hidden_from(result, mounts, whole, &result.roots[i].path)?,
-                                i,
-                            ))
-                        })
+                        .filter_map(|&i| Some((location(mounts, whole, &result.roots[i].path)?, i)))
                         .collect();
-                    hidden.sort();
-                    let mut counted: Vec<(PathBuf, usize)> = Vec::new();
-                    for (at, i) in hidden {
-                        if !counted.iter().any(|(c, _)| at.starts_with(c)) {
+                    others.sort();
+                    let mut counted: Vec<(PathBuf, usize)> = vec![(whole.clone(), w)];
+                    for (at, i) in others {
+                        if !counted
+                            .iter()
+                            .any(|(c, a)| reached_by(result, &result.roots[*a].path, c, &at))
+                        {
                             counted.push((at, i));
                         }
                     }
-                    on_devs(&result.roots[w].per_dev)
-                        + counted
-                            .iter()
-                            .map(|&(_, i)| on_devs(&result.roots[i].per_dev))
-                            .sum::<u64>()
+                    counted
+                        .iter()
+                        .map(|&(_, i)| on_devs(&result.roots[i].per_dev))
+                        .sum()
                 }
             };
             let gap = unaccounted(stats.used, scanned, full);
