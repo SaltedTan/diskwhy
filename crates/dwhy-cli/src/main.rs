@@ -491,7 +491,14 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
         serde_json::to_writer_pretty(&mut out, &report)?;
         writeln!(out)?;
     } else {
-        human::render_scan(&mut out, &report, args.depth, args.top, args.max_findings)?;
+        human::render_scan(
+            &mut out,
+            &report,
+            args.depth,
+            args.top,
+            args.max_findings,
+            tiers.is_some(),
+        )?;
     }
     if let Some(e) = save_error {
         eprintln!(

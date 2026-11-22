@@ -21,6 +21,7 @@ pub fn render_scan(
     depth: u32,
     top: usize,
     max_findings: usize,
+    tier_filtered: bool,
 ) -> io::Result<()> {
     let s = &r.scan;
     let t = &s.totals;
@@ -118,7 +119,7 @@ pub fn render_scan(
         )?;
     }
 
-    render_findings(w, r, max_findings)?;
+    render_findings(w, r, max_findings, tier_filtered)?;
 
     writeln!(w)?;
     writeln!(
@@ -674,8 +675,13 @@ fn reclaimable_note(advice: u64, blocked: u64) -> String {
 
 /// The findings section. With `findings_summary` (`--summary`), the totals
 /// are the summary's, over every finding the scan reported, not just the
-/// ones left in `findings`.
-fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result<()> {
+/// ones left in `findings`. `tier_filtered` says `--tier` dropped some.
+fn render_findings(
+    w: &mut impl Write,
+    r: &ScanReport,
+    max: usize,
+    tier_filtered: bool,
+) -> io::Result<()> {
     if r.detectors.is_empty() {
         return Ok(());
     }
@@ -780,7 +786,9 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
     }
     let more = (r.findings.len() - shown) as u64 + summary.map_or(0, |s| s.omitted);
     if more > 0 {
-        let how = if summary.is_some() {
+        let how = if summary.is_some() && tier_filtered {
+            "--json without --summary or --tier lists them"
+        } else if summary.is_some() {
             "--json without --summary lists them"
         } else {
             "--max-findings or --json lists them"
@@ -1264,7 +1272,7 @@ mod tests {
             }),
         });
         let mut out = Vec::new();
-        render_findings(&mut out, &report(vec![f]), 10).unwrap();
+        render_findings(&mut out, &report(vec![f]), 10, false).unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().map(str::trim).collect();
         let reason = lines
@@ -1419,7 +1427,7 @@ mod tests {
             ),
         ]);
         let mut out = Vec::new();
-        render_findings(&mut out, &r, 10).unwrap();
+        render_findings(&mut out, &r, 10, false).unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
@@ -1458,7 +1466,7 @@ mod tests {
             ),
         ]);
         let mut out = Vec::new();
-        render_findings(&mut out, &r, 10).unwrap();
+        render_findings(&mut out, &r, 10, false).unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
@@ -1513,7 +1521,7 @@ mod tests {
             ),
         ]);
         let mut out = Vec::new();
-        render_findings(&mut out, &r, 10).unwrap();
+        render_findings(&mut out, &r, 10, false).unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
@@ -1682,7 +1690,7 @@ mod tests {
             pruned: 0,
         });
         let mut out = Vec::new();
-        render_scan(&mut out, &r, 3, 10, 10).unwrap();
+        render_scan(&mut out, &r, 3, 10, 10, false).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert_escaped(&text);
         for shown in [

@@ -3830,6 +3830,30 @@ fn scan_tier_filters_findings_in_json_and_text() {
     assert!(text.contains(&format!("{root}/scratch/old")), "{text}");
     assert!(!text.contains(&format!("{root}/app/target")), "{text}");
 
+    // With --summary, findings left out by --tier are counted, and the hint
+    // names --tier as a reason they are missing.
+    let out = dwhy_offline(
+        state.path(),
+        &[
+            "scan",
+            &root,
+            "--summary",
+            "--tier",
+            "review",
+            "--detectors",
+            "cargo-target,stale-tree",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains(&format!(
+            "  … {} more (--json without --summary or --tier lists them)",
+            want.len() - 1
+        )),
+        "{text}"
+    );
+
     // Unknown tiers are usage errors.
     let out = dwhy_offline(state.path(), &["scan", &root, "--tier", "cheap"]);
     assert_eq!(out.status.code(), Some(1), "{out:?}");
