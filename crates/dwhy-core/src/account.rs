@@ -317,6 +317,9 @@ struct FsGroup {
     /// The mount named in the report: a whole-filesystem mount when there is one.
     mount: Mount,
     full: bool,
+    /// The scan root at the whole-filesystem mount, if one is: its walk
+    /// alone reached everything any other root on this filesystem did.
+    whole_root: Option<usize>,
     /// Every `st_dev` scanned on it.
     devs: BTreeSet<u64>,
 }
@@ -340,13 +343,14 @@ fn fs_groups(result: &ScanResult, mounts: &MountTable) -> Vec<FsGroup> {
                     key,
                     mount: m.clone(),
                     full,
+                    whole_root: None,
                     devs: BTreeSet::new(),
                 });
                 groups.len() - 1
             }
         }
     };
-    for r in &result.roots {
+    for (ri, r) in result.roots.iter().enumerate() {
         let (key, m) = match mounts.for_path(&r.path) {
             Some(m) => (FsKey::Mount(m.dev()), m.clone()),
             None => (FsKey::Dev(r.dev), unknown_mount(&r.path)),
@@ -355,6 +359,9 @@ fn fs_groups(result: &ScanResult, mounts: &MountTable) -> Vec<FsGroup> {
         // filesystem sees everything `statvfs` counts.
         let full = m.mount_point == r.path && m.is_whole_filesystem();
         let i = add(&mut groups, key, &m, full);
+        if full && groups[i].whole_root.is_none() {
+            groups[i].whole_root = Some(ri);
+        }
         groups[i].devs.insert(r.dev);
     }
     let mut entered: Vec<&Mount> = result
@@ -481,6 +488,7 @@ pub fn build_scan_report(
             let FsGroup {
                 mount: m,
                 full,
+                whole_root,
                 devs,
                 ..
             } = g;
@@ -489,9 +497,12 @@ pub fn build_scan_report(
                 used: 0,
                 avail: 0,
             });
+            // Other roots on the filesystem lie inside the whole-filesystem
+            // root's walk; adding theirs would count their bytes twice.
+            let reached = whole_root.map_or(&result.per_dev, |i| &result.roots[i].per_dev);
             let scanned: u64 = devs
                 .iter()
-                .filter_map(|d| result.per_dev.get(d))
+                .filter_map(|d| reached.get(d))
                 .map(|t| t.allocated)
                 .sum();
             let gap = unaccounted(stats.used, scanned, full);

@@ -515,10 +515,15 @@ fn bind_mount_and_whole_filesystem_report_the_whole_mount() {
     let t = tempfile::tempdir().unwrap();
     let r = fs::canonicalize(t.path()).unwrap();
     let (whole, bind) = (r.join("whole"), r.join("bind"));
-    fs::create_dir(&whole).unwrap();
+    fs::create_dir_all(whole.join("sub")).unwrap();
     fs::create_dir(&bind).unwrap();
     write_file(&whole.join("f"), 64 << 10);
+    // What the bind mount shows is also under whole/sub: stand-ins for
+    // the same blocks, and one hardlinked inode seen through both.
+    write_file(&whole.join("sub/g"), 32 << 10);
     write_file(&bind.join("g"), 32 << 10);
+    write_file(&whole.join("sub/h"), 16 << 10);
+    fs::hard_link(whole.join("sub/h"), bind.join("h")).unwrap();
     let (ma, mi) = dev_of(&r);
     let mounts = MountTable::parse(&format!(
         "1 0 {ma}:{mi} / {} rw - ext4 /dev/fake rw\n2 1 {ma}:{mi} /sub {} rw - ext4 /dev/fake rw\n",
@@ -527,7 +532,13 @@ fn bind_mount_and_whole_filesystem_report_the_whole_mount() {
     ));
     // The bind mount first, so the whole-filesystem root has to upgrade it.
     let res = scan_with(&[bind.clone(), whole.clone()], &mounts, true);
-    let scanned = res.totals().allocated;
+    // `df` counts each block once, and the whole-filesystem walk reached
+    // every one, including the inode the tree attributes to bind/h.
+    let scanned: u64 = ["", "f", "sub", "sub/g", "sub/h"]
+        .iter()
+        .map(|p| alloc(&whole.join(p)))
+        .sum();
+    assert!(res.totals().allocated > scanned);
     let gib = 1u64 << 30;
     let rep =
         account::build_scan_report(&res, &mounts, &env(false), &stats_used(scanned + 5 * gib));
@@ -617,6 +628,7 @@ fn btrfs_subvolume_devices_are_one_filesystem() {
     };
     res.roots[0].dev = top;
     res.per_dev = [(top, mb(3)), (nested, mb(5))].into_iter().collect();
+    res.roots[0].per_dev = res.per_dev.clone();
     res.dev_mounts = [(top, 1), (nested, 1)].into_iter().collect();
     let unreadable = |p: PathBuf, dev| UnreadableRecord {
         path: p,

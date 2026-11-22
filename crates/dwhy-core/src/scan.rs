@@ -71,6 +71,9 @@ pub struct RootResult {
     pub path: PathBuf,
     pub dev: u64,
     pub totals: Totals,
+    /// Allocated bytes this root's walk reached, per device (`st_dev`). An
+    /// inode with several links counts in every root that reached one.
+    pub per_dev: HashMap<u64, Totals>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,17 +164,17 @@ pub fn prepare_roots(paths: &[PathBuf], one_filesystem: bool) -> Result<Vec<Path
         paths,
         one_filesystem,
         &|| MountTable::read().ok(),
-        &mounts::btrfs_fsid,
+        &mounts::mount_id,
     )
 }
 
 /// [`prepare_roots`] with the mount table (read only when needed) and the
-/// btrfs id lookup supplied.
+/// mount id lookup supplied.
 fn prepare_roots_with(
     paths: &[PathBuf],
     one_filesystem: bool,
     read_mounts: &dyn Fn() -> Option<MountTable>,
-    btrfs_fsid: &dyn Fn(&Path, u64) -> Option<u64>,
+    mount_id: &dyn Fn(&Path, u64) -> Option<u32>,
 ) -> Result<Vec<PathBuf>, ScanError> {
     let mut out: Vec<(PathBuf, u64)> = Vec::new();
     for p in paths {
@@ -197,7 +200,7 @@ fn prepare_roots_with(
                     || table
                         .get_or_insert_with(read_mounts)
                         .as_ref()
-                        .is_some_and(|t| in_nested_subvolume(t, k, *kdev, &p, dev, btrfs_fsid)))
+                        .is_some_and(|t| in_nested_subvolume(t, k, &p, dev, mount_id)))
         });
         if !covered {
             kept.push((p, dev));
@@ -206,29 +209,21 @@ fn prepare_roots_with(
     Ok(kept.into_iter().map(|(p, _)| p).collect())
 }
 
-/// Whether a one-filesystem walk from `outer` (on `outer_dev`) reaches
-/// `inner` (on another device below it): `inner` is in a btrfs subvolume of
-/// the same filesystem, and no mount point lies below `outer` on the way.
+/// Whether a one-filesystem walk from `outer` reaches `inner` (below it,
+/// on another device): `inner` is in a btrfs subvolume reached through the
+/// btrfs mount holding `outer`, with no mount point below `outer` on the way.
 fn in_nested_subvolume(
     mounts: &MountTable,
     outer: &Path,
-    outer_dev: u64,
     inner: &Path,
     inner_dev: u64,
-    btrfs_fsid: &dyn Fn(&Path, u64) -> Option<u64>,
+    mount_id: &dyn Fn(&Path, u64) -> Option<u32>,
 ) -> bool {
-    let on_btrfs = mounts.for_path(inner).is_some_and(|m| m.fstype == "btrfs");
-    let mount_between = mounts.mounts.iter().any(|m| {
-        m.mount_point != outer
-            && m.mount_point.starts_with(outer)
-            && inner.starts_with(&m.mount_point)
-    });
-    on_btrfs
-        && !mount_between
-        && match (btrfs_fsid(outer, outer_dev), btrfs_fsid(inner, inner_dev)) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        }
+    mounts.for_path(inner).is_some_and(|m| {
+        m.fstype == "btrfs"
+            && outer.starts_with(&m.mount_point)
+            && mount_id(inner, inner_dev) == Some(m.id)
+    })
 }
 
 pub fn absolute_nofollow(p: &Path) -> io::Result<PathBuf> {
@@ -256,17 +251,17 @@ struct Link {
     locs: Vec<NodeId>,
 }
 
-/// Looks up the btrfs filesystem id of a path on a given device
-/// ([`mounts::btrfs_fsid`] outside tests).
-type BtrfsFsid<'a> = &'a (dyn Fn(&Path, u64) -> Option<u64> + Sync);
+/// Looks up the id of the mount through which a path on a given device is
+/// reached ([`mounts::mount_id`] outside tests).
+type MountId<'a> = &'a (dyn Fn(&Path, u64) -> Option<u32> + Sync);
 
 struct Shared<'a> {
     opts: &'a ScanOptions,
     mounts: &'a MountTable,
     mount_points: HashSet<&'a Path>,
-    btrfs_fsid: BtrfsFsid<'a>,
-    /// btrfs filesystem id by device, for devices found to be on btrfs.
-    fsids: Mutex<HashMap<u64, u64>>,
+    mount_id: MountId<'a>,
+    /// Devices found to be reached through a given btrfs mount.
+    on_mount: Mutex<HashSet<(u64, u32)>>,
     dev_mounts: Mutex<HashMap<u64, u32>>,
     entered_mounts: Mutex<BTreeSet<u32>>,
     nodes: Mutex<Vec<TreeNode>>,
@@ -284,7 +279,7 @@ impl<'a> Shared<'a> {
         opts: &'a ScanOptions,
         mounts: &'a MountTable,
         progress: &'a Progress,
-        btrfs_fsid: BtrfsFsid<'a>,
+        mount_id: MountId<'a>,
     ) -> Self {
         Shared {
             opts,
@@ -294,8 +289,8 @@ impl<'a> Shared<'a> {
                 .iter()
                 .map(|m| m.mount_point.as_path())
                 .collect(),
-            btrfs_fsid,
-            fsids: Mutex::default(),
+            mount_id,
+            on_mount: Mutex::default(),
             dev_mounts: Mutex::default(),
             entered_mounts: Mutex::default(),
             nodes: Mutex::default(),
@@ -390,34 +385,23 @@ impl<'a> Shared<'a> {
         self.note_dev(path, dev);
     }
 
-    /// The btrfs filesystem id of device `dev`, looked up at `path`.
-    fn fsid(&self, path: &Path, dev: u64) -> Option<u64> {
-        if let Some(&id) = self.fsids.lock().unwrap().get(&dev) {
-            return Some(id);
-        }
-        let id = (self.btrfs_fsid)(path, dev)?;
-        self.fsids.lock().unwrap().insert(dev, id);
-        Some(id)
-    }
-
-    /// Whether `path` (on `dev`), inside a directory on `parent_dev`, is a
-    /// btrfs subvolume of the same filesystem that is not mounted on its own.
-    fn nested_subvolume(&self, path: &Path, dev: u64, parent_dev: u64) -> bool {
-        if self.mount_points.contains(path)
-            || !self
-                .mounts
-                .for_path(path)
-                .is_some_and(|m| m.fstype == "btrfs")
-        {
+    /// Whether `path` (on `dev`) is a btrfs subvolume that is not mounted
+    /// on its own: it is reached through the btrfs mount holding it.
+    fn nested_subvolume(&self, path: &Path, dev: u64) -> bool {
+        if self.mount_points.contains(path) {
             return false;
         }
-        let Some(parent) = path.parent() else {
+        let Some(m) = self.mounts.for_path(path).filter(|m| m.fstype == "btrfs") else {
             return false;
         };
-        match (self.fsid(path, dev), self.fsid(parent, parent_dev)) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
+        if self.on_mount.lock().unwrap().contains(&(dev, m.id)) {
+            return true;
         }
+        let on = (self.mount_id)(path, dev) == Some(m.id);
+        if on {
+            self.on_mount.lock().unwrap().insert((dev, m.id));
+        }
+        on
     }
 
     /// Decides whether to descend into `path` (on `dev`), found inside a
@@ -432,7 +416,7 @@ impl<'a> Shared<'a> {
         // A btrfs subvolume has its own st_dev but is the same filesystem.
         // Anything else on another device that the mount table does not
         // list (mounted after it was read) still counts as a boundary.
-        if other_dev && self.nested_subvolume(path, dev, parent_dev) {
+        if other_dev && self.nested_subvolume(path, dev) {
             return None;
         }
         let is_virtual = self
@@ -505,7 +489,7 @@ pub fn scan(
     progress: &Progress,
 ) -> Result<ScanResult, ScanError> {
     let start = Instant::now();
-    let shared = Shared::new(opts, mounts, progress, &mounts::btrfs_fsid);
+    let shared = Shared::new(opts, mounts, progress, &mounts::mount_id);
 
     let mut builder = rayon::ThreadPoolBuilder::new()
         .stack_size(16 << 20)
@@ -555,11 +539,17 @@ pub fn scan(
             }
             id
         };
-        root_nodes.push((root.clone(), st.st_dev, id));
+        let reached = std::mem::take(&mut *shared.per_dev.lock().unwrap());
+        root_nodes.push((root.clone(), st.st_dev, id, reached));
     }
 
     let mut nodes = shared.nodes.into_inner().unwrap();
-    let mut per_dev = shared.per_dev.into_inner().unwrap();
+    let mut per_dev: HashMap<u64, Totals> = HashMap::new();
+    for (_, _, _, reached) in &root_nodes {
+        for (d, t) in reached {
+            *per_dev.entry(*d).or_default() += *t;
+        }
+    }
     // Per-node change in `shared`: a linked inode is shared by its attributed
     // node and every ancestor strictly below the lowest common ancestor of
     // all its links, or every ancestor when some link was not scanned.
@@ -572,6 +562,14 @@ pub fn scan(
             t.hardlink_bytes_deduped = (seen - 1) * l.leaf.allocated;
             nodes[l.node as usize].own += t;
             *per_dev.entry(l.dev).or_default() += t;
+            let mut in_roots: Vec<NodeId> = l.locs.iter().map(|&n| root_of(&nodes, n)).collect();
+            in_roots.sort_unstable();
+            in_roots.dedup();
+            for r in in_roots {
+                if let Some((_, _, _, reached)) = root_nodes.iter_mut().find(|x| x.2 == r) {
+                    *reached.entry(l.dev).or_default() += l.leaf;
+                }
+            }
             let b = l.leaf.allocated as i64;
             shared_delta[l.node as usize] += b;
             if seen >= l.nlink
@@ -634,10 +632,11 @@ pub fn scan(
         min_dir_bytes: opts.min_dir_bytes,
         roots: root_nodes
             .into_iter()
-            .map(|(path, dev, id)| RootResult {
+            .map(|(path, dev, id, reached)| RootResult {
                 path,
                 dev,
                 totals: tree.node(id).total,
+                per_dev: reached,
             })
             .collect(),
         dirs,
@@ -651,6 +650,14 @@ pub fn scan(
         elapsed: start.elapsed(),
         tree,
     })
+}
+
+/// The root `n` lies under.
+fn root_of(nodes: &[TreeNode], mut n: NodeId) -> NodeId {
+    while nodes[n as usize].parent != NO_PARENT {
+        n = nodes[n as usize].parent;
+    }
+    n
 }
 
 /// The lowest node that is `a` or an ancestor of it and `b` or an ancestor of
@@ -850,20 +857,26 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     /// A btrfs filesystem at /mnt/b with a subvolume also mounted on its own
-    /// at /mnt/b/mounted, and an ext4 filesystem at /mnt/e.
+    /// at /mnt/b/mounted, the same filesystem mounted again at /mnt/c, and
+    /// an ext4 filesystem at /mnt/e.
     const TABLE: &str = "\
 1 0 0:27 / /mnt/b rw - btrfs /dev/b rw,subvol=/
 2 1 0:27 /mounted /mnt/b/mounted rw - btrfs /dev/b rw,subvol=/mounted
+4 0 0:27 / /mnt/c rw - btrfs /dev/b rw,subvol=/
 3 0 259:7 / /mnt/e rw - ext4 /dev/e rw
 ";
 
-    /// Devices 28, 31 and 32 are subvolumes of btrfs filesystem 1, device 40
-    /// is on btrfs filesystem 2. 50 and 51 claim filesystem 1 too, but the
-    /// mount table says they are on ext4.
-    fn fsid(_: &Path, dev: u64) -> Option<u64> {
+    /// What `statx` reports as the mount id: a subvolume that is not
+    /// mounted on its own (devices 31 and 32) is reached through the mount
+    /// holding it; device 40 was mounted at /mnt/b/other after the table was
+    /// read, so its mount id is new; 50 is on the ext4 mount.
+    fn mount_id(p: &Path, dev: u64) -> Option<u32> {
         match dev {
-            28 | 31 | 32 | 50 | 51 => Some(1),
-            40 => Some(2),
+            31 | 32 if p.starts_with("/mnt/b/mounted") => Some(2),
+            31 | 32 if p.starts_with("/mnt/c") => Some(4),
+            31 | 32 => Some(1),
+            40 => Some(9),
+            50 => Some(3),
             _ => None,
         }
     }
@@ -875,13 +888,14 @@ mod tests {
         };
         let mounts = MountTable::parse(TABLE);
         let progress = Progress::default();
-        let sh = Shared::new(&opts, &mounts, &progress, &fsid);
+        let sh = Shared::new(&opts, &mounts, &progress, &mount_id);
         sh.crosses_boundary(Path::new(path), dev, parent_dev)
     }
 
     #[test]
     fn nested_btrfs_subvolume_is_entered_on_one_filesystem() {
         assert_eq!(check(true, "/mnt/b/sub", 31, 28), None);
+        assert_eq!(check(true, "/mnt/c/sub", 31, 28), None);
         assert_eq!(check(false, "/mnt/b/sub", 31, 28), None);
     }
 
@@ -895,12 +909,12 @@ mod tests {
     }
 
     #[test]
-    fn other_btrfs_filesystem_is_a_boundary() {
+    fn filesystem_mounted_since_the_table_was_read_is_a_boundary() {
         assert_eq!(
             check(true, "/mnt/b/other", 40, 28),
             Some(SkipReason::OtherFilesystem)
         );
-        // Unknown filesystem id: fail safe.
+        // Unknown mount id: fail safe.
         assert_eq!(
             check(true, "/mnt/b/gone", 99, 28),
             Some(SkipReason::OtherFilesystem)
@@ -916,11 +930,11 @@ mod tests {
     }
 
     #[test]
-    fn btrfs_ids_are_looked_up_once_per_device() {
+    fn mount_ids_are_looked_up_once_per_device_and_mount() {
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         let counting = |p: &Path, dev: u64| {
             CALLS.fetch_add(1, Ordering::Relaxed);
-            fsid(p, dev)
+            mount_id(p, dev)
         };
         let opts = ScanOptions::default();
         let mounts = MountTable::parse(TABLE);
@@ -929,27 +943,23 @@ mod tests {
         assert_eq!(sh.crosses_boundary(Path::new("/mnt/b/a"), 31, 28), None);
         assert_eq!(sh.crosses_boundary(Path::new("/mnt/b/a/b"), 32, 31), None);
         assert_eq!(sh.crosses_boundary(Path::new("/mnt/b/c"), 31, 28), None);
-        assert_eq!(CALLS.load(Ordering::Relaxed), 3, "28, 31 and 32 once each");
+        // The same subvolume reached through the other mount.
+        assert_eq!(sh.crosses_boundary(Path::new("/mnt/c/a"), 31, 28), None);
+        assert_eq!(CALLS.load(Ordering::Relaxed), 3, "31 and 32 on 1, 31 on 4");
     }
 
     #[test]
     fn nested_root_is_covered_only_inside_an_unmounted_subvolume() {
         let t = MountTable::parse(TABLE);
-        let covered = |inner: &str, dev: u64| {
-            in_nested_subvolume(&t, Path::new("/mnt/b"), 28, Path::new(inner), dev, &fsid)
+        let covered = |outer: &str, inner: &str, dev: u64| {
+            in_nested_subvolume(&t, Path::new(outer), Path::new(inner), dev, &mount_id)
         };
-        assert!(covered("/mnt/b/sub/x", 31));
+        assert!(covered("/mnt/b", "/mnt/b/sub/x", 31));
+        assert!(covered("/mnt/b/sub", "/mnt/b/sub/deeper/x", 32));
         // The walk of /mnt/b stops at the mount point /mnt/b/mounted.
-        assert!(!covered("/mnt/b/mounted", 32));
-        assert!(!covered("/mnt/b/mounted/x", 32));
-        assert!(!covered("/mnt/b/other", 40));
-        assert!(!in_nested_subvolume(
-            &t,
-            Path::new("/mnt/e"),
-            51,
-            Path::new("/mnt/e/x"),
-            50,
-            &fsid
-        ));
+        assert!(!covered("/mnt/b", "/mnt/b/mounted", 32));
+        assert!(!covered("/mnt/b", "/mnt/b/mounted/x", 32));
+        assert!(!covered("/mnt/b", "/mnt/b/other", 40));
+        assert!(!covered("/mnt/e", "/mnt/e/x", 50));
     }
 }

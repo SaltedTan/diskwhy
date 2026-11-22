@@ -183,33 +183,29 @@ pub fn statvfs(path: &Path) -> io::Result<FsStats> {
     })
 }
 
-/// `statfs` `f_type` of btrfs.
-const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
-
-/// The filesystem id (`statfs` `f_fsid`) of the btrfs filesystem holding
-/// `path`, which must be on device `dev`. Every subvolume of a btrfs
-/// filesystem has its own `st_dev`, but they all share one `f_fsid`.
-/// `None` if `path` is not on btrfs, is no longer on `dev`, or cannot be
-/// opened. Never follows a symlink and reads nothing but metadata.
-pub fn btrfs_fsid(path: &Path, dev: u64) -> Option<u64> {
-    use rustix::fs::{Mode, OFlags};
-    let fd = rustix::fs::open(
+/// The id (as in `/proc/self/mountinfo`) of the mount through which `path`
+/// is reached, provided `path` is on device `dev`. A btrfs subvolume that
+/// is not mounted on its own has its own `st_dev` but is reached through
+/// the mount holding it, so this is how a walk tells it apart from a
+/// filesystem mounted since the mount table was read. (`statfs` `f_fsid`
+/// cannot: btrfs mixes each subvolume's id into it.) `None` if `path` is
+/// gone, is no longer on `dev`, or the kernel cannot report mount ids.
+/// Never follows a symlink or triggers an automount, and opens nothing.
+pub fn mount_id(path: &Path, dev: u64) -> Option<u32> {
+    use rustix::fs::{AtFlags, StatxFlags};
+    let st = rustix::fs::statx(
+        rustix::fs::CWD,
         path,
-        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
+        AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT,
+        StatxFlags::MNT_ID,
     )
     .ok()?;
-    if rustix::fs::fstat(&fd).ok()?.st_dev != dev {
+    if st.stx_mask & StatxFlags::MNT_ID.bits() == 0
+        || rustix::fs::makedev(st.stx_dev_major, st.stx_dev_minor) != dev
+    {
         return None;
     }
-    let sf = rustix::fs::fstatfs(&fd).ok()?;
-    // f_type is a signed word of platform width; compare its low 32 bits.
-    #[allow(clippy::unnecessary_cast)]
-    let fs_type = (sf.f_type as u64) & 0xffff_ffff;
-    if fs_type != BTRFS_SUPER_MAGIC {
-        return None;
-    }
-    Some(rustix::fs::fstatvfs(&fd).ok()?.f_fsid)
+    u32::try_from(st.stx_mnt_id).ok()
 }
 
 #[cfg(test)]
@@ -262,19 +258,22 @@ mod tests {
     }
 
     #[test]
-    fn btrfs_fsid_is_none_off_btrfs_or_on_another_device() {
+    fn mount_id_matches_mountinfo_on_the_same_device_only() {
         let d = tempfile::tempdir().unwrap();
-        let dev = std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(d.path()).unwrap());
-        let on_btrfs = rustix::fs::statfs(d.path())
-            .map(|s| {
-                #[allow(clippy::unnecessary_cast)]
-                let t = (s.f_type as u64) & 0xffff_ffff;
-                t == BTRFS_SUPER_MAGIC
-            })
-            .unwrap();
-        assert_eq!(btrfs_fsid(d.path(), dev).is_some(), on_btrfs);
-        assert_eq!(btrfs_fsid(d.path(), dev.wrapping_add(1)), None);
-        assert_eq!(btrfs_fsid(&d.path().join("missing"), dev), None);
+        let path = std::fs::canonicalize(d.path()).unwrap();
+        let dev = std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(&path).unwrap());
+        let table = MountTable::read().unwrap();
+        let expected = table.for_path(&path).map(|m| m.id);
+        assert!(expected.is_some());
+        assert_eq!(mount_id(&path, dev), expected);
+        assert_eq!(mount_id(&path, dev.wrapping_add(1)), None);
+        assert_eq!(mount_id(&path.join("missing"), dev), None);
+        let link = path.join("link");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let root_dev = std::os::unix::fs::MetadataExt::dev(&std::fs::metadata("/").unwrap());
+        if root_dev != dev {
+            assert_eq!(mount_id(&link, root_dev), None, "not followed");
+        }
     }
 
     #[test]
