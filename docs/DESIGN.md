@@ -16,7 +16,7 @@ The idea is to automate what was done by hand on pc-ubuntu on 2026-11-13: 36G fr
 ## What sets it apart from gdu, lysosome, Mole and others
 
 1. **Growth, not just size.** A scan can keep a snapshot (`--snapshot`), so a later run can show what grew and how fast. The `watch` command measures growth rate within one session, and probes look for known runaway patterns. No background job is needed.
-2. **Accounting for hidden space.** It reports the gap between what `df` says is used and what the scan could see (e.g. "70G you can't read — rerun with sudo"). It lists Docker images, volumes and build cache by name, and counts each hardlinked file once, so sizes reflect what deleting actually frees.
+2. **Accounting for hidden space.** It reports the gap between what `df` says is used and what the scan could see (e.g. "35.6G you can't read — rerun with sudo"). It lists Docker images, volumes and build cache by name, counts each hardlinked inode once at its lexicographically smallest path (so per-directory sizes are deterministic for snapshots and `diff`), and subtracts files kept alive by links outside a directory from what a finding claims deleting frees.
 3. **Safety checks that look at real state**, not just name patterns:
    - commits that exist on no remote (not only unpushed relative to the upstream branch), in nested repos too
    - uncommitted or untracked files
@@ -52,10 +52,10 @@ The idea is to automate what was done by hand on pc-ubuntu on 2026-11-13: 36G fr
 ### Recommendation: root vs user
 
 - **Run as your user by default.** Everything works without sudo.
-- **Report the gap.** If `df` used minus scanned bytes is larger than a threshold, show an "unaccounted N GB" item with the likely places (`/var/lib/docker`, `/var/log`, other users' homes) and the command to rerun with sudo.
+- **Report the gap.** If `df` used minus scanned bytes is larger than a threshold (when a whole-filesystem mount point is scanned), show an "unaccounted N GB" item with the likely places (`/var/lib/docker`, `/var/lib/containerd`, `/var/log`, other users' homes) and the command to rerun with sudo (using the running binary's absolute path, since `sudo` resets `PATH`).
 - **Running under sudo is supported, not required.** System detectors (journald vacuum, old snap revisions, old kernels, apt cache) are enabled only when running as root.
 - **Never touch other users' files** unless running as root *and* `--all-users` is passed.
-- **Docker** is used through its socket and CLI. Being in the `docker` group is already root-equivalent, so Docker findings default to the `review` tier. The exception is build cache unused for a week, which is `regenerable`: it is a cache, `docker builder prune --filter until=168h` removes only those records, and the cost is re-running build steps (issue #2).
+- **Docker** is read through the Engine API over its Unix socket (`GET /system/df`, `/info`) for exact bytes—including when Docker uses the containerd image store in `/var/lib/containerd` rather than `/var/lib/docker`—while suggested removals use the CLI. Under the containerd image store, locally built images also carry a `RepoDigest`, so image recovery text says `docker pull <tag> (or docker build)`. Being in the `docker` group is already root-equivalent, so Docker findings default to the `review` tier. The exception is build cache unused for a week, which is `regenerable`: it is a cache, `docker builder prune --filter until=168h` removes only those records, and the cost is re-running build steps (issue #2).
 
 ### Recommendation: static binary
 
@@ -65,7 +65,7 @@ The idea is to automate what was done by hand on pc-ubuntu on 2026-11-13: 36G fr
 
 ## Main concepts
 
-- **Scan.** A parallel, single-filesystem (`-x`) walk. A btrfs subvolume that is not mounted on its own has its own `st_dev` but is the same filesystem, so `-x` enters it. It counts each hardlink once by (dev, inode) and records allocated vs apparent bytes. Unreadable directories are recorded, not skipped silently.
+- **Scan.** A parallel, single-filesystem walk (`-x` is the default and accepted as a no-op; `--cross-filesystems` crosses mounts). A btrfs subvolume that is not mounted on its own has its own `st_dev` but is the same filesystem, so `-x` enters it. It counts each hardlink once by `(dev, inode)` (attributed to its lexicographically smallest path) and records allocated (`st_blocks * 512`) vs apparent (`st_size` of non-directories; directories count 0, as in GNU `du >= 9.2`) bytes. Unreadable directories are recorded, not skipped silently. The walk keeps one in-memory node per directory plus multiply-linked inodes (~115 MB RSS for `/` on pc-ubuntu: 300k dirs, 200k extra links; see #16).
 - **Detector.** Recognises one kind of reclaimable thing and turns it into a **finding**, e.g. `cargo-target`, `node-modules`, `venv`, `user-cache` (go/npm/uv/pip/HF/playwright), `git-worktree`, `stale-tree` (scratch dirs by age), `tool-versions`, `trash`, `docker-image`, `docker-build-cache`, `docker-container`, `docker-volume`, `journald`.
 - **Probe.** Adds evidence that explains why a finding is big or growing. See [Decisions taken](#decisions-taken).
 - **Guard.** A safety check with a pass, warn or block result. Examples include `git-unpublished`, `git-dirty`, `git-linked-worktrees`, `in-use-cwd`, `in-use-open`, `container-mount`, `recent-write`, `git-ignored-only` (not built yet), [`path-not-utf8`](#safety-rules-non-negotiable) and [`changed-since-scan`](#safety-rules-non-negotiable).
@@ -79,8 +79,9 @@ The idea is to automate what was done by hand on pc-ubuntu on 2026-11-13: 36G fr
 ## CLI (MVP)
 
 ```
-dwhy scan [PATH…] [--json] [--snapshot] [-x]      # sizes + findings + unaccounted space
-dwhy diff [PATH…] [--since last|<snapshot>|7d|<time>] [--json]  # growth since a snapshot
+dwhy [tui [PATH…]] [-x | --cross-filesystems]     # interactive TUI (default PATH: .)
+dwhy scan [PATH…] [--json] [--snapshot] [-x | --cross-filesystems] # sizes + findings + unaccounted space (default PATH: .)
+dwhy diff [PATH…] [--since last|<snapshot>|7d|<time>] [--json]     # growth since a snapshot
 dwhy watch [PATH…] [--for 60s] [--json]           # live growth rate per directory/volume
 dwhy explain <finding-id|path> [--json]           # evidence, guards, growth, recovery cost
 dwhy plan [PATH…] [--tier regenerable|rebuildable|review] [--select ID|PATH,…] [-o plan.json] [--json]
@@ -88,7 +89,7 @@ dwhy apply plan.json [--max-tier regenerable] [--confirm ID,…] [--yes] [--dry-
 dwhy doctor                                       # available tools, detectors, probes and permissions
 ```
 
-Exit codes: `0` ok · `1` error · `2` some items were skipped · `3` refused by policy.
+Exit codes: `0` ok · `1` error (clap usage errors map to 1 so they do not clash with 2) · `2` some items were skipped · `3` refused by policy.
 
 ### TUI details
 
@@ -130,7 +131,7 @@ The TUI restores the terminal on exit, including after a panic. Quitting does no
 
 ### JSON contract
 
-The [`diskwhy/v1` serde types](../crates/dwhy-core/src/report.rs) define the JSON contract. The pinned shapes include a [WAL finding](../crates/dwhy-core/tests/snapshots/json_shape__postgres_wal_evidence_shape.snap), [API-only WAL evidence](../crates/dwhy-core/tests/snapshots/json_shape__api_only_evidence_shape.snap) and [explain reports](../crates/dwhy-core/tests/snapshots/json_shape__explain_report_shape.snap).
+The [`diskwhy/v1` serde types](../crates/dwhy-core/src/report.rs) define the JSON contract (`uid` is the effective uid alongside `root`, and `fs[].unaccounted` is `null` unless `full_coverage` is true). The pinned shapes include a [WAL finding](../crates/dwhy-core/tests/snapshots/json_shape__postgres_wal_evidence_shape.snap), [API-only WAL evidence](../crates/dwhy-core/tests/snapshots/json_shape__api_only_evidence_shape.snap) and [explain reports](../crates/dwhy-core/tests/snapshots/json_shape__explain_report_shape.snap).
 
 The versioned CLI output is the contract for agents and the planned MCP server.
 

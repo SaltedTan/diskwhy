@@ -22,7 +22,8 @@ crates/dwhy-core   engine: scan (walker), tree (the ScanTree detectors read: per
                    processes, git, container mounts),
                    plan (selection, fingerprints, expiry), apply (re-detect, tier policy, run
                    ready items, audit log), remove (path removal: no symlinks, one filesystem),
-                   gitcmd (how diskwhy runs git), doctor, system, units,
+                   gitcmd (how diskwhy runs git), cancel (per-session Cancel token and PID-tracked child runner),
+                   doctor, system, units,
                    report (diskwhy/v1 serde types: scan, plan, apply report, audit record, snapshot),
                    snapshot (scan --snapshot: build, save gzip JSON under the state dir, list, prune, load),
                    growth (diff: compare snapshots; watch: rates over a short window;
