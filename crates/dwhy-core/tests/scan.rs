@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use dwhy_core::account::{self, ReportEnv};
 use dwhy_core::mounts::{FsStats, MountTable};
-use dwhy_core::report::{HintKind, SkipReason, UnreadableReason};
-use dwhy_core::scan::{self, Progress, ScanOptions, ScanResult};
+use dwhy_core::report::{DeletedOpen, HintKind, SkipReason, Totals, UnreadableReason};
+use dwhy_core::scan::{self, Progress, ScanOptions, ScanResult, UnreadableRecord};
 use dwhy_core::system::DeletedOpenScan;
 
 fn opts() -> ScanOptions {
@@ -464,4 +464,206 @@ fn unreadable_dirs_become_hints() {
     assert_eq!(h[0].kind, HintKind::Unreadable);
     assert_eq!(h[0].path.as_deref(), Some(locked.to_str().unwrap()));
     assert_eq!(rep.scan.unreadable.count, 1);
+}
+
+/// The `major:minor` of the device holding `p`.
+fn dev_of(p: &Path) -> (u32, u32) {
+    let dev = fs::metadata(p).unwrap().dev();
+    (rustix::fs::major(dev), rustix::fs::minor(dev))
+}
+
+fn stats_used(used: u64) -> impl Fn(&Path) -> Option<FsStats> {
+    move |_: &Path| {
+        Some(FsStats {
+            size: 100 << 30,
+            used,
+            avail: 1 << 30,
+        })
+    }
+}
+
+fn scan_with(roots: &[PathBuf], mounts: &MountTable, one_filesystem: bool) -> ScanResult {
+    let o = ScanOptions {
+        one_filesystem,
+        ..opts()
+    };
+    scan::scan(roots, &o, mounts, &Progress::default()).unwrap()
+}
+
+#[test]
+fn subdirectory_bind_mount_is_not_full_coverage() {
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    write_file(&r.join("f"), 64 << 10);
+    let (ma, mi) = dev_of(&r);
+    let mounts = MountTable::parse(&format!(
+        "1 0 {ma}:{mi} /sub {} rw shared:1 - ext4 /dev/fake rw\n",
+        r.display()
+    ));
+    let res = scan_with(std::slice::from_ref(&r), &mounts, true);
+    let rep = account::build_scan_report(&res, &mounts, &env(false), &stats_used(50 << 30));
+    assert_eq!(rep.fs.len(), 1);
+    let f = &rep.fs[0];
+    assert!(!f.full_coverage);
+    assert_eq!(f.unaccounted, None);
+    assert!(f.hints.is_empty());
+    assert_eq!(f.rerun, None);
+}
+
+#[test]
+fn bind_mount_and_whole_filesystem_report_the_whole_mount() {
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let (whole, bind) = (r.join("whole"), r.join("bind"));
+    fs::create_dir(&whole).unwrap();
+    fs::create_dir(&bind).unwrap();
+    write_file(&whole.join("f"), 64 << 10);
+    write_file(&bind.join("g"), 32 << 10);
+    let (ma, mi) = dev_of(&r);
+    let mounts = MountTable::parse(&format!(
+        "1 0 {ma}:{mi} / {} rw - ext4 /dev/fake rw\n2 1 {ma}:{mi} /sub {} rw - ext4 /dev/fake rw\n",
+        whole.display(),
+        bind.display()
+    ));
+    // The bind mount first, so the whole-filesystem root has to upgrade it.
+    let res = scan_with(&[bind.clone(), whole.clone()], &mounts, true);
+    let scanned = res.totals().allocated;
+    let gib = 1u64 << 30;
+    let rep =
+        account::build_scan_report(&res, &mounts, &env(false), &stats_used(scanned + 5 * gib));
+    assert_eq!(rep.fs.len(), 1, "{:?}", rep.fs);
+    let f = &rep.fs[0];
+    assert_eq!(f.mount, whole.to_str().unwrap());
+    assert!(f.full_coverage);
+    assert_eq!(f.scanned, scanned);
+    assert_eq!(f.unaccounted, Some(5 * gib));
+    let rerun = f.rerun.as_deref().unwrap();
+    assert!(rerun.ends_with(whole.to_str().unwrap()), "{rerun}");
+}
+
+#[test]
+fn crossed_subdirectory_bind_mount_is_not_full_coverage() {
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let c = r.join("c");
+    fs::create_dir(&c).unwrap();
+    let (ma, mi) = dev_of(&r);
+    for (bind_root, want_full) in [("/sub", false), ("/", true)] {
+        let mounts = MountTable::parse(&format!(
+            "1 0 {ma}:{mi} / {} rw - ext4 /dev/fake rw\n2 1 0:99 {bind_root} {} rw - ext4 /dev/other rw\n",
+            r.display(),
+            c.display()
+        ));
+        let mut res = scan_with(std::slice::from_ref(&r), &mounts, false);
+        // Pretend `c` is the other device's mount point, entered while
+        // crossing filesystems.
+        let other = rustix::fs::makedev(0, 99);
+        res.per_dev.insert(
+            other,
+            Totals {
+                allocated: 1 << 20,
+                ..Totals::default()
+            },
+        );
+        res.dev_mounts.insert(other, 2);
+        res.entered_mounts.insert(2);
+        let rep = account::build_scan_report(&res, &mounts, &env(false), &stats_used(10 << 30));
+        assert_eq!(rep.fs.len(), 2, "{:?}", rep.fs);
+        assert!(rep.fs[0].full_coverage);
+        let f = &rep.fs[1];
+        assert_eq!(f.mount, c.to_str().unwrap());
+        assert_eq!(f.scanned, 1 << 20);
+        assert_eq!(f.full_coverage, want_full, "{bind_root}");
+        assert_eq!(f.unaccounted.is_some(), want_full, "{bind_root}");
+    }
+}
+
+#[test]
+fn btrfs_subvolume_mounted_as_root_is_not_full_coverage() {
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let (ma, mi) = dev_of(&r);
+    let mounts = MountTable::parse(&format!(
+        "1 0 {ma}:{mi} /@ {} rw - btrfs /dev/fake rw,subvol=/@\n",
+        r.display()
+    ));
+    let res = scan_with(std::slice::from_ref(&r), &mounts, true);
+    let rep = account::build_scan_report(&res, &mounts, &env(false), &stats_used(50 << 30));
+    assert_eq!(rep.fs.len(), 1);
+    assert!(!rep.fs[0].full_coverage);
+    assert_eq!(rep.fs[0].unaccounted, None);
+    assert!(rep.fs[0].hints.is_empty());
+}
+
+#[test]
+fn btrfs_subvolume_devices_are_one_filesystem() {
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    // The mount table names the filesystem 0:27; its top-level subvolume
+    // is 0:28 and a nested subvolume 0:31, as btrfs reports in st_dev.
+    let mounts = MountTable::parse(&format!(
+        "1 0 0:27 / {} rw - btrfs /dev/fake rw,subvol=/\n",
+        r.display()
+    ));
+    let mut res = scan_with(std::slice::from_ref(&r), &mounts, true);
+    let (top, nested, elsewhere) = (
+        rustix::fs::makedev(0, 28),
+        rustix::fs::makedev(0, 31),
+        rustix::fs::makedev(0, 77),
+    );
+    let mb = |n: u64| Totals {
+        allocated: n << 20,
+        ..Totals::default()
+    };
+    res.roots[0].dev = top;
+    res.per_dev = [(top, mb(3)), (nested, mb(5))].into_iter().collect();
+    res.dev_mounts = [(top, 1), (nested, 1)].into_iter().collect();
+    let unreadable = |p: PathBuf, dev| UnreadableRecord {
+        path: p,
+        dev,
+        reason: UnreadableReason::PermissionDenied,
+        entries_unknown: 0,
+        known_bytes: 4096,
+        owner_uid: 0,
+    };
+    res.unreadable = vec![
+        unreadable(r.join("a"), top),
+        unreadable(r.join("sub/b"), nested),
+    ];
+    let mut e = env(false);
+    e.deleted_open.processes_unreadable = 4;
+    for (dev, files, bytes) in [(top, 1, 1000), (nested, 2, 2000), (elsewhere, 7, 7000)] {
+        e.deleted_open.per_dev.insert(
+            dev,
+            DeletedOpen {
+                files,
+                bytes,
+                processes_unreadable: 0,
+            },
+        );
+    }
+    let used = 2u64 << 30;
+    let rep = account::build_scan_report(&res, &mounts, &e, &stats_used(used));
+    assert_eq!(rep.fs.len(), 1, "{:?}", rep.fs);
+    let f = &rep.fs[0];
+    assert_eq!(f.mount, r.to_str().unwrap());
+    assert!(f.full_coverage);
+    assert_eq!(f.scanned, 8 << 20);
+    assert_eq!(f.unaccounted, Some(used - (8 << 20)));
+    assert_eq!(
+        f.deleted_open,
+        DeletedOpen {
+            files: 3,
+            bytes: 3000,
+            processes_unreadable: 4,
+        }
+    );
+    let unread: u64 = f
+        .hints
+        .iter()
+        .filter(|h| h.kind == HintKind::Unreadable)
+        .map(|h| h.unreadable_dirs)
+        .sum();
+    assert_eq!(unread, 2, "{:?}", f.hints);
+    assert!(f.hints.iter().any(|h| h.kind == HintKind::DeletedOpen));
 }

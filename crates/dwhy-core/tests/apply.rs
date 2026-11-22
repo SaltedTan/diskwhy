@@ -1212,6 +1212,7 @@ fn tree_with_mounted_child(outer: &Path) -> ScanTree {
             parent: 0,
             major: 0,
             minor: 0,
+            root: "/".into(),
             mount_point: child.clone(),
             fstype: "ext4".into(),
             source: "/dev/fixture".into(),

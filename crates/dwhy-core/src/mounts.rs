@@ -9,6 +9,10 @@ pub struct Mount {
     pub parent: u32,
     pub major: u32,
     pub minor: u32,
+    /// The directory of the filesystem mounted here (`/` unless this is a
+    /// bind mount of a subdirectory or a btrfs subvolume other than the
+    /// top-level one).
+    pub root: PathBuf,
     pub mount_point: PathBuf,
     pub fstype: String,
     pub source: String,
@@ -21,6 +25,12 @@ impl Mount {
 
     pub fn is_virtual(&self) -> bool {
         is_virtual_fstype(&self.fstype)
+    }
+
+    /// Whether the whole filesystem is visible below this mount point, so
+    /// that a walk from it can account for everything `statvfs` counts.
+    pub fn is_whole_filesystem(&self) -> bool {
+        self.root == Path::new("/")
     }
 }
 
@@ -93,6 +103,10 @@ impl MountTable {
         self.mounts.iter().rev().find(|m| m.mount_point == path)
     }
 
+    pub fn by_id(&self, id: u32) -> Option<&Mount> {
+        self.mounts.iter().find(|m| m.id == id)
+    }
+
     /// Mounts stacked directly on `parent` (each hides whatever `parent` holds
     /// at that mount point).
     pub fn children_of<'a>(&'a self, parent: &'a Mount) -> impl Iterator<Item = &'a Mount> {
@@ -109,7 +123,7 @@ fn parse_line(line: &str) -> Option<Mount> {
     let id = pre.next()?.parse().ok()?;
     let parent = pre.next()?.parse().ok()?;
     let (major, minor) = pre.next()?.split_once(':')?;
-    let _root = pre.next()?;
+    let root = unescape(pre.next()?);
     let mount_point = unescape(pre.next()?);
     let mut post = post.split(' ');
     let fstype = post.next()?.to_string();
@@ -119,6 +133,7 @@ fn parse_line(line: &str) -> Option<Mount> {
         parent,
         major: major.parse().ok()?,
         minor: minor.parse().ok()?,
+        root: PathBuf::from(root),
         mount_point: PathBuf::from(mount_point),
         fstype,
         source,
@@ -168,6 +183,35 @@ pub fn statvfs(path: &Path) -> io::Result<FsStats> {
     })
 }
 
+/// `statfs` `f_type` of btrfs.
+const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
+
+/// The filesystem id (`statfs` `f_fsid`) of the btrfs filesystem holding
+/// `path`, which must be on device `dev`. Every subvolume of a btrfs
+/// filesystem has its own `st_dev`, but they all share one `f_fsid`.
+/// `None` if `path` is not on btrfs, is no longer on `dev`, or cannot be
+/// opened. Never follows a symlink and reads nothing but metadata.
+pub fn btrfs_fsid(path: &Path, dev: u64) -> Option<u64> {
+    use rustix::fs::{Mode, OFlags};
+    let fd = rustix::fs::open(
+        path,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    if rustix::fs::fstat(&fd).ok()?.st_dev != dev {
+        return None;
+    }
+    let sf = rustix::fs::fstatfs(&fd).ok()?;
+    // f_type is a signed word of platform width; compare its low 32 bits.
+    #[allow(clippy::unnecessary_cast)]
+    let fs_type = (sf.f_type as u64) & 0xffff_ffff;
+    if fs_type != BTRFS_SUPER_MAGIC {
+        return None;
+    }
+    Some(rustix::fs::fstatvfs(&fd).ok()?.f_fsid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +235,46 @@ mod tests {
         assert_eq!(t.mounts[4].mount_point, PathBuf::from("/mnt/with space"));
         assert!(t.mounts[1].is_virtual());
         assert!(!t.mounts[2].is_virtual());
+    }
+
+    #[test]
+    fn parses_mount_root() {
+        let t = MountTable::parse(concat!(
+            "22 1 259:7 / / rw - ext4 /dev/a rw\n",
+            "26 22 259:7 /home/x /mnt/x rw shared:1 - ext4 /dev/a rw\n",
+            "27 22 259:7 /sub\\040dir /mnt/y rw - ext4 /dev/a rw\n",
+            "28 1 0:27 /@ / rw - btrfs /dev/b rw,subvol=/@\n",
+        ));
+        let roots: Vec<&Path> = t.mounts.iter().map(|m| m.root.as_path()).collect();
+        assert_eq!(
+            roots,
+            [
+                Path::new("/"),
+                Path::new("/home/x"),
+                Path::new("/sub dir"),
+                Path::new("/@")
+            ]
+        );
+        let whole: Vec<bool> = t.mounts.iter().map(Mount::is_whole_filesystem).collect();
+        assert_eq!(whole, [true, false, false, false]);
+        assert_eq!(t.by_id(27).unwrap().mount_point, Path::new("/mnt/y"));
+        assert!(t.by_id(99).is_none());
+    }
+
+    #[test]
+    fn btrfs_fsid_is_none_off_btrfs_or_on_another_device() {
+        let d = tempfile::tempdir().unwrap();
+        let dev = std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(d.path()).unwrap());
+        let on_btrfs = rustix::fs::statfs(d.path())
+            .map(|s| {
+                #[allow(clippy::unnecessary_cast)]
+                let t = (s.f_type as u64) & 0xffff_ffff;
+                t == BTRFS_SUPER_MAGIC
+            })
+            .unwrap();
+        assert_eq!(btrfs_fsid(d.path(), dev).is_some(), on_btrfs);
+        assert_eq!(btrfs_fsid(d.path(), dev.wrapping_add(1)), None);
+        assert_eq!(btrfs_fsid(&d.path().join("missing"), dev), None);
     }
 
     #[test]

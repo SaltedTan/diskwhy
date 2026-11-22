@@ -1,7 +1,7 @@
 //! Turning a [`ScanResult`] into a `diskwhy/v1` report: per-filesystem `df`
 //! figures, the unaccounted gap, and hints for where the gap probably is.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::detect::shell_quote;
@@ -300,6 +300,127 @@ fn mount_for_dev(mounts: &MountTable, dev: u64) -> Option<&Mount> {
     mounts.mounts.iter().rev().find(|m| m.dev() == dev)
 }
 
+/// What makes two devices one filesystem in the report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FsKey {
+    /// The device the mount table gives: every mount of one filesystem
+    /// (bind mounts, btrfs subvolumes) shares it, though a btrfs
+    /// subvolume's own `st_dev` differs.
+    Mount(u64),
+    /// No mount table entry: the `st_dev` alone.
+    Dev(u64),
+}
+
+/// One filesystem the scan touched.
+struct FsGroup {
+    key: FsKey,
+    /// The mount named in the report: a whole-filesystem mount when there is one.
+    mount: Mount,
+    full: bool,
+    /// Every `st_dev` scanned on it.
+    devs: BTreeSet<u64>,
+}
+
+/// The filesystems the scan touched: those of the roots first (in root
+/// order), then any entered while crossing filesystems.
+fn fs_groups(result: &ScanResult, mounts: &MountTable) -> Vec<FsGroup> {
+    let mut groups: Vec<FsGroup> = Vec::new();
+    let add = |groups: &mut Vec<FsGroup>, key: FsKey, m: &Mount, full: bool| -> usize {
+        match groups.iter().position(|g| g.key == key) {
+            Some(i) => {
+                let g = &mut groups[i];
+                if full && !g.full {
+                    g.full = true;
+                    g.mount = m.clone();
+                }
+                i
+            }
+            None => {
+                groups.push(FsGroup {
+                    key,
+                    mount: m.clone(),
+                    full,
+                    devs: BTreeSet::new(),
+                });
+                groups.len() - 1
+            }
+        }
+    };
+    for r in &result.roots {
+        let (key, m) = match mounts.for_path(&r.path) {
+            Some(m) => (FsKey::Mount(m.dev()), m.clone()),
+            None => (FsKey::Dev(r.dev), unknown_mount(&r.path)),
+        };
+        // Only a walk from the mount point of a mount showing the whole
+        // filesystem sees everything `statvfs` counts.
+        let full = m.mount_point == r.path && m.is_whole_filesystem();
+        let i = add(&mut groups, key, &m, full);
+        groups[i].devs.insert(r.dev);
+    }
+    let mut entered: Vec<&Mount> = result
+        .entered_mounts
+        .iter()
+        .filter_map(|id| mounts.by_id(*id))
+        .collect();
+    entered.sort_by_key(|m| (m.dev(), m.id));
+    for m in entered {
+        add(
+            &mut groups,
+            FsKey::Mount(m.dev()),
+            m,
+            m.is_whole_filesystem(),
+        );
+    }
+    let mut devs: Vec<u64> = result.per_dev.keys().copied().collect();
+    devs.sort();
+    for d in devs {
+        if groups.iter().any(|g| g.devs.contains(&d)) {
+            continue;
+        }
+        if let Some(m) = owning_mount(result, mounts, d, None) {
+            // A device with no root on it and no mount entered for it: how
+            // much of it the walk saw is unknown.
+            let i = add(&mut groups, FsKey::Mount(m.dev()), m, false);
+            groups[i].devs.insert(d);
+        }
+    }
+    groups
+}
+
+/// The mount through which the scan reached `dev`: as the walk recorded
+/// it, else the mount holding `path`, else one the mount table lists for
+/// `dev`.
+fn owning_mount<'a>(
+    result: &ScanResult,
+    mounts: &'a MountTable,
+    dev: u64,
+    path: Option<&Path>,
+) -> Option<&'a Mount> {
+    result
+        .dev_mounts
+        .get(&dev)
+        .and_then(|id| mounts.by_id(*id))
+        .or_else(|| path.and_then(|p| mounts.for_path(p)))
+        .or_else(|| mount_for_dev(mounts, dev))
+}
+
+/// The group holding `dev`, if any.
+fn group_of(
+    groups: &[FsGroup],
+    result: &ScanResult,
+    mounts: &MountTable,
+    dev: u64,
+    path: Option<&Path>,
+) -> Option<usize> {
+    groups
+        .iter()
+        .position(|g| g.devs.contains(&dev))
+        .or_else(|| {
+            let key = FsKey::Mount(owning_mount(result, mounts, dev, path)?.dev());
+            groups.iter().position(|g| g.key == key)
+        })
+}
+
 /// The scan report for a finished walk on this system (host, uid, clock,
 /// users, deleted-open files, Docker access, `statvfs`), before detectors
 /// run. What `dwhy scan` and the TUI both start from.
@@ -327,52 +448,56 @@ pub fn build_scan_report(
     env: &ReportEnv,
     fs_stats: &dyn Fn(&Path) -> Option<FsStats>,
 ) -> ScanReport {
-    // Filesystems: those of the roots first (in root order), then any entered while crossing.
-    let mut fs_list: Vec<(u64, Mount, bool)> = Vec::new();
-    for r in &result.roots {
-        if fs_list.iter().any(|(d, _, _)| *d == r.dev) {
-            if mounts.at(&r.path).is_some() {
-                fs_list.iter_mut().find(|(d, _, _)| *d == r.dev).unwrap().2 = true;
-            }
-            continue;
+    let groups = fs_groups(result, mounts);
+    let mut on_fs: Vec<Vec<&UnreadableRecord>> = vec![Vec::new(); groups.len()];
+    for u in &result.unreadable {
+        if let Some(i) = group_of(&groups, result, mounts, u.dev, Some(&u.path)) {
+            on_fs[i].push(u);
         }
-        let m = mounts
-            .for_path(&r.path)
-            .cloned()
-            .unwrap_or_else(|| unknown_mount(&r.path));
-        let full = m.mount_point == r.path;
-        fs_list.push((r.dev, m, full));
     }
-    let mut crossed: Vec<u64> = result
-        .per_dev
-        .keys()
-        .copied()
-        .filter(|d| !fs_list.iter().any(|(fd, _, _)| fd == d))
-        .collect();
-    crossed.sort();
-    for d in crossed {
-        if let Some(m) = mount_for_dev(mounts, d) {
-            // Entered at its mount point while crossing filesystems.
-            fs_list.push((d, m.clone(), true));
+    // Processes whose fds could not be listed are counted once per scan,
+    // not once per device.
+    let mut deleted = vec![
+        DeletedOpen {
+            processes_unreadable: env.deleted_open.processes_unreadable,
+            ..DeletedOpen::default()
+        };
+        groups.len()
+    ];
+    let mut deleted_devs: Vec<(&u64, &DeletedOpen)> = env.deleted_open.per_dev.iter().collect();
+    deleted_devs.sort_by_key(|(d, _)| **d);
+    for (dev, d) in deleted_devs {
+        if let Some(i) = group_of(&groups, result, mounts, *dev, None) {
+            deleted[i].files += d.files;
+            deleted[i].bytes += d.bytes;
         }
     }
 
-    let fs: Vec<FsReport> = fs_list
+    let fs: Vec<FsReport> = groups
         .into_iter()
-        .map(|(dev, m, full)| {
+        .zip(on_fs)
+        .zip(deleted)
+        .map(|((g, on_fs), deleted)| {
+            let FsGroup {
+                mount: m,
+                full,
+                devs,
+                ..
+            } = g;
             let stats = fs_stats(&m.mount_point).unwrap_or(FsStats {
                 size: 0,
                 used: 0,
                 avail: 0,
             });
-            let scanned = result.per_dev.get(&dev).map(|t| t.allocated).unwrap_or(0);
+            let scanned: u64 = devs
+                .iter()
+                .filter_map(|d| result.per_dev.get(d))
+                .map(|t| t.allocated)
+                .sum();
             let gap = unaccounted(stats.used, scanned, full);
             let large = gap.is_some_and(|g| gap_is_large(g, stats.size));
-            let deleted = env.deleted_open.for_dev(dev);
             let hints = match gap {
                 Some(g) if g > 0 => {
-                    let on_fs: Vec<&UnreadableRecord> =
-                        result.unreadable.iter().filter(|u| u.dev == dev).collect();
                     let shadowing: Vec<&Mount> = mounts.children_of(&m).collect();
                     fs_hints(
                         g,
@@ -533,6 +658,7 @@ fn unknown_mount(path: &Path) -> Mount {
         parent: u32::MAX,
         major: 0,
         minor: 0,
+        root: PathBuf::from("/"),
         mount_point: path
             .ancestors()
             .last()
