@@ -737,6 +737,67 @@ fn diff_rescans_a_non_utf8_root_as_given() {
 }
 
 #[test]
+fn snapshot_only_diff_refuses_a_lossy_root() {
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt;
+
+    let (_t, root) = cargo_fixture();
+    let app = Path::new(&root).join("app");
+    let raw = Path::new(&root).join(OsStr::from_bytes(b"app\xff"));
+    if let Err(e) = fs::rename(&app, &raw) {
+        eprintln!("skipped: the filesystem refuses {raw:?}: {e}");
+        return;
+    }
+    // A real sibling spelled like the lossy root must not be opened.
+    let sibling = Path::new(&root).join("app\u{FFFD}");
+    fs::create_dir_all(sibling.join("x/y")).unwrap();
+    fs::write(sibling.join("x/y/other"), vec![5u8; 1 << 20]).unwrap();
+
+    let state = tempfile::tempdir().unwrap();
+    let run = |args: &[OsString]| {
+        Command::new(env!("CARGO_BIN_EXE_dwhy"))
+            .args(args)
+            .env("XDG_STATE_HOME", state.path())
+            .env("DOCKER_HOST", "unix:///nonexistent")
+            .output()
+            .unwrap()
+    };
+
+    let mut scan_args: Vec<OsString> = ["scan", "--snapshot"].iter().map(OsString::from).collect();
+    scan_args.push(raw.clone().into_os_string());
+    scan_args.extend(
+        ["-q", "--json", "--detectors", "cargo-target"]
+            .iter()
+            .map(OsString::from),
+    );
+    let scan_out = run(&scan_args);
+    assert_eq!(scan_out.status.code(), Some(0), "{scan_out:?}");
+    let snap_path = json_of(&scan_out)["snapshot"]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let snap_dir = state.path().join("diskwhy/snapshots");
+    let before_count = fs::read_dir(&snap_dir).unwrap().count();
+
+    // Without PATH, both `diff` and `diff --since <file>` refuse the ambiguous
+    // U+FFFD root and save no new snapshot.
+    for extra in [&[][..], &["--since", snap_path.as_str()][..]] {
+        let mut diff_args: Vec<OsString> =
+            ["diff", "--snapshot", "-q", "--detectors", "cargo-target"]
+                .iter()
+                .map(OsString::from)
+                .collect();
+        diff_args.extend(extra.iter().map(OsString::from));
+        let out = run(&diff_args);
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("U+FFFD"), "{err}");
+        assert!(err.contains("dwhy diff <PATH>"), "{err}");
+        assert_eq!(fs::read_dir(&snap_dir).unwrap().count(), before_count);
+    }
+}
+
+#[test]
 fn scan_shows_growth_from_a_snapshot_an_hour_old() {
     let (_t, root) = cargo_fixture();
     let target = format!("{root}/app/target");
