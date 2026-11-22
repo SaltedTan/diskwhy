@@ -353,6 +353,7 @@ dependencies = [
  "dwhy-tui",
  "insta",
  "ratatui",
+ "rustix",
  "serde_json",
  "tempfile",
  "time",

@@ -80,6 +80,7 @@ fn sample() -> ScanReport {
             }],
             errors: vec![],
             error_count: 0,
+            dirs_omitted: None,
         },
         fs: vec![FsReport {
             mount: "/".into(),
@@ -205,12 +206,113 @@ fn sample() -> ScanReport {
             path: "/home/u/.local/state/diskwhy/snapshots/20261115T060000Z-1f2e3d4c.json.gz".into(),
             pruned: 1,
         }),
+        findings_summary: None,
     }
 }
 
 #[test]
 fn scan_report_shape() {
     insta::assert_json_snapshot!(sample());
+}
+
+fn summary_finding(
+    id: &str,
+    path: &str,
+    bytes: u64,
+    nested: Option<u64>,
+    tier: Tier,
+    kind: ActionKind,
+) -> Finding {
+    Finding {
+        file_identity: None,
+        id: id.into(),
+        detector: "cargo-target".into(),
+        probe: None,
+        evidence: None,
+        path: path.into(),
+        bytes,
+        nested_bytes: nested,
+        last_modified: None,
+        growth: None,
+        tier,
+        reason: "build output".into(),
+        guards: vec![],
+        action: Action {
+            kind,
+            text: "cargo clean".into(),
+            argv: None,
+        },
+        recovery: Recovery {
+            cost: "rebuild".into(),
+            how: None,
+        },
+    }
+}
+
+#[test]
+fn scan_report_summary_shape() {
+    let mut r = sample();
+    r.snapshot = None;
+    for (path, depth, allocated) in [
+        ("/var", 1, 20_000_000_000),
+        ("/home/u", 2, 160_000_000_000),
+        ("/home/u/.cache", 3, 40_000_000_000),
+        ("/home/u/.cache/deep", 4, 30_000_000_000),
+    ] {
+        r.scan.dirs.push(DirEntry {
+            path: path.into(),
+            depth,
+            allocated,
+            apparent: allocated,
+            files: 10,
+        });
+    }
+    r.scan
+        .dirs
+        .sort_by(|a, b| b.allocated.cmp(&a.allocated).then(a.path.cmp(&b.path)));
+    r.findings.extend([
+        summary_finding(
+            "f_a",
+            "/home/u/src/a/target",
+            10_000_000_000,
+            Some(2_000_000_000),
+            Tier::Rebuildable,
+            ActionKind::Command,
+        ),
+        summary_finding(
+            "f_b",
+            "/home/u/.cache/pip",
+            3_000_000_000,
+            None,
+            Tier::Regenerable,
+            ActionKind::RemovePath,
+        ),
+        summary_finding(
+            "f_c",
+            "/home/u/src/a/target/debug/incremental",
+            2_000_000_000,
+            None,
+            Tier::Regenerable,
+            ActionKind::RemovePath,
+        ),
+        summary_finding(
+            "f_d",
+            "/home/u/.local/share/Trash",
+            1_000_000_000,
+            None,
+            Tier::Blocked,
+            ActionKind::RemovePath,
+        ),
+    ]);
+    r.summarize(
+        None,
+        SummaryLimits {
+            max_findings: 2,
+            max_dirs: 4,
+            max_depth: 3,
+        },
+    );
+    insta::assert_json_snapshot!(r);
 }
 
 #[test]

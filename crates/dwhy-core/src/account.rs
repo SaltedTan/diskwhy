@@ -682,6 +682,7 @@ pub fn build_scan_report(
                 })
                 .collect(),
             error_count: result.error_count,
+            dirs_omitted: None,
         },
         fs,
         // Filled in by the caller from `detect::run`.
@@ -689,6 +690,7 @@ pub fn build_scan_report(
         detectors: Vec::new(),
         docker: None,
         snapshot: None,
+        findings_summary: None,
     }
 }
 

@@ -1,0 +1,279 @@
+---
+source: crates/dwhy-core/tests/json_shape.rs
+expression: r
+---
+{
+  "schema": "diskwhy/v1",
+  "tool": {
+    "name": "diskwhy",
+    "version": "0.0.1"
+  },
+  "host": "pc-ubuntu",
+  "uid": 1000,
+  "root": false,
+  "generated_at": "2026-11-15T06:00:00Z",
+  "scan": {
+    "roots": [
+      {
+        "path": "/",
+        "mount": "/",
+        "totals": {
+          "allocated": 195234332672,
+          "apparent": 181397695055,
+          "files": 4115794,
+          "dirs": 298007,
+          "symlinks": 40620,
+          "other": 49,
+          "hardlinks_deduped": 197465,
+          "hardlink_bytes_deduped": 12216655872
+        }
+      }
+    ],
+    "one_filesystem": true,
+    "elapsed_ms": 410,
+    "totals": {
+      "allocated": 195234332672,
+      "apparent": 181397695055,
+      "files": 4115794,
+      "dirs": 298007,
+      "symlinks": 40620,
+      "other": 49,
+      "hardlinks_deduped": 197465,
+      "hardlink_bytes_deduped": 12216655872
+    },
+    "dirs": [
+      {
+        "path": "/",
+        "depth": 0,
+        "allocated": 195234332672,
+        "apparent": 181397695055,
+        "files": 4115794
+      },
+      {
+        "path": "/home",
+        "depth": 1,
+        "allocated": 170597343232,
+        "apparent": 158523958653,
+        "files": 3000000
+      },
+      {
+        "path": "/home/u",
+        "depth": 2,
+        "allocated": 160000000000,
+        "apparent": 160000000000,
+        "files": 10
+      },
+      {
+        "path": "/home/u/.cache",
+        "depth": 3,
+        "allocated": 40000000000,
+        "apparent": 40000000000,
+        "files": 10
+      }
+    ],
+    "min_dir_bytes": 104857600,
+    "unreadable": {
+      "count": 2,
+      "entries_unknown": 3,
+      "known_bytes": 4096,
+      "dirs": [
+        {
+          "path": "/home/hermes",
+          "reason": "permission_denied",
+          "entries_unknown": 0,
+          "known_bytes": 4096,
+          "owner_uid": 1003
+        },
+        {
+          "path": "/srv/listed",
+          "reason": "entries_denied",
+          "entries_unknown": 3,
+          "known_bytes": 0,
+          "owner_uid": 0
+        }
+      ],
+      "truncated": false
+    },
+    "skipped_mounts": [
+      {
+        "path": "/boot/efi",
+        "fstype": "vfat",
+        "reason": "other_filesystem"
+      }
+    ],
+    "errors": [],
+    "error_count": 0,
+    "dirs_omitted": 2
+  },
+  "fs": [
+    {
+      "mount": "/",
+      "fstype": "ext4",
+      "source": "/dev/nvme1n1p3",
+      "size": 420496252928,
+      "used": 233488711680,
+      "avail": 165572820992,
+      "scanned": 195234332672,
+      "full_coverage": true,
+      "unaccounted": 38254379008,
+      "unaccounted_large": true,
+      "hints": [
+        {
+          "kind": "docker",
+          "path": "/var/lib/docker",
+          "detail": "Docker data root",
+          "unreadable_dirs": 1,
+          "bytes": null
+        },
+        {
+          "kind": "deleted-open",
+          "path": null,
+          "detail": "1 deleted file(s) still held open",
+          "unreadable_dirs": 0,
+          "bytes": 1048576
+        }
+      ],
+      "deleted_open": {
+        "files": 1,
+        "bytes": 1048576,
+        "processes_unreadable": 584
+      },
+      "rerun": "sudo /usr/local/bin/dwhy scan /"
+    }
+  ],
+  "findings": [
+    {
+      "id": "f_7c1e",
+      "detector": "docker-volume",
+      "probe": "postgres-wal",
+      "path": "docker://volume/example_postgres_data",
+      "bytes": 33041965056,
+      "nested_bytes": null,
+      "last_modified": "2026-11-13T02:10:00Z",
+      "growth": {
+        "bytes_per_day": 4939212390,
+        "since": "2026-11-07T07:25:00Z"
+      },
+      "tier": "review",
+      "reason": "pg_wal holds 29G vs 53M data",
+      "guards": [
+        {
+          "name": "container-mount",
+          "status": "warn",
+          "detail": "mounted by example-postgres-1 (running)"
+        }
+      ],
+      "action": {
+        "kind": "advice",
+        "text": "restore the archive target"
+      },
+      "recovery": {
+        "cost": "n/a",
+        "how": null
+      }
+    },
+    {
+      "id": "f_a",
+      "detector": "cargo-target",
+      "probe": null,
+      "path": "/home/u/src/a/target",
+      "bytes": 10000000000,
+      "nested_bytes": 2000000000,
+      "last_modified": null,
+      "growth": null,
+      "tier": "rebuildable",
+      "reason": "build output",
+      "guards": [],
+      "action": {
+        "kind": "command",
+        "text": "cargo clean"
+      },
+      "recovery": {
+        "cost": "rebuild",
+        "how": null
+      }
+    }
+  ],
+  "detectors": [
+    {
+      "name": "cargo-target",
+      "status": "available",
+      "detail": "uses `cargo` for removal",
+      "ran": true,
+      "findings": 6,
+      "elapsed_ms": 1,
+      "error": null
+    },
+    {
+      "name": "venv",
+      "status": "not_implemented",
+      "detail": "not implemented yet (M1)",
+      "ran": false,
+      "findings": 0,
+      "elapsed_ms": 0,
+      "error": null
+    },
+    {
+      "name": "docker-image",
+      "status": "available",
+      "detail": "uses the docker CLI and socket",
+      "ran": true,
+      "findings": 0,
+      "elapsed_ms": 120000,
+      "error": "docker API /system/df: no response within 120s"
+    }
+  ],
+  "docker": {
+    "root_dir": "/var/lib/docker",
+    "containerd_image_store": true,
+    "images": {
+      "count": 30,
+      "active": 16,
+      "bytes": 22426296039
+    },
+    "containers": {
+      "count": 33,
+      "active": 33,
+      "bytes": 648278016
+    },
+    "volumes": {
+      "count": 15,
+      "active": 15,
+      "bytes": 1654201897
+    },
+    "build_cache": {
+      "count": 92,
+      "active": 0,
+      "bytes": 4616635167
+    },
+    "total": 29345411119
+  },
+  "findings_summary": {
+    "total": 5,
+    "omitted": 3,
+    "reclaimable_bytes": 13000000000,
+    "by_tier": {
+      "regenerable": {
+        "count": 2,
+        "bytes": 5000000000,
+        "reclaimable_bytes": 5000000000
+      },
+      "rebuildable": {
+        "count": 1,
+        "bytes": 8000000000,
+        "reclaimable_bytes": 8000000000
+      },
+      "review": {
+        "count": 1,
+        "bytes": 33041965056,
+        "reclaimable_bytes": 0,
+        "advice_count": 1
+      },
+      "blocked": {
+        "count": 1,
+        "bytes": 1000000000,
+        "reclaimable_bytes": 0
+      }
+    }
+  }
+}

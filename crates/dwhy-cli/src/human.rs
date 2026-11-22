@@ -9,8 +9,8 @@ use dwhy_core::detect::escape_controls;
 use dwhy_core::explain;
 use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{
-    ActionKind, ApplyOutcome, ApplyReport, Change, ChangeKind, DetectorAvailability, DiffReport,
-    DirEntry, DoctorReport, ExplainReport, Finding, FsReport, GuardStatus, Plan, Rate, ScanReport,
+    ApplyOutcome, ApplyReport, Change, ChangeKind, DetectorAvailability, DiffReport, DirEntry,
+    DoctorReport, ExplainReport, Finding, FsReport, GuardStatus, Plan, Rate, ScanReport,
     SkipReason, Tier, WatchReport,
 };
 use dwhy_core::units::{age, human, signed, thousands};
@@ -133,6 +133,14 @@ pub fn render_scan(
         depth,
         top,
     )?;
+    if let Some(n) = s.dirs_omitted.filter(|n| *n > 0) {
+        writeln!(
+            w,
+            "  … {} more director{} left out by --summary",
+            thousands(n),
+            if n == 1 { "y" } else { "ies" }
+        )?;
+    }
     if let Some(snap) = &r.snapshot {
         writeln!(w)?;
         write!(
@@ -639,26 +647,21 @@ pub fn render_apply(
     Ok(())
 }
 
-/// A finding's bytes less those held by findings inside it, which are
-/// listed and counted on their own.
-fn own_bytes(f: &Finding) -> u64 {
-    f.bytes.saturating_sub(f.nested_bytes.unwrap_or(0))
-}
-
 /// What the findings' actions can free, and how many findings were left
 /// out of that total: advice-only ones (such as an in-use volume) and
 /// blocked ones (a guard such as `recent-write` failed).
 fn reclaimable(findings: &[&Finding]) -> (String, String) {
-    let advice = findings
-        .iter()
-        .filter(|f| f.tier != Tier::Blocked && f.action.kind == ActionKind::Advice)
-        .count();
-    let blocked = findings.iter().filter(|f| f.tier == Tier::Blocked).count();
+    let advice = findings.iter().filter(|f| f.is_advice()).count() as u64;
+    let blocked = findings.iter().filter(|f| f.tier == Tier::Blocked).count() as u64;
     let bytes: u64 = findings
         .iter()
-        .filter(|f| f.action.kind != ActionKind::Advice && f.tier != Tier::Blocked)
-        .map(|f| own_bytes(f))
+        .filter(|f| f.is_reclaimable())
+        .map(|f| f.own_bytes())
         .sum();
+    (human(bytes), reclaimable_note(advice, blocked))
+}
+
+fn reclaimable_note(advice: u64, blocked: u64) -> String {
     let mut note = String::new();
     if advice > 0 {
         note.push_str(&format!("; {advice} in use, not counted"));
@@ -666,20 +669,39 @@ fn reclaimable(findings: &[&Finding]) -> (String, String) {
     if blocked > 0 {
         note.push_str(&format!("; {blocked} blocked, not counted"));
     }
-    (human(bytes), note)
+    note
 }
 
+/// The findings section. With `findings_summary` (`--summary`), the totals
+/// are the summary's, over every finding the scan reported, not just the
+/// ones left in `findings`.
 fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result<()> {
     if r.detectors.is_empty() {
         return Ok(());
     }
     writeln!(w)?;
-    let (total, note) = reclaimable(&r.findings.iter().collect::<Vec<_>>());
+    let summary = r.findings_summary.as_ref();
+    let (count, total, note) = match summary {
+        Some(s) => {
+            let advice: u64 = [Tier::Regenerable, Tier::Rebuildable, Tier::Review]
+                .iter()
+                .map(|t| s.by_tier.get(*t).advice_count)
+                .sum();
+            (
+                s.total,
+                human(s.reclaimable_bytes),
+                reclaimable_note(advice, s.by_tier.blocked.count),
+            )
+        }
+        None => {
+            let (total, note) = reclaimable(&r.findings.iter().collect::<Vec<_>>());
+            (r.findings.len() as u64, total, note)
+        }
+    };
     let ran = r.detectors.iter().filter(|d| d.ran).count();
     writeln!(
         w,
-        "findings: {} ({total} reclaimable{note}) from {ran} of {} detectors",
-        r.findings.len(),
+        "findings: {count} ({total} reclaimable{note}) from {ran} of {} detectors",
         r.detectors.len()
     )?;
     let mut shown = 0;
@@ -693,15 +715,25 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
         if in_tier.is_empty() || shown == max {
             continue;
         }
+        let tier_summary = summary.map(|s| s.by_tier.get(tier));
         if tier == Tier::Blocked {
-            let bytes: u64 = in_tier.iter().map(|f| own_bytes(f)).sum();
+            let bytes: u64 = match tier_summary {
+                Some(t) => t.bytes,
+                None => in_tier.iter().map(|f| f.own_bytes()).sum(),
+            };
             writeln!(
                 w,
                 "  blocked ({}, not offered: a guard failed)",
                 human(bytes)
             )?;
         } else {
-            let (bytes, note) = reclaimable(&in_tier);
+            let (bytes, note) = match tier_summary {
+                Some(t) => (
+                    human(t.reclaimable_bytes),
+                    reclaimable_note(t.advice_count, 0),
+                ),
+                None => reclaimable(&in_tier),
+            };
             writeln!(w, "  {} ({bytes}{note})", tier_name(tier))?;
         }
         for f in in_tier {
@@ -746,12 +778,14 @@ fn render_findings(w: &mut impl Write, r: &ScanReport, max: usize) -> io::Result
             }
         }
     }
-    if r.findings.len() > shown {
-        writeln!(
-            w,
-            "  … {} more (--max-findings or --json lists them)",
-            r.findings.len() - shown
-        )?;
+    let more = (r.findings.len() - shown) as u64 + summary.map_or(0, |s| s.omitted);
+    if more > 0 {
+        let how = if summary.is_some() {
+            "--json without --summary lists them"
+        } else {
+            "--max-findings or --json lists them"
+        };
+        writeln!(w, "  … {more} more ({how})")?;
     }
     let unavailable: Vec<std::borrow::Cow<'_, str>> = r
         .detectors
@@ -1124,6 +1158,7 @@ mod tests {
                 skipped_mounts: vec![],
                 errors: vec![],
                 error_count: 0,
+                dirs_omitted: None,
             },
             fs: vec![],
             findings,
@@ -1138,6 +1173,7 @@ mod tests {
             }],
             docker: None,
             snapshot: None,
+            findings_summary: None,
         }
     }
 

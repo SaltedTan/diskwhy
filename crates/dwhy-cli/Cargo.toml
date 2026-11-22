@@ -25,6 +25,8 @@ serde_json.workspace = true
 [dev-dependencies]
 insta.workspace = true
 ratatui.workspace = true
+# pty: the progress-suppression test runs dwhy on a pseudo-terminal.
+rustix = { workspace = true, features = ["pty"] }
 serde_json.workspace = true
 tempfile.workspace = true
 time.workspace = true
