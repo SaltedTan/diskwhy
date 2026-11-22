@@ -322,6 +322,8 @@ struct FsGroup {
     whole_root: Option<usize>,
     /// Every `st_dev` scanned on it.
     devs: BTreeSet<u64>,
+    /// Ids of the mounts the scan reached it through.
+    via: BTreeSet<u32>,
 }
 
 /// The filesystems the scan touched: those of the roots first (in root
@@ -345,15 +347,16 @@ fn fs_groups(result: &ScanResult, mounts: &MountTable) -> Vec<FsGroup> {
                     full,
                     whole_root: None,
                     devs: BTreeSet::new(),
+                    via: BTreeSet::new(),
                 });
                 groups.len() - 1
             }
         }
     };
     for (ri, r) in result.roots.iter().enumerate() {
-        let (key, m) = match mounts.for_path(&r.path) {
-            Some(m) => (FsKey::Mount(m.dev()), m.clone()),
-            None => (FsKey::Dev(r.dev), unknown_mount(&r.path)),
+        let (key, m, via) = match mounts.for_path(&r.path) {
+            Some(m) => (FsKey::Mount(m.dev()), m.clone(), Some(m.id)),
+            None => (FsKey::Dev(r.dev), unknown_mount(&r.path), None),
         };
         // Only a walk from the mount point of a mount showing the whole
         // filesystem sees everything `statvfs` counts.
@@ -363,6 +366,7 @@ fn fs_groups(result: &ScanResult, mounts: &MountTable) -> Vec<FsGroup> {
             groups[i].whole_root = Some(ri);
         }
         groups[i].devs.insert(r.dev);
+        groups[i].via.extend(via);
     }
     let mut entered: Vec<&Mount> = result
         .entered_mounts
@@ -371,12 +375,13 @@ fn fs_groups(result: &ScanResult, mounts: &MountTable) -> Vec<FsGroup> {
         .collect();
     entered.sort_by_key(|m| (m.dev(), m.id));
     for m in entered {
-        add(
+        let i = add(
             &mut groups,
             FsKey::Mount(m.dev()),
             m,
             m.is_whole_filesystem(),
         );
+        groups[i].via.insert(m.id);
     }
     let mut devs: Vec<u64> = result.per_dev.keys().copied().collect();
     devs.sort();
@@ -389,6 +394,15 @@ fn fs_groups(result: &ScanResult, mounts: &MountTable) -> Vec<FsGroup> {
             // much of it the walk saw is unknown.
             let i = add(&mut groups, FsKey::Mount(m.dev()), m, false);
             groups[i].devs.insert(d);
+        }
+    }
+    for g in &mut groups {
+        g.via
+            .extend(g.devs.iter().filter_map(|d| result.dev_mounts.get(d)));
+        // Without a whole-filesystem root, `scanned` adds up every walk on
+        // the filesystem: complete only if they all went through one mount.
+        if g.whole_root.is_none() && g.via.len() > 1 {
+            g.full = false;
         }
     }
     groups

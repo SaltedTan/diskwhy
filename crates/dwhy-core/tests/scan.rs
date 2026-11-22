@@ -590,6 +590,41 @@ fn crossed_subdirectory_bind_mount_is_not_full_coverage() {
 }
 
 #[test]
+fn entered_whole_mount_is_not_full_coverage_when_reached_another_way_too() {
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    write_file(&r.join("f"), 64 << 10);
+    let top = r.join("top");
+    // The root is a subvolume or subdirectory of filesystem 0:27, whose
+    // whole mount at `top` the walk then enters: `df` counts the root's
+    // blocks once, but both walks reached them.
+    for (fstype, root_dir) in [("btrfs", "/@"), ("ext4", "/x")] {
+        let mounts = MountTable::parse(&format!(
+            "1 0 0:27 {root_dir} {} rw - {fstype} /dev/fake rw\n2 1 0:27 / {} rw - {fstype} /dev/fake rw\n",
+            r.display(),
+            top.display()
+        ));
+        let mut res = scan_with(std::slice::from_ref(&r), &mounts, false);
+        let other = rustix::fs::makedev(0, 28);
+        res.per_dev.insert(
+            other,
+            Totals {
+                allocated: 1 << 20,
+                ..Totals::default()
+            },
+        );
+        res.dev_mounts.insert(other, 2);
+        res.entered_mounts.insert(2);
+        let rep = account::build_scan_report(&res, &mounts, &env(false), &stats_used(10 << 30));
+        assert_eq!(rep.fs.len(), 1, "{:?}", rep.fs);
+        let f = &rep.fs[0];
+        assert!(!f.full_coverage, "{fstype}");
+        assert_eq!(f.unaccounted, None, "{fstype}");
+        assert!(f.hints.is_empty(), "{fstype}");
+    }
+}
+
+#[test]
 fn btrfs_subvolume_mounted_as_root_is_not_full_coverage() {
     let t = tempfile::tempdir().unwrap();
     let r = fs::canonicalize(t.path()).unwrap();
