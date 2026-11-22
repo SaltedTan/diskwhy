@@ -256,7 +256,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("ran");
         let script = dir.path().join("touch");
-        write_script(&script, &format!("#!/bin/sh\ntouch '{}'\n", marker.display()));
+        write_script(
+            &script,
+            &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        );
         let cancel = Cancel::default();
         cancel.cancel();
         let result = output(&mut Command::new(&script), &cancel, None, u64::MAX);
