@@ -62,9 +62,9 @@ enum Command {
     /// Explain one finding, by id or path: evidence, guards, growth, action and recovery cost.
     Explain(ExplainArgs),
     /// Open the TUI (what bare `dwhy` does on the current directory): browse sizes and findings,
-    /// mark findings and preview their plan; writes only a plan file you ask for.
+    /// mark findings, preview or save plans, and apply with confirmation.
     Tui(TuiArgs),
-    /// Show permissions, optional tools on PATH, and which detectors they enable.
+    /// Show permissions, optional tools on PATH, and which detectors and probes they enable.
     Doctor {
         /// Print diskwhy/v1 JSON instead of text.
         #[arg(long)]

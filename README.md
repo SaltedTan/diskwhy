@@ -2,9 +2,104 @@
 
 **Why is my disk filling up, and what is safe to remove?**
 
-`diskwhy` (binary `dwhy`) is a Rust tool for Linux dev boxes and servers, used over ssh. It finds what is big *and what is growing*, explains each item, checks whether it is safe to delete, and removes it the way the owning tool would. It has a TUI for people and a JSON CLI (scan → plan → apply) that agents can drive within limits you set.
+`diskwhy` (binary `dwhy`) is a Rust tool for Linux dev boxes and servers, used over ssh. It finds what is big **and what is growing**, explains each item, checks whether it is safe to delete against live system state, and removes it the way the owning tool would. It ships one engine with two interfaces:
 
-Status: pre-MVP, private. See [docs/DESIGN.md](docs/DESIGN.md) for scope and milestones. M0 (scanner, `diskwhy/v1` JSON types, `doctor`) and M1 (detectors) are in place. M2 (guards, `plan`, `apply`) is built: an agent can clear `regenerable` items on its own and is refused `review` ones. M3 (growth) is in place. `scan --snapshot` keeps a history of scans, `diff` shows what grew since one, `watch` measures what is growing right now, and the `postgres-wal` probe explains a Postgres volume full of WAL. The TUI includes the tree browser (M4a), the findings list and detail view (M4b), marking findings, the plan preview and plan files (M4c), and applying a plan after a confirm dialog (M4d).
+- an **interactive TUI** for people (`dwhy`, `dwhy tui`; built with ratatui, usable over ssh at 80×24)
+- a **JSON CLI** (`diskwhy/v1`) for scripts and agents built around *scan → plan → apply*, where an agent can apply a plan only within the tier policy you set
+
+## Why diskwhy? (The pc-ubuntu story)
+
+`diskwhy` started from a real cleanup on a Linux dev box (`pc-ubuntu`) on 2026-11-13 that took `/` from **36 GiB free to 166 GiB free** (+130 GiB reclaimed):
+
+| What was eating space | Size | How it was resolved | What `dwhy` does |
+|---|---:|---|---|
+| PostgreSQL WAL backlog behind a stopped fake-S3 archive container (failing for 6 days) | ~29 GiB | Restarted the dead archive container so WAL archived and recycled | `watch` / `diff` flags the growing volume; `postgres-wal` probe inspects Postgres + Docker and names the exited archive target instead of suggesting volume deletion |
+| Python virtualenvs (including 4 ML/TTS engines), old local builds and unused model weights | ~46 GiB | Removed rebuildable venvs and old local trees | `venv` detects `pyvenv.cfg` and gives the project's restore command (`uv sync`, etc.); `.dwhy-scratch` opts custom dirs into `stale-tree` |
+| Language & tool caches (Go, npm, uv, pip), old CLI runtimes, desktop trash and ~8.6 GiB of local test clusters | ~24 GiB | `go clean`, `npm cache clean`, `uv cache clean`, uninstall old versions, removed test clusters | `user-cache`, `tool-versions` and `trash` report exact freeable bytes, age gates, and tool-native commands; `.dwhy-scratch` covers custom cache/test dirs |
+| Stale scratch directories and 81 clean, fully pushed `git` worktrees | ~22 GiB | Removed stale scratch trees and `git worktree remove` | `stale-tree` and `git-worktree` check age; pre-removal git guards block uncommitted changes or commits on no remote |
+| Unused Docker images, exited containers and stale build cache | ~10–14 GiB | `docker rmi`, `docker rm`, `docker builder prune` | Docker detectors read the Engine API socket directly (including containerd image stores) and attribute Docker usage on unaccounted-space hints |
+| Rust `target/` directories across workspaces and worktrees | — | `cargo clean` | `cargo-target` finds `target/` next to `Cargo.toml` and uses `cargo clean --manifest-path … --target-dir …` |
+
+A plain `du` browser (`gdu`, `ncdu`) shows what is big right now, not what is growing or *why* a database volume grew 29 GiB. A pattern-based disk cleaner guesses from directory names and can silently wipe unpushed commits, dirty worktrees, active virtualenvs, or an in-use database volume. `diskwhy` combines both halves: **growth + root-cause probes**, and **real-state safety guards + tool-native removal**.
+
+## What sets it apart
+
+- **Growth, not just size.** `scan --snapshot` saves a compact gzip-compressed JSON snapshot (~30 KB for a home directory) under `~/.local/state/diskwhy/snapshots/`. `diff` ranks what grew in bytes/day, `watch` measures live bytes/minute with no history, and the read-only `postgres-wal` probe diagnoses runaway WAL archiving.
+- **Honest accounting.** Parallel single-filesystem walks never follow symlinks, count each hardlinked inode once (deterministically at its lexicographically smallest path), subtract bytes kept alive by outside hardlinks from a finding's reclaimable size, list unreadable directories explicitly, and report **unaccounted space** (`df` used − scanned) with likely locations and a `sudo` rerun command.
+- **Safety checks on real state.** Before removing anything, `plan` and `apply` check live processes (`/proc` cwd and open files), git repositories (uncommitted/untracked files, commits on no remote, linked worktrees, submodules, bare/separate git dirs — always with `--no-optional-locks` and no repo hooks/filters), running container mounts, age gates, and path/inode identity fingerprints.
+- **Tool-native removal and recovery cost.** Uses `cargo clean`, `git worktree remove` (never `--force`), `docker builder prune --filter until=168h`, `go clean -cache`, `uv cache clean`, `rustup toolchain uninstall`, etc., and states what each item costs to restore.
+- **Bounded agent policy.** Every finding has a risk tier (`regenerable`, `rebuildable`, `review`, `blocked`). `dwhy apply` defaults to `--max-tier regenerable`, requires explicit per-item `--confirm <id>` for `review` items, never applies `blocked` items, re-scans and re-verifies fingerprints right before acting, and appends every executed action to `~/.local/state/diskwhy/audit.jsonl` (`$XDG_STATE_HOME` if set; `--dry-run` writes nothing).
+
+## Installation
+
+`dwhy` is a single static Linux binary with zero runtime dependencies. Optional tools (`git`, `docker`, `cargo`, `go`, `uv`, etc.) are detected automatically; missing tools disable only the detectors or probes that need them (`dwhy doctor` shows what is active).
+
+### Prebuilt static binaries (Linux x86_64 and aarch64)
+
+Once the first public release tag is published on GitHub Releases, download the archive for your architecture (`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`), verify `SHA256SUMS`, and put `dwhy` on your `PATH`:
+
+```sh
+# Example for x86_64 Linux (replace VERSION with the release tag)
+VERSION=v0.1.0
+curl -LO "https://github.com/SaltedTan/diskwhy/releases/download/${VERSION}/dwhy-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+curl -LO "https://github.com/SaltedTan/diskwhy/releases/download/${VERSION}/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS
+tar -xzf "dwhy-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+install -Dm 0755 "dwhy-${VERSION}-x86_64-unknown-linux-musl/dwhy" ~/.local/bin/dwhy
+```
+
+### Cargo (`cargo install`)
+
+Requires Rust 1.88+ (2024 edition).
+
+From a local checkout:
+
+```sh
+cargo install --path crates/dwhy-cli --locked
+```
+
+From Git (once public, or with Git authentication while private):
+
+```sh
+cargo install --git https://github.com/SaltedTan/diskwhy --locked dwhy-cli
+```
+
+*(Publishing to crates.io is undecided pending the final crate and binary name; see [docs/DESIGN.md](docs/DESIGN.md#open-questions).)*
+
+### Building from source
+
+```sh
+cargo build --locked --release                                               # target/release/dwhy
+cargo build --locked --release --target x86_64-unknown-linux-musl -p dwhy-cli  # static x86_64 binary
+cargo build --locked --release --target aarch64-unknown-linux-musl -p dwhy-cli # static aarch64 binary (uses rust-lld)
+```
+
+For cross-building the static `aarch64` binary on an `x86_64` Linux host, install the Rust target once (`rustup target add aarch64-unknown-linux-musl`); `.cargo/config.toml` configures `rust-lld` with self-contained musl objects, so no C cross-compiler is needed.
+
+## Quickstart
+
+```sh
+# 1. Interactive TUI on the current directory (or pass paths: `dwhy tui ~`)
+dwhy
+
+# 2. Read-only scan of / or ~ (add --snapshot to track growth over time)
+dwhy scan ~ --snapshot
+dwhy scan / --json
+
+# 3. See what is growing right now or since an earlier snapshot
+dwhy watch / --for 60s
+dwhy diff --since 24h
+dwhy explain docker://volume/my_postgres_data
+
+# 4. Safe, repeatable cleanup (regenerable items only by default)
+dwhy plan ~ -o plan.json
+dwhy apply plan.json --dry-run
+dwhy apply plan.json           # interactive y/N on a terminal
+dwhy apply plan.json --yes     # unattended / agent run (refuses with exit 3 without a terminal or --yes)
+
+# 5. Check permissions, optional tools, detectors and probes
+dwhy doctor
+```
 
 ## Usage
 
@@ -24,26 +119,54 @@ dwhy apply PLAN [--max-tier regenerable|rebuildable|review] [--confirm ID,…] [
 dwhy doctor [--json]
 ```
 
-- Both `dwhy` and `dwhy tui` open the current directory by default. Supply paths after `dwhy tui`. Use ↑/↓ to select, Enter to open a directory, Backspace to go up, `a` to switch between allocated and apparent size, and `q` to quit. In the findings list, Space marks findings and `p` previews a plan. From that preview, `w` asks where to save a plan file for `dwhy apply`. `q` quits everywhere except that path prompt, where it is typed into the path: there, Esc cancels the prompt and Ctrl-C quits. `dwhy tui --plan FILE` opens a saved plan. Press `x` from either preview to open the confirmation dialog, then Space to tick each selected `review` item you want to allow, `y` to apply, `d` to dry-run, or Esc to cancel. With `--dry-run`, `y` also previews the outcome without removing anything. The TUI needs a terminal on both standard input and standard output. Otherwise it exits 1 and points to `dwhy scan`. See [TUI details](docs/DESIGN.md#tui-details) for the confirmation, results and rescan behavior.
-- `scan` walks in parallel, never follows symlinks, stays on one filesystem unless `--cross-filesystems` is given, and counts each hardlinked inode once. Sizes are allocated bytes (`st_blocks`), which is what deleting frees; apparent sizes are reported too.
-- Directories it cannot read are listed, not skipped silently. When a scan root is the mount point of a whole filesystem (not a subdirectory bind mount, or a btrfs subvolume other than the top level), the report includes `df` figures and an **unaccounted** figure (`df` used − scanned), with likely locations and a `sudo` rerun command when the gap is large.
-- After measuring, `scan` lists **findings** from the detectors. Each finding has a risk tier, a reason, a suggested action and a recovery cost. The action can be a tool-native removal command, path removal or advice. Built so far: `cargo-target`, `node-modules` (the outermost `node_modules` next to a `package.json` whose project or workspace root has a lockfile; the recovery is `npm ci`, `pnpm install`, `yarn install` or `bun install`, chosen by that lockfile), `venv` (a directory holding `pyvenv.cfg`; the recovery comes from the project files next to it, such as `uv sync` for a `uv.lock`, and a venv with no project file is `review`, with the command to record its packages first), `user-cache` (pip, uv, npm/npx, pnpm, yarn, Go, Cargo, Playwright, Hugging Face; a cache written in the last 24 hours is shown as `blocked`, not offered), `git-worktree` (linked worktrees with nothing written for 14 days, removed with `git worktree remove` and never `--force`, and worktrees whose directory is gone, cleared with `git worktree prune`; all `review`, locked ones `blocked`), `stale-tree` (directories in a scratch location with nothing written for 7 days, all `review`; the built-in locations are `~/scratch`, `~/tmp`, `~/.t3/scratch` and `~/.t3/scratch-*`, and any directory becomes one when it holds a `.dwhy-scratch` file (an empty one is enough); a location stale as a whole is one finding), `tool-versions` (rustup toolchains, uv and pyenv Pythons, nvm and fnm Node versions, `~/sdk` Go SDKs, VS Code Server versions, and old Claude Code, Codex and T3 runtime versions that are not the default (or the version in use or run by a process), not pinned by a project in the scan, not used by a scanned venv and not the newest of their kind; `rebuildable`, removed with the tool's own uninstall command where it has one), `trash` (the home trash and `.Trash-<uid>`/`.Trash/<uid>` at mount roots, one finding per trash directory; `review`, or `blocked` when something was trashed in the last 7 days, going by each item's `DeletionDate`) and the Docker detectors (`docker-image`, `docker-build-cache`, `docker-container`, `docker-volume`). Docker findings are `review`, except build cache unused for a week, which is `regenerable`. The Docker ones read the Engine API socket and also put Docker's measured usage on the unaccounted-space hints. Every M1 detector is built. `scan` removes nothing. See the [safety rules](docs/DESIGN.md#safety-rules-non-negotiable) for the `path-not-utf8` guard recorded during detection.
-- `scan --snapshot` also saves a compact record of the scan for measuring growth: directories of 100 MiB or more (each hardlinked file counted once), Docker images, containers, volumes and build cache with their sizes, `df` per filesystem, and each finding's id, path, size and tier. Snapshots are gzip-compressed JSON (`zcat FILE | jq` reads one) in `~/.local/state/diskwhy/snapshots/` (`$XDG_STATE_HOME` if set), about 30 KB for a home directory. Saving one prunes old ones, separately for each set of scan roots: every snapshot from the last 48 hours is kept, then the newest of each day up to 90 days, and older ones are deleted. Without `--snapshot`, `scan` writes nothing. See the [Diff decision](docs/DESIGN.md#decisions-taken) for how scans use snapshots to measure finding growth.
-- `diff` rescans now and compares with a snapshot: by default the newest one, and without `PATH` it rescans that snapshot's roots (with `PATH`, only snapshots of exactly those roots count; `--cross-filesystems` needs `PATH`). `--since` takes a snapshot id or file, a duration (`24h`, `7d`: the newest snapshot at least that old) or an RFC 3339 time (the newest taken by then). Only paths both scans walked are compared: inside the roots of both, and not at or below a mount point either one did not enter; when one side was `-x` and the other was not, directories above a mount point only one side entered are left out too. A note names the mount points that kept something either side recorded out. It lists `df` used per filesystem, then directories, Docker images, containers, volumes and build cache, and findings, each ranked by growth rate in bytes per day, with new, gone and shrinking entries too; changes under `--min-change` (default 10M) are left out. A directory's change is shown on the deepest directory that holds most of it: a directory is left out when one below it changed by more than half as much in the same direction. A directory that was under the snapshot's 100 MiB threshold shows its growth as a lower bound (`≥`). `--snapshot` also saves the fresh scan. `diff` writes nothing else. See the [Diff decision](docs/DESIGN.md#decisions-taken) for path and finding ID exclusions.
-- `watch` measures growth now: it walks the roots (default: the current directory) and asks Docker for its figures (`GET /system/df`; `--no-docker` skips it), waits, and does both again, the second walk starting `--for` (default 60s) after the first one started, or right away if the first took longer. It lists `df` used per filesystem, directories and Docker images, containers, volumes and build cache, each ranked by growth rate in bytes per minute over the measured time between the two starts, with new, gone and shrinking entries too; changes under `--min-change` (default 1M, about 1.4 GiB a day over a minute) are left out. Each directory change is shown on the deepest directory that holds most of it, as in `diff`. See the Watch decision in [docs/DESIGN.md](docs/DESIGN.md#decisions-taken) for exclusions when read or mount coverage changes. `watch` writes nothing.
-- Use `dwhy explain target/` to inspect a path, or pass a finding id from a saved scan or a Docker pseudo-path such as `docker://volume/NAME`. The report shows the finding’s evidence, guard results, growth when available, and the action and recovery cost. See the [Explain decision](docs/DESIGN.md#decisions-taken) for lookup rules and edge cases.
-- Use `dwhy scan --detectors docker-volume` to focus on Docker volumes. The read-only `postgres-wal` probe adds WAL and archiving evidence to eligible findings. See the [probe behavior](docs/DESIGN.md#decisions-taken).
-- `plan` scans, runs the detectors, selects findings and writes a plan for `dwhy apply` (`-o FILE`; `--json` prints it). It selects by tier (`--tier`, `regenerable` by default, the same as `apply`'s default) and by finding id or path (`--select`, which lifts the default tier; with `--tier` too, a finding must match both). It then runs the **guards** on what it selected: a process with its working directory or a file open inside, uncommitted changes or commits on no remote in a git repository inside, worktrees outside that would break, a running container using a volume. A finding a guard blocks is listed under `blocked` and never planned; when one that `--select` named is blocked, `plan` still writes the plan but exits 2. Each item carries a fingerprint for `apply` to compare. `plan` removes nothing. See the [Plans decision](docs/DESIGN.md#decisions-taken) for selection errors and expiry and the [safety rules](docs/DESIGN.md#safety-rules-non-negotiable) for filesystem identity checks.
-- `apply` rescans the plan's roots, re-runs its detectors and guards, and acts only on matching live findings. The default `--max-tier` is `regenerable`. Use `--max-tier rebuildable` to allow rebuildable items and `--confirm ID` to allow a specific `review` item. `blocked` is never applied. On a terminal, `apply` lists what it will remove, asks y/N, and checks everything again before removing. Use `--yes` for unattended apply and `--dry-run` to preview without removals or audit writes. See the [Plans and Apply decisions](docs/DESIGN.md#decisions-taken) for plan checks, audit logs and exit codes, and the [safety rules](docs/DESIGN.md#safety-rules-non-negotiable) for removal limits.
-- `doctor` shows whether you are root, which optional tools (`git`, `docker`, `cargo`, `rustup`, `go`, `uv`, `pyenv`, `pip`, `npm`, `pnpm`, `yarn`, `fnm`, `journalctl`) are on `PATH`, what they enable, and whether each detector and probe is available.
+### TUI
 
-Exit codes: `0` ok, `1` error (usage errors and failed removals included), `2` items skipped by a guard or a changed fingerprint, `3` refused by policy.
+Both `dwhy` and `dwhy tui` open the current directory by default. Supply paths after `dwhy tui`.
 
-## Building
+- **Navigation:** `↑`/`↓` (or `k`/`j`) select, `Enter`/`→`/`l` open a directory or finding detail, `Backspace`/`←`/`h` go up, `PgUp`/`PgDn` page, `Home`/`End` (or `g`/`G`) jump to ends, `a` toggles allocated vs apparent size, `f` toggles the full filesystem list, `Tab` switches between the directory tree and the findings list, `t` filters findings by risk tier.
+- **Planning & applying:** `Space` marks findings; `p` rescans and previews a plan; `w` writes a plan file compatible with `dwhy apply`; `x` opens the confirmation dialog (where each `review` item must be ticked with `Space`, `y` applies, `d` dry-runs, and `Esc` cancels). `dwhy tui --plan FILE` opens an existing plan written by `dwhy plan -o`. With `--dry-run`, `y` also previews without removing anything or writing to the audit log.
+- **Quit:** `q` quits everywhere except the save-path prompt (where `q` types into the path, `Esc` cancels, and `Ctrl-C` quits). The TUI requires a terminal on both stdin and stdout; otherwise it exits `1` and points to `dwhy scan`. See [TUI details](docs/DESIGN.md#tui-details).
 
-```
-cargo build --release                                              # target/release/dwhy
-cargo build --release --target x86_64-unknown-linux-musl -p dwhy-cli  # static binary
-```
+### Scanning, detectors and probes
 
-See the [workspace layout](docs/DESIGN.md#architecture).
+- `scan` walks in parallel, never follows symlinks, stays on one filesystem unless `--cross-filesystems` is given (on btrfs, `-x` enters unmounted writable nested subvolumes while skipping snapshot and read-only subvolumes), and counts each hardlinked inode once. Sizes are allocated bytes (`st_blocks * 512`), which is what deleting frees; apparent sizes are reported too.
+- Unreadable directories are listed explicitly. When a scan root is the mount point of a whole filesystem (not a subdirectory bind mount or non-top-level btrfs subvolume), the report includes `df` figures and **unaccounted** space (`df` used − scanned), with likely locations and a `sudo` rerun command when the gap is large.
+- Built-in detectors:
+  - `cargo-target` (`rebuildable`) — Rust `target/` directories next to `Cargo.toml`, removed with `cargo clean`.
+  - `node-modules` (`rebuildable`) — outermost `node_modules` next to `package.json` with a lockfile (`npm ci`, `pnpm install`, `yarn install`, `bun install` recovery).
+  - `venv` (`rebuildable` with project files, `review` without) — Python virtualenvs holding `pyvenv.cfg`.
+  - `user-cache` (`regenerable`; `blocked` if written in the last 24h) — pip, uv, npm/npx, pnpm, yarn, Go, Cargo, Playwright, and Hugging Face caches.
+  - `git-worktree` (`review`; locked ones `blocked`) — linked worktrees untouched for 14 days (`git worktree remove`, never `--force`) and prunable missing worktrees (`git worktree prune`).
+  - `stale-tree` (`review`) — directories untouched for 7 days in `~/scratch`, `~/tmp`, `~/.t3/scratch`, `~/.t3/scratch-*`, or any directory containing a `.dwhy-scratch` file.
+  - `tool-versions` (`rebuildable`) — old rustup toolchains, uv/pyenv Pythons, nvm/fnm Node versions, `~/sdk` Go SDKs, VS Code Server versions, and old Claude Code, Codex and T3 runtime versions not active, pinned, in use by a running process, or newest.
+  - `trash` (`review`; `blocked` if anything was trashed in the last 7 days) — home trash and mount-root `.Trash-<uid>`/`.Trash/<uid>`.
+  - `docker-image`, `docker-container`, `docker-volume` (`review`) and `docker-build-cache` (`regenerable` for cache unused ≥ 7 days) — queried via the Docker Engine API Unix socket.
+- Built-in probe: `postgres-wal` — runs read-only during `scan` and `explain` (never `diff`, `watch`, `plan` or `apply`) on in-use `docker-volume` findings that back a running container's Postgres data directory, inspecting PostgreSQL WAL/archiver stats (or API/log fallback) and naming stopped archive target containers without changing the volume's tier or making it removable.
+- `scan` removes nothing, and without `--snapshot` writes nothing. See the [safety rules](docs/DESIGN.md#safety-rules-non-negotiable) for the `path-not-utf8` guard recorded during detection.
+
+### Growth (`--snapshot`, `diff`, `watch`) and `explain`
+
+- `scan --snapshot` saves gzip-compressed JSON (`zcat FILE | jq`) in `~/.local/state/diskwhy/snapshots/` (`$XDG_STATE_HOME` if set) recording directories ≥ 100 MiB, Docker objects, `df`, and findings, and prunes old snapshots per scope (keeping all from the last 48h, then newest per UTC day up to 90 days).
+- `diff` rescans and compares against a snapshot (`--since last|ID|FILE|24h|7d|RFC3339`), ranking `df`, deepest-changed directories, Docker objects, and findings in bytes/day (filtering changes under `--min-change`, default `10M`). `--snapshot` also saves the fresh scan.
+- `watch` samples the roots and Docker twice, `--for` apart (default `60s`), and ranks live changes in bytes/minute (filtering under `--min-change`, default `1M`; `--no-docker` skips Docker). Writes nothing.
+- `explain` inspects a finding id (`f_…` resolved from saved snapshots), filesystem path, or Docker pseudo-path (`docker://volume/NAME`), showing evidence, guards, growth when available, action, and recovery cost. See the [Diff, Watch, Explain and Probe decisions](docs/DESIGN.md#decisions-taken).
+
+### Planning, applying and `doctor`
+
+- `plan` selects findings by `--tier` (default `regenerable`) and/or `--select ID|PATH,…`, runs pre-removal guards (active processes, git state, container mounts) and live filesystem identity checks, records fingerprints, and writes a plan file (`-o FILE`) or JSON (`--json`). A finding blocked by a guard goes to `blocked` and is never planned; `plan` exits `2` only when a finding named by `--select` is blocked (tier-only selections that get blocked keep exit `0`, so `dwhy plan -o p && dwhy apply p` works). Removes nothing.
+- `apply` rescans the plan's roots, re-runs detectors and guards, verifies every fingerprint and identity check, enforces `--max-tier` (default `regenerable`; `review` items require `--confirm ID`, `blocked` is never applied), asks `y/N` on a terminal (without `--yes` and with no terminal it refuses with exit `3`; `--dry-run` removes nothing and writes no audit entry), and writes start/end entries to `$XDG_STATE_HOME/diskwhy/audit.jsonl` (default `~/.local/state/diskwhy/audit.jsonl`).
+- `doctor` reports user/root status, which optional tools are on `PATH` (or installed in common off-`PATH` locations), Docker socket access, and the availability of every detector and probe.
+
+### Exit codes
+
+`0` ok · `1` error (usage errors and failed removals included) · `2` items skipped by a guard or changed fingerprint · `3` refused by policy.
+
+## Documentation & Status
+
+MVP milestones M0–M4 are implemented and verified; M5 release preparation is underway. The repository is currently private and all rights reserved pending licence selection and the first public tag.
+
+- [docs/DESIGN.md](docs/DESIGN.md) — architecture, decisions, JSON contract (`diskwhy/v1`), safety rules, and milestones
+- [docs/COMMERCIAL.md](docs/COMMERCIAL.md) — licence and commercial direction
+- [docs/ACCEPTANCE-M1.md](docs/ACCEPTANCE-M1.md) — 2026-11-13 `pc-ubuntu` cleanup checklist
+- [docs/ACCEPTANCE-M3.md](docs/ACCEPTANCE-M3.md) — Postgres WAL demo end-to-end verification
+- [docs/ACCEPTANCE-M4.md](docs/ACCEPTANCE-M4.md) — TUI acceptance and ssh verification

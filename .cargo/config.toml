@@ -1,0 +1,9 @@
+# The runtime dependency tree is pure Rust, so rust-lld can link a static
+# aarch64-musl binary without an external C cross-compiler.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = [
+    "-C", "linker-flavor=ld.lld",
+    "-C", "link-self-contained=yes",
+    "-C", "target-feature=+crt-static",
+]
