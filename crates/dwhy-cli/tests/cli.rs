@@ -2852,7 +2852,7 @@ fn apply_refuses_a_plan_with_a_lossy_scan_root() {
             v["message"],
             format!("plan root {lossy} is not valid UTF-8; nothing applied")
         );
-        assert_eq!(v["hint"], "run `dwhy plan` to create a fresh plan");
+        assert!(v.get("hint").is_none(), "{v}");
     }
     assert!(Path::new(&root).join("app/target/debug/app").exists());
     assert!(!state.path().join("diskwhy/audit.jsonl").exists());

@@ -1236,8 +1236,16 @@ fn run_plan(args: PlanArgs) -> Result<u8> {
     })
 }
 
-/// The hint of a refusal to apply a plan that is stale or not for here.
-const FRESH_PLAN: &str = "run `dwhy plan` to create a fresh plan";
+/// The hint of a refusal to apply a plan: a fresh plan helps when it is
+/// stale or not for here, but not when its root is not valid UTF-8.
+fn unusable_hint(e: &plan::Unusable) -> Option<&'static str> {
+    match e {
+        plan::Unusable::Expired(_) | plan::Unusable::Elsewhere(_) => {
+            Some("run `dwhy plan` to create a fresh plan")
+        }
+        plan::Unusable::LossyRoot(_) => None,
+    }
+}
 
 fn run_apply(args: ApplyArgs) -> Result<u8> {
     let text = std::fs::read_to_string(&args.plan)
@@ -1259,7 +1267,7 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
     }
     let env = apply::Env::from_system();
     if let Err(e) = plan::usable(&plan, &env.host, env.uid, now_secs()) {
-        return Ok(refuse(args.json, &e.to_string(), Some(FRESH_PLAN), false));
+        return Ok(refuse(args.json, &e.to_string(), unusable_hint(&e), false));
     }
     let ask = !args.yes && !args.dry_run;
     if ask && !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
@@ -1310,7 +1318,7 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
         }
         // Check again right before removing: time has passed at the prompt.
         if let Err(e) = plan::usable(&plan, &env.host, env.uid, now_secs()) {
-            return Ok(refuse(args.json, &e.to_string(), Some(FRESH_PLAN), false));
+            return Ok(refuse(args.json, &e.to_string(), unusable_hint(&e), false));
         }
         let again = survey(
             &plan,
