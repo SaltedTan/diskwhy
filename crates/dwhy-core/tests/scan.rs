@@ -622,6 +622,50 @@ fn root_hidden_from_the_whole_filesystem_root_is_counted_too() {
 }
 
 #[test]
+fn roots_showing_the_same_hidden_part_are_counted_once() {
+    // As above, with subvolume `home` mounted again at r/h and its
+    // subdirectory x bind-mounted at r/x (copies stand in for the same
+    // blocks): all three show what the walk of `r` could not reach, and
+    // `df` counts it once.
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let (home, again, sub) = (r.join("home"), r.join("h"), r.join("x"));
+    for d in [home.join("x"), again.join("x"), sub.clone()] {
+        fs::create_dir_all(d).unwrap();
+    }
+    write_file(&r.join("f"), 64 << 10);
+    for d in [&home, &again] {
+        write_file(&d.join("g"), 32 << 10);
+        write_file(&d.join("x/k"), 16 << 10);
+    }
+    write_file(&sub.join("k"), 16 << 10);
+    let (ma, mi) = dev_of(&r);
+    let mounts = MountTable::parse(&format!(
+        "1 0 {ma}:{mi} / {} rw - btrfs /dev/fake rw,subvol=/\n\
+         2 1 {ma}:{mi} /home {} rw - btrfs /dev/fake rw,subvol=/home\n\
+         3 1 {ma}:{mi} /home {} rw - btrfs /dev/fake rw,subvol=/home\n\
+         4 1 {ma}:{mi} /home/x {} rw - btrfs /dev/fake rw,subvol=/home\n",
+        r.display(),
+        home.display(),
+        again.display(),
+        sub.display()
+    ));
+    let res = scan_with(&[r.clone(), home.clone(), again, sub], &mounts, true);
+    let scanned: u64 = ["", "f", "home", "home/g", "home/x", "home/x/k"]
+        .iter()
+        .map(|p| alloc(&r.join(p)))
+        .sum();
+    let gib = 1u64 << 30;
+    let rep =
+        account::build_scan_report(&res, &mounts, &env(false), &stats_used(scanned + 5 * gib));
+    assert_eq!(rep.fs.len(), 1, "{:?}", rep.fs);
+    let f = &rep.fs[0];
+    assert!(f.full_coverage);
+    assert_eq!(f.scanned, scanned);
+    assert_eq!(f.unaccounted, Some(5 * gib));
+}
+
+#[test]
 fn root_the_whole_filesystem_root_reaches_elsewhere_is_not_counted_twice() {
     // The same, but the subvolume lives at /@home and is mounted at
     // r/home: the walk of `r` reaches it at r/@home (here a copy stands in
