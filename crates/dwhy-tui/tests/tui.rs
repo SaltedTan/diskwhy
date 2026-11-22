@@ -3128,6 +3128,7 @@ fn hand_applied() -> Applied {
         exit: 3,
         audit_errors: Vec::new(),
         any_dispatched: true,
+        would_free: 0,
     }
 }
 
@@ -3286,6 +3287,123 @@ fn blocked_and_advice_items_are_not_counted_or_said_to_go_ahead() {
         assert!(!screen.contains("[x]"), "{screen}");
         assert!(!screen.contains("review: confirmed"), "{screen}");
     }
+}
+
+/// A plan of `/home/me/scratch` and `/home/me/scratch/data`, where `data`
+/// is another filesystem the one-filesystem scan took as its own root (in
+/// `plan.scan.roots`): its bytes are not in the outer item's.
+fn mounted_child_plan() -> Plan {
+    let mut plan = hand_plan();
+    let outer = hand_finding("stale-tree", "/home/me/scratch", 2 << 30, Tier::Rebuildable);
+    let child = hand_finding(
+        "stale-tree",
+        "/home/me/scratch/data",
+        1 << 30,
+        Tier::Rebuildable,
+    );
+    plan.scan.roots = vec!["/home/me".into(), "/home/me/scratch/data".into()];
+    plan.bytes = outer.bytes + child.bytes;
+    plan.items = [outer, child]
+        .into_iter()
+        .map(|finding| PlanItem {
+            finding,
+            fingerprint: fingerprint(),
+        })
+        .collect();
+    plan.blocked.clear();
+    plan
+}
+
+#[test]
+fn confirm_and_results_count_a_separately_mounted_root_on_its_own() {
+    use dwhy_core::units::human;
+    let plan = mounted_child_plan();
+    let (outer, both) = (plan.items[0].finding.bytes, plan.bytes);
+    let open = |plan: Plan| {
+        // `dwhy tui --plan`: no scan tree, only the plan.
+        let mut app = App::open_plan(plan, "/tmp/plans/dwhy-plan.json".into(), HOST, UID);
+        app.clock = || PLAN_AT + 60;
+        press(&mut app, &[KeyCode::Char('x')]);
+        app
+    };
+    let mut app = open(plan.clone());
+    let screen = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(
+        screen.contains(&format!("2 items, frees ≈ {}", human(both))),
+        "{screen}"
+    );
+    // The same items under one root: the inner one is in the outer's bytes.
+    let mut one_root = plan.clone();
+    one_root.scan.roots.truncate(1);
+    let mut single = open(one_root);
+    let screen = render_at(&mut single, 80, 24, None, PLAN_AT + 60);
+    assert!(
+        screen.contains(&format!("2 items, frees ≈ {}", human(outer))),
+        "{screen}"
+    );
+
+    // The results take the dry run's total from its checks and a real
+    // apply's from `freed`, both counting the child on its own.
+    let applied = |dry_run: bool| {
+        let items = plan
+            .items
+            .iter()
+            .map(|i| {
+                let f = &i.finding;
+                ApplyItem {
+                    id: f.id.clone(),
+                    detector: f.detector.clone(),
+                    path: f.path.clone(),
+                    tier: f.tier,
+                    bytes: f.bytes,
+                    action: f.action.clone(),
+                    outcome: if dry_run {
+                        ApplyOutcome::WouldRemove
+                    } else {
+                        ApplyOutcome::Removed
+                    },
+                    detail: "ready".into(),
+                    guards: Vec::new(),
+                }
+            })
+            .collect();
+        Applied {
+            report: ApplyReport {
+                schema: "diskwhy/v1".into(),
+                tool: Tool::current(),
+                host: HOST.into(),
+                uid: UID,
+                generated_at: dwhy_core::detect::rfc3339(PLAN_AT + 120),
+                plan_created_at: plan.created_at.clone(),
+                dry_run,
+                max_tier: Tier::Rebuildable,
+                confirm: Vec::new(),
+                freed: if dry_run { 0 } else { both },
+                items,
+            },
+            audit: (!dry_run).then(|| "/tmp/state/diskwhy/audit.jsonl".into()),
+            exit: 0,
+            audit_errors: Vec::new(),
+            any_dispatched: !dry_run,
+            would_free: if dry_run { both } else { 0 },
+        }
+    };
+    press(&mut app, &[KeyCode::Char('d')]);
+    assert!(app.take_apply().is_some());
+    app.apply_done(Ok(applied(true)));
+    let screen = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(
+        screen.contains(&format!("would remove 2 items ({})", human(both))),
+        "{screen}"
+    );
+    press(&mut app, &[KeyCode::Esc, KeyCode::Char('y')]);
+    assert!(app.take_apply().is_some());
+    app.apply_done(Ok(applied(false)));
+    let screen = render_at(&mut app, 80, 24, None, PLAN_AT + 60);
+    assert!(
+        screen.contains(&format!("removed 2 items, freed about {}", human(both))),
+        "{screen}"
+    );
 }
 
 /// Every command fragment on a confirm screen sits under its own `preview
@@ -3619,6 +3737,43 @@ fn stale_scratch() -> (tempfile::TempDir, PathBuf, Options) {
         ..opts(vec![scratch.clone()])
     };
     (fixture, base, options)
+}
+
+#[test]
+fn a_real_dry_run_reports_what_it_would_free_from_its_checks() {
+    use dwhy_core::apply::Env;
+    let (_fixture, base, options) = stale_scratch();
+    let env = Env::from_system();
+    let data = job::scan(&options, &Progress::default(), &mut |_| {}).unwrap();
+    let mut app = app_with(data).with_options(Options {
+        audit_log: Some(base.join("audit.jsonl")),
+        ..options
+    });
+    press(
+        &mut app,
+        &[KeyCode::Tab, KeyCode::Char(' '), KeyCode::Char('p')],
+    );
+    let plan = app
+        .take_request()
+        .unwrap()
+        .build(Processes::default, env.host.clone());
+    app.plan_built(plan, &env.host, env.uid);
+    let planned = plan_of(&app).bytes;
+    assert!(planned > 0);
+    press(
+        &mut app,
+        &[KeyCode::Char('x'), KeyCode::Char(' '), KeyCode::Char('d')],
+    );
+    let result = app
+        .take_apply()
+        .unwrap()
+        .run(Processes::default, &env)
+        .unwrap();
+    assert!(result.report.dry_run);
+    assert_eq!(result.report.items[0].outcome, ApplyOutcome::WouldRemove);
+    assert_eq!(result.would_free, planned);
+    assert!(base.join("scratch").exists());
+    assert!(!base.join("audit.jsonl").exists());
 }
 
 #[test]

@@ -1082,17 +1082,19 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
         confirm: args.confirm.clone(),
     };
     let mut checks = survey(&plan, &policy, args.threads, args.quiet)?;
+    let ready: Vec<&Check> = checks.iter().filter(|c| c.ready()).collect();
+    // Counts a root mounted below another root on its own, as `plan.bytes` does.
+    let would_free = apply::total_bytes_for_checks(ready.iter().copied());
     if args.dry_run {
         let r = apply::report(&plan, &checks, &policy, true, &env);
-        print_apply(&r, args.json, None)?;
+        print_apply(&r, args.json, None, Some(would_free))?;
         return Ok(apply::exit_code(&r));
     }
-    let ready: Vec<&Check> = checks.iter().filter(|c| c.ready()).collect();
     if ask && !ready.is_empty() {
         let preview = apply::report(&plan, &checks, &policy, true, &env);
         let mut err = std::io::stderr().lock();
-        human::render_apply(&mut err, &preview, None, true)?;
-        let bytes = apply::total_bytes(ready.iter().map(|c| &c.item));
+        human::render_apply(&mut err, &preview, None, true, Some(would_free))?;
+        let bytes = would_free;
         write!(
             err,
             "remove {} item{} ({})? [y/N] ",
@@ -1134,7 +1136,7 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
         eprintln!("dwhy: error: {}", error.escape_debug());
     }
     let r = apply::report(&plan, &checks, &policy, false, &env);
-    print_apply(&r, args.json, Some(audit.path()))?;
+    print_apply(&r, args.json, Some(audit.path()), None)?;
     Ok(apply::exit_code(&r))
 }
 
@@ -1172,13 +1174,14 @@ fn print_apply(
     r: &dwhy_core::report::ApplyReport,
     json: bool,
     audit: Option<&std::path::Path>,
+    would_free: Option<u64>,
 ) -> Result<()> {
     let mut out = std::io::stdout().lock();
     if json {
         serde_json::to_writer_pretty(&mut out, r)?;
         writeln!(out)?;
     } else {
-        human::render_apply(&mut out, r, audit, false)?;
+        human::render_apply(&mut out, r, audit, false, would_free)?;
     }
     Ok(())
 }

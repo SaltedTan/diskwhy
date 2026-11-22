@@ -12,8 +12,8 @@ use dwhy_core::guard::{Proc, Processes};
 use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection, TTL_SECS, Unusable};
 use dwhy_core::report::{
-    Action, ActionKind, DockerSocket, Finding, GuardResult, GuardStatus, Plan, PlanScan, Recovery,
-    Tier, ToolStatus,
+    Action, ActionKind, DockerSocket, Finding, GuardResult, GuardStatus, Plan, PlanItem, PlanScan,
+    Recovery, Tier, ToolStatus,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::tree::ScanTree;
@@ -441,6 +441,88 @@ fn a_separately_scanned_mount_below_another_root_counts_on_its_own() {
     let p = build_from(&tree, &b, found, &sel);
     assert_eq!(p.items.len(), 3, "{:?}", p.blocked);
     assert_eq!(p.bytes, 1300, "child counts; sub is inside outer");
+}
+
+/// A plan of `outer` (1000), `outer/child` (300, its own scan root) and
+/// `outer/sub` (100, inside the outer root's walk), with both roots listed
+/// in `plan.scan.roots`, as `dwhy plan` writes it.
+fn plan_with_mounted_child(b: &Path) -> (Plan, PathBuf, PathBuf) {
+    let outer = dir(&b.join("outer"));
+    let child = dir(&outer.join("child"));
+    let sub = dir(&outer.join("sub"));
+    let tree = tree_with_mounted_child(&outer);
+    let found = vec![
+        finding("user-cache", &outer, 1000, Tier::Regenerable),
+        finding("user-cache", &child, 300, Tier::Regenerable),
+        finding("user-cache", &sub, 100, Tier::Regenerable),
+    ];
+    let mut p = build_from(&tree, &outer, found, &Selection::default());
+    p.scan.roots = [&outer, &child]
+        .iter()
+        .map(|r| r.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(p.items.len(), 3, "{:?}", p.blocked);
+    assert_eq!(p.bytes, 1300, "child counts on its own; sub is in outer");
+    (p, outer, child)
+}
+
+fn item_at<'a>(p: &'a mut Plan, path: &Path) -> &'a mut PlanItem {
+    let path = path.to_string_lossy();
+    p.items.iter_mut().find(|i| i.finding.path == path).unwrap()
+}
+
+#[test]
+fn plan_bytes_without_a_tree_count_a_separately_scanned_root_on_its_own() {
+    let (_t, b) = base();
+    let (mut p, outer, child) = plan_with_mounted_child(&b);
+    // By the plan's roots: child is the deepest root above itself, so it is
+    // not inside outer; sub shares outer's root and counts once.
+    assert_eq!(plan::distinct_bytes_in_plan(&p, &p.items), p.bytes);
+    // Path-only nesting would drop child.
+    let pairs = p
+        .items
+        .iter()
+        .map(|i| (i.finding.path.as_str(), i.finding.bytes));
+    assert_eq!(plan::distinct_bytes(pairs), 1000);
+
+    // Pseudo-paths never nest; paths no root covers nest by path.
+    let mut extra = Vec::new();
+    for (path, bytes) in [
+        ("docker://volume/v", 7),
+        ("docker://volume/v/x", 5),
+        ("/nowhere/a", 20),
+        ("/nowhere/a/b", 3),
+    ] {
+        let mut i = p.items[0].clone();
+        i.finding.path = path.into();
+        i.finding.bytes = bytes;
+        i.fingerprint.dev = None;
+        extra.push(i);
+    }
+    let all: Vec<&PlanItem> = p.items.iter().chain(&extra).collect();
+    assert_eq!(
+        plan::distinct_bytes_in_plan(&p, all.iter().copied()),
+        1300 + 7 + 5 + 20
+    );
+
+    // Without child in the plan's roots, nesting falls to the devices: the
+    // fixture's child is on outer's device, so it nests by path.
+    p.scan.roots = vec![outer.to_string_lossy().into_owned()];
+    assert_eq!(plan::distinct_bytes_in_plan(&p, &p.items), 1000);
+    // A one-filesystem walk never crosses devices: another device recorded
+    // for child means outer's bytes do not hold it.
+    let other = item_at(&mut p, &outer).fingerprint.dev.unwrap() + 1;
+    item_at(&mut p, &child).fingerprint.dev = Some(other);
+    assert_eq!(plan::distinct_bytes_in_plan(&p, &p.items), 1300);
+    // A walk that crosses filesystems holds every device below the root.
+    p.scan.one_filesystem = false;
+    assert_eq!(plan::distinct_bytes_in_plan(&p, &p.items), 1000);
+    // Only the given items count.
+    let just_child = p
+        .items
+        .iter()
+        .filter(|i| Path::new(&i.finding.path) == child);
+    assert_eq!(plan::distinct_bytes_in_plan(&p, just_child), 300);
 }
 
 fn fingerprint_of(root: &Path, f: &Finding) -> dwhy_core::report::Fingerprint {

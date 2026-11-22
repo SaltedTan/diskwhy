@@ -507,12 +507,14 @@ pub fn render_plan(
 }
 
 /// The items of an apply, and a summary line unless `items_only` (the
-/// preview before the y/N question, which says the rest).
+/// preview before the y/N question, which says the rest). `would_free` is
+/// a dry run's bytes from its checks ([`apply::summary_with_would_free`]).
 pub fn render_apply(
     w: &mut impl Write,
     r: &ApplyReport,
     audit: Option<&Path>,
     items_only: bool,
+    would_free: Option<u64>,
 ) -> io::Result<()> {
     for i in &r.items {
         // An item's fields can come from a hand-edited plan file (an item
@@ -536,7 +538,7 @@ pub fn render_apply(
     if items_only {
         return Ok(());
     }
-    writeln!(w, "{}", apply::summary(r))?;
+    writeln!(w, "{}", apply::summary_with_would_free(r, would_free))?;
     if let Some(p) = audit {
         writeln!(w, "audit log: {}", p.display())?;
     }

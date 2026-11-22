@@ -1178,6 +1178,7 @@ fn an_item_inside_another_is_counted_once() {
     assert_eq!(would.clone().count(), 2);
     assert_eq!(apply::total_bytes(would), 10_000, "not 19 000");
     assert_eq!(apply::total_bytes(checks.iter().map(|c| &c.item)), 10_000);
+    assert_eq!(apply::total_bytes_for_checks(&checks), 10_000, "same root");
 
     let (_s, state) = base();
     let mut audit = Audit::open(&state.join("a.jsonl")).unwrap();
@@ -1198,6 +1199,159 @@ fn an_item_inside_another_is_counted_once() {
     );
     assert_eq!(apply::exit_code(&r), 0);
     assert_eq!(r.freed, 10_000);
+}
+
+/// A scan of `outer` and `outer/child` as two roots, as when `child` is
+/// another filesystem in a one-filesystem scan: the mount table names
+/// `child` as a mount point, so the outer walk does not enter it.
+fn tree_with_mounted_child(outer: &Path) -> ScanTree {
+    let child = outer.join("child");
+    let mounts = MountTable {
+        mounts: vec![dwhy_core::mounts::Mount {
+            id: 1,
+            parent: 0,
+            major: 0,
+            minor: 0,
+            mount_point: child.clone(),
+            fstype: "ext4".into(),
+            source: "/dev/fixture".into(),
+        }],
+    };
+    let opts = ScanOptions {
+        min_dir_bytes: 0,
+        threads: 2,
+        ..ScanOptions::default()
+    };
+    let tree = scan::scan(
+        &[outer.to_path_buf(), child.clone()],
+        &opts,
+        &mounts,
+        &Progress::default(),
+    )
+    .unwrap()
+    .tree;
+    assert_eq!(tree.parent(tree.find(&child).unwrap()), None, "own root");
+    tree
+}
+
+#[test]
+fn a_separately_scanned_root_below_another_counts_on_its_own_in_apply_totals() {
+    let (_t, b) = base();
+    let outer = b.join("outer");
+    let child = outer.join("child");
+    let sub = outer.join("sub");
+    write(&outer.join("file"), "o");
+    write(&child.join("file"), "c");
+    write(&sub.join("file"), "s");
+    let tree = tree_with_mounted_child(&outer);
+    let sized = |path: &Path, bytes| Finding {
+        bytes,
+        ..finding("user-cache", path, Tier::Regenerable)
+    };
+    // sub lies inside outer's walk and counts once; child is its own root.
+    let found = vec![sized(&outer, 1000), sized(&child, 300), sized(&sub, 100)];
+    let plan = plan::build(
+        found.clone(),
+        &Selection::default(),
+        &tree,
+        &ctx(),
+        &Processes::default(),
+        "host".into(),
+        PlanScan {
+            roots: [&outer, &child]
+                .iter()
+                .map(|r| r.to_string_lossy().into_owned())
+                .collect(),
+            one_filesystem: true,
+            detectors: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(plan.items.len(), 3, "{:?}", plan.blocked);
+    assert_eq!(plan.bytes, 1300);
+    assert_eq!(plan::distinct_bytes_in_plan(&plan, &plan.items), 1300);
+
+    let pol = Policy::default();
+    let mut checks = apply::evaluate(&plan, found, &tree, &ctx(), &Processes::default(), &pol);
+    assert!(checks.iter().all(|c| c.ready()), "{:?}", outcomes(&checks));
+    let root_of = |p: &Path| {
+        let p = p.to_string_lossy();
+        checks
+            .iter()
+            .find(|c| c.item.path == p)
+            .unwrap()
+            .tree_root
+            .clone()
+    };
+    assert_eq!(root_of(&child), Some(child.clone()));
+    assert_eq!(root_of(&sub), Some(outer.clone()));
+
+    let would = apply::total_bytes_for_checks(checks.iter().filter(|c| c.ready()));
+    assert_eq!(would, plan.bytes);
+    let preview = apply::report(&plan, &checks, &pol, true, &env());
+    let total = dwhy_core::units::human(1300);
+    assert_eq!(
+        apply::summary_with_would_free(&preview, Some(would)),
+        format!("would remove 3 items ({total}); nothing removed")
+    );
+    // On its own, a report nests by path only.
+    assert!(
+        apply::summary(&preview).contains(&dwhy_core::units::human(1000)),
+        "{}",
+        apply::summary(&preview)
+    );
+
+    let (_s, state) = base();
+    let mut audit = Audit::open(&state.join("a.jsonl")).unwrap();
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |_| {},
+    );
+    assert!(!outer.exists());
+    let r = apply::report(&plan, &checks, &pol, false, &env());
+    assert!(
+        r.items.iter().all(|i| i.outcome == ApplyOutcome::Removed),
+        "{:?}",
+        r.items
+    );
+    assert_eq!(r.freed, 1300, "not 1000");
+    assert_eq!(
+        apply::summary(&r),
+        format!("removed 3 items, freed about {total}")
+    );
+}
+
+#[test]
+fn checks_from_two_surveys_compare_by_tree_root_path() {
+    // Interactive `dwhy apply` mixes checks from two scans of the same
+    // roots: tree roots are paths, so the second scan's checks still nest
+    // under the first's.
+    let (_t, b) = base();
+    write(&b.join("scratch/app/target/file"), "t");
+    let mut outer = finding("stale-tree", &b.join("scratch"), Tier::Review);
+    outer.bytes = 10_000;
+    let mut inner = finding(
+        "cargo-target",
+        &b.join("scratch/app/target"),
+        Tier::Rebuildable,
+    );
+    inner.bytes = 9_000;
+    let found = vec![outer.clone(), inner];
+    let plan = make_plan(&b, found.clone());
+    let pol = policy(Tier::Rebuildable, &[&outer.id]);
+    let first = evaluate(&b, &plan, found.clone(), &pol);
+    let second = evaluate(&b, &plan, found, &pol);
+    let mixed = [&first[0], &second[1]];
+    assert!(
+        mixed
+            .iter()
+            .all(|c| c.tree_root.as_deref() == Some(b.as_path()))
+    );
+    assert_eq!(apply::total_bytes_for_checks(mixed), 10_000);
 }
 
 #[test]

@@ -614,6 +614,10 @@ pub struct Applied {
     /// command spawned). False for a dry run and when every item was left
     /// untouched, even one that failed before dispatch.
     pub any_dispatched: bool,
+    /// For a dry run, the bytes its `would_remove` items hold together
+    /// (`apply::total_bytes_for_checks`: a root mounted below another root
+    /// counts on its own, as in `plan.bytes`); 0 otherwise.
+    pub would_free: u64,
 }
 
 /// An apply that failed before running any item: what `dwhy apply` prints
@@ -708,6 +712,7 @@ impl ApplyJob {
                 exit,
                 audit_errors: Vec::new(),
                 any_dispatched: false,
+                would_free: apply::total_bytes_for_checks(checks.iter().filter(|c| c.ready())),
             });
         }
         let mut audit =
@@ -743,6 +748,7 @@ impl ApplyJob {
             exit,
             audit_errors,
             any_dispatched: checks.iter().any(|c| c.dispatched),
+            would_free: 0,
         })
     }
 }

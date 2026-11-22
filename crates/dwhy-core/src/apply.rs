@@ -106,6 +106,13 @@ pub struct Check {
     /// reached, one stopped or skipped before dispatch, and one whose audit
     /// `start` line could not be written. Not part of the report.
     pub dispatched: bool,
+    /// The root of the apply scan's tree that holds this item's path (the
+    /// node at the path, or at its nearest ancestor in the tree); `None`
+    /// for a path the tree does not cover, such as a Docker pseudo-path.
+    /// A path, not a node id, so checks from two scans of the same roots
+    /// compare. [`total_bytes_for_checks`] uses it to count a root mounted
+    /// below another root on its own.
+    pub tree_root: Option<PathBuf>,
     nested: Vec<MeasuredRoot>,
 }
 
@@ -195,7 +202,24 @@ pub fn evaluate(
         }
         c.item.guards = f.guards;
     }
+    for c in &mut checks {
+        c.tree_root = tree_root(tree, Path::new(&c.item.path));
+    }
     checks
+}
+
+/// The path of the root of `tree` that holds `path`: the root above the
+/// node at `path`, or at its nearest ancestor in the tree. `None` when the
+/// tree does not cover `path` or it is not absolute.
+fn tree_root(tree: &ScanTree, path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut id = path.ancestors().find_map(|a| tree.find(a))?;
+    while let Some(parent) = tree.parent(id) {
+        id = parent;
+    }
+    Some(tree.path(id))
 }
 
 fn decide(
@@ -221,6 +245,7 @@ fn decide(
         fresh: fresh.cloned(),
         inode: None,
         dispatched: false,
+        tree_root: None,
         nested: Vec::new(),
     };
     // Backstop for `detect::block_lossy`: never act on a path or command
@@ -629,8 +654,17 @@ pub fn exit_meaning(code: u8) -> &'static str {
 
 /// The one-line summary `dwhy apply` and the TUI show under a report:
 /// what was (or would be) removed and freed, then the counts of failed,
-/// refused and skipped items.
+/// refused and skipped items. For a dry run of a report read on its own,
+/// the bytes that would be freed nest items by path ([`total_bytes`]);
+/// [`summary_with_would_free`] takes the figure from the checks instead.
 pub fn summary(r: &ApplyReport) -> String {
+    summary_with_would_free(r, None)
+}
+
+/// [`summary`], with `would_free` as a dry run's bytes when known: the
+/// [`total_bytes_for_checks`] of its `would_remove` checks, which counts a
+/// root mounted below another root on its own as `plan.bytes` does.
+pub fn summary_with_would_free(r: &ApplyReport, would_free: Option<u64>) -> String {
     let count = |o| r.items.iter().filter(|i| i.outcome == o).count();
     let rest: Vec<String> = [
         (ApplyOutcome::Failed, "failed"),
@@ -651,11 +685,13 @@ pub fn summary(r: &ApplyReport) -> String {
     let plural = |n: usize| if n == 1 { "" } else { "s" };
     if r.dry_run {
         let n = count(ApplyOutcome::WouldRemove);
-        let bytes = total_bytes(
-            r.items
-                .iter()
-                .filter(|i| i.outcome == ApplyOutcome::WouldRemove),
-        );
+        let bytes = would_free.unwrap_or_else(|| {
+            total_bytes(
+                r.items
+                    .iter()
+                    .filter(|i| i.outcome == ApplyOutcome::WouldRemove),
+            )
+        });
         format!(
             "would remove {n} item{} ({}){rest}; nothing removed",
             plural(n),
@@ -677,6 +713,38 @@ pub fn total_bytes<'a>(items: impl IntoIterator<Item = &'a ApplyItem>) -> u64 {
     crate::plan::distinct_bytes(items.into_iter().map(|i| (i.path.as_str(), i.bytes)))
 }
 
+/// The bytes the items of `checks` hold together, counting an item inside
+/// another item once. An item is inside another only within the same root
+/// of the apply scan ([`Check::tree_root`]): a root mounted below another
+/// root counts on its own, as in [`crate::plan::distinct_bytes_in_tree`].
+/// Items without a tree root nest by path, and pseudo-paths never nest.
+pub fn total_bytes_for_checks<'a>(checks: impl IntoIterator<Item = &'a Check>) -> u64 {
+    let items: Vec<(&Path, u64, Option<&Path>)> = checks
+        .into_iter()
+        .map(|c| {
+            (
+                Path::new(&c.item.path),
+                c.item.bytes,
+                c.tree_root.as_deref(),
+            )
+        })
+        .collect();
+    let same_root = |a: Option<&Path>, b: Option<&Path>| match (a, b) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    };
+    items
+        .iter()
+        .filter(|(p, _, root)| {
+            !p.is_absolute()
+                || !items.iter().any(|(o, _, o_root)| {
+                    o.is_absolute() && o != p && p.starts_with(o) && same_root(*root, *o_root)
+                })
+        })
+        .map(|(_, b, _)| b)
+        .sum()
+}
+
 /// The report for `checks`.
 pub fn report(
     plan: &Plan,
@@ -686,7 +754,11 @@ pub fn report(
     env: &Env,
 ) -> ApplyReport {
     let items: Vec<ApplyItem> = checks.iter().map(|c| c.item.clone()).collect();
-    let freed = total_bytes(items.iter().filter(|i| i.outcome == ApplyOutcome::Removed));
+    let freed = total_bytes_for_checks(
+        checks
+            .iter()
+            .filter(|c| c.item.outcome == ApplyOutcome::Removed),
+    );
     ApplyReport {
         schema: SCHEMA.into(),
         tool: Tool::current(),

@@ -639,7 +639,9 @@ pub struct ApplyReport {
     /// One per plan item, in plan order.
     pub items: Vec<ApplyItem>,
     /// What the removed items were expected to free (their `bytes`, an item
-    /// inside another removed item counted once).
+    /// inside another removed item under the same scan root counted once; a
+    /// root mounted below another root counts on its own, as in `plan.bytes`;
+    /// see [`crate::apply::total_bytes_for_checks`]).
     pub freed: u64,
 }
 
