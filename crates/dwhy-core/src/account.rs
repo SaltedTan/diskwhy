@@ -1,14 +1,14 @@
 //! Turning a [`ScanResult`] into a `diskwhy/v1` report: per-filesystem `df`
 //! figures, the unaccounted gap, and hints for where the gap probably is.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::detect::shell_quote;
 use crate::mounts::{FsStats, Mount, MountTable};
 use crate::report::{
     self, DeletedOpen, DirEntry, DockerUsage, FsReport, Hint, HintKind, RootReport, ScanErrorEntry,
-    ScanReport, ScanSummary, SkippedMount, Tool, Unreadable, UnreadableDir,
+    ScanReport, ScanSummary, SkippedMount, Tool, Totals, Unreadable, UnreadableDir,
 };
 use crate::scan::{ScanResult, SkippedRecord, UnreadableRecord};
 use crate::system::{DeletedOpenScan, User};
@@ -317,9 +317,10 @@ struct FsGroup {
     /// The mount named in the report: a whole-filesystem mount when there is one.
     mount: Mount,
     full: bool,
-    /// The scan root at the whole-filesystem mount, if one is: its walk
-    /// alone reached everything any other root on this filesystem did.
+    /// The scan root at the whole-filesystem mount, if one is.
     whole_root: Option<usize>,
+    /// Every scan root on it.
+    roots: Vec<usize>,
     /// Every `st_dev` scanned on it.
     devs: BTreeSet<u64>,
     /// Ids of the mounts the scan reached it through.
@@ -346,6 +347,7 @@ fn fs_groups(result: &ScanResult, mounts: &MountTable) -> Vec<FsGroup> {
                     mount: m.clone(),
                     full,
                     whole_root: None,
+                    roots: Vec::new(),
                     devs: BTreeSet::new(),
                     via: BTreeSet::new(),
                 });
@@ -365,6 +367,7 @@ fn fs_groups(result: &ScanResult, mounts: &MountTable) -> Vec<FsGroup> {
         if full && groups[i].whole_root.is_none() {
             groups[i].whole_root = Some(ri);
         }
+        groups[i].roots.push(ri);
         groups[i].devs.insert(r.dev);
         groups[i].via.extend(via);
     }
@@ -406,6 +409,25 @@ fn fs_groups(result: &ScanResult, mounts: &MountTable) -> Vec<FsGroup> {
         }
     }
     groups
+}
+
+/// Whether a mount point the walk of `whole` (a root at a whole-filesystem
+/// mount) did not enter hides the part of the filesystem that `other`, a
+/// root on the same filesystem, shows.
+fn hidden_from(result: &ScanResult, mounts: &MountTable, whole: &Path, other: &Path) -> bool {
+    let Some(m) = mounts.for_path(other) else {
+        return false;
+    };
+    let Ok(below) = other.strip_prefix(&m.mount_point) else {
+        return false;
+    };
+    let at = whole
+        .join(m.root.strip_prefix("/").unwrap_or(&m.root))
+        .join(below);
+    result
+        .skipped_mounts
+        .iter()
+        .any(|s| s.path != whole && s.path.starts_with(whole) && at.starts_with(&s.path))
 }
 
 /// The mount through which the scan reached `dev`: as the walk recorded
@@ -503,6 +525,7 @@ pub fn build_scan_report(
                 mount: m,
                 full,
                 whole_root,
+                roots,
                 devs,
                 ..
             } = g;
@@ -511,14 +534,28 @@ pub fn build_scan_report(
                 used: 0,
                 avail: 0,
             });
-            // Other roots on the filesystem lie inside the whole-filesystem
-            // root's walk; adding theirs would count their bytes twice.
-            let reached = whole_root.map_or(&result.per_dev, |i| &result.roots[i].per_dev);
-            let scanned: u64 = devs
-                .iter()
-                .filter_map(|d| reached.get(d))
-                .map(|t| t.allocated)
-                .sum();
+            let on_devs = |reached: &HashMap<u64, Totals>| -> u64 {
+                devs.iter()
+                    .filter_map(|d| reached.get(d))
+                    .map(|t| t.allocated)
+                    .sum()
+            };
+            // The whole-filesystem root's walk reached what other roots on
+            // the filesystem show, except where a mount point it did not
+            // enter hides it; adding the rest would count it twice.
+            let scanned = match whole_root {
+                None => on_devs(&result.per_dev),
+                Some(w) => {
+                    let whole = &result.roots[w].path;
+                    roots
+                        .iter()
+                        .filter(|&&i| {
+                            i == w || hidden_from(result, mounts, whole, &result.roots[i].path)
+                        })
+                        .map(|&i| on_devs(&result.roots[i].per_dev))
+                        .sum()
+                }
+            };
             let gap = unaccounted(stats.used, scanned, full);
             let large = gap.is_some_and(|g| gap_is_large(g, stats.size));
             let hints = match gap {

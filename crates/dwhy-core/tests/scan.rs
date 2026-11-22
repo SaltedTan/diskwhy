@@ -590,6 +590,72 @@ fn crossed_subdirectory_bind_mount_is_not_full_coverage() {
 }
 
 #[test]
+fn root_hidden_from_the_whole_filesystem_root_is_counted_too() {
+    // btrfs top level at `r`, its subvolume `home` mounted over its own
+    // location at r/home: the walk of `r` stops at that mount point, so
+    // only the r/home root sees what is there, and `df` counts it once.
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let home = r.join("home");
+    fs::create_dir(&home).unwrap();
+    write_file(&r.join("f"), 64 << 10);
+    write_file(&home.join("g"), 32 << 10);
+    let (ma, mi) = dev_of(&r);
+    let mounts = MountTable::parse(&format!(
+        "1 0 {ma}:{mi} / {} rw - btrfs /dev/fake rw,subvol=/\n2 1 {ma}:{mi} /home {} rw - btrfs /dev/fake rw,subvol=/home\n",
+        r.display(),
+        home.display()
+    ));
+    let res = scan_with(&[r.clone(), home.clone()], &mounts, true);
+    let scanned: u64 = ["", "f", "home", "home/g"]
+        .iter()
+        .map(|p| alloc(&r.join(p)))
+        .sum();
+    let gib = 1u64 << 30;
+    let rep =
+        account::build_scan_report(&res, &mounts, &env(false), &stats_used(scanned + 5 * gib));
+    assert_eq!(rep.fs.len(), 1, "{:?}", rep.fs);
+    let f = &rep.fs[0];
+    assert!(f.full_coverage);
+    assert_eq!(f.scanned, scanned);
+    assert_eq!(f.unaccounted, Some(5 * gib));
+}
+
+#[test]
+fn root_the_whole_filesystem_root_reaches_elsewhere_is_not_counted_twice() {
+    // The same, but the subvolume lives at /@home and is mounted at
+    // r/home: the walk of `r` reaches it at r/@home (here a copy stands in
+    // for the same blocks), so the r/home root adds nothing new.
+    let t = tempfile::tempdir().unwrap();
+    let r = fs::canonicalize(t.path()).unwrap();
+    let (home, at) = (r.join("home"), r.join("@home"));
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&at).unwrap();
+    write_file(&r.join("f"), 64 << 10);
+    write_file(&home.join("g"), 32 << 10);
+    write_file(&at.join("g"), 32 << 10);
+    let (ma, mi) = dev_of(&r);
+    let mounts = MountTable::parse(&format!(
+        "1 0 {ma}:{mi} / {} rw - btrfs /dev/fake rw,subvol=/\n2 1 {ma}:{mi} /@home {} rw - btrfs /dev/fake rw,subvol=/@home\n",
+        r.display(),
+        home.display()
+    ));
+    let res = scan_with(&[r.clone(), home.clone()], &mounts, true);
+    let scanned: u64 = ["", "f", "@home", "@home/g"]
+        .iter()
+        .map(|p| alloc(&r.join(p)))
+        .sum();
+    let gib = 1u64 << 30;
+    let rep =
+        account::build_scan_report(&res, &mounts, &env(false), &stats_used(scanned + 5 * gib));
+    assert_eq!(rep.fs.len(), 1, "{:?}", rep.fs);
+    let f = &rep.fs[0];
+    assert!(f.full_coverage);
+    assert_eq!(f.scanned, scanned);
+    assert_eq!(f.unaccounted, Some(5 * gib));
+}
+
+#[test]
 fn entered_whole_mount_is_not_full_coverage_when_reached_another_way_too() {
     let t = tempfile::tempdir().unwrap();
     let r = fs::canonicalize(t.path()).unwrap();
