@@ -327,6 +327,9 @@ struct PlanArgs {
     /// Select these findings only: ids or paths (comma-separated or repeated).
     #[arg(long, value_delimiter = ',', value_name = "ID|PATH,…")]
     select: Vec<String>,
+    /// Select cheapest tiers first (largest within each tier) until at least SIZE bytes are planned.
+    #[arg(long, value_name = "SIZE", value_parser = parse_free_target, conflicts_with = "select")]
+    free: Option<u64>,
     /// Write the plan (diskwhy/v1 JSON) to this file.
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
@@ -1197,6 +1200,14 @@ fn explain_path(
     Ok((Some(result.totals()), result.tree, issue))
 }
 
+/// `--free SIZE`: a size above 0.
+fn parse_free_target(s: &str) -> std::result::Result<u64, String> {
+    match units::parse_size(s)? {
+        0 => Err("must be greater than 0".into()),
+        n => Ok(n),
+    }
+}
+
 fn run_plan(args: PlanArgs) -> Result<u8> {
     if let Some(names) = &args.detectors {
         detect::validate_selection(names)?;
@@ -1222,6 +1233,7 @@ fn run_plan(args: PlanArgs) -> Result<u8> {
     let sel = Selection {
         tier: args.tier.map(Tier::from),
         select: args.select.clone(),
+        free: args.free,
     };
     let above = sel.ceiling().map_or(0, |c| {
         findings

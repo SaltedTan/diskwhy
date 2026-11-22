@@ -870,6 +870,7 @@ fn old_claude_and_vscode_files_use_their_measured_identity_for_cleanup() {
             &Selection {
                 tier: Some(Tier::Rebuildable),
                 select: vec![],
+                free: None,
             },
             &tree,
             &ctx,
@@ -1117,6 +1118,7 @@ fn a_vscode_cli_that_was_a_directory_when_walked_is_never_planned_as_a_file() {
             &Selection {
                 tier: Some(Tier::Rebuildable),
                 select: vec![],
+                free: None,
             },
             tree,
             &ctx,

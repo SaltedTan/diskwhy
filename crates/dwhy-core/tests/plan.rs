@@ -12,8 +12,8 @@ use dwhy_core::guard::{Proc, Processes};
 use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection, TTL_SECS, Unusable};
 use dwhy_core::report::{
-    Action, ActionKind, DockerSocket, Finding, GuardResult, GuardStatus, Plan, PlanItem, PlanScan,
-    Recovery, Tier, ToolStatus,
+    Action, ActionKind, DockerSocket, Finding, GuardResult, GuardStatus, HigherTierAvailable, Plan,
+    PlanItem, PlanScan, Recovery, Tier, ToolStatus,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::tree::ScanTree;
@@ -169,12 +169,14 @@ fn tier_ceiling_includes_cheaper_tiers() {
     let sel = Selection {
         tier: Some(Tier::Rebuildable),
         select: vec![],
+        free: None,
     };
     let p = build(&b, tiers(&b), &sel, &Processes::default());
     assert_eq!(ids(&p), ["cargo-target", "user-cache"]);
     let sel = Selection {
         tier: Some(Tier::Review),
         select: vec![],
+        free: None,
     };
     let p = build(&b, tiers(&b), &sel, &Processes::default());
     assert_eq!(ids(&p), ["cargo-target", "stale-tree", "user-cache"]);
@@ -192,6 +194,7 @@ fn select_by_id_or_path_lifts_the_default_ceiling() {
     let sel = Selection {
         tier: None,
         select: vec![review_id, target.clone()],
+        free: None,
     };
     let p = build(&b, found.clone(), &sel, &Processes::default());
     assert_eq!(ids(&p), ["cargo-target", "stale-tree"]);
@@ -201,6 +204,7 @@ fn select_by_id_or_path_lifts_the_default_ceiling() {
     let sel = Selection {
         tier: Some(Tier::Rebuildable),
         select: sel.select.clone(),
+        free: None,
     };
     let p = build(&b, found.clone(), &sel, &Processes::default());
     assert_eq!(ids(&p), ["cargo-target"]);
@@ -209,6 +213,7 @@ fn select_by_id_or_path_lifts_the_default_ceiling() {
     let sel = Selection {
         tier: None,
         select: vec![format!("{target}/")],
+        free: None,
     };
     let p = build(&b, found, &sel, &Processes::default());
     assert_eq!(ids(&p), ["cargo-target"]);
@@ -221,6 +226,7 @@ fn selected_blocked_finding_is_listed_not_planned() {
     let sel = Selection {
         tier: None,
         select: vec![found[3].id.clone()],
+        free: None,
     };
     let p = build(&b, found, &sel, &Processes::default());
     assert!(p.items.is_empty());
@@ -235,6 +241,7 @@ fn unknown_or_advice_selection_is_an_error() {
     let sel = Selection {
         tier: None,
         select: vec!["f_000000000000".into()],
+        free: None,
     };
     let err = plan::select(tiers(&b), &sel).unwrap_err();
     assert!(err.contains("f_000000000000"), "{err}");
@@ -246,6 +253,7 @@ fn unknown_or_advice_selection_is_an_error() {
     let sel = Selection {
         tier: None,
         select: vec![advice.id.clone()],
+        free: None,
     };
     let err = plan::select(vec![advice.clone()], &sel).unwrap_err();
     assert!(err.contains("only advice"), "{err}");
@@ -253,6 +261,7 @@ fn unknown_or_advice_selection_is_an_error() {
     let sel = Selection {
         tier: Some(Tier::Review),
         select: vec![],
+        free: None,
     };
     let (picked, _) = plan::select(vec![advice], &sel).unwrap();
     assert!(picked.is_empty());
@@ -310,6 +319,7 @@ fn only_a_named_blocked_finding_counts_as_selected_blocked() {
         let sel = Selection {
             tier: None,
             select: vec![entry],
+            free: None,
         };
         let p = build(&b, found.clone(), &sel, &procs);
         assert!(p.items.is_empty());
@@ -321,6 +331,7 @@ fn only_a_named_blocked_finding_counts_as_selected_blocked() {
     let sel = Selection {
         tier: None,
         select: vec![trash.id.clone()],
+        free: None,
     };
     assert!(plan::selected_blocked(&build(
         &b,
@@ -360,6 +371,7 @@ fn nested_items_count_once() {
     let sel = Selection {
         tier: Some(Tier::Review),
         select: vec![],
+        free: None,
     };
     let p = build(&b, found, &sel, &Processes::default());
     assert_eq!(p.items.len(), 2);
@@ -438,6 +450,7 @@ fn a_separately_scanned_mount_below_another_root_counts_on_its_own() {
     let sel = Selection {
         tier: Some(Tier::Review),
         select: vec![],
+        free: None,
     };
     let p = build_from(&tree, &b, found, &sel);
     assert_eq!(p.items.len(), 3, "{:?}", p.blocked);
@@ -676,10 +689,12 @@ fn a_root_replaced_after_the_walk_is_blocked() {
     let by_id = Selection {
         tier: None,
         select: vec![f.id.clone()],
+        free: None,
     };
     let by_tier = Selection {
         tier: Some(Tier::Rebuildable),
         select: vec![],
+        free: None,
     };
     for sel in [&by_id, &by_tier] {
         let p = build_from(&tree, &b, vec![f.clone()], sel);
@@ -745,6 +760,7 @@ fn an_already_blocked_selected_root_is_checked_against_the_walk() {
     let sel = Selection {
         tier: None,
         select: vec![outer.id.clone(), f.id.clone()],
+        free: None,
     };
     let tree = scan_tree(&b);
     replace_same_contents(&d);
@@ -774,6 +790,7 @@ fn a_detector_blocked_selection_checks_only_its_own_root() {
     let sel = Selection {
         tier: None,
         select: vec![outer.id.clone(), inner.id.clone()],
+        free: None,
     };
     let tree = scan_tree(&b);
     replace_same_contents(&target);
@@ -805,6 +822,7 @@ fn sel_of(f: &Finding) -> Selection {
     Selection {
         tier: None,
         select: vec![f.id.clone()],
+        free: None,
     }
 }
 
@@ -969,6 +987,7 @@ fn building_a_plan_writes_nothing() {
     let sel = Selection {
         tier: Some(Tier::Review),
         select: vec![],
+        free: None,
     };
     build(&b, found, &sel, &Processes::default());
     assert_eq!(listing(&b), before);
@@ -1121,4 +1140,313 @@ fn plan_records_the_scan_root_device_of_an_item_on_another_device() {
     // Read back as a -x plan, the items still nest as the walk saw them.
     p.scan.one_filesystem = true;
     assert_eq!(plan::distinct_bytes_in_plan(&p, &p.items), p.bytes);
+}
+
+fn goal(tier: Tier, free: u64) -> Selection {
+    Selection {
+        tier: Some(tier),
+        select: vec![],
+        free: Some(free),
+    }
+}
+
+/// The paths of a plan's items, in plan order (largest first).
+fn item_paths(p: &Plan) -> Vec<&str> {
+    p.items.iter().map(|i| i.finding.path.as_str()).collect()
+}
+
+fn s(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+#[test]
+fn free_takes_the_cheapest_tier_first_and_stops_at_the_target() {
+    let (_t, b) = base();
+    let found = || {
+        vec![
+            finding("user-cache", &dir(&b.join("cache")), 100, Tier::Regenerable),
+            finding("user-cache", &dir(&b.join("cache2")), 50, Tier::Regenerable),
+            finding(
+                "cargo-target",
+                &dir(&b.join("target")),
+                200,
+                Tier::Rebuildable,
+            ),
+            finding("stale-tree", &dir(&b.join("old")), 300, Tier::Review),
+        ]
+    };
+    let p = build(&b, found(), &goal(Tier::Review, 120), &Processes::default());
+    assert_eq!(
+        item_paths(&p),
+        [s(&b.join("cache")), s(&b.join("cache2"))],
+        "regenerable covers the target: nothing costlier"
+    );
+    assert_eq!(p.bytes, 150);
+    assert_eq!(p.selection.free_target, Some(120));
+    assert_eq!(p.selection.tier, Some(Tier::Review));
+    let g = p.goal.as_ref().unwrap();
+    assert_eq!(
+        (g.target_bytes, g.planned_bytes, g.met, g.shortfall_bytes),
+        (120, 150, true, 0)
+    );
+    assert!(g.higher_tiers.is_empty(), "nothing above review");
+
+    let p = build(&b, found(), &goal(Tier::Review, 160), &Processes::default());
+    assert_eq!(
+        item_paths(&p),
+        [
+            s(&b.join("target")),
+            s(&b.join("cache")),
+            s(&b.join("cache2"))
+        ],
+        "all of regenerable, then rebuildable; review is not needed"
+    );
+    assert_eq!(p.bytes, 350);
+    assert!(p.goal.unwrap().met);
+}
+
+#[test]
+fn free_takes_the_largest_first_within_a_tier() {
+    let (_t, b) = base();
+    let found = || {
+        vec![
+            finding("user-cache", &dir(&b.join("a")), 50, Tier::Regenerable),
+            finding("user-cache", &dir(&b.join("b")), 300, Tier::Regenerable),
+            finding("user-cache", &dir(&b.join("c")), 100, Tier::Regenerable),
+        ]
+    };
+    let free = |n| {
+        build(
+            &b,
+            found(),
+            &goal(Tier::Regenerable, n),
+            &Processes::default(),
+        )
+    };
+    assert_eq!(item_paths(&free(250)), [s(&b.join("b"))]);
+    assert_eq!(item_paths(&free(300)), [s(&b.join("b"))], "exactly met");
+    let p = free(350);
+    assert_eq!(item_paths(&p), [s(&b.join("b")), s(&b.join("c"))]);
+    assert_eq!(p.bytes, 400);
+}
+
+#[test]
+fn free_counts_only_the_bytes_a_finding_adds() {
+    let (_t, b) = base();
+    // A cheaper inner finding already chosen leaves its outer finding only
+    // what lies outside it: the smaller `other` adds more.
+    let outer = dir(&b.join("outer"));
+    let inner = dir(&outer.join("inner"));
+    let other = dir(&b.join("other"));
+    let found = vec![
+        finding("user-cache", &inner, 400, Tier::Regenerable),
+        finding("cargo-target", &outer, 500, Tier::Rebuildable),
+        finding("cargo-target", &other, 150, Tier::Rebuildable),
+    ];
+    let p = build(
+        &b,
+        found,
+        &goal(Tier::Rebuildable, 520),
+        &Processes::default(),
+    );
+    assert_eq!(item_paths(&p), [s(&inner), s(&other)]);
+    assert_eq!(p.bytes, 550);
+
+    // A finding inside one already chosen adds nothing and is left out.
+    let (_t, b) = base();
+    let big = dir(&b.join("big"));
+    let within = dir(&big.join("in"));
+    let small = dir(&b.join("small"));
+    let found = vec![
+        finding("user-cache", &big, 1000, Tier::Regenerable),
+        finding("user-cache", &within, 900, Tier::Regenerable),
+        finding("user-cache", &small, 10, Tier::Regenerable),
+    ];
+    let p = build(
+        &b,
+        found,
+        &goal(Tier::Regenerable, 1005),
+        &Processes::default(),
+    );
+    assert_eq!(item_paths(&p), [s(&big), s(&small)]);
+    assert_eq!(p.bytes, 1010);
+    let g = p.goal.unwrap();
+    assert_eq!((g.planned_bytes, g.met), (1010, true));
+
+    // Empty findings add nothing either.
+    let (_t, b) = base();
+    let found = vec![finding(
+        "user-cache",
+        &dir(&b.join("e")),
+        0,
+        Tier::Regenerable,
+    )];
+    let p = build(
+        &b,
+        found,
+        &goal(Tier::Regenerable, 1),
+        &Processes::default(),
+    );
+    assert!(p.items.is_empty());
+    assert_eq!(p.goal.unwrap().shortfall_bytes, 1);
+}
+
+#[test]
+fn free_counts_a_separately_scanned_mount_on_its_own() {
+    let (_t, b) = base();
+    let outer = dir(&b.join("outer"));
+    let child = dir(&outer.join("child"));
+    let sub = dir(&outer.join("sub"));
+    let tree = tree_with_mounted_child(&outer);
+    let found = vec![
+        finding("user-cache", &outer, 1000, Tier::Regenerable),
+        finding("user-cache", &child, 300, Tier::Regenerable),
+        finding("user-cache", &sub, 100, Tier::Regenerable),
+    ];
+    let p = build_from(&tree, &b, found, &goal(Tier::Regenerable, 1200));
+    assert_eq!(item_paths(&p), [s(&outer), s(&child)], "sub adds nothing");
+    assert_eq!(p.bytes, 1300);
+    assert!(p.goal.unwrap().met);
+}
+
+#[test]
+fn free_skips_guard_blocked_and_advice_only_findings() {
+    let (_t, b) = base();
+    let busy = dir(&b.join("busy"));
+    let procs = Processes {
+        procs: vec![Proc {
+            pid: 4242,
+            name: "uv".into(),
+            cwd: Some(busy.clone()),
+            open: vec![],
+        }],
+        unreadable: 0,
+    };
+    let mut advice = finding(
+        "user-cache",
+        &dir(&b.join("advice")),
+        1000,
+        Tier::Regenerable,
+    );
+    advice.action.kind = ActionKind::Advice;
+    let found = vec![
+        finding("user-cache", &busy, 500, Tier::Regenerable),
+        advice,
+        finding("user-cache", &dir(&b.join("ok")), 100, Tier::Regenerable),
+    ];
+    let p = build(&b, found, &goal(Tier::Regenerable, 600), &procs);
+    assert_eq!(item_paths(&p), [s(&b.join("ok"))]);
+    assert_eq!(p.blocked.len(), 1);
+    assert_eq!(p.blocked[0].path, s(&busy));
+    assert!(!plan::selected_blocked(&p), "a goal names no finding");
+    let g = p.goal.unwrap();
+    assert_eq!(
+        (g.planned_bytes, g.met, g.shortfall_bytes),
+        (100, false, 500)
+    );
+}
+
+#[test]
+fn free_reports_the_shortfall_and_what_higher_tiers_hold() {
+    let (_t, b) = base();
+    let mut found = tiers(&b);
+    // Own bytes only: 50 of the target's 200 belong to a finding inside it.
+    found[1].nested_bytes = Some(50);
+    found.push(finding(
+        "cargo-target",
+        &dir(&b.join("target2")),
+        70,
+        Tier::Rebuildable,
+    ));
+    let mut advice = finding("stale-tree", &dir(&b.join("advice")), 5000, Tier::Review);
+    advice.action.kind = ActionKind::Advice;
+    found.push(advice);
+    let p = build(
+        &b,
+        found,
+        &goal(Tier::Regenerable, 1000),
+        &Processes::default(),
+    );
+    assert_eq!(ids(&p), ["user-cache"]);
+    let g = p.goal.as_ref().unwrap();
+    assert_eq!(
+        (g.target_bytes, g.planned_bytes, g.met, g.shortfall_bytes),
+        (1000, 100, false, 900)
+    );
+    assert_eq!(
+        g.higher_tiers,
+        [
+            HigherTierAvailable {
+                tier: Tier::Rebuildable,
+                count: 2,
+                bytes: 220,
+            },
+            HigherTierAvailable {
+                tier: Tier::Review,
+                count: 1,
+                bytes: 300,
+            },
+        ],
+        "advice-only and detector-blocked findings are left out"
+    );
+
+    // A rebuildable ceiling reports review only.
+    let p = build(
+        &b,
+        tiers(&b),
+        &goal(Tier::Rebuildable, 1000),
+        &Processes::default(),
+    );
+    let g = p.goal.unwrap();
+    assert_eq!((g.planned_bytes, g.shortfall_bytes), (300, 700));
+    assert_eq!(g.higher_tiers.len(), 1);
+    assert_eq!(g.higher_tiers[0].tier, Tier::Review);
+}
+
+#[test]
+fn a_goal_round_trips_and_is_absent_without_free() {
+    let (_t, b) = base();
+    let p = build(
+        &b,
+        tiers(&b),
+        &goal(Tier::Regenerable, 1000),
+        &Processes::default(),
+    );
+    let text = plan::to_json(&p).unwrap();
+    assert!(text.contains("\"free_target\": 1000"), "{text}");
+    assert_eq!(plan::parse(&text).unwrap(), p);
+
+    let p = build(&b, tiers(&b), &Selection::default(), &Processes::default());
+    assert_eq!((p.selection.free_target, &p.goal), (None, &None));
+    let text = plan::to_json(&p).unwrap();
+    assert!(
+        !text.contains("free_target") && !text.contains("goal"),
+        "{text}"
+    );
+}
+
+#[test]
+fn free_must_be_positive_and_excludes_select() {
+    let (_t, b) = base();
+    let run = |sel: &Selection| {
+        plan::build(
+            tiers(&b),
+            sel,
+            &scan_tree(&b),
+            &ctx(),
+            &Processes::default(),
+            "host".into(),
+            scan_meta(&b),
+        )
+    };
+    let err = run(&goal(Tier::Regenerable, 0)).unwrap_err();
+    assert!(err.contains("greater than 0"), "{err}");
+    let found = tiers(&b);
+    let sel = Selection {
+        tier: None,
+        select: vec![found[0].id.clone()],
+        free: Some(10),
+    };
+    let err = run(&sel).unwrap_err();
+    assert!(err.contains("--select"), "{err}");
 }

@@ -10,7 +10,7 @@ use dwhy_core::explain;
 use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{
     ApplyOutcome, ApplyReport, Change, ChangeKind, DetectorAvailability, DiffReport, DirEntry,
-    DoctorReport, ExplainReport, Finding, FsReport, GuardStatus, Plan, Rate, ScanReport,
+    DoctorReport, ExplainReport, Finding, FsReport, GuardStatus, Plan, PlanGoal, Rate, ScanReport,
     SkipReason, Tier, WatchReport,
 };
 use dwhy_core::units::{age, human, signed, thousands};
@@ -495,17 +495,60 @@ fn render_notes(w: &mut impl Write, notes: &[String]) -> io::Result<()> {
 }
 
 /// Summary of a plan: its items by tier, what is blocked, and how to apply it.
+/// The goal line of a `--free` plan, and when it falls short, what the
+/// tiers above its ceiling hold (unguarded, so stated as such).
+fn render_goal(w: &mut impl Write, goal: &PlanGoal) -> io::Result<()> {
+    let planned = format!(
+        "planned {} of {} target",
+        human(goal.planned_bytes),
+        human(goal.target_bytes)
+    );
+    if goal.met {
+        writeln!(w, "  goal: met ({planned})")?;
+        return Ok(());
+    }
+    writeln!(
+        w,
+        "  goal: short by {} ({planned})",
+        human(goal.shortfall_bytes)
+    )?;
+    if !goal.higher_tiers.is_empty() {
+        let tiers: Vec<String> = goal
+            .higher_tiers
+            .iter()
+            .map(|t| {
+                format!(
+                    "{} {} ({} finding{})",
+                    tier_name(t.tier),
+                    human(t.bytes),
+                    t.count,
+                    if t.count == 1 { "" } else { "s" }
+                )
+            })
+            .collect();
+        writeln!(
+            w,
+            "  higher tiers (unverified, not selected): {}",
+            tiers.join(", ")
+        )?;
+    }
+    Ok(())
+}
+
 pub fn render_plan(
     w: &mut impl Write,
     p: &Plan,
     written: Option<&Path>,
     above: usize,
 ) -> io::Result<()> {
-    let what = match (p.selection.tier, p.selection.select.len()) {
+    let mut what = match (p.selection.tier, p.selection.select.len()) {
         (Some(t), 0) => format!("tier ≤ {}", tier_name(t)),
         (Some(t), n) => format!("{n} selected, tier ≤ {}", tier_name(t)),
         (None, n) => format!("{n} selected"),
     };
+    if let Some(target) = p.selection.free_target {
+        what.push_str(&format!(", target {}", human(target)));
+    }
     if p.items.is_empty() {
         writeln!(w, "plan: nothing to remove ({what})")?;
     } else {
@@ -517,6 +560,9 @@ pub fn render_plan(
             human(p.bytes),
             escape_controls(&p.expires_at)
         )?;
+    }
+    if let Some(goal) = &p.goal {
+        render_goal(w, goal)?;
     }
     for tier in [Tier::Regenerable, Tier::Rebuildable, Tier::Review] {
         let in_tier: Vec<&Finding> = p
@@ -579,7 +625,9 @@ pub fn render_plan(
             }
         }
     }
+    // A goal already lists what the tiers above hold.
     if above > 0
+        && p.goal.is_none()
         && let Some(t) = p.selection.tier
     {
         writeln!(
@@ -1729,6 +1777,7 @@ mod tests {
             selection: PlanSelection {
                 tier: Some(Tier::Rebuildable),
                 select: vec![],
+                free_target: None,
             },
             items: items
                 .into_iter()
@@ -1747,6 +1796,7 @@ mod tests {
                 .collect(),
             blocked,
             bytes: 1 << 30,
+            goal: None,
         }
     }
 

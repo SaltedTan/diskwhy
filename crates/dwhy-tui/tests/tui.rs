@@ -16,8 +16,8 @@ use dwhy_core::plan;
 use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{
     Action, ActionKind, ApplyItem, ApplyOutcome, ApplyReport, ArchiveTarget, EvidenceSource,
-    Finding, Fingerprint, FsReport, Growth, GuardResult, GuardStatus, Plan, PlanItem, PlanScan,
-    PlanSelection, PostgresWal, Recovery, Tier, Tool,
+    Finding, Fingerprint, FsReport, Growth, GuardResult, GuardStatus, HigherTierAvailable, Plan,
+    PlanGoal, PlanItem, PlanScan, PlanSelection, PostgresWal, Recovery, Tier, Tool,
 };
 use dwhy_core::scan::Progress;
 use dwhy_core::{detect, growth, snapshot, system};
@@ -2058,7 +2058,11 @@ fn hand_plan() -> Plan {
             one_filesystem: true,
             detectors: None,
         },
-        selection: PlanSelection { tier: None, select },
+        selection: PlanSelection {
+            tier: None,
+            select,
+            free_target: None,
+        },
         bytes: cargo.bytes + trash.bytes,
         items: vec![
             PlanItem {
@@ -2073,6 +2077,7 @@ fn hand_plan() -> Plan {
             },
         ],
         blocked: vec![blocked],
+        goal: None,
     }
 }
 
@@ -2946,6 +2951,37 @@ fn plan_file_opens_in_the_preview() {
         let got = app.plan_view().unwrap().unusable(now).unwrap().to_string();
         assert!(got.contains(why), "{got}");
     }
+}
+
+#[test]
+fn a_goal_plan_file_opens_in_the_preview_like_any_plan() {
+    // `dwhy plan --free` adds `selection.free_target` and `goal`; the
+    // preview reads the file and shows its items as for any plan.
+    let mut plan = hand_plan();
+    plan.selection.free_target = Some(plan.bytes + 1);
+    plan.goal = Some(PlanGoal {
+        target_bytes: plan.bytes + 1,
+        planned_bytes: plan.bytes,
+        met: false,
+        shortfall_bytes: 1,
+        higher_tiers: vec![HigherTierAvailable {
+            tier: Tier::Review,
+            count: 1,
+            bytes: 7,
+        }],
+    });
+    let t = tempfile::tempdir().unwrap();
+    let file = t.path().join("goal.json");
+    fs::write(&file, plan::to_json(&plan).unwrap()).unwrap();
+    let read = job::read_plan(&file).unwrap();
+    assert_eq!(read, plan);
+    let shown = |p: Plan| {
+        let mut app = App::open_plan(p, "goal.json".into(), HOST, UID);
+        render_at(&mut app, 80, 24, None, PLAN_AT + 60)
+    };
+    let screen = shown(read);
+    assert!(!screen.contains("NOT USABLE"), "{screen}");
+    assert_eq!(screen, shown(hand_plan()));
 }
 
 #[test]

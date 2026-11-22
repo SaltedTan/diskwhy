@@ -390,6 +390,7 @@ fn plan_sample() -> Plan {
         selection: PlanSelection {
             tier: Some(Tier::Rebuildable),
             select: vec![],
+            free_target: None,
         },
         items: vec![
             PlanItem {
@@ -460,12 +461,35 @@ fn plan_sample() -> Plan {
             },
         )],
         bytes: 19_327_352_832,
+        goal: None,
     }
 }
 
 #[test]
 fn plan_shape() {
     insta::assert_json_snapshot!(plan_sample());
+}
+
+#[test]
+fn plan_goal_shape() {
+    // `dwhy plan --tier rebuildable --free 30G`: the items fall short, and
+    // review findings above the ceiling are reported.
+    let mut plan = plan_sample();
+    plan.items.truncate(1);
+    plan.bytes = plan.items[0].finding.bytes;
+    plan.selection.free_target = Some(30 << 30);
+    plan.goal = Some(PlanGoal {
+        target_bytes: 30 << 30,
+        planned_bytes: plan.bytes,
+        met: false,
+        shortfall_bytes: (30 << 30) - plan.bytes,
+        higher_tiers: vec![HigherTierAvailable {
+            tier: Tier::Review,
+            count: 2,
+            bytes: 12_884_901_888,
+        }],
+    });
+    insta::assert_json_snapshot!(plan);
 }
 
 #[test]
