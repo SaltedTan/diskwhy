@@ -3458,7 +3458,7 @@ fn text_reports_escape_control_characters_in_paths() {
     let text = escaped_text(&run(&["scan", &root, "--snapshot"]), &target_shown);
     assert!(
         text.contains(&format!(
-            "→ cargo clean --manifest-path '{root_shown}/app/Cargo.toml' --target-dir '{target_shown}' (escaped; do not copy)\n"
+            "→ cargo clean --manifest-path '{root_shown}/app/Cargo.toml' --target-dir '{target_shown}'\n"
         )),
         "{text}"
     );
@@ -3500,9 +3500,7 @@ fn text_reports_escape_control_characters_in_paths() {
     // explain, by path.
     let text = escaped_text(&run(&["explain", &target]), &target_shown);
     assert!(
-        text.contains(&format!(
-            "--target-dir '{target_shown}' (escaped; do not copy)\n"
-        )),
+        text.contains(&format!("--target-dir '{target_shown}'\n")),
         "{text}"
     );
     let out = run(&["explain", &target, "--json"]);

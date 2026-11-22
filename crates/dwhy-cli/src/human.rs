@@ -1040,17 +1040,14 @@ pub fn render_doctor(w: &mut impl Write, d: &DoctorReport) -> io::Result<()> {
     Ok(())
 }
 
-/// Marks a command shown escaped: what is on screen is not what would run.
-const ESCAPED_COMMAND: &str = " (escaped; do not copy)";
-
 /// A command for the terminal (an action, a recovery, a rerun, `dwhy
 /// apply …`). Without control characters it is shown verbatim, so it stays
 /// exactly what to run, `'\''` from `shell_quote` included. With them it is
 /// escaped like a path, every backslash doubled so `\n` cannot pass for a
-/// newline, and marked [`ESCAPED_COMMAND`].
+/// newline.
 fn command(s: &str) -> std::borrow::Cow<'_, str> {
     if s.contains(char::is_control) {
-        std::borrow::Cow::Owned(format!("{}{ESCAPED_COMMAND}", escape_controls(s)))
+        escape_controls(s)
     } else {
         std::borrow::Cow::Borrowed(s)
     }
@@ -1563,13 +1560,9 @@ mod tests {
         assert_eq!(quoted, r"'/p/it'\''s a\nb'");
         assert_eq!(command(&quoted), quoted);
         // With a control character every backslash is doubled, so the
-        // escaped newline is told apart from the literal `\n`, and the
-        // command is marked as not what would run.
+        // escaped newline is told apart from the literal `\n`.
         let quoted = dwhy_core::detect::shell_quote("/p/it's a\\nb\nc\x1b[31m");
-        assert_eq!(
-            command(&quoted),
-            r"'/p/it'\\''s a\\nb\nc\u{1b}[31m' (escaped; do not copy)"
-        );
+        assert_eq!(command(&quoted), r"'/p/it'\\''s a\\nb\nc\u{1b}[31m'");
     }
 
     #[test]
@@ -1660,12 +1653,12 @@ mod tests {
             format!("dwhy scan · host-{EVIL_SHOWN} ·"),
             format!("filesystem /m/{EVIL_SHOWN}  (fs-{EVIL_SHOWN}, /dev/{EVIL_SHOWN})"),
             format!("/var/{EVIL_SHOWN}  logs of {EVIL_SHOWN}"),
-            format!("sudo dwhy scan '/m/{EVIL_SHOWN}' (escaped; do not copy)"),
+            format!("sudo dwhy scan '/m/{EVIL_SHOWN}'"),
             format!("contents unknown: /u/{EVIL_SHOWN}"),
             format!("(first: /e/{EVIL_SHOWN}: read failed: {EVIL_SHOWN})"),
             format!("cargo-target  /p/{EVIL_SHOWN}/target"),
             format!("Cargo build output of /p/{EVIL_SHOWN}"),
-            format!("→ cargo clean --target-dir '/p/{EVIL_SHOWN}/target' (escaped; do not copy)"),
+            format!("→ cargo clean --target-dir '/p/{EVIL_SHOWN}/target'"),
             format!("blocked by guard-{EVIL_SHOWN}: held by {EVIL_SHOWN}"),
             format!("failed: det-{EVIL_SHOWN}: failed: {EVIL_SHOWN}"),
             format!("/p/{EVIL_SHOWN}\n"),
@@ -1727,13 +1720,11 @@ mod tests {
         assert_escaped(&text);
         for shown in [
             format!("cargo-target  /p/{EVIL_SHOWN}/target"),
-            format!(
-                "f_{EVIL_SHOWN} → cargo clean --target-dir '/p/{EVIL_SHOWN}/target' (escaped; do not copy)"
-            ),
+            format!("f_{EVIL_SHOWN} → cargo clean --target-dir '/p/{EVIL_SHOWN}/target'"),
             format!("warning, guard-{EVIL_SHOWN}: held by {EVIL_SHOWN}"),
             format!("blocked by guard-{EVIL_SHOWN}: held by {EVIL_SHOWN}"),
             format!(
-                "wrote /tmp/{EVIL_SHOWN}.json; apply it within an hour: dwhy apply '/tmp/{EVIL_SHOWN}.json' (escaped; do not copy)"
+                "wrote /tmp/{EVIL_SHOWN}.json; apply it within an hour: dwhy apply '/tmp/{EVIL_SHOWN}.json'"
             ),
         ] {
             assert!(text.contains(&shown), "{shown:?} not in\n{text}");
@@ -1750,7 +1741,6 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(!text.ends_with("(escaped; do not copy)\n"), "{text}");
 
         let empty = plan_with(vec![], vec![]);
         let text = render_plan_text(&empty, Some(Path::new(&format!("/tmp/{EVIL}"))));
@@ -1780,9 +1770,9 @@ mod tests {
             format!("finding f_{EVIL_SHOWN} · cargo-target · rebuildable"),
             format!("last written 2026-11-15 {EVIL_SHOWN}"),
             format!("guard-{EVIL_SHOWN} held by {EVIL_SHOWN}"),
-            format!("  cargo clean --target-dir '/p/{EVIL_SHOWN}/target' (escaped; do not copy)"),
+            format!("  cargo clean --target-dir '/p/{EVIL_SHOWN}/target'"),
             format!("cost: rebuild {EVIL_SHOWN}"),
-            format!("how:  cd '/p/{EVIL_SHOWN}' && cargo build (escaped; do not copy)"),
+            format!("how:  cd '/p/{EVIL_SHOWN}' && cargo build"),
             format!("note: note about {EVIL_SHOWN}"),
         ] {
             assert!(text.contains(&shown), "{shown:?} not in\n{text}");
@@ -1970,9 +1960,7 @@ mod tests {
         assert_escaped(&text);
         for shown in [
             format!("det-{EVIL_SHOWN} /p/{EVIL_SHOWN}/target"),
-            format!(
-                "rebuildable → cargo clean --target-dir '/p/{EVIL_SHOWN}/target' (escaped; do not copy)"
-            ),
+            format!("rebuildable → cargo clean --target-dir '/p/{EVIL_SHOWN}/target'"),
             format!(r"changed: planned det /p/a\\nb, now {EVIL_SHOWN}"),
             format!("audit log: /a/{EVIL_SHOWN}.jsonl"),
         ] {
