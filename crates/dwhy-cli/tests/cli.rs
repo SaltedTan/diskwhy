@@ -1573,7 +1573,8 @@ fn dry_run_shows_everything_and_removes_nothing() {
     let s = String::from_utf8_lossy(&text.stdout);
     assert!(s.contains("would remove"), "{s}");
     assert!(s.contains("nothing removed"), "{s}");
-    assert!(s.contains("--confirm"), "{s}");
+    assert!(s.contains("needs the user's approval"), "{s}");
+    assert!(!s.contains("--confirm"), "{s}");
 }
 
 #[test]
@@ -3319,7 +3320,7 @@ fn tui_apply_matches_dwhy_apply() {
         "{o:?}"
     );
     assert_eq!(o[1].0, "refused");
-    assert!(o[1].3.contains("--confirm"), "{o:?}");
+    assert!(o[1].3.contains("needs the user's approval"), "{o:?}");
     for t in [&tui, &cli] {
         let [app_t, lib_t, scratch] = t.targets();
         assert!(

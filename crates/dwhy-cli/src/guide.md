@@ -40,7 +40,8 @@ are bytes, and "allocated" (`st_blocks * 512`) is what removal frees. `dwhy COMM
   through on its own; each one needs `--confirm ID`.
 - Never raise `--max-tier` or pass `--confirm` unless the user explicitly approved it
   in the current conversation. A refusal ("needs the user's approval", exit 3) is a
-  stop: report it, and do not retry with more authority.
+  stop: report it, and do not retry with more authority. An expired plan, or one from
+  another host or user, also exits 3: make a fresh plan instead.
 - Hand review items to a person: `dwhy plan PATH --tier review -o plan.json`, then
   ask them to run `dwhy tui --plan plan.json`.
 
@@ -61,4 +62,5 @@ are bytes, and "allocated" (`st_blocks * 512`) is what removal frees. `dwhy COMM
 - `0` ok
 - `1` error (usage errors and failed removals included)
 - `2` items skipped by a guard or a changed fingerprint, or a `plan --select` finding blocked
-- `3` refused by policy: above `--max-tier`, no `--confirm`, or no terminal and no `--yes`
+- `3` refused: above `--max-tier`, no `--confirm`, or no terminal and no `--yes`; or the
+  plan is expired or from another host or user (make a fresh plan with `dwhy plan`)

@@ -36,7 +36,8 @@ from the installed binary, not from memory.
   apply with `dwhy apply FILE --yes --json`.
 - Never pass `--confirm` or raise `--max-tier` above `regenerable` unless the user
   explicitly told you to in the current conversation. A refusal (exit 3, "needs the
-  user's approval") is a stop: report it, do not retry with more authority.
+  user's approval") is a stop: report it, do not retry with more authority. An expired
+  plan, or one from another host or user, also exits 3: make a fresh plan instead.
 - Hand `review` items to the user: write a plan with `dwhy plan PATH --tier review -o FILE`
   and ask them to open it with `dwhy tui --plan FILE`.
 - Never remove what `dwhy` flagged with `rm` or other tools yourself; that skips its

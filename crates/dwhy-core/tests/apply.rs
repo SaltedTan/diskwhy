@@ -347,7 +347,8 @@ fn default_policy_allows_regenerable_only() {
         .find(|c| c.item.detector == "stale-tree")
         .unwrap();
     assert!(
-        review.item.detail.contains("--confirm"),
+        review.item.detail.contains("needs the user's approval")
+            && !review.item.detail.contains("--confirm"),
         "{}",
         review.item.detail
     );

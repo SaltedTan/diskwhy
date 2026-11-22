@@ -89,7 +89,7 @@ expression: r
         "text": "remove /home/me/x/target (cargo not found)"
       },
       "outcome": "refused",
-      "detail": "review items need a person's --confirm f_c2b7afdaa165",
+      "detail": "a review item needs the user's approval",
       "guards": [
         {
           "name": "in-use-cwd",

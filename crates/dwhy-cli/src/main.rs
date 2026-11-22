@@ -73,7 +73,8 @@ written).")]
     /// Carry out a plan: re-detect, re-run the guards, and remove what the tier policy allows.
     #[command(after_help = "\
 Exit codes: 0 ok, 1 error or a failed removal, 2 items skipped by a guard or a changed
-fingerprint, 3 refused by policy (above --max-tier, no --confirm) or no terminal and no --yes.")]
+fingerprint, 3 refused by policy (above --max-tier, no --confirm), no terminal and no --yes, or
+the plan is expired or from another host or user (make a fresh plan).")]
     Apply(ApplyArgs),
     /// Show what grew since a snapshot (`scan --snapshot`): rescans now and compares.
     #[command(after_help = "\

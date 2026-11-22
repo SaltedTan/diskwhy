@@ -53,7 +53,7 @@ impl Policy {
     pub fn allows(&self, f: &Finding) -> Result<(), String> {
         match f.tier {
             Tier::Review if self.confirm.contains(&f.id) => Ok(()),
-            Tier::Review => Err(format!("review items need a person's --confirm {}", f.id)),
+            Tier::Review => Err("a review item needs the user's approval".into()),
             Tier::Blocked => Err("blocked items are never applied".into()),
             t if t <= self.max_tier => Ok(()),
             t => Err(format!(
