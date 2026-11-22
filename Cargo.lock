@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "dwhy-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "clap",
  "dwhy-core",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "dwhy-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "flate2",
  "insta",
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "dwhy-tui"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "crossterm",
  "dwhy-core",
