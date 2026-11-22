@@ -1,0 +1,62 @@
+---
+source: crates/dwhy-core/tests/json_shape.rs
+expression: r
+---
+{
+  "schema": "diskwhy/v1",
+  "tool": {
+    "name": "diskwhy",
+    "version": "0.0.1"
+  },
+  "host": "pc-ubuntu",
+  "uid": 1000,
+  "generated_at": "2026-11-16T04:10:00Z",
+  "plan_created_at": "2026-11-16T04:00:00Z",
+  "dry_run": true,
+  "max_tier": "regenerable",
+  "confirm": [],
+  "items": [
+    {
+      "id": "f_c2b7afdaa165",
+      "detector": "cargo-target",
+      "path": "/home/me/x/target",
+      "tier": "rebuildable",
+      "bytes": 9663676416,
+      "action": {
+        "kind": "remove_path",
+        "text": "remove /home/me/x/target (cargo not found)"
+      },
+      "outcome": "would_remove",
+      "detail": "ready",
+      "guards": [
+        {
+          "name": "in-use-cwd",
+          "status": "pass",
+          "detail": "no process has its working directory in it"
+        }
+      ]
+    },
+    {
+      "id": "f_c2b7afdaa165",
+      "detector": "cargo-target",
+      "path": "/home/me/x/target",
+      "tier": "rebuildable",
+      "bytes": 9663676416,
+      "action": {
+        "kind": "remove_path",
+        "text": "remove /home/me/x/target (cargo not found)"
+      },
+      "outcome": "refused",
+      "detail": "review items need a person's --confirm f_c2b7afdaa165",
+      "guards": [
+        {
+          "name": "in-use-cwd",
+          "status": "pass",
+          "detail": "no process has its working directory in it"
+        }
+      ]
+    }
+  ],
+  "freed": 0,
+  "would_free": 9663676416
+}

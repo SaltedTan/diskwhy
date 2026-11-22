@@ -549,10 +549,111 @@ fn apply_report_shape() {
             apply_item(ApplyOutcome::WouldRemove, "ready"),
         ],
         freed: 9_663_676_416,
+        would_free: None,
+        audit_log: Some("/home/me/.local/state/diskwhy/audit.jsonl".into()),
     };
     insta::assert_json_snapshot!(r);
     let back: ApplyReport = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
     assert_eq!(back, r);
+}
+
+#[test]
+fn apply_report_dry_run_shape() {
+    let r = ApplyReport {
+        schema: SCHEMA.into(),
+        tool: Tool {
+            name: "diskwhy".into(),
+            version: "0.0.1".into(),
+        },
+        host: "pc-ubuntu".into(),
+        uid: 1000,
+        generated_at: "2026-11-16T04:10:00Z".into(),
+        plan_created_at: "2026-11-16T04:00:00Z".into(),
+        dry_run: true,
+        max_tier: Tier::Regenerable,
+        confirm: vec![],
+        items: vec![
+            apply_item(ApplyOutcome::WouldRemove, "ready"),
+            apply_item(
+                ApplyOutcome::Refused,
+                "review items need a person's --confirm f_c2b7afdaa165",
+            ),
+        ],
+        freed: 0,
+        would_free: Some(9_663_676_416),
+        audit_log: None,
+    };
+    insta::assert_json_snapshot!(r);
+    let back: ApplyReport = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+    assert_eq!(back, r);
+}
+
+#[test]
+fn apply_report_without_would_free_or_audit_log_still_parses() {
+    let mut v = serde_json::to_value(ApplyReport {
+        schema: SCHEMA.into(),
+        tool: Tool::current(),
+        host: "h".into(),
+        uid: 1000,
+        generated_at: "2026-11-16T04:10:00Z".into(),
+        plan_created_at: "2026-11-16T04:00:00Z".into(),
+        dry_run: true,
+        max_tier: Tier::Regenerable,
+        confirm: vec![],
+        items: vec![],
+        freed: 0,
+        would_free: Some(1),
+        audit_log: Some("/a".into()),
+    })
+    .unwrap();
+    let obj = v.as_object_mut().unwrap();
+    obj.remove("would_free");
+    obj.remove("audit_log");
+    let back: ApplyReport = serde_json::from_value(v).unwrap();
+    assert_eq!((back.would_free, back.audit_log), (None, None));
+}
+
+#[test]
+fn error_report_shape() {
+    let tool = Tool {
+        name: "diskwhy".into(),
+        version: "0.0.1".into(),
+    };
+    let reports = [
+        ErrorReport {
+            tool: tool.clone(),
+            ..ErrorReport::new(
+                ErrorKind::Usage,
+                "unexpected argument '--no-such-flag' found",
+                Some("to pass '--no-such-flag' as a value, use '-- --no-such-flag'".into()),
+                1,
+            )
+        },
+        ErrorReport {
+            tool: tool.clone(),
+            ..ErrorReport::new(
+                ErrorKind::Error,
+                "/definitely/not/here: No such file or directory (os error 2)",
+                None,
+                1,
+            )
+        },
+        ErrorReport {
+            tool,
+            ..ErrorReport::new(
+                ErrorKind::Refused,
+                "no terminal to confirm on",
+                Some("pass --yes to remove without asking, or --dry-run to preview".into()),
+                3,
+            )
+        },
+    ];
+    insta::assert_json_snapshot!(reports);
+    for r in reports {
+        assert_eq!(r.schema, SCHEMA);
+        let back: ErrorReport = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+    }
 }
 
 #[test]

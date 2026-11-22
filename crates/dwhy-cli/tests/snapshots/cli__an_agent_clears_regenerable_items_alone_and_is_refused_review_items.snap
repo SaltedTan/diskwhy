@@ -3,6 +3,7 @@ source: crates/dwhy-cli/tests/cli.rs
 expression: r
 ---
 {
+  "audit_log": "[root]/state/diskwhy/audit.jsonl",
   "confirm": [],
   "dry_run": false,
   "freed": "[freed]",

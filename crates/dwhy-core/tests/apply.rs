@@ -1295,11 +1295,21 @@ fn a_separately_scanned_root_below_another_counts_on_its_own_in_apply_totals() {
         apply::summary_with_would_free(&preview, Some(would)),
         format!("would remove 3 items ({total}); nothing removed")
     );
-    // On its own, a report nests by path only.
+    // A dry-run report carries the figure from its checks.
+    assert_eq!(preview.would_free, Some(would));
+    assert_eq!(
+        apply::summary(&preview),
+        format!("would remove 3 items ({total}); nothing removed")
+    );
+    // One without it (an older file) nests by path only.
+    let older = dwhy_core::report::ApplyReport {
+        would_free: None,
+        ..preview.clone()
+    };
     assert!(
-        apply::summary(&preview).contains(&dwhy_core::units::human(1000)),
+        apply::summary(&older).contains(&dwhy_core::units::human(1000)),
         "{}",
-        apply::summary(&preview)
+        apply::summary(&older)
     );
 
     let (_s, state) = base();

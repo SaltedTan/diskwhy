@@ -334,7 +334,10 @@ fn diff_ranks_changes_by_rate_and_attributes_dirs_to_the_deepest() {
     assert_eq!(d.findings[1].detector.as_deref(), Some("cargo-target"));
     assert_eq!(
         d.notes,
-        ["findings not compared (detector ran on one side only): go-build, user-cache"]
+        [
+            "findings not compared (detector ran on one side only): go-build, user-cache",
+            THRESHOLD_NOTE
+        ]
     );
 }
 
@@ -371,12 +374,43 @@ fn only_paths_inside_both_scans_are_compared() {
 
 const HOME_NOTE: &str = "not compared, because one side did not enter these mount points: /home";
 
-/// The notes about mount points (Docker notes left out).
+/// What `diff` says about the directories `snap` leaves out (100M).
+const THRESHOLD_NOTE: &str =
+    "directories under 100.0M are not recorded in snapshots and are not compared";
+
+#[test]
+fn diff_notes_the_snapshot_directory_threshold_last() {
+    let mut old = snap("2026-11-15T00:00:00Z", &["/h"], &[]);
+    let mut new = snap("2026-11-16T00:00:00Z", &["/h"], &[]);
+    let d = growth::diff(&old, None, "f".into(), &new, &no_tree, 0);
+    assert_eq!(d.notes.last().map(String::as_str), Some(THRESHOLD_NOTE));
+    assert_eq!(d.notes.iter().filter(|n| **n == THRESHOLD_NOTE).count(), 1);
+
+    // The larger threshold of the two sides is the one named.
+    old.scan.min_dir_bytes = 0;
+    new.scan.min_dir_bytes = 2 * M;
+    let d = growth::diff(&old, None, "f".into(), &new, &no_tree, 0);
+    assert_eq!(
+        d.notes.last().map(String::as_str),
+        Some("directories under 2.0M are not recorded in snapshots and are not compared")
+    );
+
+    // Snapshots that record every directory say nothing about it.
+    new.scan.min_dir_bytes = 0;
+    let d = growth::diff(&old, None, "f".into(), &new, &no_tree, 0);
+    assert!(
+        !d.notes.iter().any(|n| n.starts_with("directories under")),
+        "{:?}",
+        d.notes
+    );
+}
+
+/// The notes about mount points (Docker and threshold notes left out).
 fn mount_notes(d: &dwhy_core::report::DiffReport) -> Vec<&str> {
     d.notes
         .iter()
         .map(String::as_str)
-        .filter(|n| !n.starts_with("Docker"))
+        .filter(|n| !n.starts_with("Docker") && *n != THRESHOLD_NOTE)
         .collect()
 }
 
@@ -526,7 +560,10 @@ fn docker_is_compared_only_when_both_sides_have_it() {
     assert!(d.docker.is_empty());
     assert_eq!(
         d.notes,
-        ["Docker not compared: the snapshot has no Docker figures"]
+        [
+            "Docker not compared: the snapshot has no Docker figures",
+            THRESHOLD_NOTE
+        ]
     );
     let d = growth::diff(&new, None, "f".into(), &old, &no_tree, 0);
     assert!(!d.docker_compared);

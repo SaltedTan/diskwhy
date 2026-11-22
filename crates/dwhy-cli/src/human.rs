@@ -1996,6 +1996,8 @@ mod tests {
                 item(ApplyOutcome::Skipped, &detail),
             ],
             freed: 0,
+            would_free: None,
+            audit_log: None,
         };
         let audit = format!("/a/{EVIL}.jsonl");
         let mut out = Vec::new();

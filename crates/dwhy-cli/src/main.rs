@@ -22,9 +22,9 @@ use dwhy_core::guard::Processes;
 use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection};
 use dwhy_core::report::{
-    ActionKind, DEFAULT_SUMMARY_DEPTH, DEFAULT_SUMMARY_DIRS, DEFAULT_SUMMARY_FINDINGS,
-    ExplainReport, ExplainResolved, ExplainSize, ExplainVia, Plan, PlanScan, SavedSnapshot,
-    SnapshotFinding, SummaryLimits, Tier, Totals,
+    ActionKind, DEFAULT_SUMMARY_DEPTH, DEFAULT_SUMMARY_DIRS, DEFAULT_SUMMARY_FINDINGS, ErrorKind,
+    ErrorReport, ExplainReport, ExplainResolved, ExplainSize, ExplainVia, Plan, PlanScan,
+    SavedSnapshot, SnapshotFinding, SummaryLimits, Tier, Totals,
 };
 use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::tree::ScanTree;
@@ -351,8 +351,23 @@ fn main() -> ExitCode {
             // clap exits 2 on usage errors, but 2 means "skipped by a guard" here.
             let code = if e.use_stderr() { EXIT_ERROR } else { EXIT_OK };
             let _ = e.print();
+            // --help and --version are not errors: they print what was asked.
+            if e.use_stderr() && json_requested(std::env::args_os().skip(1)) {
+                let (message, hint) = usage_message(&e.render().to_string());
+                print_error_json(&ErrorReport::new(ErrorKind::Usage, message, hint, code));
+            }
             return ExitCode::from(code);
         }
+    };
+    let json = match &cli.command {
+        Some(Command::Scan(a)) => a.json,
+        Some(Command::Plan(a)) => a.json,
+        Some(Command::Apply(a)) => a.json,
+        Some(Command::Diff(a)) => a.json,
+        Some(Command::Watch(a)) => a.json,
+        Some(Command::Explain(a)) => a.json,
+        Some(Command::Doctor { json }) => *json,
+        Some(Command::Tui(_)) | None => false,
     };
     let res = match cli.command {
         Some(Command::Scan(args)) => run_scan(args),
@@ -382,9 +397,104 @@ fn main() -> ExitCode {
                 "dwhy: error: {}",
                 human::escape_only_controls(&e.to_string())
             );
+            // A report already started on stdout stays the only document there.
+            if json && !REPORT_STARTED.load(Ordering::Relaxed) {
+                print_error_json(&ErrorReport::new(
+                    ErrorKind::Error,
+                    e.to_string(),
+                    None,
+                    EXIT_ERROR,
+                ));
+            }
             ExitCode::from(EXIT_ERROR)
         }
     }
+}
+
+/// Set once a command starts writing its report on stdout: from then on a
+/// failure is told on stderr only, never as a second JSON document.
+static REPORT_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Writes `value` as the command's pretty-printed diskwhy/v1 report.
+fn print_json(value: &impl serde::Serialize) -> Result<()> {
+    REPORT_STARTED.store(true, Ordering::Relaxed);
+    let mut out = std::io::stdout().lock();
+    serde_json::to_writer_pretty(&mut out, value)?;
+    writeln!(out)?;
+    Ok(())
+}
+
+/// Writes `report` on stdout for `--json` readers of a failed command
+/// (stderr has said the same in text). Write errors are ignored: the exit
+/// code still tells.
+fn print_error_json(report: &ErrorReport) {
+    let mut out = std::io::stdout().lock();
+    if serde_json::to_writer_pretty(&mut out, report).is_ok() {
+        let _ = writeln!(out);
+    }
+    let _ = out.flush();
+}
+
+/// Says `dwhy: refused: …` on stderr (with the hint when `hint_on_stderr`)
+/// and, with `json`, as an [`ErrorReport`] on stdout. Returns the exit code
+/// for a refusal.
+fn refuse(json: bool, message: &str, hint: Option<&str>, hint_on_stderr: bool) -> u8 {
+    let text = match hint {
+        Some(hint) if hint_on_stderr => format!("{message}; {hint}"),
+        _ => message.to_owned(),
+    };
+    eprintln!("dwhy: refused: {}", human::escape_only_controls(&text));
+    if json {
+        print_error_json(&ErrorReport::new(
+            ErrorKind::Refused,
+            message,
+            hint.map(str::to_owned),
+            EXIT_REFUSED,
+        ));
+    }
+    EXIT_REFUSED
+}
+
+/// True when `--json` is among `args` (the arguments after the program
+/// name) before any `--`, which ends the options.
+fn json_requested(args: impl IntoIterator<Item = OsString>) -> bool {
+    args.into_iter()
+        .take_while(|a| a != "--")
+        .any(|a| a == "--json")
+}
+
+/// The message and hint of a usage error, from clap's plain-text rendering:
+/// the `error:` paragraph, and its `tip:` lines (else the usage line, else
+/// the pointer to `--help`).
+fn usage_message(rendered: &str) -> (String, Option<String>) {
+    let mut paragraphs = rendered
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let first = paragraphs.next().unwrap_or_default();
+    let message = first
+        .strip_prefix("error:")
+        .unwrap_or(first)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rest: Vec<&str> = paragraphs.flat_map(str::lines).map(str::trim).collect();
+    let tips: Vec<&str> = rest
+        .iter()
+        .filter_map(|l| l.strip_prefix("tip:"))
+        .map(str::trim)
+        .collect();
+    let hint = if tips.is_empty() {
+        let line = |start: &str| rest.iter().find(|l| l.starts_with(start));
+        line("Usage:")
+            .or_else(|| line("For more information"))
+            .map(|l| l.to_string())
+    } else {
+        Some(tips.join("; "))
+    };
+    (message, hint)
 }
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -486,11 +596,10 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
         report.filter_tiers(tiers);
     }
 
-    let mut out = std::io::stdout().lock();
     if args.json {
-        serde_json::to_writer_pretty(&mut out, &report)?;
-        writeln!(out)?;
+        print_json(&report)?;
     } else {
+        let mut out = std::io::stdout().lock();
         human::render_scan(
             &mut out,
             &report,
@@ -636,12 +745,10 @@ fn run_diff(args: DiffArgs) -> Result<u8> {
             Err(e) => save_error = Some(e),
         }
     }
-    let mut out = std::io::stdout().lock();
     if args.json {
-        serde_json::to_writer_pretty(&mut out, &d)?;
-        writeln!(out)?;
+        print_json(&d)?;
     } else {
-        human::render_diff(&mut out, &d, args.top)?;
+        human::render_diff(&mut std::io::stdout().lock(), &d, args.top)?;
     }
     if let Some(e) = save_error {
         eprintln!(
@@ -691,12 +798,10 @@ fn run_watch(args: WatchArgs) -> Result<u8> {
         r.notes
             .push(format!("Docker not compared: {}", reasons.join("; ")));
     }
-    let mut out = std::io::stdout().lock();
     if args.json {
-        serde_json::to_writer_pretty(&mut out, &r)?;
-        writeln!(out)?;
+        print_json(&r)?;
     } else {
-        human::render_watch(&mut out, &r, args.top)?;
+        human::render_watch(&mut std::io::stdout().lock(), &r, args.top)?;
     }
     Ok(EXIT_OK)
 }
@@ -942,12 +1047,10 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
         inside,
         notes,
     };
-    let mut out = std::io::stdout().lock();
     if args.json {
-        serde_json::to_writer_pretty(&mut out, &report)?;
-        writeln!(out)?;
+        print_json(&report)?;
     } else {
-        human::render_explain(&mut out, &report)?;
+        human::render_explain(&mut std::io::stdout().lock(), &report)?;
     }
     Ok(EXIT_OK)
 }
@@ -1116,12 +1219,15 @@ fn run_plan(args: PlanArgs) -> Result<u8> {
         let text = plan::to_json(&plan)?;
         std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     }
-    let mut out = std::io::stdout().lock();
     if args.json {
-        serde_json::to_writer_pretty(&mut out, &plan)?;
-        writeln!(out)?;
+        print_json(&plan)?;
     } else {
-        human::render_plan(&mut out, &plan, args.output.as_deref(), above)?;
+        human::render_plan(
+            &mut std::io::stdout().lock(),
+            &plan,
+            args.output.as_deref(),
+            above,
+        )?;
     }
     Ok(if plan::selected_blocked(&plan) {
         EXIT_SKIPPED
@@ -1129,6 +1235,9 @@ fn run_plan(args: PlanArgs) -> Result<u8> {
         EXIT_OK
     })
 }
+
+/// The hint of a refusal to apply a plan that is stale or not for here.
+const FRESH_PLAN: &str = "run `dwhy plan` to create a fresh plan";
 
 fn run_apply(args: ApplyArgs) -> Result<u8> {
     let text = std::fs::read_to_string(&args.plan)
@@ -1150,18 +1259,16 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
     }
     let env = apply::Env::from_system();
     if let Err(e) = plan::usable(&plan, &env.host, env.uid, now_secs()) {
-        eprintln!(
-            "dwhy: refused: {}",
-            human::escape_only_controls(&e.to_string())
-        );
-        return Ok(EXIT_REFUSED);
+        return Ok(refuse(args.json, &e.to_string(), Some(FRESH_PLAN), false));
     }
     let ask = !args.yes && !args.dry_run;
     if ask && !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
-        eprintln!(
-            "dwhy: refused: no terminal to confirm on; pass --yes to remove without asking, or --dry-run to preview"
-        );
-        return Ok(EXIT_REFUSED);
+        return Ok(refuse(
+            args.json,
+            "no terminal to confirm on",
+            Some("pass --yes to remove without asking, or --dry-run to preview"),
+            true,
+        ));
     }
     let policy = Policy {
         max_tier: args.max_tier.into(),
@@ -1203,11 +1310,7 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
         }
         // Check again right before removing: time has passed at the prompt.
         if let Err(e) = plan::usable(&plan, &env.host, env.uid, now_secs()) {
-            eprintln!(
-                "dwhy: refused: {}",
-                human::escape_only_controls(&e.to_string())
-            );
-            return Ok(EXIT_REFUSED);
+            return Ok(refuse(args.json, &e.to_string(), Some(FRESH_PLAN), false));
         }
         let again = survey(
             &plan,
@@ -1240,7 +1343,8 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
     for error in audit_errors {
         eprintln!("dwhy: error: {}", error.escape_debug());
     }
-    let r = apply::report(&plan, &checks, &policy, false, &env);
+    let mut r = apply::report(&plan, &checks, &policy, false, &env);
+    r.audit_log = Some(audit.path().to_string_lossy().into_owned());
     print_apply(&r, args.json, Some(audit.path()), None)?;
     Ok(apply::exit_code(&r))
 }
@@ -1281,12 +1385,10 @@ fn print_apply(
     audit: Option<&std::path::Path>,
     would_free: Option<u64>,
 ) -> Result<()> {
-    let mut out = std::io::stdout().lock();
     if json {
-        serde_json::to_writer_pretty(&mut out, r)?;
-        writeln!(out)?;
+        print_json(r)?;
     } else {
-        human::render_apply(&mut out, r, audit, false, would_free)?;
+        human::render_apply(&mut std::io::stdout().lock(), r, audit, false, would_free)?;
     }
     Ok(())
 }
@@ -1386,12 +1488,10 @@ fn measure(
 
 fn run_doctor(json: bool) -> Result<u8> {
     let report = doctor::doctor();
-    let mut out = std::io::stdout().lock();
     if json {
-        serde_json::to_writer_pretty(&mut out, &report)?;
-        writeln!(out)?;
+        print_json(&report)?;
     } else {
-        human::render_doctor(&mut out, &report)?;
+        human::render_doctor(&mut std::io::stdout().lock(), &report)?;
     }
     Ok(EXIT_OK)
 }

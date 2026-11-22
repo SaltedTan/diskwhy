@@ -348,6 +348,15 @@ pub fn diff(
         }
     }
     notes.extend(c.findings_note);
+    // Growth inside directories below the threshold still counts in their
+    // parents and in `fs`; only the small directories themselves are unseen.
+    let threshold = old.scan.min_dir_bytes.max(new.scan.min_dir_bytes);
+    if threshold > 0 {
+        notes.push(format!(
+            "directories under {} are not recorded in snapshots and are not compared",
+            crate::units::human(threshold)
+        ));
+    }
     let docker_compared = c.docker.is_some();
     let [mut fs, mut dirs, mut docker, mut findings] =
         [c.fs, c.dirs, c.docker.unwrap_or_default(), c.findings];

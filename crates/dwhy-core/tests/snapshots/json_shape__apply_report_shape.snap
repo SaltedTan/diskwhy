@@ -119,5 +119,6 @@ expression: r
       ]
     }
   ],
-  "freed": 9663676416
+  "freed": 9663676416,
+  "audit_log": "/home/me/.local/state/diskwhy/audit.jsonl"
 }

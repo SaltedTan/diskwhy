@@ -91,6 +91,8 @@ dwhy doctor                                       # available tools, detectors, 
 
 Exit codes: `0` ok · `1` error (clap usage errors map to 1 so they do not clash with 2) · `2` some items were skipped · `3` refused by policy.
 
+With `--json`, a command that fails or refuses before it has a report writes an [`ErrorReport`](../crates/dwhy-core/src/report.rs) on stdout (`kind` `usage`, `error` or `refused`, a `message`, an optional `hint`, and the `exit_code` it exits with); stderr says the same in text as without `--json`. A report already started on stdout stays the only document there: when `scan` or `diff` cannot save its `--snapshot`, or `apply` has run, the exit code and stderr tell the rest. `--help` and `--version` are not errors. `apply --json` adds `would_free` on a dry run and `audit_log` on a real run.
+
 ### TUI details
 
 The scan stays on each root's filesystem by default. The explicit `-x` flag also accepts the spelling `--one-file-system`. Either spelling conflicts with `--cross-filesystems`, which allows the scan to descend into other mounted filesystems while still skipping pseudo-filesystems such as proc and sysfs.
