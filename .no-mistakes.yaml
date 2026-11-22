@@ -8,8 +8,7 @@ commands:
   lint: 'PATH="$HOME/.cargo/bin:$PATH"; cargo fmt --all --check && cargo clippy --locked --all-targets --all-features -- -D warnings'
   format: 'PATH="$HOME/.cargo/bin:$PATH" cargo fmt --all'
 
-# The repo is all rights reserved until the public release (docs/COMMERCIAL.md);
-# automatic fixes must never add a licence. The CI workflow is changed by hand only.
+# Licence files and CI workflows are changed by hand only.
 protected_paths:
   - "LICENSE*"
   - "COPYING*"

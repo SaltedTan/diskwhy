@@ -36,7 +36,7 @@ A plain `du` browser (`gdu`, `ncdu`) shows what is big right now, not what is gr
 
 ### Prebuilt static binaries (Linux x86_64 and aarch64)
 
-Once the first public release tag is published on GitHub Releases, download the archive for your architecture (`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`), verify `SHA256SUMS`, and put `dwhy` on your `PATH`:
+Download the archive for your architecture (`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`) from GitHub Releases, verify `SHA256SUMS`, and put `dwhy` on your `PATH`:
 
 ```sh
 # Example for x86_64 Linux (replace VERSION with the release tag)
@@ -52,19 +52,19 @@ install -Dm 0755 "dwhy-${VERSION}-x86_64-unknown-linux-musl/dwhy" ~/.local/bin/d
 
 Requires Rust 1.88+ (2024 edition).
 
+From Git:
+
+```sh
+cargo install --git https://github.com/SaltedTan/diskwhy --locked dwhy-cli
+```
+
 From a local checkout:
 
 ```sh
 cargo install --path crates/dwhy-cli --locked
 ```
 
-From Git (once public, or with Git authentication while private):
-
-```sh
-cargo install --git https://github.com/SaltedTan/diskwhy --locked dwhy-cli
-```
-
-*(Publishing to crates.io is undecided pending the final crate and binary name; see [docs/DESIGN.md](docs/DESIGN.md#open-questions).)*
+*(v0.1.0 ships via GitHub Releases and `cargo install --git`; crates.io publishing is deferred.)*
 
 ### Building from source
 
@@ -161,12 +161,19 @@ Both `dwhy` and `dwhy tui` open the current directory by default. Supply paths a
 
 `0` ok · `1` error (usage errors and failed removals included) · `2` items skipped by a guard or changed fingerprint · `3` refused by policy.
 
-## Documentation & Status
-
-MVP milestones M0–M4 are implemented and verified; M5 release preparation is underway. The repository is currently private and all rights reserved pending licence selection and the first public tag.
+## Documentation
 
 - [docs/DESIGN.md](docs/DESIGN.md) — architecture, decisions, JSON contract (`diskwhy/v1`), safety rules, and milestones
-- [docs/COMMERCIAL.md](docs/COMMERCIAL.md) — licence and commercial direction
+- [docs/COMMERCIAL.md](docs/COMMERCIAL.md) — licence rationale and commercial notes
 - [docs/ACCEPTANCE-M1.md](docs/ACCEPTANCE-M1.md) — 2026-11-13 `pc-ubuntu` cleanup checklist
 - [docs/ACCEPTANCE-M3.md](docs/ACCEPTANCE-M3.md) — Postgres WAL demo end-to-end verification
 - [docs/ACCEPTANCE-M4.md](docs/ACCEPTANCE-M4.md) — TUI acceptance and ssh verification
+
+## License
+
+Licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.

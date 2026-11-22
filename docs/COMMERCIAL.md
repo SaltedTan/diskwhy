@@ -1,5 +1,7 @@
 # Commercial feasibility and licence (2026-11-15)
 
+> Update (2026-11-22): Decided to open-source `diskwhy` under `MIT OR Apache-2.0` (`LICENSE-MIT`, `LICENSE-APACHE`). The notes below are kept for historical context.
+
 ## Short answer
 
 People are unlikely to pay for the **single-machine CLI/TUI**. Free tools that are good enough already exist (gdu, ncdu, Mole, lysosome's MIT CLI, and many small ratatui cleaners), and Linux terminal users rarely pay for local tools. A **fleet/team layer** could be paid, later, once the free tool has users. Keep the repo private while building the MVP, then open-source the core.

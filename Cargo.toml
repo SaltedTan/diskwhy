@@ -3,9 +3,10 @@ resolver = "3"
 members = ["crates/dwhy-core", "crates/dwhy-cli", "crates/dwhy-tui"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+license = "MIT OR Apache-2.0"
 publish = false
 repository = "https://github.com/SaltedTan/diskwhy"
 homepage = "https://github.com/SaltedTan/diskwhy"
@@ -14,8 +15,8 @@ keywords = ["disk", "cleanup", "du", "tui", "linux"]
 categories = ["command-line-utilities", "filesystem"]
 
 [workspace.dependencies]
-dwhy-core = { version = "0.0.1", path = "crates/dwhy-core" }
-dwhy-tui = { version = "0.0.1", path = "crates/dwhy-tui" }
+dwhy-core = { version = "0.1.0", path = "crates/dwhy-core" }
+dwhy-tui = { version = "0.1.0", path = "crates/dwhy-tui" }
 clap = { version = "4.6", features = ["derive"] }
 # use-dev-tty: the default (mio) event source spins forever on EOF once the
 # terminal hangs up, so event::poll never returns and dwhy can't exit.
