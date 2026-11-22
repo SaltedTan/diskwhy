@@ -30,29 +30,67 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       # Runs as the unprivileged `runner` user, so the unreadable-directory tests are exercised.
       - run: cargo test --locked --all-features
+      - name: Check crate packaging metadata
+        run: |
+          # Inline patch lets cargo package resolve unpublished workspace crates
+          # without adding [patch.crates-io] to .cargo/config.toml.
+          cargo package --workspace --no-verify --locked \
+            --config 'patch.crates-io.dwhy-core.path="crates/dwhy-core"' \
+            --config 'patch.crates-io.dwhy-tui.path="crates/dwhy-tui"'
 
   musl:
-    name: static build (x86_64-unknown-linux-musl)
+    name: static build (${{ matrix.target }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            file_arch: x86-64
+            qemu: false
+            extra_rustflags: ""
+          - target: aarch64-unknown-linux-musl
+            file_arch: ARM aarch64
+            qemu: true
+            extra_rustflags: "-C linker-flavor=ld.lld -C link-self-contained=yes -C target-feature=+crt-static"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: musl
-      - run: cargo build --locked --release --target x86_64-unknown-linux-musl -p dwhy-cli
+          key: musl-${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }} -p dwhy-cli
+        env:
+          # The workflow-level RUSTFLAGS overrides .cargo/config.toml's
+          # [target.*.rustflags] (linker = "rust-lld" still comes from config),
+          # so the musl target flags are repeated here.
+          RUSTFLAGS: -D warnings ${{ matrix.extra_rustflags }}
       - name: Check the binary is static and runs
+        env:
+          TARGET: ${{ matrix.target }}
+          FILE_ARCH: ${{ matrix.file_arch }}
+          QEMU: ${{ matrix.qemu }}
         run: |
-          bin=target/x86_64-unknown-linux-musl/release/dwhy
+          bin="target/$TARGET/release/dwhy"
           file "$bin"
-          file "$bin" | grep -Eq 'static(-pie)? linked'
-          "$bin" --version
-          "$bin" doctor
-          "$bin" scan . --json -q > /dev/null
+          file "$bin" | grep -F "$FILE_ARCH"
+          # aarch64-musl links non-PIE, so `file` says "statically linked";
+          # x86_64-musl says "static-pie linked".
+          file "$bin" | grep -Eq 'static(-pie)? linked|statically linked'
+          if [ "$QEMU" = "true" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends qemu-user-static
+            run=qemu-aarch64-static
+          else
+            run=
+          fi
+          DOCKER_HOST=unix:///nonexistent $run "$bin" --version
+          DOCKER_HOST=unix:///nonexistent $run "$bin" doctor
+          DOCKER_HOST=unix:///nonexistent $run "$bin" scan . --json -q --detectors cargo-target > /dev/null
       - uses: actions/upload-artifact@v4
         with:
-          name: dwhy-x86_64-unknown-linux-musl
-          path: target/x86_64-unknown-linux-musl/release/dwhy
+          name: dwhy-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/dwhy
           retention-days: 14

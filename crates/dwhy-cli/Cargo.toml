@@ -1,10 +1,15 @@
 [package]
 name = "dwhy-cli"
-description = "diskwhy command-line front end"
+description = "Why is my disk filling up, and what is safe to remove? CLI and TUI for Linux."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "dwhy"

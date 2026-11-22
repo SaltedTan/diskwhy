@@ -1,10 +1,15 @@
 [package]
 name = "dwhy-core"
-description = "diskwhy engine: scanner, filesystem accounting and the diskwhy/v1 JSON types"
+description = "diskwhy engine: scanner, detectors, probes, guards, plan/apply, growth and diskwhy/v1 types"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 flate2 = "1"

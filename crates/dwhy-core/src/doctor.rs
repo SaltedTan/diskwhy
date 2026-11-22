@@ -1,4 +1,4 @@
-//! `dwhy doctor`: permissions, optional tools, and which detectors they enable.
+//! `dwhy doctor`: permissions, optional tools, and which detectors and probes they enable.
 //!
 //! Only looks things up; it runs no external commands.
 
