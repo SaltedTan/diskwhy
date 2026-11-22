@@ -143,6 +143,7 @@ Both `dwhy` and `dwhy tui` open the current directory by default. Supply paths a
   - `trash` (`review`; `blocked` if anything was trashed in the last 7 days) — home trash and mount-root `.Trash-<uid>`/`.Trash/<uid>`.
   - `docker-image`, `docker-container`, `docker-volume` (`review`) and `docker-build-cache` (`regenerable` for cache unused ≥ 7 days) — queried via the Docker Engine API Unix socket.
 - Built-in probe: `postgres-wal` — runs read-only during `scan` and `explain` (never `diff`, `watch`, `plan` or `apply`) on in-use `docker-volume` findings that back a running container's Postgres data directory, inspecting PostgreSQL WAL/archiver stats (or API/log fallback) and naming stopped archive target containers without changing the volume's tier or making it removable.
+- `scan --tier TIER,…` lists only findings in those tiers. `scan --json --summary` gives agents a compact report: the largest directories (`--depth` deep, 25 at most), `--max-findings` findings, and `findings_summary` totals over every finding. A `--snapshot` still holds the whole scan. With `--json`, no command writes progress lines to stderr.
 - `scan` removes nothing, and without `--snapshot` writes nothing. See the [safety rules](docs/DESIGN.md#safety-rules-non-negotiable) for the `path-not-utf8` guard recorded during detection.
 
 ### Growth (`--snapshot`, `diff`, `watch`) and `explain`
