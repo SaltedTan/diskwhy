@@ -28,12 +28,17 @@ crates/dwhy-core   engine: scan (walker), tree (the ScanTree detectors read: per
                    snapshot (scan --snapshot: build, save gzip JSON under the state dir, list, prune, load),
                    growth (diff: compare snapshots; watch: rates over a short window;
                    deepest-dir attribution; growth on findings)
-                   explain (dwhy explain: id vs path, id → path through the snapshots, picking the finding at a path)
+                   explain (dwhy explain: id vs path, id → path through the snapshots, picking the finding at a path),
+                   ops (the commands' orchestration the CLI and MCP server share, behind a Frontend for
+                   progress, status and warnings)
 crates/dwhy-cli    clap front end, text rendering (human.rs), exit codes; binary `dwhy`
+crates/dwhy-mcp    rmcp stdio MCP server (binary `dwhy-mcp`): six tools over dwhy-core::ops returning
+                   diskwhy/v1 JSON; apply's ceiling is a launch flag (--max-tier, --read-only), never a
+                   tool argument; stdout is only the protocol. The only crate with tokio/rmcp.
 crates/dwhy-tui    ratatui + crossterm TUI (`dwhy`, `dwhy tui`): app state machine driven by key events; scan, plan build and apply on worker threads; tree, findings, plan preview and apply; calls dwhy-core directly
 ```
 
-Don't create empty crates for later milestones (`dwhy-mcp`); add them when that work starts.
+Don't create empty crates for later milestones; add them when that work starts. Keep `dwhy-cli` free of async runtimes: MCP work belongs in `dwhy-mcp`.
 
 ## Commands
 
