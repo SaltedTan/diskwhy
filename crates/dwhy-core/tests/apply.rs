@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dwhy_core::apply::{self, Audit, AuditInvocation, AuditQuery, Check, Env, Policy};
+use dwhy_core::apply::{self, Audit, AuditInvocation, Check, Env, Policy};
 use dwhy_core::detect::{DetectContext, finding_id};
 use dwhy_core::docker::Source;
 use dwhy_core::guard::{Proc, Processes};
@@ -1887,17 +1887,23 @@ fn confirm_modes_decide_review_items() {
     assert_eq!(allows("flag", false), Ok(()));
     assert_eq!(allows("flag", true), Ok(()));
     // interactive: only with a person on a terminal.
-    let e = allows("interactive", false).unwrap_err();
-    assert!(
-        e.starts_with("review items require an interactive terminal under policy"),
-        "{e}"
+    assert_eq!(
+        allows("interactive", false),
+        Err("review items require an interactive terminal under policy \
+             confirm = \"interactive\" set in /etc/diskwhy/policy.toml \
+             (confirm at the prompt, without --yes)"
+            .into())
     );
     assert_eq!(allows("interactive", true), Ok(()));
     // never: not even then.
     for tty in [false, true] {
         assert_eq!(
             allows("never", tty),
-            Err("review items are disabled by policy".into())
+            Err(
+                "review items are disabled by policy confirm = \"never\" set in \
+                 /etc/diskwhy/policy.toml"
+                    .into()
+            )
         );
     }
     // Without --confirm, the usual wording.
@@ -1919,7 +1925,14 @@ fn confirm_modes_decide_review_items() {
         .find(|c| c.item.detector == "stale-tree")
         .unwrap();
     assert_eq!(stale.item.outcome, ApplyOutcome::Refused);
-    assert_eq!(stale.item.detail, "review items are disabled by policy");
+    assert!(
+        stale
+            .item
+            .detail
+            .starts_with("review items are disabled by policy"),
+        "{}",
+        stale.item.detail
+    );
     // The other tiers do not care about the confirm mode.
     assert!(
         checks
@@ -2070,12 +2083,12 @@ fn old_audit_lines_still_parse() {
 }
 
 #[test]
-fn read_audit_log_filters_and_orders_newest_first() {
+fn read_audit_log_limits_and_orders_newest_first() {
     let (_t, b) = base();
     let log = b.join("audit.jsonl");
     let e = env();
 
-    let missing = apply::read_audit_log(&log, &AuditQuery::default(), &e).unwrap();
+    let missing = apply::read_audit_log(&log, apply::AUDIT_DEFAULT_LIMIT, &e).unwrap();
     assert!(missing.missing);
     assert_eq!((missing.total, missing.records.len()), (0, 0));
 
@@ -2095,7 +2108,7 @@ fn read_audit_log_filters_and_orders_newest_first() {
     let paths = |r: &dwhy_core::report::AuditReport| -> Vec<String> {
         r.records.iter().map(|r| r.path.clone()).collect()
     };
-    let all = apply::read_audit_log(&log, &AuditQuery::default(), &e).unwrap();
+    let all = apply::read_audit_log(&log, apply::AUDIT_DEFAULT_LIMIT, &e).unwrap();
     assert!(!all.missing);
     assert_eq!(all.malformed_lines, 2);
     assert_eq!((all.total, all.omitted), (5, 0));
@@ -2103,59 +2116,11 @@ fn read_audit_log_filters_and_orders_newest_first() {
     assert_eq!(all.records[2].event, AuditEvent::End);
     assert_eq!((all.host.as_str(), all.uid), ("host", 1000));
 
-    let limited = apply::read_audit_log(
-        &log,
-        &AuditQuery {
-            limit: 2,
-            ..AuditQuery::default()
-        },
-        &e,
-    )
-    .unwrap();
+    let limited = apply::read_audit_log(&log, 2, &e).unwrap();
     assert_eq!((limited.total, limited.omitted), (5, 3));
     assert_eq!(paths(&limited), ["/d", "/c"]);
 
-    let outcomes = apply::read_audit_log(
-        &log,
-        &AuditQuery {
-            outcomes: vec![ApplyOutcome::Removed, ApplyOutcome::Refused],
-            limit: 0,
-            ..AuditQuery::default()
-        },
-        &e,
-    )
-    .unwrap();
-    assert_eq!(paths(&outcomes), ["/b", "/a"]);
-    assert_eq!(outcomes.records[0].event, AuditEvent::End);
-
-    let since = apply::parse_audit_since("2026-11-02T00:00:00Z", 0).unwrap();
-    let recent = apply::read_audit_log(
-        &log,
-        &AuditQuery {
-            since: Some(since),
-            ..AuditQuery::default()
-        },
-        &e,
-    )
-    .unwrap();
-    // The record whose time does not parse is left out.
-    assert_eq!(paths(&recent), ["/c", "/b", "/b"]);
-}
-
-#[test]
-fn audit_since_takes_a_duration_or_a_time() {
-    assert_eq!(
-        apply::parse_audit_since("24h", 100_000),
-        Ok(100_000 - 86_400)
-    );
-    assert_eq!(
-        apply::parse_audit_since("7d", 1_000_000),
-        Ok(1_000_000 - 7 * 86_400)
-    );
-    assert_eq!(
-        apply::parse_audit_since("1970-01-02T00:00:00Z", 0),
-        Ok(86_400)
-    );
-    let e = apply::parse_audit_since("yesterday", 0).unwrap_err();
-    assert!(e.contains("--since \"yesterday\""), "{e}");
+    let unlimited = apply::read_audit_log(&log, 0, &e).unwrap();
+    assert_eq!((unlimited.total, unlimited.omitted), (5, 0));
+    assert_eq!(paths(&unlimited), paths(&all));
 }

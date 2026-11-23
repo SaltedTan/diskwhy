@@ -42,15 +42,6 @@ pub enum ConfirmMode {
     Never,
 }
 
-/// The name of a [`ConfirmMode`] as the policy file spells it.
-pub fn confirm_mode_name(m: ConfirmMode) -> &'static str {
-    match m {
-        ConfirmMode::Flag => "flag",
-        ConfirmMode::Interactive => "interactive",
-        ConfirmMode::Never => "never",
-    }
-}
-
 /// One policy file as written.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,8 +76,6 @@ pub struct PolicyConfig {
     pub scratch_paths: Vec<String>,
     /// Days with nothing written after which scratch is stale.
     pub scratch_stale_days: i64,
-    /// The files read, system first.
-    pub loaded: Vec<PathBuf>,
 }
 
 impl Default for PolicyConfig {
@@ -98,7 +87,6 @@ impl Default for PolicyConfig {
             confirm_source: None,
             scratch_paths: Vec::new(),
             scratch_stale_days: SCRATCH_STALE_DAYS,
-            loaded: Vec::new(),
         }
     }
 }
@@ -140,7 +128,6 @@ struct Merge {
 impl Merge {
     fn add(&mut self, file: PolicyFile, path: &Path) {
         let config = &mut self.config;
-        config.loaded.push(path.to_path_buf());
         if let Some(t) = file.max_tier
             && config.max_tier.is_none_or(|cur| t < cur)
         {
@@ -290,13 +277,7 @@ mod tests {
     #[test]
     fn an_empty_file_is_the_default() {
         let c = PolicyConfig::parse("", Path::new("/p.toml")).unwrap();
-        assert_eq!(
-            c,
-            PolicyConfig {
-                loaded: vec!["/p.toml".into()],
-                ..PolicyConfig::default()
-            }
-        );
+        assert_eq!(c, PolicyConfig::default());
         assert_eq!(c.scratch_stale_days, SCRATCH_STALE_DAYS);
         assert_eq!(c.confirm, ConfirmMode::Flag);
     }
@@ -372,7 +353,6 @@ mod tests {
         assert_eq!(c.confirm_source.as_deref(), Some(sys.as_path()));
         assert_eq!(c.scratch_paths, ["/srv/scratch", "~/a", "~/b"]);
         assert_eq!(c.scratch_stale_days, 14);
-        assert_eq!(c.loaded, [sys.clone(), loose.clone()]);
 
         // And to tighten everything.
         let tight = write(

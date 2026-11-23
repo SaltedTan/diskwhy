@@ -116,40 +116,12 @@ Exit codes: 0 ok (also when there is no audit log yet), 1 error.")]
 
 #[derive(Args, Debug)]
 struct AuditArgs {
-    /// Show the newest N matching records (0: all).
+    /// Show the newest N records (0: all).
     #[arg(long, value_name = "N", default_value_t = apply::AUDIT_DEFAULT_LIMIT)]
     limit: usize,
-    /// Only records since WHEN: a duration back from now (24h, 7d) or an RFC 3339 time.
-    #[arg(long, value_name = "WHEN")]
-    since: Option<String>,
-    /// Only `end` records with these outcomes (comma-separated: removed, failed, skipped,
-    /// refused).
-    #[arg(long, value_enum, value_delimiter = ',', value_name = "OUTCOME,…")]
-    outcome: Vec<OutcomeArg>,
     /// Print diskwhy/v1 JSON instead of text.
     #[arg(long)]
     json: bool,
-}
-
-/// Outcomes `audit --outcome` accepts.
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
-enum OutcomeArg {
-    Removed,
-    Failed,
-    Skipped,
-    Refused,
-}
-
-impl From<OutcomeArg> for dwhy_core::report::ApplyOutcome {
-    fn from(o: OutcomeArg) -> Self {
-        use dwhy_core::report::ApplyOutcome;
-        match o {
-            OutcomeArg::Removed => ApplyOutcome::Removed,
-            OutcomeArg::Failed => ApplyOutcome::Failed,
-            OutcomeArg::Skipped => ApplyOutcome::Skipped,
-            OutcomeArg::Refused => ApplyOutcome::Refused,
-        }
-    }
 }
 
 #[derive(Args, Debug)]
@@ -1643,18 +1615,8 @@ fn measure(
 }
 
 fn run_audit(args: AuditArgs) -> Result<u8> {
-    let since = args
-        .since
-        .as_deref()
-        .map(|s| apply::parse_audit_since(s, now_secs()))
-        .transpose()?;
     let path = Audit::default_path().ok_or(apply::AUDIT_UNPLACED)?;
-    let query = apply::AuditQuery {
-        since,
-        outcomes: args.outcome.iter().copied().map(Into::into).collect(),
-        limit: args.limit,
-    };
-    let report = apply::read_audit_log(&path, &query, &apply::Env::from_system())?;
+    let report = apply::read_audit_log(&path, args.limit, &apply::Env::from_system())?;
     if args.json {
         print_json(&report)?;
     } else {

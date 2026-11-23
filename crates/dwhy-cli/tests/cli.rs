@@ -4648,7 +4648,7 @@ fn policy_confirm_modes_refuse_review_items() {
     ] {
         let w = Twin::new();
         let plan = w.cli_plan("plan.json");
-        w.policy(&format!("confirm = \"{mode}\"\n"));
+        let policy = w.policy(&format!("confirm = \"{mode}\"\n"));
         let (n, review) = review_item(&plan);
         let out = w.dwhy_policy(&[
             "apply",
@@ -4664,8 +4664,10 @@ fn policy_confirm_modes_refuse_review_items() {
         let r = report_of(&out);
         let item = &r["items"][n];
         assert_eq!(item["outcome"], "refused", "{mode}: {item}");
+        let detail = item["detail"].as_str().unwrap();
+        assert!(detail.starts_with(why), "{mode}: {item}");
         assert!(
-            item["detail"].as_str().unwrap().starts_with(why),
+            detail.contains(&format!("confirm = \"{mode}\" set in {policy}")),
             "{mode}: {item}"
         );
         let [app, lib, scratch] = w.targets();
@@ -4747,7 +4749,7 @@ fn policy_scratch_paths_and_stale_days_reach_scan() {
 }
 
 #[test]
-fn audit_shows_the_log_newest_first_with_filters() {
+fn audit_shows_the_log_newest_first() {
     let w = Twin::new();
     let audit = |args: &[&str]| {
         let mut all = vec!["audit"];
@@ -4801,15 +4803,6 @@ fn audit_shows_the_log_newest_first_with_filters() {
     );
     assert_eq!(r["records"].as_array().unwrap().len(), 2);
 
-    let r = report_of(&audit(&["--json", "--outcome", "refused,failed"]));
-    let records = r["records"].as_array().unwrap();
-    assert_eq!(records.len(), 1, "{r}");
-    assert_eq!(records[0]["detector"], "stale-tree");
-    let r = report_of(&audit(&["--json", "--outcome", "removed", "--since", "1h"]));
-    assert_eq!(r["records"].as_array().unwrap().len(), 2, "{r}");
-    let r = report_of(&audit(&["--json", "--since", "2999-01-01T00:00:00Z"]));
-    assert_eq!(r["total"], 0, "{r}");
-
     // A line cut short and a hand-edited one with control characters.
     let mut log = fs::read_to_string(w.audit()).unwrap();
     let mut evil: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
@@ -4834,11 +4827,7 @@ fn audit_shows_the_log_newest_first_with_filters() {
     assert!(text.contains("max-tier rebuildable"), "{text}");
 
     // Errors under --json are error reports.
-    let out = audit(&["--json", "--since", "yesterday"]);
-    assert_eq!(out.status.code(), Some(1));
-    let v = error_report(&out, "error");
-    assert!(v["message"].as_str().unwrap().contains("--since"), "{v}");
-    let out = audit(&["--json", "--outcome", "would_remove"]);
+    let out = audit(&["--json", "--limit", "some"]);
     assert_eq!(out.status.code(), Some(1));
     error_report(&out, "usage");
     let out = w

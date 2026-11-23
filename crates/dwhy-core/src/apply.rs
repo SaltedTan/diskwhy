@@ -41,6 +41,8 @@ pub struct Policy {
     pub confirm: Vec<String>,
     /// The policy config's `confirm` mode (default `flag`).
     pub confirm_mode: ConfirmMode,
+    /// The file that set [`Policy::confirm_mode`].
+    pub confirm_source: Option<PathBuf>,
     /// Whether a person confirms this apply on a terminal: `dwhy apply`
     /// without `--yes` on a terminal, and the TUI. `ConfirmMode::Interactive`
     /// refuses review items without it.
@@ -64,6 +66,7 @@ impl Default for Policy {
             max_tier: Tier::Regenerable,
             confirm: Vec::new(),
             confirm_mode: ConfirmMode::Flag,
+            confirm_source: None,
             tty: false,
             ceiling: None,
         }
@@ -93,6 +96,7 @@ impl Policy {
                 .map_or(requested, |c| requested.min(c.tier)),
             confirm,
             confirm_mode: config.confirm,
+            confirm_source: config.confirm_source.clone(),
             tty,
             ceiling,
         }
@@ -110,19 +114,34 @@ impl Policy {
                 )
             })
         };
+        let confirm_source = || {
+            escape_controls(
+                &self
+                    .confirm_source
+                    .as_deref()
+                    .unwrap_or(Path::new("policy.toml"))
+                    .to_string_lossy(),
+            )
+            .into_owned()
+        };
         match f.tier {
             Tier::Blocked => Err("blocked items are never applied".into()),
             Tier::Review => {
                 if self.confirm_mode == ConfirmMode::Never {
-                    return Err("review items are disabled by policy".into());
+                    return Err(format!(
+                        "review items are disabled by policy confirm = \"never\" set in {}",
+                        confirm_source()
+                    ));
                 }
                 if let Some(why) = above_ceiling(Tier::Review) {
                     return Err(why);
                 }
                 if self.confirm_mode == ConfirmMode::Interactive && !self.tty {
-                    return Err("review items require an interactive terminal under policy \
-                         (confirm at the prompt, without --yes)"
-                        .into());
+                    return Err(format!(
+                        "review items require an interactive terminal under policy \
+                         confirm = \"interactive\" set in {} (confirm at the prompt, without --yes)",
+                        confirm_source()
+                    ));
                 }
                 if self.confirm.contains(&f.id) {
                     Ok(())
@@ -552,51 +571,14 @@ fn record(
     }
 }
 
-/// What `dwhy audit` shows of the audit log.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuditQuery {
-    /// Only records at or after this time (seconds since the epoch).
-    pub since: Option<i64>,
-    /// Only `end` records with one of these outcomes; empty: every record.
-    pub outcomes: Vec<ApplyOutcome>,
-    /// The newest this many matching records; 0: all of them.
-    pub limit: usize,
-}
-
 /// `dwhy audit --limit` by default.
 pub const AUDIT_DEFAULT_LIMIT: usize = 50;
 
-impl Default for AuditQuery {
-    fn default() -> Self {
-        AuditQuery {
-            since: None,
-            outcomes: Vec::new(),
-            limit: AUDIT_DEFAULT_LIMIT,
-        }
-    }
-}
-
-/// `dwhy audit --since`: a duration back from `now` (`24h`, `7d`) or an
-/// RFC 3339 time. Returns seconds since the epoch.
-pub fn parse_audit_since(s: &str, now: i64) -> Result<i64, String> {
-    if s.starts_with(|c: char| c.is_ascii_digit())
-        && let Ok(secs) = crate::units::parse_duration(s)
-    {
-        return Ok(now.saturating_sub(secs));
-    }
-    crate::snapshot::parse_time(s).ok_or_else(|| {
-        format!(
-            "--since {:?}: expected a duration such as 24h or 7d, or an RFC 3339 time",
-            escape_controls(s)
-        )
-    })
-}
-
-/// Reads the audit log at `path` for `dwhy audit`: the records matching
-/// `query`, newest first. A missing log is an empty report with `missing`
-/// set; a line that is not a record is counted in `malformed_lines` and
-/// skipped. With `since`, a record whose time does not parse is left out.
-pub fn read_audit_log(path: &Path, query: &AuditQuery, env: &Env) -> Result<AuditReport, String> {
+/// Reads the audit log at `path` for `dwhy audit`: the newest `limit`
+/// records (0: all of them), newest first. A missing log is an empty report
+/// with `missing` set; a line that is not a record is counted in
+/// `malformed_lines` and skipped.
+pub fn read_audit_log(path: &Path, limit: usize, env: &Env) -> Result<AuditReport, String> {
     let mut report = AuditReport {
         schema: SCHEMA.into(),
         tool: Tool::current(),
@@ -630,32 +612,23 @@ pub fn read_audit_log(path: &Path, query: &AuditQuery, env: &Env) -> Result<Audi
             ));
         }
     };
-    let mut matching = Vec::new();
+    let mut records = Vec::new();
     for line in bytes.split(|&b| b == b'\n') {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let Ok(rec) = serde_json::from_slice::<AuditRecord>(line) else {
-            report.malformed_lines += 1;
-            continue;
-        };
-        if let Some(since) = query.since
-            && crate::snapshot::parse_time(&rec.time).is_none_or(|t| t < since)
-        {
-            continue;
+        match serde_json::from_slice::<AuditRecord>(line) {
+            Ok(rec) => records.push(rec),
+            Err(_) => report.malformed_lines += 1,
         }
-        if !query.outcomes.is_empty() && !rec.outcome.is_some_and(|o| query.outcomes.contains(&o)) {
-            continue;
-        }
-        matching.push(rec);
     }
-    report.total = matching.len() as u64;
-    let keep = match query.limit {
-        0 => matching.len(),
-        n => n.min(matching.len()),
+    report.total = records.len() as u64;
+    let keep = match limit {
+        0 => records.len(),
+        n => n.min(records.len()),
     };
-    report.omitted = (matching.len() - keep) as u64;
-    report.records = matching.into_iter().rev().take(keep).collect();
+    report.omitted = (records.len() - keep) as u64;
+    report.records = records.into_iter().rev().take(keep).collect();
     Ok(report)
 }
 

@@ -120,7 +120,7 @@ dwhy explain ID|PATH|docker://… [--json] [--detectors NAME,…]
 dwhy plan [PATH…] [--tier regenerable|rebuildable|review] [--select ID|PATH,… | --free SIZE] [-o FILE] [--json]
           [-x | --cross-filesystems] [--detectors NAME,…]
 dwhy apply PLAN [--max-tier regenerable|rebuildable|review] [--confirm ID,…] [--yes] [--dry-run] [--json]
-dwhy audit [--limit N] [--since 24h|7d|TIME] [--outcome removed|failed|skipped|refused,…] [--json]
+dwhy audit [--limit N] [--json]
 dwhy doctor [--json]
 dwhy guide
 ```
@@ -162,7 +162,7 @@ Both `dwhy` and `dwhy tui` open the current directory by default. Supply paths a
 
 - `plan` selects findings by `--tier` (default `regenerable`) and/or `--select ID|PATH,…`, runs pre-removal guards (active processes, git state, container mounts) and live filesystem identity checks, records fingerprints, and writes a plan file (`-o FILE`) or JSON (`--json`). `--free SIZE` keeps only enough of the eligible findings within the tier ceiling to plan at least SIZE: cheapest tier first, then the finding that adds the most bytes not already planned. Its `goal` reports whether the target was met, the shortfall, and what removable findings the tiers above the ceiling hold (not guarded, never selected); a shortfall still exits `0`. A finding blocked by a guard goes to `blocked` and is never planned; `plan` exits `2` only when a finding named by `--select` is blocked (tier-only selections that get blocked keep exit `0`, so `dwhy plan -o p && dwhy apply p` works). Removes nothing.
 - `apply` rescans the plan's roots, re-runs detectors and guards, verifies every fingerprint and identity check, enforces `--max-tier` (default `regenerable`; `review` items require `--confirm ID`, `blocked` is never applied), asks `y/N` on a terminal (without `--yes` and with no terminal it refuses with exit `3`; `--dry-run` removes nothing and writes no audit entry), and writes start/end entries to `$XDG_STATE_HOME/diskwhy/audit.jsonl` (default `~/.local/state/diskwhy/audit.jsonl`). `apply --json` reports that path as `audit_log`, and a dry run's estimate as `would_free`.
-- `audit` prints the audit log newest first: each item's `start` and `end` records with the outcome, and how apply was invoked (effective `max_tier`, `--confirm` ids, `--yes`, terminal). `--limit N` (default 50, `0` for all), `--since 24h|7d|RFC3339` and `--outcome removed,failed,skipped,refused` narrow it; `--json` gives a `diskwhy/v1` report with `total`, `omitted` and `malformed_lines`. With no log yet it says so and exits `0`.
+- `audit` prints the audit log newest first: each item's `start` and `end` records with the outcome, and how apply was invoked (effective `max_tier`, `--confirm` ids, `--yes`, terminal). `--limit N` (default 50, `0` for all) narrows it; `--json` gives a `diskwhy/v1` report with `total`, `omitted` and `malformed_lines`. With no log yet it says so and exits `0`.
 - `guide` prints a short quickstart for AI agents and automation, matched to the installed version: the safe workflow, risk tiers and authority rules, caveats, and exit codes. It writes nothing and needs no terminal or Docker.
 - `doctor` reports user/root status, which optional tools are on `PATH` (or installed in common off-`PATH` locations), Docker socket access, and the availability of every detector and probe.
 
