@@ -552,11 +552,17 @@ fn apply_refuses_an_expired_plan_and_rejects_junk() {
         let e = called.err();
         assert_eq!(e["kind"], "refused", "{e}");
         assert_eq!(e["exit_code"], 3, "{e}");
-        assert!(e["message"].as_str().unwrap().contains("expired"), "{e}");
-        assert!(e["hint"].as_str().unwrap().contains("`plan`"), "{e}");
+        let message = e["message"].as_str().unwrap();
+        let hint = e["hint"].as_str().unwrap();
+        assert!(message.contains("expired"), "{e}");
+        assert!(hint.contains("`plan`"), "{e}");
+        assert!(!message.contains("dwhy") && !hint.contains("dwhy"), "{e}");
     }
     let called = mcp.call("apply", json!({"plan": {}}));
     assert_eq!(called.err()["kind"], "error");
+    let text = serde_json::to_string(&plan_all(&mut mcp, &h)).unwrap();
+    let called = mcp.call("apply", json!({"plan": text, "dry_run": true}));
+    assert_eq!(called.err()["kind"], "usage");
     let called = mcp.call("apply", json!({}));
     assert_eq!(called.err()["kind"], "usage");
     assert!(h.pip().exists() && h.target().exists() && h.scratch().exists());

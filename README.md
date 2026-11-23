@@ -184,7 +184,7 @@ Both `dwhy` and `dwhy tui` open the current directory by default. Supply paths a
 - `--max-tier regenerable|rebuildable` (default `regenerable`) is the most `apply` removes. The `apply` tool takes a plan and `dry_run` only: no tier and no confirmations, so the model cannot raise the ceiling and `review` items are never removed through MCP. The policy config below can lower the ceiling further.
 - `--read-only` leaves `apply` out of the tool list and refuses calls to it.
 - `apply` re-scans, re-detects, re-runs guards and fingerprints like `dwhy apply --yes`, and records each removal in `audit.jsonl` with `yes: true`, `tty: false`.
-- stdout carries only the protocol; warnings go to stderr. `--threads N` sets walker threads.
+- stdout carries only the protocol; warnings go to stderr.
 
 ### Policy config
 

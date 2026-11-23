@@ -27,9 +27,6 @@ struct Cli {
     /// No `apply` tool: scan, explain, diff, watch and plan only.
     #[arg(long)]
     read_only: bool,
-    /// Worker threads for walks [default: one per CPU].
-    #[arg(long, default_value_t = 0)]
-    threads: usize,
 }
 
 fn main() -> ExitCode {
@@ -45,7 +42,6 @@ fn main() -> ExitCode {
     let server = Server::new(Options {
         max_tier: cli.max_tier,
         read_only: cli.read_only,
-        threads: cli.threads,
     });
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

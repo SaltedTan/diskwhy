@@ -73,8 +73,6 @@ pub struct Options {
     pub max_tier: MaxTier,
     /// No `apply` tool: it is not listed, and calls to it are refused.
     pub read_only: bool,
-    /// Walker threads (0: one per CPU).
-    pub threads: usize,
 }
 
 /// The MCP server.
@@ -277,7 +275,7 @@ impl From<PlanTier> for Tier {
 #[serde(deny_unknown_fields)]
 pub struct ApplyParams {
     /// The diskwhy/v1 Plan object `plan` returned, unchanged.
-    pub plan: serde_json::Value,
+    pub plan: serde_json::Map<String, serde_json::Value>,
     /// Show what would be removed; remove nothing (default false).
     pub dry_run: Option<bool>,
 }
@@ -318,7 +316,7 @@ impl Server {
         )
     )]
     async fn scan(&self, Parameters(p): Parameters<ScanParams>) -> CallToolResult {
-        let fe = self.frontend();
+        let fe = Quiet;
         blocking(move || {
             if p.no_detectors == Some(true) && p.detectors.is_some() {
                 return Err(usage("'no_detectors' cannot be used with 'detectors'"));
@@ -356,7 +354,7 @@ impl Server {
         )
     )]
     async fn explain(&self, Parameters(p): Parameters<ExplainParams>) -> CallToolResult {
-        let fe = self.frontend();
+        let fe = Quiet;
         blocking(move || {
             let report = ops::explain(&p.target, p.detectors.as_deref(), &fe).map_err(error)?;
             content(&report)
@@ -379,7 +377,7 @@ impl Server {
         )
     )]
     async fn diff(&self, Parameters(p): Parameters<DiffParams>) -> CallToolResult {
-        let fe = self.frontend();
+        let fe = Quiet;
         blocking(move || {
             if p.no_detectors == Some(true) && p.detectors.is_some() {
                 return Err(usage("'no_detectors' cannot be used with 'detectors'"));
@@ -413,7 +411,7 @@ impl Server {
         annotations(title = "Watch growth", read_only_hint = true, open_world_hint = false)
     )]
     async fn watch(&self, Parameters(p): Parameters<WatchParams>) -> CallToolResult {
-        let fe = self.frontend();
+        let fe = Quiet;
         blocking(move || {
             let duration = p.duration.as_deref().unwrap_or("60s");
             let window_secs =
@@ -447,7 +445,7 @@ impl Server {
         )
     )]
     async fn plan(&self, Parameters(p): Parameters<PlanParams>) -> CallToolResult {
-        let fe = self.frontend();
+        let fe = Quiet;
         blocking(move || {
             let select = p.select.unwrap_or_default();
             if p.free.is_some() && !select.is_empty() {
@@ -501,17 +499,8 @@ impl Server {
             return error_result(&read_only_refusal());
         }
         let _one_at_a_time = self.apply_lock.lock().await;
-        let fe = self.frontend();
         let max_tier = self.options.max_tier;
-        blocking(move || run_apply(p, max_tier, &fe)).await
-    }
-}
-
-impl Server {
-    fn frontend(&self) -> Quiet {
-        Quiet {
-            threads: self.options.threads,
-        }
+        blocking(move || run_apply(p, max_tier, &Quiet)).await
     }
 }
 
@@ -528,11 +517,7 @@ fn read_only_refusal() -> ErrorReport {
 /// `apply` under the server's ceiling: no confirmations, no terminal, as if
 /// `dwhy apply --yes` ran with no terminal.
 fn run_apply(p: ApplyParams, max_tier: MaxTier, fe: &Quiet) -> Result<Vec<ContentBlock>, Failure> {
-    let text = match p.plan {
-        // A plan passed as its JSON text is the same plan.
-        serde_json::Value::String(s) => s,
-        v => serde_json::to_string(&v).map_err(|e| error(e.to_string()))?,
-    };
+    let text = serde_json::to_string(&p.plan).map_err(|e| error(e.to_string()))?;
     let plan = plan::parse(&text).map_err(error)?;
     if let Some(names) = &plan.scan.detectors {
         detect::validate_selection(names).map_err(error)?;
@@ -548,8 +533,8 @@ fn run_apply(p: ApplyParams, max_tier: MaxTier, fe: &Quiet) -> Result<Vec<Conten
     if let Err(e) = plan::usable(&plan, &env.host, env.uid, ops::now_secs()) {
         return Err(Box::new(ErrorReport::new(
             ErrorKind::Refused,
-            e.to_string(),
-            ops::unusable_hint(&e).map(|h| h.replace("run `dwhy plan`", "call `plan`")),
+            mcp_wording(&e.to_string()),
+            ops::unusable_hint(&e).map(mcp_wording),
             EXIT_REFUSED,
         )));
     }
@@ -569,10 +554,13 @@ fn run_apply(p: ApplyParams, max_tier: MaxTier, fe: &Quiet) -> Result<Vec<Conten
     content(&r)
 }
 
-/// How the server walks: no progress, no status lines, warnings on stderr.
-struct Quiet {
-    threads: usize,
+/// Core messages name the `dwhy plan` command; an MCP client calls the tool.
+fn mcp_wording(s: &str) -> String {
+    s.replace("`dwhy plan`", "the `plan` tool")
 }
+
+/// How the server walks: no progress, no status lines, warnings on stderr.
+struct Quiet;
 
 impl ops::Frontend for Quiet {
     fn measure(
@@ -586,7 +574,7 @@ impl ops::Frontend for Quiet {
             paths,
             one_filesystem,
             min_dir_bytes,
-            self.threads,
+            0,
             mounts,
             &Progress::default(),
             &|msg| self.warn(msg),
