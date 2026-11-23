@@ -3142,6 +3142,8 @@ impl Twin {
             },
             docker: dwhy_core::docker::Source::none(),
             cancel: Default::default(),
+            scratch_paths: Vec::new(),
+            scratch_stale_days: dwhy_core::detectors::SCRATCH_STALE_DAYS,
         }
     }
     /// The TUI session's options for this fixture.
@@ -3156,6 +3158,7 @@ impl Twin {
             audit_log: Some(self.audit()),
             context: Some(self.context()),
             cancel: Default::default(),
+            policy: Default::default(),
         }
     }
     /// `dwhy tui --plan FILE` on this fixture.
@@ -4534,5 +4537,372 @@ fn plan_free_rejects_zero_and_select() {
         assert_eq!(out.status.code(), Some(1), "{extra:?}: {out:?}");
         let v = error_report(&out, "usage");
         assert!(v["message"].as_str().unwrap().contains("--free"), "{v}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Policy config (policy.toml) and `dwhy audit`
+// ---------------------------------------------------------------------------
+
+impl Twin {
+    /// Writes `text` as the user's policy file (under `config/`, passed as
+    /// XDG_CONFIG_HOME by [`Twin::dwhy_policy`]); returns its path.
+    fn policy(&self, text: &str) -> String {
+        let p = self.base.join("config/diskwhy/policy.toml");
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, text).unwrap();
+        p.to_str().unwrap().to_string()
+    }
+    /// [`Twin::dwhy`] with its own XDG_CONFIG_HOME and no Docker daemon.
+    fn dwhy_policy(&self, args: &[&str]) -> Output {
+        self.command(env!("CARGO_BIN_EXE_dwhy"))
+            .env("XDG_CONFIG_HOME", self.base.join("config"))
+            .env("DOCKER_HOST", "unix:///nonexistent")
+            .args(args)
+            .output()
+            .expect("run dwhy")
+    }
+    /// The audit log's records.
+    fn audit_records(&self) -> Vec<Value> {
+        fs::read_to_string(self.audit())
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+}
+
+#[test]
+fn policy_max_tier_caps_apply_and_the_audit_log_records_the_invocation() {
+    let w = Twin::new();
+    let plan = w.cli_plan("plan.json");
+    let policy = w.policy("max_tier = \"regenerable\"\n");
+    let (_, review) = review_item(&plan);
+    let out = w.dwhy_policy(&[
+        "apply",
+        &plan,
+        "--max-tier",
+        "rebuildable",
+        "--confirm",
+        &review,
+        "--yes",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    for t in w.targets() {
+        assert!(t.exists(), "{} was removed", t.display());
+    }
+    let r = report_of(&out);
+    assert_eq!(r["max_tier"], "regenerable", "the effective ceiling");
+    for item in r["items"].as_array().unwrap() {
+        assert_eq!(item["outcome"], "refused", "{item}");
+        let detail = item["detail"].as_str().unwrap();
+        let tier = item["tier"].as_str().unwrap();
+        assert_eq!(
+            detail,
+            format!(
+                "{tier} is above policy max_tier regenerable set in {policy} \
+                 (needs the user's approval)"
+            )
+        );
+    }
+    let records = w.audit_records();
+    assert_eq!(records.len(), 3, "{records:?}");
+    for rec in &records {
+        assert_eq!(rec["outcome"], "refused");
+        assert_eq!(rec["max_tier"], "regenerable");
+        assert_eq!(rec["confirm"], serde_json::json!([review]));
+        assert_eq!(rec["yes"], true);
+        assert_eq!(rec["tty"], false);
+    }
+
+    // The user file can lower the ceiling, never raise it: without it,
+    // the flags decide again.
+    let out = w.dwhy_policy(&["apply", &plan, "--max-tier", "rebuildable", "--yes", "-q"]);
+    assert_eq!(out.status.code(), Some(3));
+    w.policy("max_tier = \"review\"\n");
+    let out = w.dwhy_policy(&[
+        "apply",
+        &plan,
+        "--max-tier",
+        "rebuildable",
+        "--confirm",
+        &review,
+        "--yes",
+        "-q",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    for t in w.targets() {
+        assert!(!t.exists(), "{} is still there", t.display());
+    }
+}
+
+#[test]
+fn policy_confirm_modes_refuse_review_items() {
+    for (mode, why) in [
+        (
+            "interactive",
+            "review items require an interactive terminal under policy",
+        ),
+        ("never", "review items are disabled by policy"),
+    ] {
+        let w = Twin::new();
+        let plan = w.cli_plan("plan.json");
+        w.policy(&format!("confirm = \"{mode}\"\n"));
+        let (n, review) = review_item(&plan);
+        let out = w.dwhy_policy(&[
+            "apply",
+            &plan,
+            "--max-tier",
+            "rebuildable",
+            "--confirm",
+            &review,
+            "--yes",
+            "--json",
+        ]);
+        assert_eq!(out.status.code(), Some(3), "{mode}: {out:?}");
+        let r = report_of(&out);
+        let item = &r["items"][n];
+        assert_eq!(item["outcome"], "refused", "{mode}: {item}");
+        assert!(
+            item["detail"].as_str().unwrap().starts_with(why),
+            "{mode}: {item}"
+        );
+        let [app, lib, scratch] = w.targets();
+        assert!(
+            !app.exists() && !lib.exists(),
+            "{mode}: rebuildable items go"
+        );
+        assert!(scratch.exists(), "{mode}: the review item stays");
+    }
+}
+
+#[test]
+fn a_malformed_policy_fails_closed() {
+    let w = Twin::new();
+    let plan = w.cli_plan("plan.json");
+    let policy = w.policy("max_tier = \"regenrable\"\n");
+    let work = w.work();
+    let work = work.to_str().unwrap();
+    for args in [
+        vec!["apply", plan.as_str(), "--yes", "--json"],
+        vec!["scan", work, "--detectors", APPLY_DETECTORS, "--json"],
+        vec!["plan", work, "--detectors", APPLY_DETECTORS, "--json"],
+    ] {
+        let out = w.dwhy_policy(&args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        let v = error_report(&out, "error");
+        let message = v["message"].as_str().unwrap();
+        assert!(
+            message.starts_with(&format!("invalid policy file {policy}: ")),
+            "{message}"
+        );
+        assert!(message.contains("line 1"), "{message}");
+    }
+    for t in w.targets() {
+        assert!(t.exists());
+    }
+    assert!(!w.audit().exists());
+    // Text: one line on stderr.
+    let out = w.dwhy_policy(&["apply", &plan, "--yes"]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("dwhy: error: invalid policy file"), "{err}");
+    assert_eq!(err.lines().count(), 1, "{err}");
+}
+
+#[test]
+fn policy_scratch_paths_and_stale_days_reach_scan() {
+    let w = Twin::new();
+    let mine = w.base.join("home/projects/sandbox");
+    fs::create_dir_all(mine.join("old")).unwrap();
+    fs::write(mine.join("old/blob"), vec![7u8; 2 << 20]).unwrap();
+    fs::write(mine.join("fresh.txt"), "x").unwrap();
+    age_tree(&mine.join("old"), 10 * 86_400);
+    let scan = |w: &Twin| {
+        let home = w.base.join("home");
+        let out = w.dwhy_policy(&[
+            "scan",
+            home.to_str().unwrap(),
+            "--detectors",
+            "stale-tree",
+            "--json",
+        ]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        report_of(&out)["findings"].as_array().unwrap().clone()
+    };
+    assert!(scan(&w).is_empty(), "not a scratch location by default");
+
+    w.policy("[scratch]\npaths = [\"~/projects/sandbox\"]\nstale_days = 9\n");
+    let found = scan(&w);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["path"], mine.join("old").to_str().unwrap());
+    assert_eq!(found[0]["tier"], "review");
+    let reason = found[0]["reason"].as_str().unwrap();
+    assert!(reason.contains("configured in policy.toml"), "{reason}");
+    assert!(reason.ends_with("stale after 9 days"), "{reason}");
+
+    w.policy("[scratch]\npaths = [\"~/projects/sandbox\"]\nstale_days = 14\n");
+    assert!(scan(&w).is_empty(), "10 days is not stale after 14");
+}
+
+#[test]
+fn audit_shows_the_log_newest_first_with_filters() {
+    let w = Twin::new();
+    let audit = |args: &[&str]| {
+        let mut all = vec!["audit"];
+        all.extend(args);
+        w.dwhy_policy(&all)
+    };
+
+    // No log yet.
+    let out = audit(&["--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let r = report_of(&out);
+    assert_eq!(r["missing"], true);
+    assert_eq!(r["path"], w.audit().to_str().unwrap());
+    assert_eq!(r["records"], serde_json::json!([]));
+    let out = audit(&[]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("no audit log at "),
+        "{out:?}"
+    );
+
+    // An apply: the review item refused, the two targets removed.
+    let plan = w.cli_plan("plan.json");
+    let out = w.dwhy_policy(&["apply", &plan, "--max-tier", "rebuildable", "--yes", "-q"]);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+
+    let r = report_of(&audit(&["--json"]));
+    assert_eq!(r["schema"], "diskwhy/v1");
+    assert_eq!(r["missing"], false);
+    assert_eq!(
+        r["total"], 5,
+        "a refused end, and a start and end for each target"
+    );
+    assert_eq!(r["omitted"], 0);
+    assert!(r.get("malformed_lines").is_none(), "{r}");
+    let records = r["records"].as_array().unwrap();
+    let file_order = w.audit_records();
+    let newest_first: Vec<Value> = file_order.into_iter().rev().collect();
+    assert_eq!(records, &newest_first);
+    for rec in records {
+        assert_eq!(rec["max_tier"], "rebuildable");
+        assert_eq!(rec["confirm"], serde_json::json!([]));
+        assert_eq!(rec["yes"], true);
+        assert_eq!(rec["tty"], false);
+    }
+
+    let r = report_of(&audit(&["--json", "--limit", "2"]));
+    assert_eq!(
+        (r["total"].as_u64(), r["omitted"].as_u64()),
+        (Some(5), Some(3))
+    );
+    assert_eq!(r["records"].as_array().unwrap().len(), 2);
+
+    let r = report_of(&audit(&["--json", "--outcome", "refused,failed"]));
+    let records = r["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{r}");
+    assert_eq!(records[0]["detector"], "stale-tree");
+    let r = report_of(&audit(&["--json", "--outcome", "removed", "--since", "1h"]));
+    assert_eq!(r["records"].as_array().unwrap().len(), 2, "{r}");
+    let r = report_of(&audit(&["--json", "--since", "2999-01-01T00:00:00Z"]));
+    assert_eq!(r["total"], 0, "{r}");
+
+    // A line cut short and a hand-edited one with control characters.
+    let mut log = fs::read_to_string(w.audit()).unwrap();
+    let mut evil: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+    evil["path"] = Value::from(format!("/x/{EVIL}"));
+    evil["detail"] = Value::from(EVIL);
+    evil["host"] = Value::from(EVIL);
+    log.push_str("{\"schema\":\"diskwhy/v1\",\"ti\n");
+    log.push_str(&serde_json::to_string(&evil).unwrap());
+    log.push('\n');
+    fs::write(w.audit(), log).unwrap();
+    let r = report_of(&audit(&["--json"]));
+    assert_eq!(r["malformed_lines"], 1);
+    assert_eq!(r["total"], 6);
+    assert_eq!(r["records"][0]["path"], format!("/x/{EVIL}"));
+    let out = audit(&["--limit", "1"]);
+    let text = escaped_text(&out, EVIL_SHOWN);
+    assert!(
+        text.contains("1 line not an audit record, skipped"),
+        "{text}"
+    );
+    assert!(text.contains("5 older not shown"), "{text}");
+    assert!(text.contains("max-tier rebuildable"), "{text}");
+
+    // Errors under --json are error reports.
+    let out = audit(&["--json", "--since", "yesterday"]);
+    assert_eq!(out.status.code(), Some(1));
+    let v = error_report(&out, "error");
+    assert!(v["message"].as_str().unwrap().contains("--since"), "{v}");
+    let out = audit(&["--json", "--outcome", "would_remove"]);
+    assert_eq!(out.status.code(), Some(1));
+    error_report(&out, "usage");
+    let out = w
+        .command(env!("CARGO_BIN_EXE_dwhy"))
+        .env("HOME", "relative")
+        .env_remove("XDG_STATE_HOME")
+        .args(["audit", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v = error_report(&out, "error");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot place the audit log"),
+        "{v}"
+    );
+}
+
+#[test]
+fn tui_apply_keeps_to_the_policy_config() {
+    use dwhy_tui::KeyCode::*;
+    let w = Twin::new();
+    let file = w.cli_plan("plan.json");
+    let (n, review) = review_item(&file);
+    let path = w.policy("max_tier = \"regenerable\"\n");
+    let config = dwhy_core::policy::PolicyConfig::load_from(None, Some(Path::new(&path))).unwrap();
+    let plan = dwhy_tui::job::read_plan(Path::new(&file)).unwrap();
+    let mut app = dwhy_tui::App::open_plan(
+        plan,
+        file.clone().into(),
+        &dwhy_core::system::hostname(),
+        dwhy_core::system::euid(),
+    )
+    .with_options(dwhy_tui::Options {
+        policy: config,
+        ..w.options()
+    });
+    // Tick the review item, then apply.
+    let mut keys = vec![Char('x')];
+    keys.extend(std::iter::repeat_n(Down, n));
+    keys.extend([Char(' '), Char('y')]);
+    press(&mut app, &keys);
+    let (r, exit) = run_tui_apply(&mut app);
+    assert_eq!(exit, 3, "{r}");
+    assert_eq!(r["max_tier"], "regenerable");
+    for item in r["items"].as_array().unwrap() {
+        assert_eq!(item["outcome"], "refused", "{item}");
+        assert!(
+            item["detail"]
+                .as_str()
+                .unwrap()
+                .contains("above policy max_tier regenerable"),
+            "{item}"
+        );
+    }
+    for t in w.targets() {
+        assert!(t.exists());
+    }
+    for rec in w.audit_records() {
+        assert_eq!(rec["max_tier"], "regenerable");
+        assert_eq!(rec["confirm"], serde_json::json!([review]));
+        assert_eq!(rec["yes"], false);
+        assert_eq!(rec["tty"], true);
     }
 }

@@ -24,19 +24,38 @@ use crate::plan::{
     self, MeasuredRoot, add_changed_guard, changed_removal_root, changed_since_scan,
     measured_roots, nested_roots, removal_path_absent,
 };
+use crate::policy::{ConfirmMode, PolicyConfig};
 use crate::report::{
-    Action, ActionKind, ApplyItem, ApplyOutcome, ApplyReport, AuditEvent, AuditRecord, Finding,
-    GuardStatus, Plan, PlanItem, SCHEMA, Tier, Tool,
+    Action, ActionKind, ApplyItem, ApplyOutcome, ApplyReport, AuditEvent, AuditRecord, AuditReport,
+    Finding, GuardStatus, Plan, PlanItem, SCHEMA, Tier, Tool,
 };
 use crate::tree::ScanTree;
 
 /// What `dwhy apply` may remove.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
-    /// `--max-tier` (default `regenerable`).
+    /// The effective `--max-tier` (default `regenerable`): what was asked
+    /// for, lowered to the policy config's ceiling when that is lower.
     pub max_tier: Tier,
     /// `--confirm`: ids of review items a person confirmed.
     pub confirm: Vec<String>,
+    /// The policy config's `confirm` mode (default `flag`).
+    pub confirm_mode: ConfirmMode,
+    /// Whether a person confirms this apply on a terminal: `dwhy apply`
+    /// without `--yes` on a terminal, and the TUI. `ConfirmMode::Interactive`
+    /// refuses review items without it.
+    pub tty: bool,
+    /// The policy config's `max_tier`, when it sets one.
+    pub ceiling: Option<Ceiling>,
+}
+
+/// A `max_tier` set by the policy config: nothing above it is applied,
+/// review items included, whatever `--max-tier` and `--confirm` say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ceiling {
+    pub tier: Tier,
+    /// The file that set it.
+    pub source: PathBuf,
 }
 
 impl Default for Policy {
@@ -44,23 +63,81 @@ impl Default for Policy {
         Policy {
             max_tier: Tier::Regenerable,
             confirm: Vec::new(),
+            confirm_mode: ConfirmMode::Flag,
+            tty: false,
+            ceiling: None,
         }
     }
 }
 
 impl Policy {
+    /// The policy for `--max-tier requested --confirm confirm` under
+    /// `config`: `max_tier` lowered to the config's, its confirm mode, and
+    /// whether a person confirms on a terminal (`tty`).
+    pub fn with_config(
+        requested: Tier,
+        confirm: Vec<String>,
+        config: &PolicyConfig,
+        tty: bool,
+    ) -> Policy {
+        let ceiling = config.max_tier.map(|tier| Ceiling {
+            tier,
+            source: config
+                .max_tier_source
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("policy.toml")),
+        });
+        Policy {
+            max_tier: ceiling
+                .as_ref()
+                .map_or(requested, |c| requested.min(c.tier)),
+            confirm,
+            confirm_mode: config.confirm,
+            tty,
+            ceiling,
+        }
+    }
+
     /// `Err` with the reason when `f` is not allowed.
     pub fn allows(&self, f: &Finding) -> Result<(), String> {
+        let above_ceiling = |t: Tier| {
+            self.ceiling.as_ref().filter(|c| t > c.tier).map(|c| {
+                format!(
+                    "{} is above policy max_tier {} set in {} (needs the user's approval)",
+                    tier_name(t),
+                    tier_name(c.tier),
+                    escape_controls(&c.source.to_string_lossy()),
+                )
+            })
+        };
         match f.tier {
-            Tier::Review if self.confirm.contains(&f.id) => Ok(()),
-            Tier::Review => Err("a review item needs the user's approval".into()),
             Tier::Blocked => Err("blocked items are never applied".into()),
+            Tier::Review => {
+                if self.confirm_mode == ConfirmMode::Never {
+                    return Err("review items are disabled by policy".into());
+                }
+                if let Some(why) = above_ceiling(Tier::Review) {
+                    return Err(why);
+                }
+                if self.confirm_mode == ConfirmMode::Interactive && !self.tty {
+                    return Err("review items require an interactive terminal under policy \
+                         (confirm at the prompt, without --yes)"
+                        .into());
+                }
+                if self.confirm.contains(&f.id) {
+                    Ok(())
+                } else {
+                    Err("a review item needs the user's approval".into())
+                }
+            }
             t if t <= self.max_tier => Ok(()),
-            t => Err(format!(
-                "{} is above --max-tier {} (needs the user's approval)",
-                tier_name(t),
-                tier_name(self.max_tier),
-            )),
+            t => Err(above_ceiling(t).unwrap_or_else(|| {
+                format!(
+                    "{} is above --max-tier {} (needs the user's approval)",
+                    tier_name(t),
+                    tier_name(self.max_tier),
+                )
+            })),
         }
     }
 }
@@ -409,6 +486,21 @@ pub struct Env {
     pub uid: u32,
     /// Current time as RFC 3339; called for each record.
     pub now: fn() -> String,
+    /// How apply was invoked, stamped on every audit record when set.
+    pub invocation: Option<AuditInvocation>,
+}
+
+/// How an apply was invoked, as its audit records tell it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditInvocation {
+    /// The effective `max_tier` ([`Policy::max_tier`]).
+    pub max_tier: Tier,
+    /// `--confirm` ids (the TUI's ticked review items).
+    pub confirm: Vec<String>,
+    /// `--yes`.
+    pub yes: bool,
+    /// Whether stdin and stderr were a terminal (always true in the TUI).
+    pub tty: bool,
 }
 
 impl Env {
@@ -417,6 +509,15 @@ impl Env {
             host: crate::system::hostname(),
             uid: crate::system::euid(),
             now: crate::system::now_rfc3339,
+            invocation: None,
+        }
+    }
+
+    /// This env with `invocation` stamped on the audit records.
+    pub fn with_invocation(self, invocation: AuditInvocation) -> Env {
+        Env {
+            invocation: Some(invocation),
+            ..self
         }
     }
 }
@@ -444,7 +545,118 @@ fn record(
         action: item.action.clone(),
         outcome,
         detail: outcome.map(|_| item.detail.clone()),
+        max_tier: env.invocation.as_ref().map(|i| i.max_tier),
+        confirm: env.invocation.as_ref().map(|i| i.confirm.clone()),
+        yes: env.invocation.as_ref().map(|i| i.yes),
+        tty: env.invocation.as_ref().map(|i| i.tty),
     }
+}
+
+/// What `dwhy audit` shows of the audit log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditQuery {
+    /// Only records at or after this time (seconds since the epoch).
+    pub since: Option<i64>,
+    /// Only `end` records with one of these outcomes; empty: every record.
+    pub outcomes: Vec<ApplyOutcome>,
+    /// The newest this many matching records; 0: all of them.
+    pub limit: usize,
+}
+
+/// `dwhy audit --limit` by default.
+pub const AUDIT_DEFAULT_LIMIT: usize = 50;
+
+impl Default for AuditQuery {
+    fn default() -> Self {
+        AuditQuery {
+            since: None,
+            outcomes: Vec::new(),
+            limit: AUDIT_DEFAULT_LIMIT,
+        }
+    }
+}
+
+/// `dwhy audit --since`: a duration back from `now` (`24h`, `7d`) or an
+/// RFC 3339 time. Returns seconds since the epoch.
+pub fn parse_audit_since(s: &str, now: i64) -> Result<i64, String> {
+    if s.starts_with(|c: char| c.is_ascii_digit())
+        && let Ok(secs) = crate::units::parse_duration(s)
+    {
+        return Ok(now.saturating_sub(secs));
+    }
+    crate::snapshot::parse_time(s).ok_or_else(|| {
+        format!(
+            "--since {:?}: expected a duration such as 24h or 7d, or an RFC 3339 time",
+            escape_controls(s)
+        )
+    })
+}
+
+/// Reads the audit log at `path` for `dwhy audit`: the records matching
+/// `query`, newest first. A missing log is an empty report with `missing`
+/// set; a line that is not a record is counted in `malformed_lines` and
+/// skipped. With `since`, a record whose time does not parse is left out.
+pub fn read_audit_log(path: &Path, query: &AuditQuery, env: &Env) -> Result<AuditReport, String> {
+    let mut report = AuditReport {
+        schema: SCHEMA.into(),
+        tool: Tool::current(),
+        host: env.host.clone(),
+        uid: env.uid,
+        path: path.to_string_lossy().into_owned(),
+        missing: false,
+        total: 0,
+        omitted: 0,
+        malformed_lines: 0,
+        records: Vec::new(),
+    };
+    let read = OpenOptions::new()
+        .read(true)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(path)
+        .and_then(|mut f| {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut bytes).map(|_| bytes)
+        });
+    let bytes = match read {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            report.missing = true;
+            return Ok(report);
+        }
+        Err(e) => {
+            return Err(format!(
+                "cannot read the audit log {}: {e}",
+                escape_controls(&path.to_string_lossy())
+            ));
+        }
+    };
+    let mut matching = Vec::new();
+    for line in bytes.split(|&b| b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Ok(rec) = serde_json::from_slice::<AuditRecord>(line) else {
+            report.malformed_lines += 1;
+            continue;
+        };
+        if let Some(since) = query.since
+            && crate::snapshot::parse_time(&rec.time).is_none_or(|t| t < since)
+        {
+            continue;
+        }
+        if !query.outcomes.is_empty() && !rec.outcome.is_some_and(|o| query.outcomes.contains(&o)) {
+            continue;
+        }
+        matching.push(rec);
+    }
+    report.total = matching.len() as u64;
+    let keep = match query.limit {
+        0 => matching.len(),
+        n => n.min(matching.len()),
+    };
+    report.omitted = (matching.len() - keep) as u64;
+    report.records = matching.into_iter().rev().take(keep).collect();
+    Ok(report)
 }
 
 /// Runs the ready checks, deepest path first, and attempts to audit every item.

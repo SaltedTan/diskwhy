@@ -53,6 +53,8 @@ fn ctx(home: Option<&Path>) -> DetectContext {
         },
         docker: dwhy_core::docker::Source::none(),
         cancel: Default::default(),
+        scratch_paths: Vec::new(),
+        scratch_stale_days: dwhy_core::detectors::SCRATCH_STALE_DAYS,
     }
 }
 
@@ -417,6 +419,99 @@ fn marked_location_inside_a_location_is_reported_once() {
             "Scratch location {} (marked as scratch by .dwhy-scratch)",
             sandbox.display()
         )),
+        "{}",
+        found[0].reason
+    );
+}
+
+fn detect_with(root: &Path, home: Option<&Path>, paths: &[&str], days: i64) -> Vec<Finding> {
+    let ctx = DetectContext {
+        scratch_paths: paths.iter().map(|p| p.to_string()).collect(),
+        scratch_stale_days: days,
+        ..ctx(home)
+    };
+    let mut f = StaleTree
+        .detect(&scan_tree(root), &ctx)
+        .expect("stale-tree never fails");
+    f.sort_by(|a, b| a.path.cmp(&b.path));
+    f
+}
+
+#[test]
+fn configured_scratch_paths() {
+    let base = tempfile::tempdir().unwrap();
+    let base = base.path();
+    let home = base.join("home");
+    // Absolute, ~/…, relative to home, and a trailing * prefix.
+    let abs = base.join("srv/scratch");
+    let tilde = home.join("work/scratch");
+    let rel = home.join("builds");
+    let globbed = home.join("runs/run-1");
+    let stale = [
+        item(&abs.join("old"), 2 * MB, OLD),
+        item(&tilde.join("old"), 2 * MB, OLD),
+        item(&rel.join("old"), 2 * MB, OLD),
+        item(&globbed.join("old"), 2 * MB, OLD),
+    ];
+    for loc in [&abs, &tilde, &rel, &globbed] {
+        file(&loc.join("fresh.txt"), 10);
+    }
+    // Lookalikes: `runs/run-` itself does not match `run-*`, nor does a
+    // place nobody configured.
+    item(&home.join("runs/run-/old"), 2 * MB, OLD);
+    file(&home.join("runs/run-/fresh.txt"), 10);
+    item(&home.join("elsewhere/old"), 2 * MB, OLD);
+    file(&home.join("elsewhere/fresh.txt"), 10);
+
+    let configured = [
+        abs.to_str().unwrap(),
+        "~/work/scratch/",
+        "builds",
+        "~/runs/run-*",
+    ];
+    let found = detect_with(base, Some(&home), &configured, SCRATCH_STALE_DAYS);
+    let mut want: Vec<String> = stale.iter().map(|p| s(p)).collect();
+    want.sort();
+    assert_eq!(paths(&found), want);
+    for f in &found {
+        assert_eq!(f.tier, Tier::Review);
+        assert!(
+            f.reason.contains("configured in policy.toml"),
+            "{}",
+            f.reason
+        );
+        assert!(f.reason.ends_with("stale after 7 days"), "{}", f.reason);
+    }
+
+    // Without a home, only the absolute entry applies.
+    let found = detect_with(base, None, &configured, SCRATCH_STALE_DAYS);
+    assert_eq!(paths(&found), [s(&stale[0])]);
+}
+
+#[test]
+fn configured_stale_days() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let loc = home.join("scratch");
+    let ten = item(&loc.join("ten"), 2 * MB, 10);
+    let twenty = item(&loc.join("twenty"), 2 * MB, 20);
+    file(&loc.join("fresh.txt"), 10);
+    // The default (7) finds both; 14 only the older one.
+    assert_eq!(
+        paths(&detect_with(home, Some(home), &[], SCRATCH_STALE_DAYS)),
+        [s(&ten), s(&twenty)]
+    );
+    let found = detect_with(home, Some(home), &[], 14);
+    assert_eq!(paths(&found), [s(&twenty)]);
+    assert!(
+        found[0].reason.ends_with("stale after 14 days"),
+        "{}",
+        found[0].reason
+    );
+    // One day: singular.
+    let found = detect_with(home, Some(home), &[], 1);
+    assert!(
+        found[0].reason.ends_with("stale after 1 day"),
         "{}",
         found[0].reason
     );

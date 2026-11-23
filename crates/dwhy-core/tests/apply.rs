@@ -7,12 +7,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use dwhy_core::apply::{self, Audit, Check, Env, Policy};
+use dwhy_core::apply::{self, Audit, AuditInvocation, AuditQuery, Check, Env, Policy};
 use dwhy_core::detect::{DetectContext, finding_id};
 use dwhy_core::docker::Source;
 use dwhy_core::guard::{Proc, Processes};
 use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection};
+use dwhy_core::policy::PolicyConfig;
 use dwhy_core::remove::remove_tree;
 use dwhy_core::report::{
     Action, ActionKind, ApplyOutcome, AuditEvent, AuditRecord, DockerSocket, Finding, GuardResult,
@@ -223,6 +224,8 @@ fn ctx() -> DetectContext {
         },
         docker: Source::none(),
         cancel: Default::default(),
+        scratch_paths: Vec::new(),
+        scratch_stale_days: dwhy_core::detectors::SCRATCH_STALE_DAYS,
     }
 }
 
@@ -313,6 +316,7 @@ fn policy(max: Tier, confirm: &[&str]) -> Policy {
     Policy {
         max_tier: max,
         confirm: confirm.iter().map(|s| s.to_string()).collect(),
+        ..Policy::default()
     }
 }
 
@@ -903,6 +907,7 @@ fn env() -> Env {
         host: "host".into(),
         uid: 1000,
         now: || "2026-11-16T05:00:00Z".to_string(),
+        invocation: None,
     }
 }
 
@@ -1846,4 +1851,311 @@ fn a_mismatched_plan_item_is_reported_with_terminal_controls_escaped() {
         )
     );
     assert!(!item.detail.contains(char::is_control));
+}
+
+// ---------------------------------------------------------------------------
+// Policy config: max_tier ceiling and confirm modes
+// ---------------------------------------------------------------------------
+
+fn config(text: &str) -> PolicyConfig {
+    PolicyConfig::parse(text, Path::new("/etc/diskwhy/policy.toml")).unwrap()
+}
+
+/// The detail of `detector`'s item.
+fn detail<'a>(checks: &'a [Check], detector: &str) -> &'a str {
+    &checks
+        .iter()
+        .find(|c| c.item.detector == detector)
+        .unwrap()
+        .item
+        .detail
+}
+
+#[test]
+fn confirm_modes_decide_review_items() {
+    let (_t, b) = base();
+    let found = fixture(&b);
+    let plan = make_plan(&b, found.clone());
+    let review = &found[2];
+    assert_eq!(review.tier, Tier::Review);
+    let ids = vec![review.id.clone()];
+    let allows = |mode: &str, tty: bool| {
+        let c = config(&format!("confirm = \"{mode}\""));
+        Policy::with_config(Tier::Review, ids.clone(), &c, tty).allows(review)
+    };
+    // flag: --confirm is enough, with or without a terminal.
+    assert_eq!(allows("flag", false), Ok(()));
+    assert_eq!(allows("flag", true), Ok(()));
+    // interactive: only with a person on a terminal.
+    let e = allows("interactive", false).unwrap_err();
+    assert!(
+        e.starts_with("review items require an interactive terminal under policy"),
+        "{e}"
+    );
+    assert_eq!(allows("interactive", true), Ok(()));
+    // never: not even then.
+    for tty in [false, true] {
+        assert_eq!(
+            allows("never", tty),
+            Err("review items are disabled by policy".into())
+        );
+    }
+    // Without --confirm, the usual wording.
+    let c = config("confirm = \"interactive\"");
+    assert_eq!(
+        Policy::with_config(Tier::Review, Vec::new(), &c, true).allows(review),
+        Err("a review item needs the user's approval".into())
+    );
+    // Through evaluate, a refusal (exit 3), not a skip.
+    let c = config("confirm = \"never\"");
+    let checks = evaluate(
+        &b,
+        &plan,
+        found.clone(),
+        &Policy::with_config(Tier::Review, ids.clone(), &c, true),
+    );
+    let stale = checks
+        .iter()
+        .find(|c| c.item.detector == "stale-tree")
+        .unwrap();
+    assert_eq!(stale.item.outcome, ApplyOutcome::Refused);
+    assert_eq!(stale.item.detail, "review items are disabled by policy");
+    // The other tiers do not care about the confirm mode.
+    assert!(
+        checks
+            .iter()
+            .filter(|c| c.item.detector != "stale-tree")
+            .all(|c| c.ready()),
+        "{:?}",
+        outcomes(&checks)
+    );
+}
+
+#[test]
+fn the_config_max_tier_is_a_ceiling_flags_cannot_raise() {
+    let (_t, b) = base();
+    let found = fixture(&b);
+    let plan = make_plan(&b, found.clone());
+    let ids = vec![found[2].id.clone()];
+    let c = config("max_tier = \"regenerable\"");
+    let policy = Policy::with_config(Tier::Rebuildable, ids.clone(), &c, true);
+    assert_eq!(policy.max_tier, Tier::Regenerable, "clamped");
+    let checks = evaluate(&b, &plan, found.clone(), &policy);
+    let mut got = outcomes(&checks);
+    got.sort_by_key(|(d, _)| *d);
+    assert_eq!(
+        got,
+        [
+            ("cargo-target", ApplyOutcome::Refused),
+            ("stale-tree", ApplyOutcome::Refused),
+            ("user-cache", ApplyOutcome::WouldRemove),
+        ]
+    );
+    assert_eq!(
+        detail(&checks, "cargo-target"),
+        "rebuildable is above policy max_tier regenerable set in \
+         /etc/diskwhy/policy.toml (needs the user's approval)"
+    );
+    // A confirmed review item is above the ceiling too.
+    assert!(
+        detail(&checks, "stale-tree").starts_with("review is above policy max_tier regenerable"),
+        "{}",
+        detail(&checks, "stale-tree")
+    );
+
+    // A ceiling at or above what was asked for changes nothing, and the
+    // refusal names --max-tier.
+    let c = config("max_tier = \"review\"");
+    let policy = Policy::with_config(Tier::Regenerable, Vec::new(), &c, true);
+    assert_eq!(policy.max_tier, Tier::Regenerable);
+    let checks = evaluate(&b, &plan, found.clone(), &policy);
+    assert!(
+        detail(&checks, "cargo-target").contains("above --max-tier regenerable"),
+        "{}",
+        detail(&checks, "cargo-target")
+    );
+    // A ceiling of review lets a confirmed review item through.
+    let policy = Policy::with_config(Tier::Rebuildable, ids, &c, true);
+    let checks = evaluate(&b, &plan, found, &policy);
+    assert!(checks.iter().all(|c| c.ready()), "{:?}", outcomes(&checks));
+
+    // No config: the flags as given.
+    let policy = Policy::with_config(
+        Tier::Rebuildable,
+        Vec::new(),
+        &PolicyConfig::default(),
+        false,
+    );
+    assert_eq!(
+        policy,
+        Policy {
+            max_tier: Tier::Rebuildable,
+            ..Policy::default()
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Audit invocation metadata and `dwhy audit`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn audit_records_carry_the_invocation() {
+    let (_t, b) = base();
+    let found = fixture(&b);
+    let plan = make_plan(&b, found.clone());
+    let policy = policy(Tier::Regenerable, &[]);
+    let mut checks = evaluate(&b, &plan, found.clone(), &policy);
+    let (_s, state) = base();
+    let log = state.join("audit.jsonl");
+    let mut audit = Audit::open(&log).unwrap();
+    let invoked = env().with_invocation(AuditInvocation {
+        max_tier: Tier::Regenerable,
+        confirm: vec![found[2].id.clone()],
+        yes: true,
+        tty: false,
+    });
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &invoked,
+        &mut |_| {},
+    );
+    let lines = audit_lines(&log);
+    assert_eq!(lines.len(), 4);
+    for l in &lines {
+        assert_eq!(l.max_tier, Some(Tier::Regenerable));
+        assert_eq!(l.confirm.as_deref(), Some(&[found[2].id.clone()][..]));
+        assert_eq!(l.yes, Some(true));
+        assert_eq!(l.tty, Some(false));
+    }
+    // Without an invocation, the fields are left out of the line.
+    let mut checks = evaluate(&b, &plan, found, &policy);
+    let log2 = state.join("audit2.jsonl");
+    let mut audit = Audit::open(&log2).unwrap();
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &no_mounts(),
+        &env(),
+        &mut |_| {},
+    );
+    let text = fs::read_to_string(&log2).unwrap();
+    for key in ["max_tier", "confirm", "\"yes\"", "\"tty\""] {
+        assert!(!text.contains(key), "{key} in {text}");
+    }
+}
+
+/// An audit line as diskwhy wrote it before invocation metadata.
+fn old_line(time: &str, event: &str, outcome: Option<&str>, path: &str) -> String {
+    let outcome = outcome.map_or("null".to_string(), |o| format!("\"{o}\""));
+    let detail = if event == "end" { "\"done\"" } else { "null" };
+    format!(
+        r#"{{"schema":"diskwhy/v1","time":"{time}","host":"h","uid":1000,"pid":7,"event":"{event}","plan_created_at":"2026-11-01T00:00:00Z","id":"f_000000000001","detector":"user-cache","path":"{path}","tier":"regenerable","bytes":4096,"action":{{"kind":"remove_path","text":"remove {path}","argv":null}},"outcome":{outcome},"detail":{detail}}}"#
+    )
+}
+
+#[test]
+fn old_audit_lines_still_parse() {
+    let line = old_line("2026-11-01T00:00:00Z", "end", Some("removed"), "/x");
+    let r: AuditRecord = serde_json::from_str(&line).unwrap();
+    assert_eq!(r.outcome, Some(ApplyOutcome::Removed));
+    assert_eq!(
+        (r.max_tier, r.confirm, r.yes, r.tty),
+        (None, None, None, None)
+    );
+}
+
+#[test]
+fn read_audit_log_filters_and_orders_newest_first() {
+    let (_t, b) = base();
+    let log = b.join("audit.jsonl");
+    let e = env();
+
+    let missing = apply::read_audit_log(&log, &AuditQuery::default(), &e).unwrap();
+    assert!(missing.missing);
+    assert_eq!((missing.total, missing.records.len()), (0, 0));
+
+    let text = [
+        old_line("2026-11-01T00:00:00Z", "end", Some("refused"), "/a"),
+        old_line("2026-11-02T00:00:00Z", "start", None, "/b"),
+        "{\"truncated".to_string(),
+        old_line("2026-11-02T00:00:01Z", "end", Some("removed"), "/b"),
+        String::new(),
+        "not json at all".to_string(),
+        old_line("2026-11-03T00:00:00Z", "end", Some("failed"), "/c"),
+        old_line("not a time", "end", Some("skipped"), "/d"),
+    ]
+    .join("\n");
+    fs::write(&log, text + "\n").unwrap();
+
+    let paths = |r: &dwhy_core::report::AuditReport| -> Vec<String> {
+        r.records.iter().map(|r| r.path.clone()).collect()
+    };
+    let all = apply::read_audit_log(&log, &AuditQuery::default(), &e).unwrap();
+    assert!(!all.missing);
+    assert_eq!(all.malformed_lines, 2);
+    assert_eq!((all.total, all.omitted), (5, 0));
+    assert_eq!(paths(&all), ["/d", "/c", "/b", "/b", "/a"]);
+    assert_eq!(all.records[2].event, AuditEvent::End);
+    assert_eq!((all.host.as_str(), all.uid), ("host", 1000));
+
+    let limited = apply::read_audit_log(
+        &log,
+        &AuditQuery {
+            limit: 2,
+            ..AuditQuery::default()
+        },
+        &e,
+    )
+    .unwrap();
+    assert_eq!((limited.total, limited.omitted), (5, 3));
+    assert_eq!(paths(&limited), ["/d", "/c"]);
+
+    let outcomes = apply::read_audit_log(
+        &log,
+        &AuditQuery {
+            outcomes: vec![ApplyOutcome::Removed, ApplyOutcome::Refused],
+            limit: 0,
+            ..AuditQuery::default()
+        },
+        &e,
+    )
+    .unwrap();
+    assert_eq!(paths(&outcomes), ["/b", "/a"]);
+    assert_eq!(outcomes.records[0].event, AuditEvent::End);
+
+    let since = apply::parse_audit_since("2026-11-02T00:00:00Z", 0).unwrap();
+    let recent = apply::read_audit_log(
+        &log,
+        &AuditQuery {
+            since: Some(since),
+            ..AuditQuery::default()
+        },
+        &e,
+    )
+    .unwrap();
+    // The record whose time does not parse is left out.
+    assert_eq!(paths(&recent), ["/c", "/b", "/b"]);
+}
+
+#[test]
+fn audit_since_takes_a_duration_or_a_time() {
+    assert_eq!(
+        apply::parse_audit_since("24h", 100_000),
+        Ok(100_000 - 86_400)
+    );
+    assert_eq!(
+        apply::parse_audit_since("7d", 1_000_000),
+        Ok(1_000_000 - 7 * 86_400)
+    );
+    assert_eq!(
+        apply::parse_audit_since("1970-01-02T00:00:00Z", 0),
+        Ok(86_400)
+    );
+    let e = apply::parse_audit_since("yesterday", 0).unwrap_err();
+    assert!(e.contains("--since \"yesterday\""), "{e}");
 }

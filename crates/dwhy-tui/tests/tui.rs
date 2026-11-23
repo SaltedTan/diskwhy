@@ -100,6 +100,7 @@ fn opts(paths: Vec<PathBuf>) -> Options {
         audit_log: None,
         context: None,
         cancel: Default::default(),
+        policy: Default::default(),
     }
 }
 

@@ -49,6 +49,23 @@ pub fn state_dir() -> Option<PathBuf> {
     Some(state.join("diskwhy"))
 }
 
+/// diskwhy's config: `$XDG_CONFIG_HOME/diskwhy`, else
+/// `$HOME/.config/diskwhy`. A relative or empty `XDG_CONFIG_HOME` is
+/// ignored, and a relative or empty `HOME` gives `None`, as in
+/// [`state_dir`].
+pub fn config_dir() -> Option<PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .map(|h| h.join(".config"))
+        })?;
+    Some(config.join("diskwhy"))
+}
+
 pub fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)

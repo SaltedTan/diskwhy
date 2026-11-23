@@ -21,6 +21,7 @@ use dwhy_core::growth;
 use dwhy_core::guard::Processes;
 use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection};
+use dwhy_core::policy::PolicyConfig;
 use dwhy_core::report::{
     ActionKind, ApplyItem, ApplyReport, DetectorRun, Finding, Plan, PlanScan, ScanReport,
     SkipReason, UnreadableReason,
@@ -58,6 +59,10 @@ pub struct Options {
     /// and plan builds with these options run. The TUI cancels it on quit:
     /// those workers are not joined. An apply never uses it.
     pub cancel: Cancel,
+    /// The policy config (`PolicyConfig::load`): its `max_tier` and
+    /// `confirm` limit what apply removes, and its scratch settings go to
+    /// the detectors when `context` is `None`.
+    pub policy: PolicyConfig,
 }
 
 impl Options {
@@ -108,7 +113,7 @@ impl Options {
                 now: now(),
                 ..ctx.clone()
             },
-            None => DetectContext::from_system(),
+            None => DetectContext::from_system().with_policy(&self.policy),
         };
         DetectContext {
             cancel: self.cancel.clone(),
@@ -678,6 +683,16 @@ impl ApplyJob {
         if let Some(names) = &plan.scan.detectors {
             detect::validate_selection(names).map_err(ApplyFailed::error)?;
         }
+        // The dialog is the confirmation: no --yes, on a terminal.
+        let env = &match &env.invocation {
+            Some(_) => env.clone(),
+            None => env.clone().with_invocation(apply::AuditInvocation {
+                max_tier: policy.max_tier,
+                confirm: policy.confirm.clone(),
+                yes: false,
+                tty: true,
+            }),
+        };
         if let Err(e) = plan::usable(&plan, &env.host, env.uid, now()) {
             return Err(ApplyFailed {
                 message: format!("refused: {e}"),

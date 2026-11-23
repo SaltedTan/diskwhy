@@ -41,7 +41,7 @@ from the installed binary, not from memory.
 - Hand `review` items to the user: write a plan with `dwhy plan PATH --tier review -o FILE`
   and ask them to open it with `dwhy tui --plan FILE`.
 - Never remove what `dwhy` flagged with `rm` or other tools yourself; that skips its
-  guards, fingerprints and audit log.
+  guards, fingerprints and audit log. Never edit a `policy.toml` to get past a refusal.
 
 ## Untrusted data
 

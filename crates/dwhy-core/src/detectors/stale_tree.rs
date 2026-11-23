@@ -2,12 +2,16 @@
 //!
 //! A **scratch location** is a directory meant for throwaway work:
 //!
-//! - one of [`SCRATCH_LOCATIONS`] under the home directory, or
+//! - one of [`SCRATCH_LOCATIONS`] under the home directory,
+//! - one of the `[scratch] paths` of the policy config
+//!   ([`DetectContext::scratch_paths`]: absolute, `~/…`, or relative to the
+//!   home directory, with the same trailing `*` as the built-in ones), or
 //! - any directory holding a regular file named [`SCRATCH_MARKER`] (an empty
 //!   file is enough), so other places can opt in without a config file.
 //!
-//! A location with nothing written anywhere in it for [`SCRATCH_STALE_DAYS`]
-//! days is one finding. Otherwise each of its subdirectories with nothing
+//! A location with nothing written anywhere in it for
+//! [`DetectContext::scratch_stale_days`] days (default
+//! [`SCRATCH_STALE_DAYS`]) is one finding. Otherwise each of its subdirectories with nothing
 //! written for that long is a finding; scratch locations such as
 //! `~/.t3/scratch-virgil` get new work every day, so the location as a whole
 //! is never stale even when most of what is in it is. Files directly in a
@@ -20,7 +24,7 @@
 //! it is inside the scanned paths.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::detect::{Candidate, DetectContext, Detector, age, finding_id, rfc3339, shell_quote};
 use crate::report::{Action, ActionKind, Finding, Recovery, Tier};
@@ -44,6 +48,7 @@ const MIN_BYTES: u64 = 1 << 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Origin {
     BuiltIn,
+    Configured,
     Marked,
 }
 
@@ -51,6 +56,7 @@ impl Origin {
     fn describe(self) -> String {
         match self {
             Origin::BuiltIn => "a built-in scratch location".into(),
+            Origin::Configured => "configured in policy.toml".into(),
             Origin::Marked => format!("marked as scratch by {SCRATCH_MARKER}"),
         }
     }
@@ -76,12 +82,20 @@ impl Detector for StaleTree {
             }
         }
         if let Some(home) = &ctx.home {
-            for id in builtin_locations(tree, home) {
+            let builtin = SCRATCH_LOCATIONS.iter().map(|p| home.join(p));
+            for id in matching(tree, builtin) {
                 locations.entry(id).or_insert(Origin::BuiltIn);
             }
         }
+        let configured = ctx
+            .scratch_paths
+            .iter()
+            .filter_map(|p| configured_pattern(p, ctx.home.as_deref()));
+        for id in matching(tree, configured) {
+            locations.entry(id).or_insert(Origin::Configured);
+        }
 
-        let stale_after = SCRATCH_STALE_DAYS * 86_400;
+        let stale_after = ctx.scratch_stale_days.max(1).saturating_mul(86_400);
         let is_stale = |id: NodeId| ctx.now - tree.node(id).newest_mtime >= stale_after;
         let mut out = Vec::new();
         for (&loc, &origin) in &locations {
@@ -140,8 +154,10 @@ impl StaleTree {
                 human(n.shared)
             ));
         }
+        let days = ctx.scratch_stale_days.max(1);
         reason.push_str(&format!(
-            "); scratch counts as stale after {SCRATCH_STALE_DAYS} days"
+            "); scratch counts as stale after {days} day{}",
+            if days == 1 { "" } else { "s" }
         ));
 
         let finding = Finding {
@@ -172,34 +188,50 @@ impl StaleTree {
     }
 }
 
-/// Directories in the tree that match [`SCRATCH_LOCATIONS`] under `home`.
-fn builtin_locations(tree: &ScanTree, home: &Path) -> Vec<NodeId> {
+/// A `[scratch] paths` entry as an absolute pattern: `~/…` and relative
+/// entries are under `home` (`None` without one).
+fn configured_pattern(p: &str, home: Option<&Path>) -> Option<PathBuf> {
+    if let Some(rest) = p.strip_prefix("~/") {
+        Some(home?.join(rest))
+    } else if p.starts_with('/') {
+        Some(PathBuf::from(p))
+    } else {
+        Some(home?.join(p))
+    }
+}
+
+/// Directories in the tree that match `patterns`: absolute paths whose last
+/// component may end in `*`, which matches every directory whose name
+/// starts with what comes before it (and is longer).
+fn matching(tree: &ScanTree, patterns: impl Iterator<Item = PathBuf>) -> Vec<NodeId> {
     let mut out = Vec::new();
-    for pattern in SCRATCH_LOCATIONS {
-        match pattern.strip_suffix('*') {
-            Some(stem) => {
-                let (parent, prefix) = match stem.rsplit_once('/') {
-                    Some((dir, prefix)) => (home.join(dir), prefix),
-                    None => (home.to_path_buf(), stem),
+    for pattern in patterns {
+        // Drops a trailing `/` and `.` components, as the tree's paths have none.
+        let pattern: PathBuf = pattern.components().collect();
+        let Some(name) = pattern.file_name() else {
+            continue;
+        };
+        match name.as_encoded_bytes().strip_suffix(b"*") {
+            Some(prefix) => {
+                let Some(parent) = pattern.parent() else {
+                    continue;
                 };
-                let children = tree.find(&parent).map_or(&[][..], |pid| tree.children(pid));
+                let children = tree.find(parent).map_or(&[][..], |pid| tree.children(pid));
                 let roots = tree
                     .roots()
                     .iter()
-                    .filter(|&&r| Path::new(tree.name(r)).parent() == Some(parent.as_path()));
+                    .filter(|&&r| Path::new(tree.name(r)).parent() == Some(parent));
                 for &id in children.iter().chain(roots) {
                     let path = tree.path(id);
                     let name = path.file_name().unwrap_or_default().as_encoded_bytes();
-                    if tree.node(id).is_dir
-                        && name.len() > prefix.len()
-                        && name.starts_with(prefix.as_bytes())
+                    if tree.node(id).is_dir && name.len() > prefix.len() && name.starts_with(prefix)
                     {
                         out.push(id);
                     }
                 }
             }
             None => {
-                if let Some(id) = tree.find(&home.join(pattern))
+                if let Some(id) = tree.find(&pattern)
                     && tree.node(id).is_dir
                 {
                     out.push(id);

@@ -9,7 +9,8 @@
 //! record scans so later runs can tell what grew ([`growth`]), and
 //! [`probes`] explain why a finding is big; [`explain`] picks what `dwhy
 //! explain` reports. [`cancel`] stops the read-only child processes of a scan
-//! or plan build that its caller abandons.
+//! or plan build that its caller abandons. [`policy`] reads the policy
+//! config that limits apply and adds scratch locations.
 
 pub mod account;
 pub mod apply;
@@ -24,6 +25,7 @@ pub mod growth;
 pub mod guard;
 pub mod mounts;
 pub mod plan;
+pub mod policy;
 pub mod probes;
 pub mod remove;
 pub mod report;

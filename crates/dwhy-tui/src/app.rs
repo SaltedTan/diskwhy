@@ -11,6 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use dwhy_core::apply::Policy;
 use dwhy_core::explain::lossy_finding_paths;
 use dwhy_core::plan;
+use dwhy_core::policy::PolicyConfig;
 use dwhy_core::report::{ActionKind, ApplyOutcome, Finding, Plan, Tier};
 use dwhy_core::scan::Progress;
 use dwhy_core::tree::NodeId;
@@ -579,12 +580,13 @@ impl App {
     /// and hands the apply to the caller. Returns the status message.
     fn start_apply(&mut self, dry_run: bool) -> Option<String> {
         let now = (self.clock)();
+        let config = self.options.policy.clone();
         let view = self.plan_view_mut()?;
         if let Some(why) = view.unusable(now) {
             view.confirm = None;
             return Some(format!("cannot apply: {why}"));
         }
-        let policy = dialog_policy(&view.plan, &view.confirm.as_ref()?.confirmed);
+        let policy = dialog_policy(&view.plan, &view.confirm.as_ref()?.confirmed, &config);
         let plan = view.plan.clone();
         let rescan = match &self.state {
             State::Plan(_) => self.options.for_plan(&plan),
@@ -673,18 +675,18 @@ impl App {
 }
 
 /// What the confirm dialog's ticks ask of core: `--max-tier review` with
-/// `--confirm` for each ticked review item.
-pub(crate) fn dialog_policy(plan: &Plan, confirmed: &BTreeSet<String>) -> Policy {
-    Policy {
-        max_tier: Tier::Review,
-        confirm: plan
-            .items
-            .iter()
-            .map(|i| &i.finding)
-            .filter(|f| needs_review_confirm(f) && confirmed.contains(&f.id))
-            .map(|f| f.id.clone())
-            .collect(),
-    }
+/// `--confirm` for each ticked review item, under the policy config (its
+/// `max_tier` ceiling and `confirm` mode). The dialog is a person
+/// confirming on a terminal, so `confirm = "interactive"` allows ticks.
+pub fn dialog_policy(plan: &Plan, confirmed: &BTreeSet<String>, config: &PolicyConfig) -> Policy {
+    let confirm = plan
+        .items
+        .iter()
+        .map(|i| &i.finding)
+        .filter(|f| needs_review_confirm(f) && confirmed.contains(&f.id))
+        .map(|f| f.id.clone())
+        .collect();
+    Policy::with_config(Tier::Review, confirm, config, true)
 }
 
 /// Whether the confirm dialog offers `f` a tick: a review item that runs

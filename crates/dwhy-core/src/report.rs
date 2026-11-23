@@ -997,6 +997,44 @@ pub struct AuditRecord {
     /// Set on `end`.
     pub outcome: Option<ApplyOutcome>,
     pub detail: Option<String>,
+    /// Effective `max_tier` of the apply invocation: `--max-tier` (the
+    /// TUI's `review`) lowered to the policy config's `max_tier`. Absent in
+    /// records written before diskwhy recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tier: Option<Tier>,
+    /// `--confirm` ids passed to the apply invocation (the review items
+    /// ticked in the TUI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<Vec<String>>,
+    /// Whether `--yes` was passed (false in the TUI, whose dialog confirms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yes: Option<bool>,
+    /// Whether apply ran with an interactive terminal (stdin and stderr for
+    /// `dwhy apply`; always true in the TUI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tty: Option<bool>,
+}
+
+/// Output of `dwhy audit --json`: the audit log's records, newest first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuditReport {
+    pub schema: String,
+    pub tool: Tool,
+    pub host: String,
+    pub uid: u32,
+    /// The audit log read.
+    pub path: String,
+    /// True when there is no audit log yet (nothing was ever applied).
+    pub missing: bool,
+    /// Records that match the filters.
+    pub total: u64,
+    /// Matching records left out by `--limit` (the oldest ones).
+    pub omitted: u64,
+    /// Lines that are not an audit record (cut short or edited); skipped.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub malformed_lines: u64,
+    /// Matching records, newest first (the reverse of file order).
+    pub records: Vec<AuditRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

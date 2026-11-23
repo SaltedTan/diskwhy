@@ -76,9 +76,25 @@ pub struct DetectContext {
     /// Cancels the read-only commands (git, psql) detectors, probes and
     /// guards run with this context; a fresh token by default.
     pub cancel: crate::cancel::Cancel,
+    /// Scratch locations from the policy config (`[scratch] paths`), added
+    /// to the built-in ones for `stale-tree`.
+    pub scratch_paths: Vec<String>,
+    /// Days with nothing written after which `stale-tree` calls scratch
+    /// stale (`[scratch] stale_days`; default
+    /// [`crate::detectors::SCRATCH_STALE_DAYS`]).
+    pub scratch_stale_days: i64,
 }
 
 impl DetectContext {
+    /// This context with the policy config's scratch settings.
+    pub fn with_policy(self, policy: &crate::policy::PolicyConfig) -> DetectContext {
+        DetectContext {
+            scratch_paths: policy.scratch_paths.clone(),
+            scratch_stale_days: policy.scratch_stale_days,
+            ..self
+        }
+    }
+
     /// The real system: euid, `$HOME`, the clock, tools on PATH, the Docker socket.
     pub fn from_system() -> DetectContext {
         let euid = crate::system::euid();
@@ -103,6 +119,8 @@ impl DetectContext {
             docker_socket,
             docker,
             cancel: Default::default(),
+            scratch_paths: Vec::new(),
+            scratch_stale_days: crate::detectors::SCRATCH_STALE_DAYS,
         }
     }
 
@@ -578,6 +596,8 @@ mod tests {
             },
             docker: crate::docker::Source::none(),
             cancel: Default::default(),
+            scratch_paths: Vec::new(),
+            scratch_stale_days: crate::detectors::SCRATCH_STALE_DAYS,
         }
     }
 

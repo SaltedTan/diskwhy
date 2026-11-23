@@ -78,6 +78,8 @@ fn ctx(home: &Path) -> DetectContext {
         },
         docker: Source::fixed(snapshot()),
         cancel: Default::default(),
+        scratch_paths: Vec::new(),
+        scratch_stale_days: dwhy_core::detectors::SCRATCH_STALE_DAYS,
     }
 }
 

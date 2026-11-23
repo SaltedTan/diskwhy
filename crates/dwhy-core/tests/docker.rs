@@ -47,6 +47,8 @@ fn ctx_with(source: Arc<Source>) -> DetectContext {
         },
         docker: source,
         cancel: Default::default(),
+        scratch_paths: Vec::new(),
+        scratch_stale_days: dwhy_core::detectors::SCRATCH_STALE_DAYS,
     }
 }
 

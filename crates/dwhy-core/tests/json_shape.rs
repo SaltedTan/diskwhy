@@ -702,6 +702,10 @@ fn audit_record_shape() {
         },
         outcome: None,
         detail: None,
+        max_tier: None,
+        confirm: None,
+        yes: None,
+        tty: None,
     };
     let end = AuditRecord {
         event: AuditEvent::End,
@@ -709,7 +713,79 @@ fn audit_record_shape() {
         detail: Some("ran cargo clean".into()),
         ..start.clone()
     };
-    insta::assert_json_snapshot!(vec![start, end]);
+    // A record that says how apply was invoked (diskwhy records it now;
+    // the two above are what older versions wrote, and still parse).
+    let invoked = AuditRecord {
+        max_tier: Some(Tier::Rebuildable),
+        confirm: Some(vec!["f_0123456789ab".into()]),
+        yes: Some(true),
+        tty: Some(false),
+        ..end.clone()
+    };
+    let records = vec![start, end, invoked];
+    insta::assert_json_snapshot!(records);
+    for r in &records {
+        let line = serde_json::to_string(r).unwrap();
+        assert_eq!(&serde_json::from_str::<AuditRecord>(&line).unwrap(), r);
+    }
+}
+
+#[test]
+fn audit_report_shape() {
+    let record = AuditRecord {
+        schema: SCHEMA.into(),
+        time: "2026-11-16T04:10:01Z".into(),
+        host: "pc-ubuntu".into(),
+        uid: 1000,
+        pid: 4242,
+        event: AuditEvent::End,
+        plan_created_at: "2026-11-16T04:00:00Z".into(),
+        id: "f_c2b7afdaa165".into(),
+        detector: "cargo-target".into(),
+        path: "/home/me/x/target".into(),
+        tier: Tier::Rebuildable,
+        bytes: 9_663_676_416,
+        action: Action {
+            kind: ActionKind::Command,
+            text: "cargo clean".into(),
+            argv: Some(vec!["cargo".into(), "clean".into()]),
+        },
+        outcome: Some(ApplyOutcome::Removed),
+        detail: Some("ran cargo clean".into()),
+        max_tier: Some(Tier::Rebuildable),
+        confirm: Some(Vec::new()),
+        yes: Some(true),
+        tty: Some(false),
+    };
+    let report = AuditReport {
+        schema: SCHEMA.into(),
+        tool: Tool {
+            name: "diskwhy".into(),
+            version: "0.0.1".into(),
+        },
+        host: "pc-ubuntu".into(),
+        uid: 1000,
+        path: "/home/me/.local/state/diskwhy/audit.jsonl".into(),
+        missing: false,
+        total: 3,
+        omitted: 2,
+        malformed_lines: 1,
+        records: vec![record],
+    };
+    let missing = AuditReport {
+        path: "/home/new/.local/state/diskwhy/audit.jsonl".into(),
+        missing: true,
+        total: 0,
+        omitted: 0,
+        malformed_lines: 0,
+        records: Vec::new(),
+        ..report.clone()
+    };
+    insta::assert_json_snapshot!(vec![report.clone(), missing.clone()]);
+    for r in [report, missing] {
+        let back: AuditReport = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back, r);
+    }
 }
 
 #[test]

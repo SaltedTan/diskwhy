@@ -28,7 +28,7 @@ A plain `du` browser (`gdu`, `ncdu`) shows what is big right now, not what is gr
 - **Honest accounting.** Parallel single-filesystem walks never follow symlinks, count each hardlinked inode once (deterministically at its lexicographically smallest path), subtract bytes kept alive by outside hardlinks from a finding's reclaimable size, list unreadable directories explicitly, and report **unaccounted space** (`df` used − scanned) with likely locations and a `sudo` rerun command.
 - **Safety checks on real state.** Before removing anything, `plan` and `apply` check live processes (`/proc` cwd and open files), git repositories (uncommitted/untracked files, commits on no remote, linked worktrees, submodules, bare/separate git dirs — always with `--no-optional-locks` and no repo hooks/filters), running container mounts, age gates, and path/inode identity fingerprints.
 - **Tool-native removal and recovery cost.** Uses `cargo clean`, `git worktree remove` (never `--force`), `docker builder prune --filter until=168h`, `go clean -cache`, `uv cache clean`, `rustup toolchain uninstall`, etc., and states what each item costs to restore.
-- **Bounded agent policy.** Every finding has a risk tier (`regenerable`, `rebuildable`, `review`, `blocked`). `dwhy apply` defaults to `--max-tier regenerable`, requires explicit per-item `--confirm <id>` for `review` items, never applies `blocked` items, re-scans and re-verifies fingerprints right before acting, and appends every executed action to `~/.local/state/diskwhy/audit.jsonl` (`$XDG_STATE_HOME` if set; `--dry-run` writes nothing).
+- **Bounded agent policy.** Every finding has a risk tier (`regenerable`, `rebuildable`, `review`, `blocked`). `dwhy apply` defaults to `--max-tier regenerable`, requires explicit per-item `--confirm <id>` for `review` items, never applies `blocked` items, re-scans and re-verifies fingerprints right before acting, and appends every executed action, with how apply was invoked, to `~/.local/state/diskwhy/audit.jsonl` (`$XDG_STATE_HOME` if set; `--dry-run` writes nothing; `dwhy audit` reads it). A root-owned `/etc/diskwhy/policy.toml` can cap the tier and how review items are confirmed for the whole machine.
 
 ## Installation
 
@@ -120,6 +120,7 @@ dwhy explain ID|PATH|docker://… [--json] [--detectors NAME,…]
 dwhy plan [PATH…] [--tier regenerable|rebuildable|review] [--select ID|PATH,… | --free SIZE] [-o FILE] [--json]
           [-x | --cross-filesystems] [--detectors NAME,…]
 dwhy apply PLAN [--max-tier regenerable|rebuildable|review] [--confirm ID,…] [--yes] [--dry-run] [--json]
+dwhy audit [--limit N] [--since 24h|7d|TIME] [--outcome removed|failed|skipped|refused,…] [--json]
 dwhy doctor [--json]
 dwhy guide
 ```
@@ -142,7 +143,7 @@ Both `dwhy` and `dwhy tui` open the current directory by default. Supply paths a
   - `venv` (`rebuildable` with project files, `review` without) — Python virtualenvs holding `pyvenv.cfg`.
   - `user-cache` (`regenerable`; `blocked` if written in the last 24h) — pip, uv, npm/npx, pnpm, yarn, Go, Cargo, Playwright, and Hugging Face caches.
   - `git-worktree` (`review`; locked ones `blocked`) — linked worktrees untouched for 14 days (`git worktree remove`, never `--force`) and prunable missing worktrees (`git worktree prune`).
-  - `stale-tree` (`review`) — directories untouched for 7 days in `~/scratch`, `~/tmp`, `~/.t3/scratch`, `~/.t3/scratch-*`, or any directory containing a `.dwhy-scratch` file.
+  - `stale-tree` (`review`) — directories untouched for 7 days in `~/scratch`, `~/tmp`, `~/.t3/scratch`, `~/.t3/scratch-*`, any directory containing a `.dwhy-scratch` file, or `[scratch] paths` from the [policy config](#policy-config) (which can also set the age).
   - `tool-versions` (`rebuildable`) — old rustup toolchains, uv/pyenv Pythons, nvm/fnm Node versions, `~/sdk` Go SDKs, VS Code Server versions, and old Claude Code, Codex and T3 runtime versions not active, pinned, in use by a running process, or newest.
   - `trash` (`review`; `blocked` if anything was trashed in the last 7 days) — home trash and mount-root `.Trash-<uid>`/`.Trash/<uid>`.
   - `docker-image`, `docker-container`, `docker-volume` (`review`) and `docker-build-cache` (`regenerable` for cache unused ≥ 7 days) — queried via the Docker Engine API Unix socket.
@@ -161,8 +162,28 @@ Both `dwhy` and `dwhy tui` open the current directory by default. Supply paths a
 
 - `plan` selects findings by `--tier` (default `regenerable`) and/or `--select ID|PATH,…`, runs pre-removal guards (active processes, git state, container mounts) and live filesystem identity checks, records fingerprints, and writes a plan file (`-o FILE`) or JSON (`--json`). `--free SIZE` keeps only enough of the eligible findings within the tier ceiling to plan at least SIZE: cheapest tier first, then the finding that adds the most bytes not already planned. Its `goal` reports whether the target was met, the shortfall, and what removable findings the tiers above the ceiling hold (not guarded, never selected); a shortfall still exits `0`. A finding blocked by a guard goes to `blocked` and is never planned; `plan` exits `2` only when a finding named by `--select` is blocked (tier-only selections that get blocked keep exit `0`, so `dwhy plan -o p && dwhy apply p` works). Removes nothing.
 - `apply` rescans the plan's roots, re-runs detectors and guards, verifies every fingerprint and identity check, enforces `--max-tier` (default `regenerable`; `review` items require `--confirm ID`, `blocked` is never applied), asks `y/N` on a terminal (without `--yes` and with no terminal it refuses with exit `3`; `--dry-run` removes nothing and writes no audit entry), and writes start/end entries to `$XDG_STATE_HOME/diskwhy/audit.jsonl` (default `~/.local/state/diskwhy/audit.jsonl`). `apply --json` reports that path as `audit_log`, and a dry run's estimate as `would_free`.
+- `audit` prints the audit log newest first: each item's `start` and `end` records with the outcome, and how apply was invoked (effective `max_tier`, `--confirm` ids, `--yes`, terminal). `--limit N` (default 50, `0` for all), `--since 24h|7d|RFC3339` and `--outcome removed,failed,skipped,refused` narrow it; `--json` gives a `diskwhy/v1` report with `total`, `omitted` and `malformed_lines`. With no log yet it says so and exits `0`.
 - `guide` prints a short quickstart for AI agents and automation, matched to the installed version: the safe workflow, risk tiers and authority rules, caveats, and exit codes. It writes nothing and needs no terminal or Docker.
 - `doctor` reports user/root status, which optional tools are on `PATH` (or installed in common off-`PATH` locations), Docker socket access, and the availability of every detector and probe.
+
+### Policy config
+
+Two optional TOML files limit what `apply` and the TUI remove and add scratch locations: `/etc/diskwhy/policy.toml` (root-owned, the machine's ceiling) and `$XDG_CONFIG_HOME/diskwhy/policy.toml` (default `~/.config/diskwhy/policy.toml`). Every key is optional:
+
+```toml
+max_tier = "regenerable"   # regenerable | rebuildable | review
+confirm = "flag"           # flag (default) | interactive | never
+
+[scratch]
+paths = ["~/work/scratch", "/srv/scratch"]  # added to the built-in scratch locations
+stale_days = 14                             # default 7
+```
+
+- The user file and the flags can only tighten `/etc`: the lower `max_tier`, the stricter `confirm`, the larger `stale_days`, and the union of `scratch.paths` win. `max_tier` lowers `--max-tier` and also refuses `review` items above it, even with `--confirm`.
+- `confirm = "interactive"` refuses `review` items unless a person confirms at the terminal prompt (`--yes` or no terminal is refused; the TUI's dialog counts); `"never"` refuses every `review` item.
+- An unknown key, a bad value or unparsable TOML is an error (exit `1`), never ignored.
+
+**Trust boundary.** Flags and the user's own config guard against mistakes and accidental escalation, by a person or an agent running as your user; they are not a security boundary against that agent, which can edit your files or remove things without diskwhy. The root-owned `/etc/diskwhy/policy.toml` sets a ceiling no flag or user file raises, and `audit.jsonl` records how every apply was invoked. A hard boundary for an AI agent needs a non-shell client (the planned MCP server) or an OS privilege boundary (a separate user). See [Policy config](docs/DESIGN.md#policy-config).
 
 ### Exit codes
 
