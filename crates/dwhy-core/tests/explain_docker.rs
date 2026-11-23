@@ -36,6 +36,8 @@ fn findings(d: &docker::Snapshot) -> Vec<Finding> {
         },
         docker: Source::fixed(d.clone()),
         cancel: Default::default(),
+        scratch_paths: Vec::new(),
+        scratch_stale_days: dwhy_core::detectors::SCRATCH_STALE_DAYS,
     };
     [
         &DockerImage as &dyn Detector,

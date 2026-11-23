@@ -9,9 +9,9 @@ use dwhy_core::detect::escape_controls;
 use dwhy_core::explain;
 use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{
-    ApplyOutcome, ApplyReport, Change, ChangeKind, DetectorAvailability, DiffReport, DirEntry,
-    DoctorReport, ExplainReport, Finding, FsReport, GuardStatus, Plan, PlanGoal, Rate, ScanReport,
-    SkipReason, Tier, WatchReport,
+    ApplyOutcome, ApplyReport, AuditEvent, AuditReport, Change, ChangeKind, DetectorAvailability,
+    DiffReport, DirEntry, DoctorReport, ExplainReport, Finding, FsReport, GuardStatus, Plan,
+    PlanGoal, Rate, ScanReport, SkipReason, Tier, WatchReport,
 };
 use dwhy_core::units::{age, human, signed, thousands};
 
@@ -1042,6 +1042,88 @@ fn walk(
             human(rest),
             kids.len() - shown
         )?;
+    }
+    Ok(())
+}
+
+/// `dwhy audit`: the audit log's records, newest first. Every field comes
+/// from a file anyone with the user's rights can edit: all of it is escaped.
+pub fn render_audit(w: &mut impl Write, r: &AuditReport) -> io::Result<()> {
+    let path = escape_controls(&r.path);
+    if r.missing {
+        writeln!(w, "no audit log at {path}: nothing has been applied yet")?;
+        return Ok(());
+    }
+    let shown = r.records.len();
+    let plural = |n: u64| if n == 1 { "" } else { "s" };
+    writeln!(w, "audit log {path}")?;
+    let mut summary = format!(
+        "{shown} of {} matching record{}, newest first",
+        r.total,
+        plural(r.total)
+    );
+    if r.omitted > 0 {
+        summary.push_str(&format!(
+            "; {} older not shown (--limit 0 shows all)",
+            r.omitted
+        ));
+    }
+    writeln!(w, "{summary}")?;
+    if r.malformed_lines > 0 {
+        writeln!(
+            w,
+            "{} line{} not an audit record, skipped",
+            r.malformed_lines,
+            plural(r.malformed_lines)
+        )?;
+    }
+    for rec in &r.records {
+        writeln!(w)?;
+        let what = match (rec.event, rec.outcome) {
+            (AuditEvent::Start, _) => "start".to_string(),
+            (AuditEvent::End, Some(o)) => apply::outcome_label(o).to_string(),
+            (AuditEvent::End, None) => "end".to_string(),
+        };
+        writeln!(
+            w,
+            "{}  {:<12} {:<11} {:>8}  {}",
+            escape_controls(&rec.time),
+            what,
+            tier_name(rec.tier),
+            human(rec.bytes),
+            escape_controls(&rec.path)
+        )?;
+        let mut how = vec![
+            format!(
+                "{} {}",
+                escape_controls(&rec.detector),
+                escape_controls(&rec.id)
+            ),
+            format!(
+                "uid {} on {}, pid {}",
+                rec.uid,
+                escape_controls(&rec.host),
+                rec.pid
+            ),
+        ];
+        if let Some(t) = rec.max_tier {
+            how.push(format!("max-tier {}", tier_name(t)));
+        }
+        if let Some(c) = rec.confirm.as_ref().filter(|c| !c.is_empty()) {
+            let ids: Vec<_> = c.iter().map(|id| escape_controls(id)).collect();
+            how.push(format!("confirm {}", ids.join(",")));
+        }
+        if let Some(yes) = rec.yes {
+            how.push(if yes { "--yes" } else { "no --yes" }.into());
+        }
+        if let Some(tty) = rec.tty {
+            how.push(if tty { "terminal" } else { "no terminal" }.into());
+        }
+        writeln!(w, "  {}", how.join(" · "))?;
+        writeln!(w, "  action: {}", escape_controls(&rec.action.text))?;
+        if let Some(detail) = rec.detail.as_deref().filter(|d| !d.is_empty()) {
+            writeln!(w, "  {}", escape_controls(detail))?;
+        }
     }
     Ok(())
 }

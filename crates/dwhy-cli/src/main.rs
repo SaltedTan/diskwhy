@@ -22,6 +22,7 @@ use dwhy_core::explain::{self, Place, Query, Walk};
 use dwhy_core::guard::Processes;
 use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection};
+use dwhy_core::policy::PolicyConfig;
 use dwhy_core::report::{
     ActionKind, DEFAULT_SUMMARY_DEPTH, DEFAULT_SUMMARY_DIRS, DEFAULT_SUMMARY_FINDINGS, ErrorKind,
     ErrorReport, ExplainReport, ExplainResolved, ExplainSize, ExplainVia, Plan, PlanScan,
@@ -72,9 +73,12 @@ written).")]
     Plan(PlanArgs),
     /// Carry out a plan: re-detect, re-run the guards, and remove what the tier policy allows.
     #[command(after_help = "\
+/etc/diskwhy/policy.toml and ~/.config/diskwhy/policy.toml can lower --max-tier and require a
+terminal for (or refuse) review items; neither flags nor the user file can raise /etc.
+
 Exit codes: 0 ok, 1 error or a failed removal, 2 items skipped by a guard or a changed
-fingerprint, 3 refused by policy (above --max-tier, no --confirm), no terminal and no --yes, or
-the plan is expired or from another host or user (make a fresh plan).")]
+fingerprint, 3 refused by policy (above --max-tier or policy.toml, no --confirm), no terminal
+and no --yes, or the plan is expired or from another host or user (make a fresh plan).")]
     Apply(ApplyArgs),
     /// Show what grew since a snapshot (`scan --snapshot`): rescans now and compares.
     #[command(after_help = "\
@@ -98,9 +102,26 @@ Exit codes: 0 ok, 1 error.")]
         #[arg(long)]
         json: bool,
     },
+    /// Show what `dwhy apply` and the TUI did: the audit log's records, newest first.
+    #[command(after_help = "\
+Records are read from $XDG_STATE_HOME/diskwhy/audit.jsonl (else ~/.local/state/diskwhy/).
+Each removal has a `start` record before it runs and an `end` record with its outcome.
+
+Exit codes: 0 ok (also when there is no audit log yet), 1 error.")]
+    Audit(AuditArgs),
     /// Print a concise quickstart for AI agents and automation (version-matched).
     #[command(after_help = "Exit codes: 0 ok, 1 error.")]
     Guide,
+}
+
+#[derive(Args, Debug)]
+struct AuditArgs {
+    /// Show the newest N records (0: all).
+    #[arg(long, value_name = "N", default_value_t = apply::AUDIT_DEFAULT_LIMIT)]
+    limit: usize,
+    /// Print diskwhy/v1 JSON instead of text.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -405,6 +426,7 @@ fn main() -> ExitCode {
         Some(Command::Watch(a)) => a.json,
         Some(Command::Explain(a)) => a.json,
         Some(Command::Doctor { json }) => *json,
+        Some(Command::Audit(a)) => a.json,
         Some(Command::Tui(_) | Command::Guide) | None => false,
     };
     let res = match cli.command {
@@ -415,6 +437,7 @@ fn main() -> ExitCode {
         Some(Command::Watch(args)) => run_watch(args),
         Some(Command::Explain(args)) => run_explain(args),
         Some(Command::Doctor { json }) => run_doctor(json),
+        Some(Command::Audit(args)) => run_audit(args),
         Some(Command::Guide) => guide::run(),
         Some(Command::Tui(args)) => run_tui(args),
         None => run_tui(TuiArgs {
@@ -538,7 +561,21 @@ fn usage_message(rendered: &str) -> (String, Option<String>) {
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// The policy config (`/etc/diskwhy/policy.toml`, then the user's). A file
+/// that exists but is unreadable or invalid is an error: commands fail
+/// closed rather than run without a limit someone set.
+fn policy_config() -> Result<PolicyConfig> {
+    Ok(PolicyConfig::load()?)
+}
+
+/// What detectors know about this system, with the policy config's scratch
+/// settings.
+fn detect_context(policy: &PolicyConfig) -> DetectContext {
+    DetectContext::from_system().with_policy(policy)
+}
+
 fn run_tui(args: TuiArgs) -> Result<u8> {
+    let policy = policy_config()?;
     let opts = dwhy_tui::Options {
         paths: args.paths,
         cross_filesystems: args.cross_filesystems,
@@ -549,6 +586,7 @@ fn run_tui(args: TuiArgs) -> Result<u8> {
         audit_log: Audit::default_path(),
         context: None,
         cancel: Default::default(),
+        policy,
     };
     match &args.plan {
         Some(file) => dwhy_tui::run_plan(file, opts),
@@ -571,6 +609,7 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
     if let Some(names) = &args.detectors {
         detect::validate_selection(names)?;
     }
+    let policy = policy_config()?;
     let mounts = MountTable::read().unwrap_or_default();
     let mut result = measure(
         &args.paths,
@@ -593,7 +632,13 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
     let docker_snap = if args.no_detectors {
         None
     } else {
-        detect::detect_into(&mut report, &result.tree, args.detectors.as_deref(), true)
+        detect::detect_into_with(
+            &mut report,
+            &result.tree,
+            &detect_context(&policy),
+            args.detectors.as_deref(),
+            true,
+        )
     };
 
     // Growth on findings, from a snapshot of the same roots old enough for
@@ -678,6 +723,7 @@ fn run_diff(args: DiffArgs) -> Result<u8> {
         detect::validate_selection(names)?;
     }
     let since = snapshot::parse_since(&args.since)?;
+    let policy = policy_config()?;
     let dir = match (snapshot::default_dir(), &since) {
         (Some(d), _) => d,
         (None, snapshot::Since::File(_)) => PathBuf::new(),
@@ -755,7 +801,13 @@ fn run_diff(args: DiffArgs) -> Result<u8> {
     let docker_snap = if args.no_detectors {
         None
     } else {
-        detect::detect_into(&mut report, &result.tree, args.detectors.as_deref(), false)
+        detect::detect_into_with(
+            &mut report,
+            &result.tree,
+            &detect_context(&policy),
+            args.detectors.as_deref(),
+            false,
+        )
     };
     let fresh = snapshot::build(
         &report,
@@ -910,6 +962,7 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
     if let Some(names) = &args.detectors {
         detect::validate_selection(names)?;
     }
+    let policy = policy_config()?;
     let host = system::hostname();
     let uid = system::euid();
     let dir = snapshot::default_dir();
@@ -933,7 +986,7 @@ fn run_explain(args: ExplainArgs) -> Result<u8> {
     };
 
     let generated_at = system::now_rfc3339();
-    let ctx = DetectContext::from_system();
+    let ctx = detect_context(&policy);
     let mut size = None;
     let is_docker = matches!(&place, Place::Docker(_));
     // A walk that could not read part of the path; a failed walk of a
@@ -1212,6 +1265,7 @@ fn run_plan(args: PlanArgs) -> Result<u8> {
     if let Some(names) = &args.detectors {
         detect::validate_selection(names)?;
     }
+    let policy = policy_config()?;
     let mounts = MountTable::read().unwrap_or_default();
     let one_fs = !args.cross_filesystems;
     // Detectors read the tree; no directory list is needed.
@@ -1223,7 +1277,7 @@ fn run_plan(args: PlanArgs) -> Result<u8> {
         silent_progress(args.quiet, args.json),
         &mounts,
     )?;
-    let ctx = DetectContext::from_system();
+    let ctx = detect_context(&policy);
     let (findings, _) = detect::run_with(
         &result.tree,
         &ctx,
@@ -1302,6 +1356,7 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
     if let Some(names) = &plan.scan.detectors {
         detect::validate_selection(names)?;
     }
+    let config = policy_config()?;
     if let Some(bad) = args
         .confirm
         .iter()
@@ -1313,12 +1368,25 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
         )
         .into());
     }
-    let env = apply::Env::from_system();
+    let terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    // A person confirms on the terminal unless --yes skips the prompt.
+    let policy = Policy::with_config(
+        args.max_tier.into(),
+        args.confirm.clone(),
+        &config,
+        terminal && !args.yes,
+    );
+    let env = apply::Env::from_system().with_invocation(apply::AuditInvocation {
+        max_tier: policy.max_tier,
+        confirm: args.confirm.clone(),
+        yes: args.yes,
+        tty: terminal,
+    });
     if let Err(e) = plan::usable(&plan, &env.host, env.uid, now_secs()) {
         return Ok(refuse(args.json, &e.to_string(), unusable_hint(&e), false));
     }
     let ask = !args.yes && !args.dry_run;
-    if ask && !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+    if ask && !terminal {
         return Ok(refuse(
             args.json,
             "no terminal to confirm on",
@@ -1326,13 +1394,10 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
             true,
         ));
     }
-    let policy = Policy {
-        max_tier: args.max_tier.into(),
-        confirm: args.confirm.clone(),
-    };
     let mut checks = survey(
         &plan,
         &policy,
+        &config,
         args.threads,
         silent_progress(args.quiet, args.json),
     )?;
@@ -1371,6 +1436,7 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
         let again = survey(
             &plan,
             &policy,
+            &config,
             args.threads,
             silent_progress(args.quiet, args.json),
         )?;
@@ -1406,7 +1472,13 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
 }
 
 /// Rescans the plan's roots, re-runs its detectors, and decides each item.
-fn survey(plan: &Plan, policy: &Policy, threads: usize, quiet: bool) -> Result<Vec<Check>> {
+fn survey(
+    plan: &Plan,
+    policy: &Policy,
+    config: &PolicyConfig,
+    threads: usize,
+    quiet: bool,
+) -> Result<Vec<Check>> {
     let mounts = MountTable::read().unwrap_or_default();
     let roots: Vec<PathBuf> = plan.scan.roots.iter().map(PathBuf::from).collect();
     let result = measure(
@@ -1417,7 +1489,7 @@ fn survey(plan: &Plan, policy: &Policy, threads: usize, quiet: bool) -> Result<V
         quiet,
         &mounts,
     )?;
-    let ctx = DetectContext::from_system();
+    let ctx = detect_context(config);
     let (findings, _) = detect::run_with(
         &result.tree,
         &ctx,
@@ -1540,6 +1612,17 @@ fn measure(
         let _ = t.join();
     }
     result
+}
+
+fn run_audit(args: AuditArgs) -> Result<u8> {
+    let path = Audit::default_path().ok_or(apply::AUDIT_UNPLACED)?;
+    let report = apply::read_audit_log(&path, args.limit, &apply::Env::from_system())?;
+    if args.json {
+        print_json(&report)?;
+    } else {
+        human::render_audit(&mut std::io::stdout().lock(), &report)?;
+    }
+    Ok(EXIT_OK)
 }
 
 fn run_doctor(json: bool) -> Result<u8> {

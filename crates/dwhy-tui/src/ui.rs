@@ -14,6 +14,7 @@ use dwhy_core::apply::{
 };
 use dwhy_core::detect::{PATH_NOT_UTF8_RECOVERY_NOTE, is_lossy, rfc3339};
 use dwhy_core::plan;
+use dwhy_core::policy::PolicyConfig;
 use dwhy_core::probes::postgres_wal;
 use dwhy_core::report::{
     ActionKind, ApplyOutcome, Finding, FsReport, GuardStatus, Plan, SkipReason, Tier,
@@ -86,6 +87,7 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let prompt_open = app.plan_view().is_some_and(|v| v.prompt.is_some());
     let dry_session = app.dry_run();
+    let policy = app.options.policy.clone();
     let areas = PlanAreas {
         title,
         list,
@@ -135,7 +137,7 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
         }
         State::Plan(view) => {
             let help = " ↑↓ PgUp PgDn scroll · x apply · q quit";
-            app.viewport = draw_plan(f, view, &areas, help, dry_session, now);
+            app.viewport = draw_plan(f, view, &areas, help, dry_session, now, &policy);
         }
         State::Applying(v) => {
             app.viewport = draw_apply(f, v, &areas);
@@ -144,7 +146,7 @@ pub fn draw_at(f: &mut Frame, app: &mut App, now: i64) {
             PlanState::Ready(view) => {
                 let help =
                     " ↑↓ PgUp PgDn scroll · x apply · w write plan · Esc back · Tab tree · q quit";
-                app.viewport = draw_plan(f, view, &areas, help, dry_session, now);
+                app.viewport = draw_plan(f, view, &areas, help, dry_session, now, &policy);
             }
             PlanState::Building { progress, marks } => {
                 f.render_widget(title_line("plan", "", tw), title);
@@ -297,9 +299,10 @@ fn draw_plan(
     help: &str,
     dry_session: bool,
     now: i64,
+    policy: &PolicyConfig,
 ) -> usize {
     if v.confirm.is_some() {
-        return draw_confirm(f, v, a, dry_session);
+        return draw_confirm(f, v, a, dry_session, policy);
     }
     let width = a.list.width as usize;
     let dim = Style::new().add_modifier(Modifier::DIM);
@@ -396,7 +399,13 @@ fn draw_plan(
 
 /// The confirm dialog: a summary, then every item (tier, size, path,
 /// action), with a checkbox on each `review` item. Returns the action page size.
-fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: bool) -> usize {
+fn draw_confirm(
+    f: &mut Frame,
+    v: &mut PlanView,
+    a: &PlanAreas,
+    dry_session: bool,
+    config: &PolicyConfig,
+) -> usize {
     let dim = Style::new().add_modifier(Modifier::DIM);
     let (p, c) = v.confirmation().unwrap();
     let items = &p.items;
@@ -427,7 +436,7 @@ fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: boo
     let y = if dry_session { "y dry run" } else { "y apply" };
     let keys = format!(" ↑↓ · PgUp/PgDn scroll · Space tick · {y} · d dry run · Esc back · q quit");
     if c.layout.as_ref().is_none_or(|layout| layout.width != width) {
-        c.layout = Some(confirm_layout(p, c, width));
+        c.layout = Some(confirm_layout(p, c, width, config));
     }
     let layout = c.layout.as_ref().unwrap();
     let row = &layout.rows[c.selected];
@@ -503,11 +512,26 @@ fn draw_confirm(f: &mut Frame, v: &mut PlanView, a: &PlanAreas, dry_session: boo
     header.spans[0].content = Cow::Borrowed("> ");
     *header = std::mem::take(header).style(Style::new().add_modifier(Modifier::REVERSED));
     f.render_widget(Paragraph::new(shown), inner);
-    let status = match p.items.get(c.selected).map(|i| &i.finding) {
+    // What the policy config refuses even when the item is ticked.
+    let refused = |f: &dwhy_core::report::Finding| {
+        let mut ticked = c.confirmed.clone();
+        ticked.insert(f.id.clone());
+        crate::app::dialog_policy(p, &ticked, config)
+            .allows(f)
+            .err()
+    };
+    let selected = p.items.get(c.selected).map(|i| &i.finding);
+    let refusal = selected.and_then(refused);
+    let status = match selected {
         Some(f) if f.tier == Tier::Blocked => "blocked: never applied".into(),
         Some(f) if f.action.kind == ActionKind::Advice => {
             format!("{}: advice only, nothing runs", tier_name(f.tier))
         }
+        Some(f) if refusal.is_some() => format!(
+            "{}: refused: {}",
+            tier_name(f.tier),
+            sanitize(refusal.as_deref().unwrap_or_default())
+        ),
         Some(f) if f.tier == Tier::Review && c.confirmed.contains(&f.id) => {
             "review: confirmed".to_string()
         }
@@ -541,7 +565,7 @@ struct ConfirmRow {
     label_height: usize,
 }
 
-fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
+fn confirm_layout(p: &Plan, c: &Confirm, width: usize, config: &PolicyConfig) -> ConfirmLayout {
     let dim = Style::new().add_modifier(Modifier::DIM);
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let items = &p.items;
@@ -556,7 +580,7 @@ fn confirm_layout(p: &Plan, c: &Confirm, width: usize) -> ConfirmLayout {
         .count();
     // What apply would run: core's tier policy for these ticks, and no
     // advice-only item (apply skips those).
-    let policy = crate::app::dialog_policy(p, &c.confirmed);
+    let policy = crate::app::dialog_policy(p, &c.confirmed, config);
     // Nested items count once, but a root mounted below another root
     // counts on its own, as in `plan.bytes`, with or without a scan tree.
     let going = plan::distinct_bytes_in_plan(

@@ -57,6 +57,8 @@ fn ctx_with(git: Option<&str>, docker: std::sync::Arc<Source>) -> DetectContext 
         },
         docker,
         cancel: Default::default(),
+        scratch_paths: Vec::new(),
+        scratch_stale_days: dwhy_core::detectors::SCRATCH_STALE_DAYS,
     }
 }
 
