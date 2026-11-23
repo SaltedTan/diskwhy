@@ -1026,14 +1026,14 @@ pub struct AuditReport {
     pub path: String,
     /// True when there is no audit log yet (nothing was ever applied).
     pub missing: bool,
-    /// Records that match the filters.
+    /// Records in the log.
     pub total: u64,
-    /// Matching records left out by `--limit` (the oldest ones).
+    /// Records left out by `--limit` (the oldest ones).
     pub omitted: u64,
     /// Lines that are not an audit record (cut short or edited); skipped.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub malformed_lines: u64,
-    /// Matching records, newest first (the reverse of file order).
+    /// The newest records, newest first (the reverse of file order).
     pub records: Vec<AuditRecord>,
 }
 
