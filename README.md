@@ -2,10 +2,11 @@
 
 **Why is my disk filling up, and what is safe to remove?**
 
-`diskwhy` (binary `dwhy`) is a Rust tool for Linux dev boxes and servers, used over ssh. It finds what is big **and what is growing**, explains each item, checks whether it is safe to delete against live system state, and removes it the way the owning tool would. It ships one engine with two interfaces:
+`diskwhy` (binary `dwhy`) is a Rust tool for Linux dev boxes and servers, used over ssh. It finds what is big **and what is growing**, explains each item, checks whether it is safe to delete against live system state, and removes it the way the owning tool would. It ships one engine with three interfaces:
 
 - an **interactive TUI** for people (`dwhy`, `dwhy tui`; built with ratatui, usable over ssh at 80×24)
 - a **JSON CLI** (`diskwhy/v1`) for scripts and agents built around *scan → plan → apply*, where an agent can apply a plan only within the tier policy you set
+- an **MCP server** (`dwhy-mcp`, stdio) for agent clients without a shell, where the person who launches it sets the most `apply` may remove
 
 ## Why diskwhy? (The pc-ubuntu story)
 
@@ -64,12 +65,18 @@ From a local checkout:
 cargo install --path crates/dwhy-cli --locked
 ```
 
+The MCP server is a separate binary (`dwhy-mcp`), so `dwhy` itself stays synchronous with no async runtime:
+
+```sh
+cargo install --git https://github.com/SaltedTan/diskwhy --locked dwhy-mcp
+```
+
 *(v0.1.0 ships via GitHub Releases and `cargo install --git`; crates.io publishing is deferred.)*
 
 ### Building from source
 
 ```sh
-cargo build --locked --release                                               # target/release/dwhy
+cargo build --locked --release                                               # target/release/dwhy and dwhy-mcp
 cargo build --locked --release --target x86_64-unknown-linux-musl -p dwhy-cli  # static x86_64 binary
 cargo build --locked --release --target aarch64-unknown-linux-musl -p dwhy-cli # static aarch64 binary (uses rust-lld)
 ```
@@ -166,6 +173,19 @@ Both `dwhy` and `dwhy tui` open the current directory by default. Supply paths a
 - `guide` prints a short quickstart for AI agents and automation, matched to the installed version: the safe workflow, risk tiers and authority rules, caveats, and exit codes. It writes nothing and needs no terminal or Docker.
 - `doctor` reports user/root status, which optional tools are on `PATH` (or installed in common off-`PATH` locations), Docker socket access, and the availability of every detector and probe.
 
+### MCP server (`dwhy-mcp`)
+
+`dwhy-mcp` serves six tools over stdio for MCP clients without a shell: `scan`, `explain`, `diff`, `watch`, `plan` and `apply`. They run the same engine code as the CLI commands and return the same `diskwhy/v1` JSON; a failure returns a `diskwhy/v1` error object (`kind`, `message`, `hint`, `exit_code`) with `isError` set. `scan` returns the compact `--summary` report unless asked for `summary: false`. Register it with your client, for example:
+
+```json
+{ "mcpServers": { "diskwhy": { "command": "dwhy-mcp", "args": ["--max-tier", "regenerable"] } } }
+```
+
+- `--max-tier regenerable|rebuildable` (default `regenerable`) is the most `apply` removes. The `apply` tool takes a plan and `dry_run` only: no tier and no confirmations, so the model cannot raise the ceiling and `review` items are never removed through MCP. The policy config below can lower the ceiling further.
+- `--read-only` leaves `apply` out of the tool list and refuses calls to it.
+- `apply` re-scans, re-detects, re-runs guards and fingerprints like `dwhy apply --yes`, and records each removal in `audit.jsonl` with `yes: true`, `tty: false`.
+- stdout carries only the protocol; warnings go to stderr.
+
 ### Policy config
 
 Two optional TOML files limit what `apply` and the TUI remove and add scratch locations: `/etc/diskwhy/policy.toml` (root-owned, the machine's ceiling) and `$XDG_CONFIG_HOME/diskwhy/policy.toml` (default `~/.config/diskwhy/policy.toml`). Every key is optional:
@@ -183,7 +203,7 @@ stale_days = 14                             # default 7
 - `confirm = "interactive"` refuses `review` items unless a person confirms at the terminal prompt (`--yes` or no terminal is refused; the TUI's dialog counts); `"never"` refuses every `review` item.
 - An unknown key, a bad value or unparsable TOML is an error (exit `1`), never ignored.
 
-**Trust boundary.** Flags and the user's own config guard against mistakes and accidental escalation, by a person or an agent running as your user; they are not a security boundary against that agent, which can edit your files or remove things without diskwhy. The root-owned `/etc/diskwhy/policy.toml` sets a ceiling no flag or user file raises, and `audit.jsonl` records how every apply was invoked. A hard boundary for an AI agent needs a non-shell client (the planned MCP server) or an OS privilege boundary (a separate user). See [Policy config](docs/DESIGN.md#policy-config).
+**Trust boundary.** Flags and the user's own config guard against mistakes and accidental escalation, by a person or an agent running as your user; they are not a security boundary against that agent, which can edit your files or remove things without diskwhy. The root-owned `/etc/diskwhy/policy.toml` sets a ceiling no flag or user file raises, and `audit.jsonl` records how every apply was invoked. A hard boundary for an AI agent needs a non-shell client, such as `dwhy-mcp` (the ceiling is set when it is launched, and the model has no flag to raise it), or an OS privilege boundary (a separate user). See [Policy config](docs/DESIGN.md#policy-config).
 
 ### Exit codes
 

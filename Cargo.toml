@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/dwhy-core", "crates/dwhy-cli", "crates/dwhy-tui"]
+members = ["crates/dwhy-core", "crates/dwhy-cli", "crates/dwhy-tui", "crates/dwhy-mcp"]
 
 [workspace.package]
 version = "0.1.0"

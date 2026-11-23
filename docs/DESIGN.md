@@ -155,13 +155,13 @@ Every key is optional, and an unknown key is an error, so a typo cannot drop a l
 - `scratch.paths`: the union, in order. Entries are absolute, `~/…`, or relative to the home directory; a last component ending in `*` is a prefix, as in the built-in list; `.`, `..`, empty entries and a bare `*` are errors.
 - `scratch.stale_days`: the larger of the two.
 
-**Trust boundary.** `--max-tier`, `--confirm` and the user's policy file guard against mistakes and accidental escalation, by a person or by an agent running as the same uid. They are not a security boundary: an agent with a shell can edit the user's files or pass any flag. The root-owned `/etc/diskwhy/policy.toml` sets a ceiling such an agent cannot raise through diskwhy, and `audit.jsonl` records how each apply was invoked (`max_tier`, `confirm`, `yes`, `tty`) for review with `dwhy audit`. An agent with a shell can still remove files without diskwhy. A hard boundary needs a non-shell client, such as the planned MCP server, or an OS privilege boundary, such as a separate user.
+**Trust boundary.** `--max-tier`, `--confirm` and the user's policy file guard against mistakes and accidental escalation, by a person or by an agent running as the same uid. They are not a security boundary: an agent with a shell can edit the user's files or pass any flag. The root-owned `/etc/diskwhy/policy.toml` sets a ceiling such an agent cannot raise through diskwhy, and `audit.jsonl` records how each apply was invoked (`max_tier`, `confirm`, `yes`, `tty`) for review with `dwhy audit`. An agent with a shell can still remove files without diskwhy. A hard boundary needs a non-shell client, such as `dwhy-mcp` (whose ceiling is a launch flag the model cannot pass), or an OS privilege boundary, such as a separate user.
 
 ### JSON contract
 
 The [`diskwhy/v1` serde types](../crates/dwhy-core/src/report.rs) define the JSON contract (in scan output, `uid` is the effective uid alongside `root`, while `dwhy doctor --json` reports both the real `uid` and `euid`; `fs[].unaccounted` is `null` unless `full_coverage` is true). The pinned shapes include a [WAL finding](../crates/dwhy-core/tests/snapshots/json_shape__postgres_wal_evidence_shape.snap), [API-only WAL evidence](../crates/dwhy-core/tests/snapshots/json_shape__api_only_evidence_shape.snap) and [explain reports](../crates/dwhy-core/tests/snapshots/json_shape__explain_report_shape.snap).
 
-The versioned CLI output is the contract for agents and the planned MCP server.
+The versioned CLI output is the contract for agents and the MCP server.
 
 ## Growth without a background job
 
@@ -193,8 +193,12 @@ crates/
   dwhy-core     scan engine, snapshot/diff/watch (growth), detectors, probes, guards, plan/apply, JSON types
   dwhy-cli      clap front end, JSON output, exit codes (binary: dwhy)
   dwhy-tui      ratatui + crossterm terminal interface
-  dwhy-mcp      (later) rmcp server exposing scan/explain/plan/apply with the same policy
+  dwhy-mcp      rmcp stdio server (binary: dwhy-mcp): scan/explain/diff/watch/plan/apply with the same policy
 ```
+
+`dwhy-core::ops` holds the commands' orchestration (scan, diff, watch, explain, plan, and the rescan apply makes), so `dwhy` and `dwhy-mcp` give the same answers; each front end only renders. `dwhy-mcp` is a separate crate and binary so `dwhy` stays synchronous, without tokio or rmcp.
+
+**MCP server.** Tools return the `diskwhy/v1` report as JSON text, or an `ErrorReport` with `isError` (`usage` for bad arguments, unknown ones included; `error`; `refused`). `scan` defaults to the summary report. The person launching the server sets `apply`'s ceiling (`--max-tier regenerable|rebuildable`) or removes it (`--read-only`); `apply` takes a plan and `dry_run` only, applies with no `--confirm` ids and no terminal (so `review` items are always refused), and the policy config lowers the ceiling as for `dwhy apply`. Audit records say `yes: true`, `tty: false`. The policy config is loaded on every call and fails closed. Blocking work runs on tokio's blocking pool; stdout carries only the protocol.
 
 Crates likely needed: `clap`, `ratatui`, `crossterm`, `serde`/`serde_json`, `rayon` (or `jwalk`), `procfs`, `flate2` (gzip, pure Rust), `directories`, `time`, `insta` (snapshot tests).
 
@@ -209,7 +213,7 @@ Crates likely needed: `clap`, `ratatui`, `crossterm`, `serde`/`serde_json`, `ray
 | M4 | TUI: tree + findings, mark, plan preview, apply with confirmation | Usable over ssh at 80×24; the same plan file works in TUI and CLI (recorded checks: [ACCEPTANCE-M4.md](ACCEPTANCE-M4.md)) |
 | M5 | Release: musl static builds, README with the pc-ubuntu story, `cargo install` | First public tag |
 
-**After the MVP:** MCP server, `notify` alerts, systemd timer, root-only system detectors (snap, kernels, apt, journald vacuum), more probes (Docker logs, core dumps, other databases), TOML config for custom detectors (the policy config is done).
+**After the MVP:** `notify` alerts, systemd timer, root-only system detectors (snap, kernels, apt, journald vacuum), more probes (Docker logs, core dumps, other databases), TOML config for custom detectors (the policy config is done).
 
 ## Non-goals (for now)
 

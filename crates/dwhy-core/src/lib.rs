@@ -10,7 +10,8 @@
 //! [`probes`] explain why a finding is big; [`explain`] picks what `dwhy
 //! explain` reports. [`cancel`] stops the read-only child processes of a scan
 //! or plan build that its caller abandons. [`policy`] reads the policy
-//! config that limits apply and adds scratch locations.
+//! config that limits apply and adds scratch locations. [`ops`] runs the
+//! commands the CLI and the MCP server share.
 
 pub mod account;
 pub mod apply;
@@ -24,6 +25,7 @@ mod gitcmd;
 pub mod growth;
 pub mod guard;
 pub mod mounts;
+pub mod ops;
 pub mod plan;
 pub mod policy;
 pub mod probes;

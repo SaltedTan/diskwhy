@@ -8,29 +8,24 @@ mod human;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use dwhy_core::account;
 use dwhy_core::apply::{self, Audit, Check, Policy};
-use dwhy_core::detect::{self, DetectContext};
-use dwhy_core::explain::{self, Place, Query, Walk};
-use dwhy_core::guard::Processes;
+use dwhy_core::detect;
 use dwhy_core::mounts::MountTable;
 use dwhy_core::plan::{self, Selection};
 use dwhy_core::policy::PolicyConfig;
 use dwhy_core::report::{
-    ActionKind, DEFAULT_SUMMARY_DEPTH, DEFAULT_SUMMARY_DIRS, DEFAULT_SUMMARY_FINDINGS, ErrorKind,
-    ErrorReport, ExplainReport, ExplainResolved, ExplainSize, ExplainVia, Plan, PlanScan,
-    SavedSnapshot, SnapshotFinding, SummaryLimits, Tier, Totals,
+    DEFAULT_SUMMARY_DEPTH, DEFAULT_SUMMARY_DIRS, DEFAULT_SUMMARY_FINDINGS, ErrorKind, ErrorReport,
+    SummaryLimits, Tier,
 };
-use dwhy_core::scan::{self, Progress, ScanOptions};
-use dwhy_core::tree::ScanTree;
-use dwhy_core::{docker, doctor, growth, probes, snapshot, system, units};
+use dwhy_core::scan::{self, Progress};
+use dwhy_core::{doctor, ops, snapshot, units};
 
 pub const EXIT_OK: u8 = 0;
 pub const EXIT_ERROR: u8 = 1;
@@ -568,12 +563,6 @@ fn policy_config() -> Result<PolicyConfig> {
     Ok(PolicyConfig::load()?)
 }
 
-/// What detectors know about this system, with the policy config's scratch
-/// settings.
-fn detect_context(policy: &PolicyConfig) -> DetectContext {
-    DetectContext::from_system().with_policy(policy)
-}
-
 fn run_tui(args: TuiArgs) -> Result<u8> {
     let policy = policy_config()?;
     let opts = dwhy_tui::Options {
@@ -605,80 +594,72 @@ fn run_tui(args: TuiArgs) -> Result<u8> {
     })
 }
 
-fn run_scan(args: ScanArgs) -> Result<u8> {
-    if let Some(names) = &args.detectors {
-        detect::validate_selection(names)?;
-    }
-    let policy = policy_config()?;
-    let mounts = MountTable::read().unwrap_or_default();
-    let mut result = measure(
-        &args.paths,
-        !args.cross_filesystems,
-        // Keep enough to pick a threshold after the scan.
-        args.min_size.unwrap_or(1 << 20),
-        args.threads,
-        silent_progress(args.quiet, args.json),
-        &mounts,
-    )?;
+/// How the CLI walks and reports progress: progress and status lines on a
+/// terminal stderr unless `quiet`, warnings on stderr.
+struct Term {
+    threads: usize,
+    quiet: bool,
+}
 
-    // Default threshold: 1% of what was scanned, between 1M and 100M.
-    let threshold = args
-        .min_size
-        .unwrap_or_else(|| (result.totals().allocated / 100).clamp(1 << 20, 100 << 20));
-    result.dirs.retain(|d| d.totals.allocated >= threshold);
-    result.min_dir_bytes = threshold;
-
-    let mut report = account::system_scan_report(&result, &mounts);
-    let docker_snap = if args.no_detectors {
-        None
-    } else {
-        detect::detect_into_with(
-            &mut report,
-            &result.tree,
-            &detect_context(&policy),
-            args.detectors.as_deref(),
-            true,
+impl ops::Frontend for Term {
+    fn measure(
+        &self,
+        paths: &[PathBuf],
+        one_filesystem: bool,
+        min_dir_bytes: u64,
+        mounts: &MountTable,
+    ) -> std::result::Result<scan::ScanResult, scan::ScanError> {
+        measure(
+            paths,
+            one_filesystem,
+            min_dir_bytes,
+            self.threads,
+            self.quiet,
+            mounts,
         )
-    };
-
-    // Growth on findings, from a snapshot of the same roots old enough for
-    // a meaningful rate. Best effort: without one, findings have no growth.
-    if let Some(dir) = snapshot::default_dir() {
-        growth::fill_scan_growth(&mut report, &dir, now_secs());
     }
 
-    // The report is still printed when the snapshot cannot be saved.
-    let mut save_error = None;
-    if args.snapshot {
-        let snap = snapshot::build(
-            &report,
-            &result.tree,
-            docker_snap.as_deref(),
-            snapshot::MIN_DIR_BYTES,
-        );
-        match save_snapshot(&snap) {
-            Ok(saved) => report.snapshot = Some(saved),
-            Err(e) => save_error = Some(e),
+    fn status(&self, msg: Option<&str>) {
+        if self.quiet || !std::io::stderr().is_terminal() {
+            return;
         }
+        let mut err = std::io::stderr();
+        let _ = write!(err, "\r\x1b[2K{}", msg.unwrap_or_default());
+        let _ = err.flush();
     }
 
-    // Only now, so growth and the snapshot above saw every finding and directory.
+    fn warn(&self, msg: &str) {
+        eprintln!("dwhy: warning: {}", human::escape_only_controls(msg));
+    }
+}
+
+fn run_scan(args: ScanArgs) -> Result<u8> {
     let tiers: Option<Vec<Tier>> = args
         .tier
         .as_ref()
         .map(|t| t.iter().copied().map(Tier::from).collect());
-    if args.summary {
-        report.summarize(
-            tiers.as_deref(),
-            SummaryLimits {
-                max_findings: args.max_findings,
-                max_dirs: DEFAULT_SUMMARY_DIRS,
-                max_depth: args.depth,
-            },
-        );
-    } else if let Some(tiers) = &tiers {
-        report.filter_tiers(tiers);
-    }
+    let req = ops::ScanRequest {
+        paths: args.paths.clone(),
+        cross_filesystems: args.cross_filesystems,
+        min_size: args.min_size,
+        no_detectors: args.no_detectors,
+        detectors: args.detectors.clone(),
+        tiers: tiers.clone(),
+        summary: args.summary.then_some(SummaryLimits {
+            max_findings: args.max_findings,
+            max_dirs: DEFAULT_SUMMARY_DIRS,
+            max_depth: args.depth,
+        }),
+        snapshot: args.snapshot,
+    };
+    let term = Term {
+        threads: args.threads,
+        quiet: silent_progress(args.quiet, args.json),
+    };
+    let ops::ScanOutcome {
+        report,
+        snapshot_error,
+    } = ops::scan(&req, &term)?;
 
     if args.json {
         print_json(&report)?;
@@ -693,158 +674,43 @@ fn run_scan(args: ScanArgs) -> Result<u8> {
             tiers.is_some(),
         )?;
     }
-    if let Some(e) = save_error {
+    if let Some(e) = snapshot_error {
         eprintln!(
             "dwhy: error: snapshot not saved: {}",
-            human::escape_only_controls(&e.to_string())
+            human::escape_only_controls(&e)
         );
         return Ok(EXIT_ERROR);
     }
     Ok(EXIT_OK)
 }
 
-/// Saves `snap` in the snapshot directory, warning when pruning failed.
-fn save_snapshot(snap: &dwhy_core::report::Snapshot) -> std::result::Result<SavedSnapshot, String> {
-    let dir = snapshot::default_dir().ok_or_else(|| {
-        "cannot place snapshots: neither XDG_STATE_HOME nor HOME is an absolute path".to_string()
-    })?;
-    let saved = snapshot::save(&dir, snap, now_secs())?;
-    if let Some(e) = saved.prune_error {
-        eprintln!(
-            "dwhy: warning: old snapshots not pruned: {}",
-            human::escape_only_controls(&e.to_string())
-        );
-    }
-    Ok(saved.snapshot)
-}
-
 fn run_diff(args: DiffArgs) -> Result<u8> {
-    if let Some(names) = &args.detectors {
-        detect::validate_selection(names)?;
-    }
-    let since = snapshot::parse_since(&args.since)?;
-    let policy = policy_config()?;
-    let dir = match (snapshot::default_dir(), &since) {
-        (Some(d), _) => d,
-        (None, snapshot::Since::File(_)) => PathBuf::new(),
-        (None, _) => {
-            return Err(
-                "cannot find snapshots: neither XDG_STATE_HOME nor HOME is an absolute path".into(),
-            );
-        }
+    let req = ops::DiffRequest {
+        paths: args.paths.clone(),
+        since: args.since.clone(),
+        min_change: args.min_change,
+        cross_filesystems: args.cross_filesystems,
+        no_detectors: args.no_detectors,
+        detectors: args.detectors.clone(),
+        snapshot: args.snapshot,
     };
-    let host = system::hostname();
-    let uid = system::euid();
-    // With PATH, compare with a snapshot of those roots; without, with the
-    // newest of any roots, and rescan its roots. Given roots are rescanned
-    // as given, byte for byte; only the snapshot lookup uses their text.
-    let given = if args.paths.is_empty() {
-        None
-    } else {
-        let one_fs = !args.cross_filesystems;
-        let roots = scan::prepare_roots(&args.paths, one_fs)?;
-        let names: Vec<String> = roots
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        Some((roots, names, one_fs))
+    let term = Term {
+        threads: args.threads,
+        quiet: silent_progress(args.quiet, args.json),
     };
-    let found = snapshot::find(
-        &dir,
-        &since,
-        &host,
-        uid,
-        given.as_ref().map(|(_, n, x)| (n.as_slice(), *x)),
-        now_secs(),
-    )?;
-    let (roots, one_fs) = match given {
-        Some((roots, _, one_fs)) => (roots, one_fs),
-        None => {
-            if let Some(root) = found
-                .snapshot
-                .scan
-                .roots
-                .iter()
-                .find(|root| root.contains('\u{FFFD}'))
-            {
-                return Err(format!(
-                    "snapshot root {} contains U+FFFD, which v1 snapshots also write in place \
-                     of non-UTF-8 bytes; pass the path explicitly to `dwhy diff <PATH>`",
-                    detect::escape_controls(root),
-                )
-                .into());
-            }
-            (
-                found
-                    .snapshot
-                    .scan
-                    .roots
-                    .iter()
-                    .map(PathBuf::from)
-                    .collect(),
-                found.snapshot.scan.one_filesystem,
-            )
-        }
-    };
-
-    let mounts = MountTable::read().unwrap_or_default();
-    // The snapshot records directories from the tree; no list is needed.
-    let result = measure(
-        &roots,
-        one_fs,
-        u64::MAX,
-        args.threads,
-        silent_progress(args.quiet, args.json),
-        &mounts,
-    )?;
-    let mut report = account::system_scan_report(&result, &mounts);
-    let docker_snap = if args.no_detectors {
-        None
-    } else {
-        detect::detect_into_with(
-            &mut report,
-            &result.tree,
-            &detect_context(&policy),
-            args.detectors.as_deref(),
-            false,
-        )
-    };
-    let fresh = snapshot::build(
-        &report,
-        &result.tree,
-        docker_snap.as_deref(),
-        snapshot::MIN_DIR_BYTES,
-    );
-    let tree = &result.tree;
-    let size_now = |p: &str| {
-        tree.find(std::path::Path::new(p))
-            .filter(|&id| tree.node(id).is_dir)
-            .map(|id| tree.node(id).total.allocated)
-    };
-    let mut d = growth::diff(
-        &found.snapshot,
-        found.id,
-        found.path.to_string_lossy().into_owned(),
-        &fresh,
-        &size_now,
-        args.min_change,
-    );
-    let mut save_error = None;
-    if args.snapshot {
-        match save_snapshot(&fresh) {
-            Ok(saved) => d.snapshot = Some(saved),
-            Err(e) => save_error = Some(e),
-        }
-    }
+    let ops::DiffOutcome {
+        report: d,
+        snapshot_error,
+    } = ops::diff(&req, &term)?;
     if args.json {
         print_json(&d)?;
     } else {
         human::render_diff(&mut std::io::stdout().lock(), &d, args.top)?;
     }
-    if let Some(e) = save_error {
+    if let Some(e) = snapshot_error {
         eprintln!(
             "dwhy: error: snapshot not saved: {}",
-            human::escape_only_controls(&e.to_string())
+            human::escape_only_controls(&e)
         );
         return Ok(EXIT_ERROR);
     }
@@ -852,43 +718,18 @@ fn run_diff(args: DiffArgs) -> Result<u8> {
 }
 
 fn run_watch(args: WatchArgs) -> Result<u8> {
-    let one_fs = !args.cross_filesystems;
-    let window = Duration::from_secs(args.window);
-    let t0 = std::time::Instant::now();
-    let started_at = system::now_rfc3339();
-    let mut start = watch_sample(&args, one_fs)?;
-    start.snapshot.created_at = started_at;
-    // The second walk starts `--for` after the first one started.
-    let deadline = t0 + window;
-    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
-        if left.is_zero() {
-            break;
-        }
-        let _status = status_line(
-            silent_progress(args.quiet, args.json),
-            &format!("watching… {}s left", left.as_secs_f64().ceil() as u64),
-        );
-        std::thread::sleep(left.min(Duration::from_secs(1)));
-    }
-    let elapsed_ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
-    let end = watch_sample(&args, one_fs)?;
-    let mut r = growth::watch(
-        &start.snapshot,
-        &end.snapshot,
-        args.window,
-        elapsed_ms,
-        args.min_change,
-        [&start.unreadable, &end.unreadable],
-    );
-    let mut reasons: Vec<String> = [start.docker.err(), end.docker.err()]
-        .into_iter()
-        .flatten()
-        .collect();
-    reasons.dedup();
-    if !reasons.is_empty() {
-        r.notes
-            .push(format!("Docker not compared: {}", reasons.join("; ")));
-    }
+    let req = ops::WatchRequest {
+        paths: args.paths.clone(),
+        window_secs: args.window,
+        min_change: args.min_change,
+        cross_filesystems: args.cross_filesystems,
+        no_docker: args.no_docker,
+    };
+    let term = Term {
+        threads: args.threads,
+        quiet: silent_progress(args.quiet, args.json),
+    };
+    let r = ops::watch(&req, &term)?;
     if args.json {
         print_json(&r)?;
     } else {
@@ -897,360 +738,19 @@ fn run_watch(args: WatchArgs) -> Result<u8> {
     Ok(EXIT_OK)
 }
 
-struct WatchSample {
-    snapshot: dwhy_core::report::Snapshot,
-    unreadable: Vec<String>,
-    docker: std::result::Result<(), String>,
-}
-
-/// One end of a watch window: a walk of the roots recording every
-/// directory, and Docker's figures (`Err` with the reason when there are
-/// none). Nothing is saved.
-fn watch_sample(args: &WatchArgs, one_fs: bool) -> Result<WatchSample> {
-    let mounts = MountTable::read().unwrap_or_default();
-    let result = measure(
-        &args.paths,
-        one_fs,
-        u64::MAX,
-        args.threads,
-        silent_progress(args.quiet, args.json),
-        &mounts,
-    )?;
-    if result.error_count > result.errors.len() as u64 {
-        return Err("watch sample has unrecorded scan errors; coverage is unknown".into());
-    }
-    let unreadable = result
-        .unreadable
-        .iter()
-        .map(|u| &u.path)
-        .chain(result.errors.iter().map(|(path, _)| path))
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect();
-    let report = account::system_scan_report(&result, &mounts);
-    let docker = if args.no_docker {
-        Err("--no-docker given".to_string())
-    } else {
-        let _status = status_line(silent_progress(args.quiet, args.json), "asking Docker…");
-        docker_now()
-    };
-    let snap = snapshot::build(&report, &result.tree, docker.as_deref().ok(), 0);
-    Ok(WatchSample {
-        snapshot: snap,
-        unreadable,
-        docker: docker.map(|_| ()),
-    })
-}
-
-/// Docker's figures now, from `GET /system/df` and `/info`.
-fn docker_now() -> std::result::Result<Arc<docker::Snapshot>, String> {
-    let sock = doctor::docker_socket();
-    if !sock.exists {
-        return Err(format!("no Docker socket at {}", sock.path));
-    }
-    if !sock.accessible {
-        return Err(format!(
-            "cannot use {} (not root and not in the docker group)",
-            sock.path
-        ));
-    }
-    docker::Source::socket(std::path::Path::new(&sock.path), docker::DEFAULT_TIMEOUT).get()
-}
-
 fn run_explain(args: ExplainArgs) -> Result<u8> {
-    const UTF8_PATH: &str = "explain needs a UTF-8 path (diskwhy/v1 reports paths as UTF-8)";
-    let query = args.target.to_str().ok_or(UTF8_PATH)?;
-    if let Some(names) = &args.detectors {
-        detect::validate_selection(names)?;
-    }
-    let policy = policy_config()?;
-    let host = system::hostname();
-    let uid = system::euid();
-    let dir = snapshot::default_dir();
-    let mut notes = Vec::new();
-
-    // A finding id becomes the path it had in the newest snapshot listing it.
-    let (place, resolved) = match explain::classify(query) {
-        Query::Id(id) => {
-            let dir = dir.as_deref().ok_or_else(|| format!(
-                "cannot find snapshots: neither XDG_STATE_HOME nor HOME is an absolute path; {}",
-                explain::PATH_HINT
-            ))?;
-            let resolved = explain::resolve_id(dir, &host, uid, &id)?;
-            (explain::place(&resolved.finding.path), Some(resolved))
-        }
-        Query::Place(p) => (p, None),
+    let query = args.target.to_str().ok_or(ops::EXPLAIN_UTF8_PATH)?;
+    let term = Term {
+        threads: args.threads,
+        quiet: silent_progress(args.quiet, args.json),
     };
-    let (snap, saved, saved_object) = match resolved {
-        Some(r) => (Some(r.snapshot), Some(r.finding), r.docker),
-        None => (None, None, None),
-    };
-
-    let generated_at = system::now_rfc3339();
-    let ctx = detect_context(&policy);
-    let mut size = None;
-    let is_docker = matches!(&place, Place::Docker(_));
-    // A walk that could not read part of the path; a failed walk of a
-    // saved path is only a scan issue.
-    let mut coverage = None;
-    let (path, tree, only, scan_issue) = match place {
-        // Docker objects are not on the walked filesystem: an empty tree.
-        Place::Docker(p) => {
-            let only = explain::docker_selection(args.detectors.as_deref());
-            if only.is_empty() {
-                notes.push("no Docker detector selected (--detectors)".into());
-            }
-            (p, Some(ScanTree::default()), Some(only), None)
-        }
-        Place::Path(p) => {
-            // Docker detectors never claim a filesystem path: don't wait on the daemon.
-            let only = explain::filesystem_selection(args.detectors.as_deref());
-            if only.is_empty() {
-                notes.push("no filesystem detector selected (--detectors)".into());
-            }
-            let abs = std::path::absolute(&p)?;
-            let input = abs.to_str().ok_or(UTF8_PATH)?;
-            // tool-versions compares a version with what sits around it,
-            // which can be more than one level up.
-            let context = if only.iter().any(|n| n == "tool-versions") {
-                dwhy_core::detectors::ToolVersions::from_system().context_roots(&ctx)
-            } else {
-                Vec::new()
-            };
-            let (path, walked) = match scan::absolute_nofollow(&abs) {
-                Ok(resolved) => (
-                    resolved.to_str().ok_or(UTF8_PATH)?.to_owned(),
-                    explain_path(&resolved, &context, &args, &mut notes),
-                ),
-                Err(source) => (
-                    input.to_owned(),
-                    Err(scan::ScanError::Root { path: p, source }),
-                ),
-            };
-            match walked {
-                Ok((totals, tree, issue)) => {
-                    size = totals.map(|t| ExplainSize {
-                        allocated: t.allocated,
-                        apparent: t.apparent,
-                    });
-                    coverage.clone_from(&issue);
-                    (path, Some(tree), Some(only), issue)
-                }
-                Err(e) if saved.is_some() => (path, None, Some(only), Some(e.to_string())),
-                Err(e) => return Err(e.into()),
-            }
-        }
-    };
-
-    let (findings, runs) = tree.as_ref().map_or_else(Default::default, |tree| {
-        let (candidates, runs) = detect::run_candidates(
-            tree,
-            &ctx,
-            &dwhy_core::detectors::registry(),
-            only.as_deref(),
-        );
-        let mut candidates = candidates.into_iter().map(|c| c.finding).collect();
-        if !is_docker {
-            explain::exclude_lossy_paths(&mut candidates, tree);
-        }
-        (candidates, runs)
-    });
-    notes.extend(explain::detector_notes(&runs, only.as_deref()));
-    let detector_issue = |saved: &SnapshotFinding| {
-        tree.as_ref()
-            .and_then(|_| explain::detector_gap(&runs, only.as_deref(), &saved.detector))
-    };
-    let daemon = ctx.docker.fetched();
-    let mut path = path;
-    let mut gone = false;
-    let (mut finding, inside) = match &saved {
-        // A saved Docker object is matched by its immutable id.
-        Some(saved) if is_docker => {
-            let out = explain::explain_docker_id(
-                saved,
-                saved_object.as_ref(),
-                daemon.as_deref(),
-                findings,
-                detector_issue(saved),
-            );
-            path = out.path;
-            gone = out.gone;
-            notes.extend(out.notes);
-            (out.finding, out.inside)
-        }
-        _ => {
-            let (finding, inside) =
-                explain::pick(findings, &path, saved.as_ref().map(|f| f.id.as_str()));
-            if let Some(saved) = &saved
-                && finding.is_none()
-            {
-                gone = explain_missing(&saved.path, detector_issue(saved), scan_issue, &mut notes);
-            }
-            (finding, inside)
-        }
-    };
-    // What the walk of the path could not read, whatever was found.
-    if let Some(issue) = coverage
-        && !notes.contains(&issue)
-    {
-        notes.push(issue);
-    }
-    if let (Some(f), Some(tree)) = (&mut finding, &tree) {
-        let one = std::slice::from_mut(f);
-        probes::run(one, &ctx);
-        detect::block_lossy(one);
-        let status = status_line(silent_progress(args.quiet, args.json), "checking guards…");
-        let processes = if is_docker {
-            Processes::default()
-        } else {
-            Processes::read()
-        };
-        dwhy_core::guard::check(one, tree, &ctx, &processes);
-        drop(status);
-        let base = dir
-            .as_deref()
-            .and_then(|dir| explain::growth_base(dir, &host, uid, &f.id, &generated_at));
-        notes.extend(explain::fill_growth(
-            f,
-            base.as_ref(),
-            &generated_at,
-            daemon.as_deref(),
-            saved_object.as_ref(),
-        ));
-    }
-    let report = ExplainReport {
-        schema: dwhy_core::SCHEMA.into(),
-        tool: dwhy_core::report::Tool::current(),
-        host,
-        uid,
-        generated_at,
-        query: query.to_owned(),
-        resolved: ExplainResolved {
-            via: if saved.is_some() {
-                ExplainVia::Id
-            } else {
-                ExplainVia::Path
-            },
-            snapshot: snap,
-        },
-        path,
-        gone,
-        finding,
-        size,
-        inside,
-        notes,
-    };
+    let report = ops::explain(query, args.detectors.as_deref(), &term)?;
     if args.json {
         print_json(&report)?;
     } else {
         human::render_explain(&mut std::io::stdout().lock(), &report)?;
     }
     Ok(EXIT_OK)
-}
-
-/// Notes on a saved filesystem path that no finding matched now.
-fn explain_missing(
-    path: &str,
-    detector_issue: Option<String>,
-    scan_issue: Option<String>,
-    notes: &mut Vec<String>,
-) -> bool {
-    let exists = match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(e) => Err(format!("{path}: {e}")),
-    };
-    explain::absence(path, exists, detector_issue, scan_issue, None, notes)
-}
-
-/// Walks what [`explain::walk_for`] says for `abs`. Returns `abs`'s size
-/// (`None` when it could not be measured), the walked tree, and a note on
-/// partial coverage when the walk could not read something at, above or
-/// below `abs`.
-fn explain_path(
-    abs: &Path,
-    context: &[(PathBuf, usize)],
-    args: &ExplainArgs,
-    notes: &mut Vec<String>,
-) -> std::result::Result<(Option<Totals>, ScanTree, Option<String>), scan::ScanError> {
-    let mounts = MountTable::read().unwrap_or_default();
-    let scan = |root: &Path| {
-        measure(
-            &[root.to_path_buf()],
-            true,
-            u64::MAX,
-            args.threads,
-            silent_progress(args.quiet, args.json),
-            &mounts,
-        )
-    };
-    let read_issue = |result: &scan::ScanResult| {
-        result
-            .unreadable
-            .iter()
-            .map(|u| u.path.as_path())
-            .chain(result.errors.iter().map(|(p, _)| p.as_path()))
-            .find(|p| abs.starts_with(p) || p.starts_with(abs))
-            .map(|p| format!("partial coverage: {} could not be read", p.display()))
-            .or_else(|| {
-                (result.error_count > result.errors.len() as u64)
-                    .then(|| "partial coverage: the scan has unrecorded errors".to_string())
-            })
-    };
-    let dir = match explain::walk_for(abs, &mounts, context) {
-        Walk::Above { dir, note } => {
-            notes.extend(note);
-            Some(dir)
-        }
-        Walk::Itself(note) => {
-            notes.extend(note);
-            None
-        }
-    };
-    if let Some(dir) = dir {
-        let result = scan(&dir)?;
-        let issue = read_issue(&result);
-        // The tree has nodes for directories only: a file is in the walk
-        // when its directory is.
-        let is_dir = std::fs::symlink_metadata(abs).is_ok_and(|md| md.is_dir());
-        let node = if is_dir {
-            result.tree.find(abs)
-        } else {
-            abs.parent().and_then(|p| result.tree.find(p))
-        };
-        if let Some(node) = node {
-            // The wider walk credits a hardlinked file to its smallest path
-            // in the walk, which can lie outside `abs`, and has no node for
-            // a file: measure `abs` on its own then, as `du` would.
-            let totals = if is_dir && result.totals().hardlinks_deduped == 0 {
-                Some(result.tree.node(node).total.totals())
-            } else {
-                match scan(abs) {
-                    Ok(own) => Some(own.totals()),
-                    Err(e) => {
-                        notes.push(format!("could not measure {}: {e}", abs.display()));
-                        None
-                    }
-                }
-            };
-            return Ok((totals, result.tree, issue));
-        }
-        notes.push(format!(
-            "{} was not in the scan of {}: scanned it alone",
-            abs.display(),
-            dir.display()
-        ));
-        notes.extend(issue);
-    }
-    let result = scan(abs)?;
-    let issue = read_issue(&result);
-    Ok((Some(result.totals()), result.tree, issue))
 }
 
 /// `--free SIZE`: a size above 0.
@@ -1262,61 +762,24 @@ fn parse_free_target(s: &str) -> std::result::Result<u64, String> {
 }
 
 fn run_plan(args: PlanArgs) -> Result<u8> {
-    if let Some(names) = &args.detectors {
-        detect::validate_selection(names)?;
-    }
-    let policy = policy_config()?;
-    let mounts = MountTable::read().unwrap_or_default();
-    let one_fs = !args.cross_filesystems;
-    // Detectors read the tree; no directory list is needed.
-    let result = measure(
-        &args.paths,
-        one_fs,
-        u64::MAX,
-        args.threads,
-        silent_progress(args.quiet, args.json),
-        &mounts,
-    )?;
-    let ctx = detect_context(&policy);
-    let (findings, _) = detect::run_with(
-        &result.tree,
-        &ctx,
-        &dwhy_core::detectors::registry(),
-        args.detectors.as_deref(),
-    );
-    let sel = Selection {
-        tier: args.tier.map(Tier::from),
-        select: args.select.clone(),
-        free: args.free,
-    };
-    let above = sel.ceiling().map_or(0, |c| {
-        findings
-            .iter()
-            .filter(|f| {
-                f.tier > c && f.tier != Tier::Blocked && f.action.kind != ActionKind::Advice
-            })
-            .count()
-    });
-    let status = status_line(silent_progress(args.quiet, args.json), "checking guards…");
-    let plan = plan::build(
-        findings,
-        &sel,
-        &result.tree,
-        &ctx,
-        &Processes::read(),
-        system::hostname(),
-        PlanScan {
-            roots: result
-                .roots
-                .iter()
-                .map(|r| r.path.to_string_lossy().into_owned())
-                .collect(),
-            one_filesystem: one_fs,
-            detectors: args.detectors.clone(),
+    let req = ops::PlanRequest {
+        paths: args.paths.clone(),
+        cross_filesystems: args.cross_filesystems,
+        detectors: args.detectors.clone(),
+        selection: Selection {
+            tier: args.tier.map(Tier::from),
+            select: args.select.clone(),
+            free: args.free,
         },
-    );
-    drop(status);
-    let plan = plan?;
+    };
+    let term = Term {
+        threads: args.threads,
+        quiet: silent_progress(args.quiet, args.json),
+    };
+    let ops::PlanOutcome {
+        plan,
+        above_ceiling: above,
+    } = ops::plan(&req, &term)?;
     if let Some(path) = &args.output {
         let text = plan::to_json(&plan)?;
         std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
@@ -1336,17 +799,6 @@ fn run_plan(args: PlanArgs) -> Result<u8> {
     } else {
         EXIT_OK
     })
-}
-
-/// The hint of a refusal to apply a plan: a fresh plan helps when it is
-/// stale or not for here, but not when its root is not valid UTF-8.
-fn unusable_hint(e: &plan::Unusable) -> Option<&'static str> {
-    match e {
-        plan::Unusable::Expired(_) | plan::Unusable::Elsewhere(_) => {
-            Some("run `dwhy plan` to create a fresh plan")
-        }
-        plan::Unusable::LossyRoot(_) => None,
-    }
 }
 
 fn run_apply(args: ApplyArgs) -> Result<u8> {
@@ -1382,8 +834,13 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
         yes: args.yes,
         tty: terminal,
     });
-    if let Err(e) = plan::usable(&plan, &env.host, env.uid, now_secs()) {
-        return Ok(refuse(args.json, &e.to_string(), unusable_hint(&e), false));
+    if let Err(e) = plan::usable(&plan, &env.host, env.uid, ops::now_secs()) {
+        return Ok(refuse(
+            args.json,
+            &e.to_string(),
+            ops::unusable_hint(&e),
+            false,
+        ));
     }
     let ask = !args.yes && !args.dry_run;
     if ask && !terminal {
@@ -1394,13 +851,11 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
             true,
         ));
     }
-    let mut checks = survey(
-        &plan,
-        &policy,
-        &config,
-        args.threads,
-        silent_progress(args.quiet, args.json),
-    )?;
+    let term = Term {
+        threads: args.threads,
+        quiet: silent_progress(args.quiet, args.json),
+    };
+    let mut checks = ops::survey(&plan, &policy, &config, &term)?;
     let ready: Vec<&Check> = checks.iter().filter(|c| c.ready()).collect();
     // Counts a root mounted below another root on its own, as `plan.bytes` does.
     let would_free = apply::total_bytes_for_checks(ready.iter().copied());
@@ -1430,16 +885,15 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
             return Ok(EXIT_OK);
         }
         // Check again right before removing: time has passed at the prompt.
-        if let Err(e) = plan::usable(&plan, &env.host, env.uid, now_secs()) {
-            return Ok(refuse(args.json, &e.to_string(), unusable_hint(&e), false));
+        if let Err(e) = plan::usable(&plan, &env.host, env.uid, ops::now_secs()) {
+            return Ok(refuse(
+                args.json,
+                &e.to_string(),
+                ops::unusable_hint(&e),
+                false,
+            ));
         }
-        let again = survey(
-            &plan,
-            &policy,
-            &config,
-            args.threads,
-            silent_progress(args.quiet, args.json),
-        )?;
+        let again = ops::survey(&plan, &policy, &config, &term)?;
         for (c, a) in checks.iter_mut().zip(again) {
             // Only what was shown may run; it must still be ready.
             if c.ready() {
@@ -1471,42 +925,6 @@ fn run_apply(args: ApplyArgs) -> Result<u8> {
     Ok(apply::exit_code(&r))
 }
 
-/// Rescans the plan's roots, re-runs its detectors, and decides each item.
-fn survey(
-    plan: &Plan,
-    policy: &Policy,
-    config: &PolicyConfig,
-    threads: usize,
-    quiet: bool,
-) -> Result<Vec<Check>> {
-    let mounts = MountTable::read().unwrap_or_default();
-    let roots: Vec<PathBuf> = plan.scan.roots.iter().map(PathBuf::from).collect();
-    let result = measure(
-        &roots,
-        plan.scan.one_filesystem,
-        u64::MAX,
-        threads,
-        quiet,
-        &mounts,
-    )?;
-    let ctx = detect_context(config);
-    let (findings, _) = detect::run_with(
-        &result.tree,
-        &ctx,
-        &dwhy_core::detectors::registry(),
-        plan.scan.detectors.as_deref(),
-    );
-    let _status = status_line(quiet, "checking guards…");
-    Ok(apply::evaluate(
-        plan,
-        findings,
-        &result.tree,
-        &ctx,
-        &Processes::read(),
-        policy,
-    ))
-}
-
 fn print_apply(
     r: &dwhy_core::report::ApplyReport,
     json: bool,
@@ -1519,13 +937,6 @@ fn print_apply(
         human::render_apply(&mut std::io::stdout().lock(), r, audit, false, would_free)?;
     }
     Ok(())
-}
-
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// True when progress and status lines must stay off stderr: with
@@ -1554,8 +965,8 @@ impl Drop for StatusLine {
     }
 }
 
-/// Walks `paths` (default: the current directory) with a progress line on
-/// a terminal stderr unless `quiet`.
+/// Walks `paths` (default: the current directory, see [`ops::prepare`]) with
+/// a progress line on a terminal stderr unless `quiet`.
 fn measure(
     paths: &[PathBuf],
     one_fs: bool,
@@ -1564,28 +975,10 @@ fn measure(
     quiet: bool,
     mounts: &MountTable,
 ) -> std::result::Result<scan::ScanResult, scan::ScanError> {
-    let paths = if paths.is_empty() {
-        vec![PathBuf::from(".")]
-    } else {
-        paths.to_vec()
-    };
-    for p in &paths {
-        if let Ok(md) = std::fs::symlink_metadata(p)
-            && md.file_type().is_symlink()
-        {
-            eprintln!(
-                "dwhy: warning: {} is a symlink; counting the link itself (symlinks are never followed)",
-                dwhy_core::detect::escape_controls(&p.to_string_lossy())
-            );
-        }
-    }
-    let roots = scan::prepare_roots(&paths, one_fs)?;
-    let opts = ScanOptions {
-        one_filesystem: one_fs,
-        min_dir_bytes,
-        threads,
-        ..ScanOptions::default()
-    };
+    let roots = ops::prepare(paths, one_fs, &|msg| {
+        ops::Frontend::warn(&Term { threads, quiet }, msg)
+    })?;
+    let opts = ops::scan_options(one_fs, min_dir_bytes, threads);
     let progress = Arc::new(Progress::default());
     let done = Arc::new(AtomicBool::new(false));
     let ticker = (!quiet && std::io::stderr().is_terminal()).then(|| {
