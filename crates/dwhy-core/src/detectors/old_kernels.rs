@@ -63,10 +63,10 @@
 //! The finding is `review`: an old kernel is the fallback when a new one
 //! does not boot. The action is
 //! `env -u APT_CONFIG DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y --no-auto-remove <packages>`,
-//! the packages sorted. Before plan and apply, the `apt-removal-set` guard
-//! ([`removal_set_guard`]) checks the version and the package set again
-//! and simulates that exact removal, blocking when apt would remove
-//! anything else.
+//! the packages sorted. Before plan and apply, and again right before the
+//! command runs, the `apt-removal-set` guard ([`removal_set_guard`])
+//! checks the version and the package set again and simulates that exact
+//! removal, blocking when apt would remove anything else.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
