@@ -682,7 +682,7 @@ pub(crate) fn add_changed_guard(guards: &mut Vec<GuardResult>, detail: String) {
 }
 
 /// The fingerprint of `f` from the scan tree or the detector's file measurement.
-/// Only Git and Docker state are read live.
+/// Only Git, Docker and (for `old-kernels`) dpkg state are read live.
 pub fn fingerprint(f: &Finding, tree: &ScanTree, ctx: &DetectContext) -> Fingerprint {
     let mut fp = Fingerprint {
         dev: None,
@@ -691,6 +691,7 @@ pub fn fingerprint(f: &Finding, tree: &ScanTree, ctx: &DetectContext) -> Fingerp
         size_bucket: size_bucket(f.bytes),
         git: None,
         docker_id: None,
+        packages: None,
     };
     if f.path.starts_with('/') {
         let p = Path::new(&f.path);
@@ -707,6 +708,9 @@ pub fn fingerprint(f: &Finding, tree: &ScanTree, ctx: &DetectContext) -> Fingerp
             if f.detector != "journald" {
                 fp.newest_mtime = Some(id.mtime);
             }
+        }
+        if f.detector == "old-kernels" {
+            fp.packages = crate::detectors::package_state(f, ctx);
         }
         if node.is_some_and(|n| n.is_dir && n.markers.contains(Markers::DOT_GIT))
             && guard::git_guarded(f)
@@ -772,6 +776,9 @@ pub fn differences(planned: &Fingerprint, now: &Fingerprint) -> Vec<&'static str
     }
     if planned.docker_id != now.docker_id {
         out.push("docker object");
+    }
+    if planned.packages != now.packages {
+        out.push("packages");
     }
     out
 }
@@ -954,6 +961,7 @@ mod tests {
                 size_bucket: 0,
                 git: None,
                 docker_id: None,
+                packages: None,
             },
             scan_root_dev: None,
         };

@@ -43,6 +43,17 @@
 //! For a Docker volume, `container-mount`: mounted by a running container
 //! (block) or a stopped one (warn).
 //!
+//! For an `old-kernels` finding, `apt-removal-set`
+//! ([`crate::detectors::removal_set_guard`]): read afresh, the version must
+//! not be the running kernel (`uname`), one of the two newest installed or
+//! a `/boot/vmlinuz` or `vmlinuz.old` target, no listed package may belong
+//! to such a kernel, the listed packages must be exactly the version's
+//! packages dpkg reports now (each `ii` or `rc`), and
+//! `LANG=C apt-get -s remove --purge --no-auto-remove <packages>` must
+//! succeed and purge exactly those packages, installing nothing. It blocks
+//! otherwise, and when any of that cannot be checked. Like every guard, it
+//! runs when `plan` builds a plan and again when `apply` checks it.
+//!
 //! Git guards skip repositories inside a cache (below a `CACHEDIR.TAG`)
 //! and do not apply to `user-cache` and `tool-versions` findings: those
 //! repositories are the tools' own checkouts. Neither git nor process
@@ -56,7 +67,11 @@
 //! open or mapped file in the `.snap` file, the revision's mount or its
 //! `/var/snap/<name>/<rev>` data directory (for a parallel instance, also
 //! those paths without the instance key). Apps running on a disabled base
-//! revision are not seen: it is their namespace's root.
+//! revision are not seen: it is their namespace's root. Git guards do not
+//! apply to `old-kernels` (`apt-get remove --purge` removes only the
+//! packages' files); the process guards do, on the modules directory and
+//! the version's `/usr/src/linux-headers-*` and `linux-tools` directories,
+//! so a DKMS build or a `perf` running from them blocks.
 //!
 //! Identities are checked again at this boundary, before any git state is
 //! read: a finding root or repository that is no longer the directory the
@@ -321,6 +336,13 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
             if let Some(detail) = root_change {
                 plan::add_changed_guard(&mut results, detail);
             } else {
+                if f.detector == "old-kernels" {
+                    results.push(crate::detectors::removal_set_guard(
+                        f,
+                        ctx,
+                        crate::detectors::running_release(),
+                    ));
+                }
                 let mine: Vec<(&Repo, &RepoState)> =
                     inside(f).into_iter().map(|r| (r, &states[r])).collect();
                 if !mine.is_empty() {
@@ -346,14 +368,20 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
 /// versions, whose repositories are the tools' own checkouts (Cargo's git
 /// dependencies, uv's source builds, VS Code's servers).
 ///
-/// Nor to `journald`, `apt-cache` and `snap-revisions`: the vacuum
-/// removes only archived journal files, `apt-get clean` only apt's own
-/// cache files and `snap remove --revision` only snapd's files for that
-/// revision, so none of them can touch a repository.
+/// Nor to `journald`, `apt-cache`, `snap-revisions` and `old-kernels`:
+/// the vacuum removes only archived journal files, `apt-get clean` only
+/// apt's own cache files, `snap remove --revision` only snapd's files for
+/// that revision and `apt-get remove --purge` only the kernel packages'
+/// files, so none of them can touch a repository.
 pub(crate) fn git_guarded(f: &Finding) -> bool {
     !matches!(
         f.detector.as_str(),
-        "user-cache" | "tool-versions" | "journald" | "apt-cache" | "snap-revisions"
+        "user-cache"
+            | "tool-versions"
+            | "journald"
+            | "apt-cache"
+            | "snap-revisions"
+            | "old-kernels"
     )
 }
 
@@ -385,8 +413,15 @@ fn process_guarded(f: &Finding) -> bool {
 /// still run on is not seen: snap-confine makes the base's mount the root
 /// of their namespace, so their paths carry no `/snap/<base>/<rev>`
 /// prefix.
+///
+/// For `old-kernels`, also the version's `/usr/src/linux-headers-*` and
+/// `linux-tools` directories ([`crate::detectors::old_kernel_process_roots`]).
 fn process_roots(f: &Finding, root: &Path) -> Vec<PathBuf> {
     let mut roots = vec![root.to_path_buf()];
+    if f.detector == "old-kernels" {
+        roots.extend(crate::detectors::old_kernel_process_roots(f));
+        return roots;
+    }
     if f.detector != "snap-revisions" {
         return roots;
     }

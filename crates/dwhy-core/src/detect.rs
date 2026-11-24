@@ -3,8 +3,9 @@
 //! and the rule for nested findings.
 //!
 //! Detectors only read: they look at the [`ScanTree`] and may read small
-//! files, run read-only tool commands, or make read-only Docker or snapd
-//! API GETs (see [`crate::docker`]). They never remove anything.
+//! files, run read-only tool commands (`old-kernels` runs apt's
+//! simulations), or make read-only Docker or snapd API GETs (see
+//! [`crate::docker`]). They never remove anything.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,6 +28,8 @@ pub enum Needs {
     /// The docker CLI and a usable socket.
     Docker,
     RootAnd(&'static str),
+    /// Root, and every one of these tools.
+    RootAndAll(&'static [&'static str]),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +56,11 @@ pub const CATALOG: &[DetectorInfo] = &[
     info("journald", "post-MVP", Needs::RootAnd("journalctl")),
     info("apt-cache", "post-MVP", Needs::RootAnd("apt-get")),
     info("snap-revisions", "post-MVP", Needs::RootAnd("snap")),
+    info(
+        "old-kernels",
+        "post-MVP",
+        Needs::RootAndAll(&["apt-get", "dpkg-query"]),
+    ),
 ];
 
 const fn info(name: &'static str, milestone: &'static str, needs: Needs) -> DetectorInfo {
@@ -194,6 +202,20 @@ pub fn availability(info: &DetectorInfo, ctx: &DetectContext) -> (DetectorAvaila
         Needs::RootAnd(t) if !ctx.on_path(t) => (Unavailable, ctx.missing(t)),
         Needs::RootAnd(_) if !ctx.root => (Unavailable, "system detector; run as root".into()),
         Needs::RootAnd(t) => (Available, format!("uses `{t}`")),
+        Needs::RootAndAll(ts) => match ts.iter().find(|t| !ctx.on_path(t)) {
+            Some(t) => (Unavailable, ctx.missing(t)),
+            None if !ctx.root => (Unavailable, "system detector; run as root".into()),
+            None => (
+                Available,
+                format!(
+                    "uses {}",
+                    ts.iter()
+                        .map(|t| format!("`{t}`"))
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                ),
+            ),
+        },
     }
 }
 

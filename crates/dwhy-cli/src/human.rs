@@ -1872,6 +1872,7 @@ mod tests {
                         size_bucket: 0,
                         git: None,
                         docker_id: None,
+                        packages: None,
                     },
                     scan_root_dev: None,
                 })

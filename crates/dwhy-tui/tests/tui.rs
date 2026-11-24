@@ -1993,6 +1993,7 @@ fn fingerprint() -> Fingerprint {
         size_bucket: 100,
         git: None,
         docker_id: None,
+        packages: None,
     }
 }
 

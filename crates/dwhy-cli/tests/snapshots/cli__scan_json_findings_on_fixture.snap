@@ -138,6 +138,15 @@ expression: v
       "name": "snap-revisions",
       "ran": false,
       "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "error": null,
+      "findings": 0,
+      "name": "old-kernels",
+      "ran": false,
+      "status": "[status]"
     }
   ],
   "findings": [

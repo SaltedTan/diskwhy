@@ -842,6 +842,13 @@ pub struct Fingerprint {
     /// For a Docker finding: the image or container id, or the volume name
     /// and creation time. Docker build cache has no object ID for fingerprinting.
     pub docker_id: Option<String>,
+    /// For an `old-kernels` finding: FNV-1a (64-bit, hex) of the name,
+    /// version and status `dpkg-query` reports for the action's packages,
+    /// so a package upgraded, reinstalled or removed since the plan
+    /// re-plans. Absent for other findings, when dpkg could not be read,
+    /// and in plans written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packages: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
