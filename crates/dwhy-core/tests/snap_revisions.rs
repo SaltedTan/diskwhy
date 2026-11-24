@@ -390,6 +390,80 @@ fn local_revisions_and_instance_names() {
 }
 
 #[test]
+fn a_parallel_instance_running_from_its_disabled_revision_blocks() {
+    let (_t, b) = base();
+    let dir = snaps(&b);
+    let body = r#"{"type":"sync","status-code":200,"result":[
+        {"name":"firefox_work","revision":"9057","status":"installed","type":"app"},
+        {"name":"firefox_work","revision":"9137","status":"active","type":"app"}
+    ]}"#;
+    for name in ["firefox_work_9057.snap", "firefox_work_9137.snap"] {
+        write(&dir.join(name), 2 * MIB, 3);
+    }
+    let det = SnapRevisions::with_listing(snapd_root(&b), Ok(body.as_bytes().to_vec()));
+    let tree = scan_tree(&b);
+    let cx = root_ctx();
+    let plan_with = |open: &str| {
+        let found = det.detect(&tree, &cx).unwrap();
+        assert_eq!(
+            found[0].action.argv.as_deref().unwrap(),
+            ["snap", "remove", "--revision=9057", "firefox_work"]
+        );
+        let id = found[0].id.clone();
+        plan::build(
+            found,
+            &Selection {
+                tier: None,
+                select: vec![id],
+                free: None,
+            },
+            &tree,
+            &cx,
+            &Processes {
+                procs: vec![Proc {
+                    pid: 4545,
+                    name: "firefox".into(),
+                    cwd: Some(PathBuf::from("/")),
+                    open: vec![PathBuf::from(open)],
+                }],
+                unreadable: 0,
+            },
+            "host".into(),
+            PlanScan {
+                roots: vec![b.to_string_lossy().into_owned()],
+                one_filesystem: true,
+                detectors: None,
+            },
+        )
+        .unwrap()
+    };
+
+    // Inside the instance's namespace snap-confine maps /snap/firefox_work
+    // onto /snap/firefox, so that is what its maps show; the host path
+    // blocks too.
+    for open in [
+        "/snap/firefox/9057/usr/lib/firefox/libxul.so",
+        "/var/snap/firefox/9057/.mozilla/lock",
+        "/snap/firefox_work/9057/usr/lib/firefox/libxul.so",
+    ] {
+        let plan = plan_with(open);
+        assert!(plan.items.is_empty(), "{open}: {plan:?}");
+        let g = plan.blocked[0]
+            .guards
+            .iter()
+            .find(|g| g.name == "in-use-open")
+            .unwrap();
+        assert_eq!(g.status, GuardStatus::Block, "{open}");
+    }
+    assert_eq!(
+        plan_with("/snap/firefox/9137/usr/lib/firefox/libxul.so")
+            .items
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn action_uses_the_resolved_command() {
     let (_t, b) = base();
     populated(&b);

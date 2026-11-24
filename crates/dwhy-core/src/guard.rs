@@ -54,7 +54,9 @@
 //! `snap remove --revision` removes only snapd's own files, and the
 //! process guards block while a process has its working directory or an
 //! open or mapped file in the `.snap` file, the revision's mount or its
-//! `/var/snap/<name>/<rev>` data directory.
+//! `/var/snap/<name>/<rev>` data directory (for a parallel instance, also
+//! those paths without the instance key). Apps running on a disabled base
+//! revision are not seen: it is their namespace's root.
 //!
 //! Identities are checked again at this boundary, before any git state is
 //! read: a finding root or repository that is no longer the directory the
@@ -371,10 +373,18 @@ fn process_guarded(f: &Finding) -> bool {
 /// system data directory (`/var/snap/<name>/<rev>`). The kernel's loop
 /// device holds the `.snap` file, not a process, so an app still running
 /// from a disabled revision shows up only through paths under its mount,
-/// and `snap remove --revision` deletes the data directory under it. The
-/// name and revision come from the action's argv (`snap remove
-/// --revision=<rev> <name>`), which the detector built from names it
-/// validated.
+/// and `snap remove --revision` deletes the data directory under it. For
+/// a parallel instance (`<name>_<key>`) the same paths without the key
+/// are checked too: inside the instance's mount namespace snap-confine
+/// maps its directories onto `/snap/<name>` and `/var/snap/<name>`, which
+/// is what its processes show. The name and revision come from the
+/// action's argv (`snap remove --revision=<rev> <name>`), which the
+/// detector built from names it validated.
+///
+/// A disabled `base` or `os` revision that apps started before a refresh
+/// still run on is not seen: snap-confine makes the base's mount the root
+/// of their namespace, so their paths carry no `/snap/<base>/<rev>`
+/// prefix.
 fn process_roots(f: &Finding, root: &Path) -> Vec<PathBuf> {
     let mut roots = vec![root.to_path_buf()];
     if f.detector != "snap-revisions" {
@@ -389,8 +399,11 @@ fn process_roots(f: &Finding, root: &Path) -> Vec<PathBuf> {
         && safe(rev)
         && safe(name)
     {
-        for base in ["/snap", "/var/lib/snapd/snap", "/var/snap"] {
-            roots.push(Path::new(base).join(name).join(rev));
+        let names = std::iter::once(name.as_str()).chain(name.split_once('_').map(|(n, _)| n));
+        for n in names {
+            for base in ["/snap", "/var/lib/snapd/snap", "/var/snap"] {
+                roots.push(Path::new(base).join(n).join(rev));
+            }
         }
     }
     roots
