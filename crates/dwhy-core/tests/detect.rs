@@ -330,7 +330,8 @@ fn run_reports_every_catalog_detector() {
     assert_eq!(cargo.findings, 1);
     let journald = runs.iter().find(|r| r.name == "journald").unwrap();
     assert!(!journald.ran);
-    assert_eq!(journald.status, DetectorAvailability::NotImplemented);
+    // Built, but this context is not root and has no journalctl.
+    assert_eq!(journald.status, DetectorAvailability::Unavailable);
 }
 
 #[test]
