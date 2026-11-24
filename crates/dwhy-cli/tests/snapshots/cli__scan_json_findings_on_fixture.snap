@@ -120,6 +120,15 @@ expression: v
       "name": "journald",
       "ran": false,
       "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "error": null,
+      "findings": 0,
+      "name": "apt-cache",
+      "ran": false,
+      "status": "[status]"
     }
   ],
   "findings": [

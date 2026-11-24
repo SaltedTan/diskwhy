@@ -56,6 +56,7 @@ pub const TOOLS: &[(&str, &[&str])] = &[
         &["tool-versions: fnm Node versions (`fnm uninstall`)"],
     ),
     ("journalctl", &["journald (root only)"]),
+    ("apt-get", &["apt-cache (root only)"]),
 ];
 
 /// Resolves `name` on `path_var` the way a shell would (first executable hit).
@@ -123,7 +124,7 @@ fn off_path_candidates(name: &str) -> Vec<PathBuf> {
                 v.push(h.join(".cargo/bin/uv"));
             }
         }
-        "git" | "docker" | "journalctl" => {
+        "git" | "docker" | "journalctl" | "apt-get" => {
             v.push(PathBuf::from("/usr/bin").join(name));
             v.push(PathBuf::from("/bin").join(name));
         }
@@ -293,7 +294,8 @@ mod tests {
                 "rustup",
                 "pyenv",
                 "fnm",
-                "journalctl"
+                "journalctl",
+                "apt-get"
             ]
         );
         assert_eq!(d.detectors.len(), CATALOG.len());
