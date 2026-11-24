@@ -24,12 +24,17 @@
 //! Age is judged as `journalctl` judges it: the head (first-entry) realtime
 //! in the file's name, or the file's ctime, atime or mtime when earlier. The
 //! vacuum removes a whole file started more than 14 days ago, entries from
-//! the last 14 days in it included, so such a file counts in full.
+//! the last 14 days in it included, so such a file counts in full. It goes
+//! through each directory's archived files oldest first (by head seqnum
+//! within one seqnum ID, otherwise by that time) and stops at the first that
+//! is not old, so an old file sorted after a recent one (the clock went back
+//! between rotations) stays and does not count.
 //! The finding is `review`: logs are not regenerable. The action is
 //! `journalctl --directory <dir> --vacuum-time=14d`, which leaves the
 //! directory, the active journals and archived files started in the last
 //! 14 days in place.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::mem::MaybeUninit;
@@ -208,14 +213,18 @@ impl Journald {
         }
         let dev = node.dev;
         let mut inodes: HashMap<(u64, u64), Inode> = HashMap::new();
-        for (name, st) in entries(&root, dev) {
+        let top = entries(&root, dev);
+        let files = top
+            .iter()
+            .filter(|(_, st)| FileType::from_raw_mode(st.st_mode) == FileType::RegularFile);
+        note_dir(&mut inodes, files, cutoff);
+        for (name, st) in &top {
             match FileType::from_raw_mode(st.st_mode) {
-                FileType::RegularFile => note(&mut inodes, &name, &st, cutoff),
                 FileType::Directory => {
                     // A `<machine-id>/` directory, checked to be the inode
                     // just stat'ed; nothing below it is read. journalctl
                     // vacuums no other subdirectory.
-                    if !is_id128(&name) {
+                    if !is_id128(name) {
                         continue;
                     }
                     let Ok(sub) = rustix::fs::openat(&root, name.as_slice(), flags, Mode::empty())
@@ -228,13 +237,14 @@ impl Journald {
                     if (sst.st_dev, sst.st_ino) != (st.st_dev, st.st_ino) {
                         continue;
                     }
-                    for (name, st) in entries(&sub, dev) {
-                        if FileType::from_raw_mode(st.st_mode) == FileType::RegularFile {
-                            note(&mut inodes, &name, &st, cutoff);
-                        }
-                    }
+                    let sub = entries(&sub, dev);
+                    let files = sub.iter().filter(|(_, st)| {
+                        FileType::from_raw_mode(st.st_mode) == FileType::RegularFile
+                    });
+                    note_dir(&mut inodes, files, cutoff);
                 }
-                // Symlinks are never followed; anything else is not a journal.
+                // Regular files are noted above. Symlinks are never
+                // followed; anything else is not a journal.
                 _ => {}
             }
         }
@@ -284,43 +294,116 @@ fn entries(dir: &OwnedFd, dev: u64) -> Vec<(Vec<u8>, Stat)> {
         .collect()
 }
 
-/// Records the regular file `name` if it is a journal file.
-fn note(inodes: &mut HashMap<(u64, u64), Inode>, name: &[u8], st: &Stat, cutoff: i64) {
-    let head = archived_head(name);
-    if head.is_none() && !name.ends_with(b".journal") && !name.ends_with(b".journal~") {
-        return;
+/// An archived journal the vacuum of one directory may remove.
+struct Archived<'a> {
+    name: &'a [u8],
+    st: &'a Stat,
+    /// The time the vacuum judges it by, in seconds ([`vacuum_time`]).
+    time: i64,
+    /// `(seqnum id, head seqnum)`; `None` for a `.journal~`.
+    seq: Option<(u128, u64)>,
+}
+
+/// journal-vacuum.c's `vacuum_compare`: by head seqnum within one seqnum ID,
+/// otherwise by time, then seqnum ID, then name.
+fn vacuum_order(a: &Archived, b: &Archived) -> Ordering {
+    if let (Some((ia, sa)), Some((ib, sb))) = (a.seq, b.seq) {
+        if ia == ib {
+            return sa.cmp(&sb);
+        }
     }
-    let i = inodes.entry((st.st_dev, st.st_ino)).or_insert(Inode {
+    a.time.cmp(&b.time).then_with(|| match (a.seq, b.seq) {
+        (Some((ia, _)), Some((ib, _))) => ia.cmp(&ib),
+        _ => a.name.cmp(b.name),
+    })
+}
+
+/// Records the journal files among one directory's regular `files`. Its
+/// archived ones are old, as `journalctl --vacuum-time` removes them, up to
+/// the first in vacuum order that is not; the rest stay.
+fn note_dir<'a>(
+    inodes: &mut HashMap<(u64, u64), Inode>,
+    files: impl Iterator<Item = &'a (Vec<u8>, Stat)>,
+    cutoff: i64,
+) {
+    let mut archived: Vec<Archived> = Vec::new();
+    for (name, st) in files {
+        if let Some(a) = archived_journal(name) {
+            archived.push(Archived {
+                name,
+                st,
+                time: vacuum_time(st, a.head),
+                seq: a.seq,
+            });
+        } else if name.ends_with(b".journal") || name.ends_with(b".journal~") {
+            inode(inodes, st).kept_name = true;
+        }
+    }
+    // An insertion sort: `vacuum_compare` is not a total order when times
+    // disagree with seqnums, and `sort_by` may panic on such an order.
+    for i in 1..archived.len() {
+        let mut j = i;
+        while j > 0 && vacuum_order(&archived[j - 1], &archived[j]) == Ordering::Greater {
+            archived.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    let mut old = true;
+    for a in &archived {
+        old = old && a.time < cutoff;
+        let i = inode(inodes, a.st);
+        if old {
+            i.old_names += 1;
+        } else {
+            i.kept_name = true;
+        }
+    }
+}
+
+/// The entry for the inode `st`.
+fn inode<'a>(inodes: &'a mut HashMap<(u64, u64), Inode>, st: &Stat) -> &'a mut Inode {
+    inodes.entry((st.st_dev, st.st_ino)).or_insert(Inode {
         allocated: st.st_blocks.max(0) as u64 * 512,
         nlink: nlink(st),
         mtime: mtime(st),
         old_names: 0,
         kept_name: false,
-    });
-    match head {
-        Some(head) if vacuum_time(st, head) < cutoff => i.old_names += 1,
-        _ => i.kept_name = true,
-    }
+    })
 }
 
-/// The head realtime, in seconds, that `journalctl --vacuum-time` reads
-/// from the name of an archived journal it may remove; `None` for any other
-/// name, which the vacuum leaves alone.
-fn archived_head(name: &[u8]) -> Option<i64> {
-    let usec = if let Some(stem) = name.strip_suffix(b".journal") {
+/// What `journalctl --vacuum-time` reads from an archived journal's name.
+struct ArchivedName {
+    /// Head realtime, in seconds.
+    head: i64,
+    /// `(seqnum id, head seqnum)`; `None` for a `.journal~`.
+    seq: Option<(u128, u64)>,
+}
+
+/// The name of an archived journal the vacuum may remove, parsed; `None`
+/// for any other name, which the vacuum leaves alone.
+fn archived_journal(name: &[u8]) -> Option<ArchivedName> {
+    let (usec, seq) = if let Some(stem) = name.strip_suffix(b".journal") {
         // `@<32 hex seqnum id>-<16 hex head seqnum>-<16 hex head realtime>`
         let t = &stem[stem.len().checked_sub(67)?..];
-        let ok = t[0] == b'@' && is_id128(&t[1..33]) && t[33] == b'-' && t[50] == b'-';
-        hex(&t[34..50])?;
-        ok.then_some(hex(&t[51..])?)?
+        if !(t[0] == b'@' && is_id128(&t[1..33]) && t[33] == b'-' && t[50] == b'-') {
+            return None;
+        }
+        let id = u128::from_str_radix(std::str::from_utf8(&t[1..33]).ok()?, 16).ok()?;
+        (hex(&t[51..])?, Some((id, hex(&t[34..50])?)))
     } else {
         // `@<16 hex head realtime>-<16 hex>`
         let stem = name.strip_suffix(b".journal~")?;
         let t = &stem[stem.len().checked_sub(34)?..];
         hex(&t[18..])?;
-        (t[0] == b'@' && t[17] == b'-').then_some(hex(&t[1..17])?)?
+        if !(t[0] == b'@' && t[17] == b'-') {
+            return None;
+        }
+        (hex(&t[1..17])?, None)
     };
-    Some((usec / 1_000_000) as i64)
+    Some(ArchivedName {
+        head: (usec / 1_000_000) as i64,
+        seq,
+    })
 }
 
 /// A 128-bit ID in its plain form: 32 hex digits.
@@ -360,7 +443,11 @@ fn nlink(st: &Stat) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::archived_head;
+    use super::archived_journal;
+
+    fn archived_head(name: &[u8]) -> Option<i64> {
+        archived_journal(name).map(|a| a.head)
+    }
 
     #[test]
     fn archived_journal_names() {

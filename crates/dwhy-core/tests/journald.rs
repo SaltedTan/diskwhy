@@ -298,6 +298,30 @@ fn a_file_started_over_14_days_ago_counts_though_written_since() {
 }
 
 #[test]
+fn an_old_file_after_a_recent_one_in_seqnum_order_is_kept() {
+    // The clock went back between rotations 2 and 3. journalctl 259's
+    // vacuum goes through a directory's archived files in seqnum order and
+    // stops at the first recent one: run on this layout, it removed only
+    // seqnum 1 and kept the 20-day-old seqnum 3.
+    let (_t, b) = base();
+    let m = journal_root(&b).join(MID);
+    let first = m.join(archived("system", 1, 30));
+    write(&first, 2 * MIB, 30);
+    write(&m.join(archived("system", 2, 2)), 2 * MIB, 2);
+    write(&m.join(archived("system", 3, 20)), 2 * MIB, 20);
+    write(&m.join("system.journal"), MIB, 0);
+    let found = detect(&b, &b);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let f = &found[0];
+    assert_eq!(f.bytes, allocated(&first));
+    assert!(
+        f.reason.starts_with("1 archived journal file started"),
+        "{}",
+        f.reason
+    );
+}
+
+#[test]
 fn no_finding_below_one_mib() {
     let (_t, b) = base();
     let m = journal_root(&b).join(MID);
