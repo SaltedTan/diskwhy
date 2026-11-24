@@ -246,35 +246,45 @@ impl std::fmt::Display for GetError {
 
 impl Api {
     pub fn get(&self, path: &str) -> Result<Vec<u8>, GetError> {
-        let err = |e: std::io::Error| GetError::Other(format!("{}: {e}", self.socket.display()));
-        let mut s = UnixStream::connect(&self.socket).map_err(err)?;
-        s.set_read_timeout(Some(self.timeout)).map_err(err)?;
-        s.set_write_timeout(Some(self.timeout)).map_err(err)?;
-        write!(
-            s,
-            "GET {path} HTTP/1.0\r\nHost: docker\r\nUser-Agent: diskwhy\r\n\r\n"
-        )
-        .map_err(err)?;
-        let mut raw = Vec::new();
-        s.read_to_end(&mut raw).map_err(|e| {
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) {
-                GetError::Other(format!(
-                    "docker API {path}: no response within {:?}",
-                    self.timeout
-                ))
-            } else {
-                err(e)
-            }
-        })?;
-        parse_http(&raw, path)
+        unix_get(&self.socket, self.timeout, "docker", "docker API", path)
     }
 }
 
-fn parse_http(raw: &[u8], path: &str) -> Result<Vec<u8>, GetError> {
-    let other = |detail| GetError::Other(format!("docker API {path}: {detail}"));
+/// `GET path` over the HTTP/1.0 unix socket `socket`, sending `Host:
+/// host`; errors name the API as `label`. The body of a 200 response, or
+/// the error. Shared by the Docker Engine API and snapd's REST API.
+pub(crate) fn unix_get(
+    socket: &Path,
+    timeout: Duration,
+    host: &str,
+    label: &str,
+    path: &str,
+) -> Result<Vec<u8>, GetError> {
+    let err = |e: std::io::Error| GetError::Other(format!("{}: {e}", socket.display()));
+    let mut s = UnixStream::connect(socket).map_err(err)?;
+    s.set_read_timeout(Some(timeout)).map_err(err)?;
+    s.set_write_timeout(Some(timeout)).map_err(err)?;
+    write!(
+        s,
+        "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: diskwhy\r\n\r\n"
+    )
+    .map_err(err)?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).map_err(|e| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            GetError::Other(format!("{label} {path}: no response within {timeout:?}"))
+        } else {
+            err(e)
+        }
+    })?;
+    parse_http(&raw, label, path)
+}
+
+fn parse_http(raw: &[u8], label: &str, path: &str) -> Result<Vec<u8>, GetError> {
+    let other = |detail| GetError::Other(format!("{label} {path}: {detail}"));
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -292,7 +302,7 @@ fn parse_http(raw: &[u8], path: &str) -> Result<Vec<u8>, GetError> {
         let msg = String::from_utf8_lossy(body);
         return Err(GetError::Http(
             code,
-            format!("docker API {path}: {status}: {}", msg.trim()),
+            format!("{label} {path}: {status}: {}", msg.trim()),
         ));
     }
     let chunked = head.lines().any(|l| {

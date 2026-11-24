@@ -50,7 +50,9 @@
 //! journals open, and the vacuum removes only closed archived files. Git
 //! guards do not apply to `apt-cache` either (`apt-get clean` removes only
 //! apt's cache files), but process guards do: `apt` and `dpkg` hold
-//! `archives/lock` open while they work.
+//! `archives/lock` open while they work. Likewise for `snap-revisions`:
+//! `snap remove --revision` removes only snapd's own files, and
+//! `in-use-open` blocks while a process has the `.snap` file open.
 //!
 //! Identities are checked again at this boundary, before any git state is
 //! read: a finding root or repository that is no longer the directory the
@@ -339,13 +341,14 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
 /// versions, whose repositories are the tools' own checkouts (Cargo's git
 /// dependencies, uv's source builds, VS Code's servers).
 ///
-/// Nor to `journald` and `apt-cache`: the vacuum removes only archived
-/// journal files and `apt-get clean` only apt's own cache files, so
-/// neither can touch a repository.
+/// Nor to `journald`, `apt-cache` and `snap-revisions`: the vacuum
+/// removes only archived journal files, `apt-get clean` only apt's own
+/// cache files and `snap remove --revision` only snapd's files for that
+/// revision, so none of them can touch a repository.
 pub(crate) fn git_guarded(f: &Finding) -> bool {
     !matches!(
         f.detector.as_str(),
-        "user-cache" | "tool-versions" | "journald" | "apt-cache"
+        "user-cache" | "tool-versions" | "journald" | "apt-cache" | "snap-revisions"
     )
 }
 

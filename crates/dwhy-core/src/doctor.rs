@@ -57,6 +57,7 @@ pub const TOOLS: &[(&str, &[&str])] = &[
     ),
     ("journalctl", &["journald (root only)"]),
     ("apt-get", &["apt-cache (root only)"]),
+    ("snap", &["snap-revisions (root only)"]),
 ];
 
 /// Resolves `name` on `path_var` the way a shell would (first executable hit).
@@ -124,7 +125,7 @@ fn off_path_candidates(name: &str) -> Vec<PathBuf> {
                 v.push(h.join(".cargo/bin/uv"));
             }
         }
-        "git" | "docker" | "journalctl" | "apt-get" => {
+        "git" | "docker" | "journalctl" | "apt-get" | "snap" => {
             v.push(PathBuf::from("/usr/bin").join(name));
             v.push(PathBuf::from("/bin").join(name));
         }
@@ -295,7 +296,8 @@ mod tests {
                 "pyenv",
                 "fnm",
                 "journalctl",
-                "apt-get"
+                "apt-get",
+                "snap"
             ]
         );
         assert_eq!(d.detectors.len(), CATALOG.len());

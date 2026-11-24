@@ -566,11 +566,16 @@ pub fn explain(
             let input = abs.to_str().ok_or(EXPLAIN_UTF8_PATH)?;
             // tool-versions compares a version with what sits around it,
             // which can be more than one level up.
-            let context = if only.iter().any(|n| n == "tool-versions") {
+            let mut context = if only.iter().any(|n| n == "tool-versions") {
                 detectors::ToolVersions::from_system().context_roots(&ctx)
             } else {
                 Vec::new()
             };
+            // snap-revisions names `.snap` files and reads the directory
+            // they are in.
+            if only.iter().any(|n| n == "snap-revisions") {
+                context.push((detectors::SnapRevisions::from_system().snaps_dir(), 1));
+            }
             let (path, walked) = match scan::absolute_nofollow(&abs) {
                 Ok(resolved) => (
                     resolved.to_str().ok_or(EXPLAIN_UTF8_PATH)?.to_owned(),
