@@ -67,7 +67,7 @@ use std::ffi::OsStr;
 use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawDir, Stat};
@@ -167,8 +167,6 @@ struct Entry {
     status: String,
     #[serde(rename = "type")]
     kind: String,
-    #[serde(rename = "mounted-from", default)]
-    mounted_from: Option<String>,
 }
 
 /// A disabled revision of a snap with an active one.
@@ -179,9 +177,9 @@ struct Disabled {
     active: String,
 }
 
-/// The disabled revisions of the snaps `body` lists, for snaps whose `.snap`
-/// files live in `snaps_dir`. `Err` when the body is not a listing.
-fn disabled_revisions(body: &[u8], snaps_dir: &Path) -> Result<Vec<Disabled>, String> {
+/// The disabled revisions of the snaps `body` lists. `Err` when the body is
+/// not a listing.
+fn disabled_revisions(body: &[u8]) -> Result<Vec<Disabled>, String> {
     let r: Response =
         serde_json::from_slice(body).map_err(|e| format!("snapd API /v2/snaps: {e}"))?;
     if r.kind != "sync" || r.status_code != 200 {
@@ -219,13 +217,6 @@ fn disabled_revisions(body: &[u8], snaps_dir: &Path) -> Result<Vec<Disabled>, St
             continue;
         };
         for e in revs.iter().filter(|e| e.status == "installed") {
-            let file = snaps_dir.join(file_name(name, &e.revision));
-            if e.mounted_from
-                .as_ref()
-                .is_some_and(|m| Path::new(m) != file)
-            {
-                continue;
-            }
             out.push(Disabled {
                 name: name.to_string(),
                 revision: e.revision.clone(),
@@ -297,7 +288,7 @@ impl Detector for SnapRevisions {
         if !node.is_dir {
             return Ok(Vec::new());
         }
-        let disabled = disabled_revisions(&self.fetch()?, &snaps_dir)?;
+        let disabled = disabled_revisions(&self.fetch()?)?;
         if disabled.is_empty() {
             return Ok(Vec::new());
         }
@@ -586,7 +577,7 @@ mod tests {
     }
 
     fn parse(entries: &[String]) -> Vec<(String, String, String)> {
-        disabled_revisions(&listing(entries), Path::new("/var/lib/snapd/snaps"))
+        disabled_revisions(&listing(entries))
             .unwrap()
             .into_iter()
             .map(|d| (d.name, d.revision, d.active))
@@ -653,19 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn a_revision_mounted_from_elsewhere_is_skipped() {
-        let got = parse(&[
-            r#"{"name":"tried","revision":"x1","status":"installed","type":"app","mounted-from":"/home/me/src/tried/prime"}"#.into(),
-            entry("tried", "x2", "active", "app"),
-            r#"{"name":"nomount","revision":"3","status":"installed","type":"app"}"#.into(),
-            entry("nomount", "4", "active", "app"),
-        ]);
-        assert_eq!(got, [("nomount".into(), "3".into(), "4".into())]);
-    }
-
-    #[test]
     fn a_body_that_is_not_a_listing_is_an_error() {
-        let dir = Path::new("/var/lib/snapd/snaps");
         for body in [
             &b""[..],
             b"not json",
@@ -677,13 +656,13 @@ mod tests {
             br#"{"type":"sync","status-code":200,"result":[{"name":"a","revision":1,"status":"installed","type":"app"}]}"#,
         ] {
             assert!(
-                disabled_revisions(body, dir).is_err(),
+                disabled_revisions(body).is_err(),
                 "{}",
                 String::from_utf8_lossy(body)
             );
         }
         assert_eq!(
-            disabled_revisions(br#"{"type":"sync","status-code":200,"result":[]}"#, dir).unwrap(),
+            disabled_revisions(br#"{"type":"sync","status-code":200,"result":[]}"#).unwrap(),
             []
         );
     }
