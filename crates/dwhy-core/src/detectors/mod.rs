@@ -6,6 +6,7 @@ mod docker;
 mod git_worktree;
 mod journald;
 mod node_modules;
+mod old_kernels;
 mod snap_revisions;
 mod stale_tree;
 mod tool_versions;
@@ -32,6 +33,8 @@ pub use git_worktree::{
 };
 pub use journald::Journald;
 pub use node_modules::NodeModules;
+pub use old_kernels::{APT_REMOVAL_SET, OldKernels, removal_set_guard, running_release};
+pub(crate) use old_kernels::{package_state, process_roots as old_kernel_process_roots};
 pub use snap_revisions::SnapRevisions;
 pub use stale_tree::{SCRATCH_LOCATIONS, SCRATCH_MARKER, SCRATCH_STALE_DAYS, StaleTree};
 pub use tool_versions::ToolVersions;
@@ -57,6 +60,7 @@ pub fn registry() -> Vec<Box<dyn Detector>> {
         Box::new(Journald::from_system()),
         Box::new(AptCache::from_system()),
         Box::new(SnapRevisions::from_system()),
+        Box::new(OldKernels::from_system()),
     ]
 }
 

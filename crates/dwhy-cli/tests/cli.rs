@@ -610,7 +610,8 @@ fn doctor_json() {
             "fnm",
             "journalctl",
             "apt-get",
-            "snap"
+            "snap",
+            "dpkg-query"
         ]
     );
     assert!(v["detectors"].as_array().unwrap().len() >= 12);

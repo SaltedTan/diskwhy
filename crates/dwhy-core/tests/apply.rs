@@ -1784,6 +1784,7 @@ fn skipped_docker_items_make_no_docker_api_reads() {
                 size_bucket: plan::size_bucket(f.bytes),
                 git: None,
                 docker_id: Some(format!("{}@1", f.path)),
+                packages: None,
             },
             scan_root_dev: None,
         });

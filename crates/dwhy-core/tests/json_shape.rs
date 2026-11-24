@@ -423,6 +423,7 @@ fn plan_sample() -> Plan {
                     size_bucket: 133,
                     git: None,
                     docker_id: None,
+                    packages: None,
                 },
                 scan_root_dev: None,
             },
@@ -445,6 +446,7 @@ fn plan_sample() -> Plan {
                     size_bucket: 133,
                     git: None,
                     docker_id: Some("sha256:5bcecbbe34b6".into()),
+                    packages: None,
                 },
                 scan_root_dev: None,
             },
@@ -504,6 +506,7 @@ fn plan_git_fingerprint_shape() {
             status_hash: "cbf29ce484222325".into(),
         }),
         docker_id: None,
+        packages: None,
     };
     insta::assert_json_snapshot!(fp);
 }

@@ -19,7 +19,7 @@ crates/dwhy-core   engine: scan (walker), tree (the ScanTree detectors read: per
                    after the detectors: postgres-wal reads the Engine API and runs read-only psql
                    through docker exec), docker (read-only Engine API client:
                    GETs over the unix socket; snap-revisions uses its GET for snapd's API), guard (pre-removal checks:
-                   processes, git, container mounts),
+                   processes, git, container mounts, old-kernels' apt removal simulation),
                    plan (selection, fingerprints, expiry), apply (re-detect, tier policy, run
                    ready items, audit log), remove (path removal: no symlinks, one filesystem),
                    gitcmd (how diskwhy runs git), cancel (per-session Cancel token and PID-tracked child runner),
@@ -72,7 +72,7 @@ Insta snapshots in `crates/*/tests/snapshots/` pin the shape. When a snapshot ch
 - Use `tempfile` fixtures and assert behaviour through public APIs or the `dwhy` binary. Never assert on the text of source code.
 - TUI tests render with ratatui's TestBackend and pin 80×24 screens with insta; no pty.
 - Tests that rely on permissions (mode 000 dirs) skip themselves when running as root. Restore permissions in a `Drop` guard so temp dirs can be cleaned up.
-- Docker detector tests use the fixed snapshot in `crates/dwhy-core/tests/data/docker-system-df.json`; never depend on the machine's daemon. CLI tests that check findings pass `--detectors cargo-target` so local Docker state and the machine's own caches can't leak into snapshots. `user-cache` tests build a fake home and pass the environment through `UserCache::with_env`. `snap-revisions` tests take snapd's revision list from `crates/dwhy-core/tests/data/snapd-snaps-all.json` through `SnapRevisions::with_listing`; never from the machine's snapd.
+- Docker detector tests use the fixed snapshot in `crates/dwhy-core/tests/data/docker-system-df.json`; never depend on the machine's daemon. CLI tests that check findings pass `--detectors cargo-target` so local Docker state and the machine's own caches can't leak into snapshots. `user-cache` tests build a fake home and pass the environment through `UserCache::with_env`. `snap-revisions` tests take snapd's revision list from `crates/dwhy-core/tests/data/snapd-snaps-all.json` through `SnapRevisions::with_listing`; never from the machine's snapd. `old-kernels` tests build a system root in a temp dir, pass it and the running release through `OldKernels::with_root`, and fake `dpkg-query` and `apt-get` with scripts (given as off-PATH tools) that answer from files the test writes; never the machine's dpkg or apt.
 - Mount tests read the real mount table (mounts under `/dev`) and skip when nothing is there. Don't mount anything.
 - Directory sizes must be deterministic. A hardlinked inode is attributed to its lexicographically smallest path, and tests rely on that.
 - Detectors only read: the `ScanTree`, small files opened with `O_NOFOLLOW`, read-only tool commands, and read-only Docker and snapd API GETs. Every detector gets fixture tests for what it must find and for lookalikes it must ignore. A finding's `id` comes from `detect::finding_id` and must stay stable. Filesystem detectors report `TreeNode::freeable()` as `bytes` (allocated minus bytes kept alive by hardlinks outside the directory), never raw `total.allocated`.
