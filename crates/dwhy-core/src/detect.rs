@@ -51,6 +51,7 @@ pub const CATALOG: &[DetectorInfo] = &[
     info("docker-container", "M1", Needs::Docker),
     info("docker-volume", "M1", Needs::Docker),
     info("journald", "post-MVP", Needs::RootAnd("journalctl")),
+    info("apt-cache", "post-MVP", Needs::RootAnd("apt-get")),
 ];
 
 const fn info(name: &'static str, milestone: &'static str, needs: Needs) -> DetectorInfo {

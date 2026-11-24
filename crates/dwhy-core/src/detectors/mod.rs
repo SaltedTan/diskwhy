@@ -1,5 +1,6 @@
 //! Built detectors. Each one matches a [`crate::detect::CATALOG`] entry.
 
+mod apt_cache;
 mod cargo_target;
 mod docker;
 mod git_worktree;
@@ -16,6 +17,7 @@ use std::path::Path;
 
 use crate::detect::Detector;
 
+pub use apt_cache::AptCache;
 pub use cargo_target::CargoTarget;
 pub use docker::{
     BUILD_CACHE_AGE_HOURS, DockerBuildCache, DockerContainer, DockerImage, DockerPresence,
@@ -51,6 +53,7 @@ pub fn registry() -> Vec<Box<dyn Detector>> {
         Box::new(DockerContainer),
         Box::new(DockerVolume),
         Box::new(Journald::from_system()),
+        Box::new(AptCache::from_system()),
     ]
 }
 

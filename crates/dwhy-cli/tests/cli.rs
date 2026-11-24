@@ -608,7 +608,8 @@ fn doctor_json() {
             "rustup",
             "pyenv",
             "fnm",
-            "journalctl"
+            "journalctl",
+            "apt-get"
         ]
     );
     assert!(v["detectors"].as_array().unwrap().len() >= 12);

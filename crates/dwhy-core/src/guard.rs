@@ -47,7 +47,10 @@
 //! and do not apply to `user-cache` and `tool-versions` findings: those
 //! repositories are the tools' own checkouts. Neither git nor process
 //! guards apply to `journald`: `systemd-journald` always has the active
-//! journals open, and the vacuum removes only closed archived files.
+//! journals open, and the vacuum removes only closed archived files. Git
+//! guards do not apply to `apt-cache` either (`apt-get clean` removes only
+//! apt's cache files), but process guards do: `apt` and `dpkg` hold
+//! `archives/lock` open while they work.
 //!
 //! Identities are checked again at this boundary, before any git state is
 //! read: a finding root or repository that is no longer the directory the
@@ -336,12 +339,13 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
 /// versions, whose repositories are the tools' own checkouts (Cargo's git
 /// dependencies, uv's source builds, VS Code's servers).
 ///
-/// Nor to `journald`: its vacuum removes only archived journal files, so
-/// it cannot touch a repository.
+/// Nor to `journald` and `apt-cache`: the vacuum removes only archived
+/// journal files and `apt-get clean` only apt's own cache files, so
+/// neither can touch a repository.
 pub(crate) fn git_guarded(f: &Finding) -> bool {
     !matches!(
         f.detector.as_str(),
-        "user-cache" | "tool-versions" | "journald"
+        "user-cache" | "tool-versions" | "journald" | "apt-cache"
     )
 }
 
