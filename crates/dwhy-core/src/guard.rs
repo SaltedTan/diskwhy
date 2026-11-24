@@ -45,7 +45,9 @@
 //!
 //! Git guards skip repositories inside a cache (below a `CACHEDIR.TAG`)
 //! and do not apply to `user-cache` and `tool-versions` findings: those
-//! repositories are the tools' own checkouts.
+//! repositories are the tools' own checkouts. Neither git nor process
+//! guards apply to `journald`: `systemd-journald` always has the active
+//! journals open, and the vacuum removes only closed archived files.
 //!
 //! Identities are checked again at this boundary, before any git state is
 //! read: a finding root or repository that is no longer the directory the
@@ -302,8 +304,10 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
         let mut results = Vec::new();
         if f.path.starts_with('/') {
             let root = PathBuf::from(&f.path);
-            results.push(in_use_cwd(&root, procs));
-            results.push(in_use_open(&root, procs));
+            if process_guarded(f) {
+                results.push(in_use_cwd(&root, procs));
+                results.push(in_use_open(&root, procs));
+            }
             if let Some(detail) = root_change {
                 plan::add_changed_guard(&mut results, detail);
             } else {
@@ -331,8 +335,24 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
 /// Whether the git guards apply: not to tool-managed caches and tool
 /// versions, whose repositories are the tools' own checkouts (Cargo's git
 /// dependencies, uv's source builds, VS Code's servers).
+///
+/// Nor to `journald`: its vacuum removes only archived journal files, so
+/// it cannot touch a repository.
 pub(crate) fn git_guarded(f: &Finding) -> bool {
-    !matches!(f.detector.as_str(), "user-cache" | "tool-versions")
+    !matches!(
+        f.detector.as_str(),
+        "user-cache" | "tool-versions" | "journald"
+    )
+}
+
+/// Whether `in-use-cwd` and `in-use-open` apply. Not to `journald`:
+/// `systemd-journald` always has the active journals in `/var/log/journal`
+/// open, so the guards would block every finding, and the action
+/// (`journalctl --vacuum-time`) removes only closed archived files, leaving
+/// the directory and the active journals in place. `changed-since-scan`
+/// still applies.
+fn process_guarded(f: &Finding) -> bool {
+    f.detector != "journald"
 }
 
 /// What the git guards check. Work trees sort before git directories, so

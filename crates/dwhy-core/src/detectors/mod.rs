@@ -3,6 +3,7 @@
 mod cargo_target;
 mod docker;
 mod git_worktree;
+mod journald;
 mod node_modules;
 mod stale_tree;
 mod tool_versions;
@@ -26,6 +27,7 @@ pub(crate) use docker::{
 pub use git_worktree::{
     GitWorktree, STALE_DAYS, WorktreeEntry, parse_porcelain, parse_porcelain_z,
 };
+pub use journald::Journald;
 pub use node_modules::NodeModules;
 pub use stale_tree::{SCRATCH_LOCATIONS, SCRATCH_MARKER, SCRATCH_STALE_DAYS, StaleTree};
 pub use tool_versions::ToolVersions;
@@ -48,6 +50,7 @@ pub fn registry() -> Vec<Box<dyn Detector>> {
         Box::new(DockerBuildCache),
         Box::new(DockerContainer),
         Box::new(DockerVolume),
+        Box::new(Journald::from_system()),
     ]
 }
 

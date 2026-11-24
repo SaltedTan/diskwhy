@@ -698,7 +698,15 @@ pub fn fingerprint(f: &Finding, tree: &ScanTree, ctx: &DetectContext) -> Fingerp
         if let Ok(Some(id)) = root_identity(f.file_identity, node) {
             fp.dev = Some(id.dev);
             fp.inode = Some(id.ino);
-            fp.newest_mtime = Some(id.mtime);
+            // Not for `journald`: systemd-journald writes the active
+            // journals all the time, which moves the directory's newest
+            // mtime and would invalidate every plan before `apply`. The
+            // vacuum leaves the active journals alone; device/inode, the
+            // size bucket of the old archived files and the removal-root
+            // check still tell whether the directory is the one planned.
+            if f.detector != "journald" {
+                fp.newest_mtime = Some(id.mtime);
+            }
         }
         if node.is_some_and(|n| n.is_dir && n.markers.contains(Markers::DOT_GIT))
             && guard::git_guarded(f)
