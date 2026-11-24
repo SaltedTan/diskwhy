@@ -1210,7 +1210,13 @@ mod tests {
             CATALOG.len(),
             "every detector is one or the other"
         );
-        assert!(all.iter().all(|n| !n.starts_with("docker-")), "{all:?}");
+        assert!(
+            all.iter().all(|n| CATALOG
+                .iter()
+                .any(|d| d.name == n && d.needs != Needs::Docker)),
+            "{all:?}"
+        );
+        assert!(all.iter().any(|n| n == "docker-logs"), "{all:?}");
         let only = vec!["cargo-target".to_string(), "docker-volume".to_string()];
         assert_eq!(filesystem_selection(Some(&only)), ["cargo-target"]);
         assert!(filesystem_selection(Some(&only[1..])).is_empty());

@@ -576,6 +576,13 @@ pub fn explain(
             if only.iter().any(|n| n == "snap-revisions") {
                 context.push((detectors::SnapRevisions::from_system().snaps_dir(), 1));
             }
+            // docker-logs reads a container's log in the `containers`
+            // directory the walk holds.
+            if only.iter().any(|n| n == "docker-logs")
+                && let Some(c) = detectors::DockerLogs::context_root(&abs)
+            {
+                context.push(c);
+            }
             let (path, walked) = match scan::absolute_nofollow(&abs) {
                 Ok(resolved) => (
                     resolved.to_str().ok_or(EXPLAIN_UTF8_PATH)?.to_owned(),

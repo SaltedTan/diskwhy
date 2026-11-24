@@ -147,6 +147,15 @@ expression: v
       "name": "old-kernels",
       "ran": false,
       "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "error": null,
+      "findings": 0,
+      "name": "docker-logs",
+      "ran": false,
+      "status": "[status]"
     }
   ],
   "docker": null,
