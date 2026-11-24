@@ -241,9 +241,9 @@ fn holds_container_dir(tree: &ScanTree) -> bool {
     tree.ids().any(|id| {
         tree.node(id).is_dir
             && is_id(tree.name(id).as_bytes())
-            && tree
-                .parent(id)
-                .is_some_and(|p| tree.name(p).as_bytes() == b"containers")
+            && tree.parent(id).is_some_and(|p| {
+                Path::new(tree.name(p)).file_name() == Some(OsStr::new("containers"))
+            })
     })
 }
 
@@ -353,8 +353,8 @@ fn candidate(ctx: &DetectContext, c: &Inspect, b: Big) -> Candidate {
         "unknown"
     };
     let opts = c.host_config.log_config.config.as_ref();
-    let max_size = cap(opts, "max-size").filter(|v| plain_name(v));
-    let max_file = cap(opts, "max-file").filter(|v| plain_name(v));
+    let max_size = cap(opts, "max-size");
+    let max_file = cap(opts, "max-file");
     let labels = c.config.labels.as_ref();
     let label = |k: &str| {
         labels
@@ -372,10 +372,19 @@ fn candidate(ctx: &DetectContext, c: &Inspect, b: Big) -> Candidate {
     );
     match &max_size {
         None => reason.push_str("no max-size is set, so Docker never rotates it"),
-        Some(size) => reason.push_str(&format!(
-            "Docker rotates it at max-size {size} and keeps max-file {} files",
-            max_file.as_deref().unwrap_or("1")
-        )),
+        Some(size) => {
+            let size = if plain_name(size) {
+                format!("max-size {size}")
+            } else {
+                "its max-size".to_string()
+            };
+            let files = match &max_file {
+                None => "max-file 1 files".to_string(),
+                Some(n) if plain_name(n) => format!("max-file {n} files"),
+                Some(_) => "as many files as its max-file".to_string(),
+            };
+            reason.push_str(&format!("Docker rotates it at {size} and keeps {files}"));
+        }
     }
 
     let cap_how = match &max_size {
@@ -394,12 +403,6 @@ fn candidate(ctx: &DetectContext, c: &Inspect, b: Big) -> Candidate {
     advice.push_str(
         "; Docker deletes this log with the old container, and the new one starts a fresh log",
     );
-    if state != "running" {
-        advice.push_str(&format!(
-            "; the container is {state}, so `docker rm {}` also deletes the log",
-            shell_quote(short)
-        ));
-    }
 
     let path_s = b.path.to_string_lossy().into_owned();
     let finding = Finding {

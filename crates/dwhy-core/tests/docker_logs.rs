@@ -251,7 +251,7 @@ fn reports_at_the_default_threshold_and_not_below() {
 }
 
 #[test]
-fn a_capped_stopped_container_gets_rotation_and_rm_advice() {
+fn a_capped_stopped_container_gets_rotation_advice() {
     let (_t, b) = base();
     let mut c = C::new(&b, id(3), "batch");
     c.state = "exited";
@@ -270,13 +270,60 @@ fn a_capped_stopped_container_gets_rotation_and_rm_advice() {
     );
     assert!(
         f.action.text.contains("lower its caps")
-            && f.action.text.contains("--log-opt max-size=10m")
-            && f.action.text.contains(
-                "the container is exited, so `docker rm 030303030303` also deletes the log"
-            ),
+            && f.action.text.contains("--log-opt max-size=10m"),
         "{}",
         f.action.text
     );
+}
+
+#[test]
+fn a_cap_that_is_not_plain_still_counts_as_set() {
+    let (_t, b) = base();
+    let mut c = C::new(&b, id(5), "api");
+    c.opts = json!({"max-size": "200 MB", "max-file": "4 "});
+    write(&log_path(&b, &c.id), 2 * MIB);
+    let found = detect_with(&b, responses(&b, &[&c], &[&c]), MIN).unwrap();
+    let f = &found[0];
+    assert!(
+        f.reason
+            .contains("Docker rotates it at its max-size and keeps max-file 4 files")
+            && !f.reason.contains("200 MB")
+            && !f.reason.contains("no max-size"),
+        "{}",
+        f.reason
+    );
+    assert!(
+        f.action.text.contains("lower its caps"),
+        "{}",
+        f.action.text
+    );
+
+    c.opts = json!({"max-size": "50m", "max-file": "3 files"});
+    let found = detect_with(&b, responses(&b, &[&c], &[&c]), MIN).unwrap();
+    assert!(
+        found[0]
+            .reason
+            .contains("Docker rotates it at max-size 50m and keeps as many files as its max-file")
+            && !found[0].reason.contains("3 files"),
+        "{}",
+        found[0].reason
+    );
+}
+
+#[test]
+fn reports_from_a_walk_of_the_containers_directory_itself() {
+    // `dwhy explain` on a log walks from `containers`, so that directory is
+    // the walk's root and its node is named by its full path.
+    let (_t, b) = base();
+    let c = C::new(&b, id(1), "web");
+    let p = log_path(&b, &c.id);
+    write(&p, 2 * MIB);
+    let tree = scan_tree(&docker_root(&b).join("containers"));
+    let found = DockerLogs::with_responses(responses(&b, &[&c], &[&c]), MIN)
+        .detect_candidates(&tree, &root_ctx())
+        .unwrap();
+    let paths: Vec<_> = found.iter().map(|c| c.finding.path.clone()).collect();
+    assert_eq!(paths, [p.to_string_lossy().into_owned()]);
 }
 
 #[test]
