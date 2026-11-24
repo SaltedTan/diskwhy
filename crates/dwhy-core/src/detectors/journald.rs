@@ -1,15 +1,17 @@
-//! `journald`: archived systemd journal files older than
-//! [`Journald::VACUUM_DAYS`] days in the persistent journal,
+//! `journald`: archived systemd journal files started more than
+//! [`Journald::VACUUM_DAYS`] days ago in the persistent journal,
 //! `/var/log/journal`. Root only (the catalog's `Needs::RootAnd`).
 //!
 //! The journal directory holds the active journals (`system.journal`,
 //! `user-<uid>.journal`), which `systemd-journald` keeps open and writes,
-//! and archived ones it rotated out: `system@<id>.journal`, or
-//! `system@<id>.journal~` for a file closed uncleanly. Only archived files
-//! are vacuum targets; `journalctl --vacuum-time` never touches an active
-//! journal. They sit directly in the journal directory or in its
-//! `<machine-id>/` subdirectories, so the detector reads the directory and
-//! its immediate subdirectories, no deeper.
+//! and archived ones it rotated out. `journalctl --vacuum-time` removes only
+//! archived files named as journald names them,
+//! `<prefix>@<32 hex seqnum id>-<16 hex head seqnum>-<16 hex head realtime>.journal`,
+//! or `<prefix>@<16 hex head realtime>-<16 hex>.journal~` for a file closed
+//! uncleanly; it treats every other `.journal` or `.journal~` file as active
+//! and leaves it. It looks directly in the journal directory and in its
+//! subdirectories named by a 128-bit ID (`<machine-id>/`), so the detector
+//! reads the directory and those immediate subdirectories, no deeper.
 //!
 //! Reading follows the walk's rules: every directory is opened with
 //! `O_NOFOLLOW` and checked to be the inode just `lstat`ed, entries are
@@ -19,11 +21,14 @@
 //! journal (otherwise vacuuming would not free them); the total is also
 //! capped at the directory's [`TreeNode::freeable`] bytes.
 //!
-//! Age is the file's mtime, the time of its last entry. `journalctl`
-//! judges by the entry times inside, so the estimate errs towards keeping.
+//! Age is judged as `journalctl` judges it: the head (first-entry) realtime
+//! in the file's name, or the file's ctime, atime or mtime when earlier. The
+//! vacuum removes a whole file started more than 14 days ago, entries from
+//! the last 14 days in it included, so such a file counts in full.
 //! The finding is `review`: logs are not regenerable. The action is
 //! `journalctl --directory <dir> --vacuum-time=14d`, which leaves the
-//! directory, the active journals and the last 14 days in place.
+//! directory, the active journals and archived files started in the last
+//! 14 days in place.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -51,7 +56,7 @@ impl Journald {
     /// The persistent journal directory.
     pub const DEFAULT_ROOT: &str = "/var/log/journal";
 
-    /// Archived journals whose last write is older than this many days are
+    /// Archived journals started more than this many days ago are
     /// reclaimable; the action vacuums with the same age.
     pub const VACUUM_DAYS: i64 = 14;
 
@@ -72,7 +77,7 @@ struct Tally {
     reclaimable_bytes: u64,
     reclaimable_files: u64,
     newest_old_mtime: Option<i64>,
-    /// Active and recent journal files that stay.
+    /// Journal files the vacuum leaves: active ones, recent archived ones.
     kept_bytes: u64,
     /// Old archived journals hardlinked to a name vacuuming keeps.
     linked_bytes: u64,
@@ -128,7 +133,7 @@ impl Detector for Journald {
         ];
         let n = tally.reclaimable_files;
         let mut reason = format!(
-            "{n} archived journal file{} older than {days} days in {} ({})",
+            "{n} archived journal file{} started over {days} days ago in {} ({})",
             if n == 1 { "" } else { "s" },
             self.root.display(),
             human(bytes),
@@ -145,7 +150,9 @@ impl Detector for Journald {
                 human(tally.linked_bytes)
             ));
         }
-        reason.push_str(&format!("; active and recent (<{days}d) journals are kept"));
+        reason.push_str(&format!(
+            "; active journals and archived ones started in the last {days} days are kept"
+        ));
         if tally.kept_bytes > 0 {
             reason.push_str(&format!(
                 " ({} of {} total)",
@@ -177,7 +184,9 @@ impl Detector for Journald {
                 argv: Some(argv),
             },
             recovery: Recovery {
-                cost: "vacuumed journal entries older than 14 days cannot be recovered; active logs and the last 14 days stay".into(),
+                cost: format!(
+                    "vacuuming removes whole archived journal files started over {days} days ago, newer entries in them included, and they cannot be recovered; active journals stay"
+                ),
                 how: None,
             },
             path: path_s,
@@ -204,7 +213,11 @@ impl Journald {
                 FileType::RegularFile => note(&mut inodes, &name, &st, cutoff),
                 FileType::Directory => {
                     // A `<machine-id>/` directory, checked to be the inode
-                    // just stat'ed; nothing below it is read.
+                    // just stat'ed; nothing below it is read. journalctl
+                    // vacuums no other subdirectory.
+                    if !is_id128(&name) {
+                        continue;
+                    }
                     let Ok(sub) = rustix::fs::openat(&root, name.as_slice(), flags, Mode::empty())
                     else {
                         continue;
@@ -273,47 +286,64 @@ fn entries(dir: &OwnedFd, dev: u64) -> Vec<(Vec<u8>, Stat)> {
 
 /// Records the regular file `name` if it is a journal file.
 fn note(inodes: &mut HashMap<(u64, u64), Inode>, name: &[u8], st: &Stat, cutoff: i64) {
-    let Some(archived) = journal_kind(name) else {
+    let head = archived_head(name);
+    if head.is_none() && !name.ends_with(b".journal") && !name.ends_with(b".journal~") {
         return;
-    };
-    let mtime = mtime(st);
+    }
     let i = inodes.entry((st.st_dev, st.st_ino)).or_insert(Inode {
         allocated: st.st_blocks.max(0) as u64 * 512,
         nlink: nlink(st),
-        mtime,
+        mtime: mtime(st),
         old_names: 0,
         kept_name: false,
     });
-    if archived && mtime <= cutoff {
-        i.old_names += 1;
-    } else {
-        i.kept_name = true;
+    match head {
+        Some(head) if vacuum_time(st, head) < cutoff => i.old_names += 1,
+        _ => i.kept_name = true,
     }
 }
 
-/// `Some(true)` for an archived journal (`<name>@<id>.journal` or
-/// `.journal~`), `Some(false)` for an active one, `None` for anything else.
-fn journal_kind(name: &[u8]) -> Option<bool> {
-    let stem = name
-        .strip_suffix(b".journal")
-        .or_else(|| name.strip_suffix(b".journal~"))?;
-    if stem.is_empty() {
-        return None;
-    }
-    let archived = match stem.iter().position(|&b| b == b'@') {
-        Some(at) => {
-            if at == 0 || at + 1 == stem.len() {
-                return None;
-            }
-            true
-        }
-        None => false,
+/// The head realtime, in seconds, that `journalctl --vacuum-time` reads
+/// from the name of an archived journal it may remove; `None` for any other
+/// name, which the vacuum leaves alone.
+fn archived_head(name: &[u8]) -> Option<i64> {
+    let usec = if let Some(stem) = name.strip_suffix(b".journal") {
+        // `@<32 hex seqnum id>-<16 hex head seqnum>-<16 hex head realtime>`
+        let t = &stem[stem.len().checked_sub(67)?..];
+        let ok = t[0] == b'@' && is_id128(&t[1..33]) && t[33] == b'-' && t[50] == b'-';
+        hex(&t[34..50])?;
+        ok.then_some(hex(&t[51..])?)?
+    } else {
+        // `@<16 hex head realtime>-<16 hex>`
+        let stem = name.strip_suffix(b".journal~")?;
+        let t = &stem[stem.len().checked_sub(34)?..];
+        hex(&t[18..])?;
+        (t[0] == b'@' && t[17] == b'-').then_some(hex(&t[1..17])?)?
     };
-    // An active journal is never `.journal~`: that is a file closed uncleanly.
-    if !archived && name.ends_with(b"~") {
+    Some((usec / 1_000_000) as i64)
+}
+
+/// A 128-bit ID in its plain form: 32 hex digits.
+fn is_id128(s: &[u8]) -> bool {
+    s.len() == 32 && s.iter().all(u8::is_ascii_hexdigit)
+}
+
+/// `s`, 16 hex digits, as a number.
+fn hex(s: &[u8]) -> Option<u64> {
+    if s.len() != 16 || !s.iter().all(u8::is_ascii_hexdigit) {
         return None;
     }
-    Some(archived)
+    u64::from_str_radix(std::str::from_utf8(s).ok()?, 16).ok()
+}
+
+/// The time `journalctl --vacuum-time` judges an archived file by: `head`,
+/// or the file's ctime, atime or mtime when earlier.
+#[allow(clippy::unnecessary_cast)]
+fn vacuum_time(st: &Stat, head: i64) -> i64 {
+    [st.st_ctime as i64, st.st_atime as i64, mtime(st)]
+        .into_iter()
+        .filter(|&t| t > 0)
+        .fold(head, i64::min)
 }
 
 /// mtime in seconds; `st_mtime` is narrower than i64 on 32-bit targets.
@@ -330,34 +360,40 @@ fn nlink(st: &Stat) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::journal_kind;
+    use super::archived_head;
 
     #[test]
-    fn journal_names() {
+    fn archived_journal_names() {
+        // 0x0005f0a1b2c3d4e5 microseconds.
+        let head = 0x0005f0a1b2c3d4e5_i64 / 1_000_000;
         for archived in [
-            "system@0123abcd-0000000000000001-0005f0a1b2c3d4e5.journal",
-            "system@0123abcd-0000000000000001-0005f0a1b2c3d4e5.journal~",
-            "user-1000@0123abcd-0000000000000001-0005f0a1b2c3d4e5.journal",
-            "user-1000@x.journal~",
+            "system@70c2d3c15eb342d091269c9ee491d117-0000000000000001-0005f0a1b2c3d4e5.journal",
+            "user-1000@70C2D3C15EB342D091269C9EE491D117-00000000000a0001-0005f0a1b2c3d4e5.journal",
+            "@70c2d3c15eb342d091269c9ee491d117-0000000000000001-0005f0a1b2c3d4e5.journal",
+            "system@0005f0a1b2c3d4e5-9d3e1f0a2b4c6d8e.journal~",
+            "user-1000@0005f0a1b2c3d4e5-9d3e1f0a2b4c6d8e.journal~",
         ] {
-            assert_eq!(journal_kind(archived.as_bytes()), Some(true), "{archived}");
-        }
-        for active in ["system.journal", "user-1000.journal"] {
-            assert_eq!(journal_kind(active.as_bytes()), Some(false), "{active}");
+            assert_eq!(archived_head(archived.as_bytes()), Some(head), "{archived}");
         }
         for other in [
-            "README",
-            "foo.log",
-            "system.journal.bak",
-            "foo@bar.txt",
-            ".journal",
-            "@.journal",
-            "@x.journal",
-            "system@.journal",
+            "system.journal",
+            "user-1000.journal",
             "system.journal~",
-            "system@x.journal.gz",
+            "README",
+            ".journal",
+            "system@x.journal",
+            "user-1000@x.journal~",
+            "system@0123abcd-0000000000000001-0005f0a1b2c3d4e5.journal",
+            "system@70c2d3c15eb342d091269c9ee491d11g-0000000000000001-0005f0a1b2c3d4e5.journal",
+            "system#70c2d3c15eb342d091269c9ee491d117-0000000000000001-0005f0a1b2c3d4e5.journal",
+            "system@70c2d3c15eb342d091269c9ee491d117_0000000000000001-0005f0a1b2c3d4e5.journal",
+            "system@70c2d3c15eb342d091269c9ee491d117-0000000000000001-0005f0a1b2c3d4e.journal",
+            "system@70c2d3c15eb342d091269c9ee491d117-0000000000000001-0005f0a1b2c3d4e5.journal.gz",
+            "system@0005f0a1b2c3d4e5-9d3e1f0a2b4c6d8.journal~",
+            "system@0005f0a1b2c3d4e5_9d3e1f0a2b4c6d8e.journal~",
+            "system-0005f0a1b2c3d4e5-9d3e1f0a2b4c6d8e.journal~",
         ] {
-            assert_eq!(journal_kind(other.as_bytes()), None, "{other}");
+            assert_eq!(archived_head(other.as_bytes()), None, "{other}");
         }
     }
 }

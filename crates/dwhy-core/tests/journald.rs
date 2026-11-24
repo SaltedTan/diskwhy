@@ -1,5 +1,8 @@
-//! `journald` on temp-dir fixtures: archived journals older than 14 days
-//! in a journal directory and its `<machine-id>/` subdirectories.
+//! `journald` on temp-dir fixtures: archived journals started more than
+//! 14 days ago in a journal directory and its `<machine-id>/`
+//! subdirectories. File names follow journald's archive naming, the format
+//! systemd's journal-vacuum.c parses to decide what `journalctl
+//! --vacuum-time` removes.
 
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -20,7 +23,31 @@ use dwhy_core::scan::{self, Progress, ScanOptions};
 use dwhy_core::tree::ScanTree;
 
 const MID: &str = "70c2d3c15eb342d091269c9ee491d117";
+const SEQNUM_ID: &str = "4f3c1e2d5a6b7c8d9e0f1a2b3c4d5e6f";
 const DAY: u64 = 86_400;
+
+/// Head realtime, in microseconds, `days_ago` days ago.
+fn head_usec(days_ago: u64) -> u64 {
+    (SystemTime::now() - Duration::from_secs(days_ago * DAY))
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
+}
+
+/// An archived journal's name, its first entry `days_ago` days ago:
+/// `<prefix>@<seqnum id>-<head seqnum>-<head realtime>.journal`.
+fn archived(prefix: &str, seq: u64, days_ago: u64) -> String {
+    format!(
+        "{prefix}@{SEQNUM_ID}-{seq:016x}-{:016x}.journal",
+        head_usec(days_ago)
+    )
+}
+
+/// An uncleanly closed journal's name, its first entry `days_ago` days ago:
+/// `<prefix>@<head realtime>-<random>.journal~`.
+fn corrupt(prefix: &str, seq: u64, days_ago: u64) -> String {
+    format!("{prefix}@{:016x}-{seq:016x}.journal~", head_usec(days_ago))
+}
 
 fn base() -> (tempfile::TempDir, PathBuf) {
     let t = tempfile::tempdir().unwrap();
@@ -130,11 +157,11 @@ fn finds_old_archived_journals_and_nothing_else() {
     let j = journal_root(&b);
     let m = j.join(MID);
     let old = [
-        m.join("system@0123abcd-0000000000000001-0005f0a1b2c3d4e5.journal"),
-        m.join("system@0123abcd-0000000000000002-0005f0a1b2c3d4e6.journal~"),
-        m.join("user-1000@0123abcd-0000000000000003-0005f0a1b2c3d4e7.journal"),
+        m.join(archived("system", 1, 20)),
+        m.join(corrupt("system", 2, 21)),
+        m.join(archived("user-1000", 3, 22)),
         // Directly in the journal directory.
-        j.join("system@0123abcd-0000000000000004-0005f0a1b2c3d4e8.journal"),
+        j.join(archived("system", 4, 23)),
     ];
     for (i, p) in old.iter().enumerate() {
         write(p, 2 * MIB, 20 + i as u64);
@@ -142,17 +169,33 @@ fn finds_old_archived_journals_and_nothing_else() {
     // Active journals, however old their mtime, and recent archived ones.
     write(&m.join("system.journal"), 3 * MIB, 30);
     write(&m.join("user-1000.journal"), MIB, 30);
-    write(
-        &m.join("system@0123abcd-0000000000000009-0005f0a1b2c3d4f0.journal"),
-        2 * MIB,
-        2,
-    );
-    // Lookalikes.
-    for name in ["README", "foo.log", "system.journal.bak", "foo@bar.txt"] {
+    write(&m.join(archived("system", 9, 2)), 2 * MIB, 2);
+    // Lookalikes, including names journalctl's vacuum treats as active.
+    for name in [
+        "README",
+        "foo.log",
+        "system.journal.bak",
+        "foo@bar.txt",
+        "system@x.journal",
+        "system@x.journal~",
+        "system@0123abcd-0000000000000001-0005f0a1b2c3d4e5.journal",
+    ] {
         write(&m.join(name), MIB, 30);
     }
     // Deeper than one subdirectory level.
-    write(&m.join("deep/system@0123abcd-1.journal"), 2 * MIB, 30);
+    write(&m.join("deep").join(archived("system", 5, 30)), 2 * MIB, 30);
+    // Subdirectories not named by a 128-bit ID, which journalctl does not
+    // vacuum: systemd-journal-remote's default `remote/`, and a short ID.
+    write(
+        &j.join("remote").join(archived("remote-host", 6, 30)),
+        2 * MIB,
+        30,
+    );
+    write(
+        &j.join(&MID[..31]).join(archived("system", 7, 30)),
+        2 * MIB,
+        30,
+    );
 
     let found = detect(&b, &b);
     assert_eq!(found.len(), 1, "{found:?}");
@@ -167,14 +210,14 @@ fn finds_old_archived_journals_and_nothing_else() {
     assert_eq!(f.last_modified, Some(rfc3339(mtime(&old[0]))));
     assert!(
         f.reason.starts_with(&format!(
-            "4 archived journal files older than 14 days in {path} ("
+            "4 archived journal files started over 14 days ago in {path} ("
         )),
         "{}",
         f.reason
     );
     assert!(
         f.reason
-            .contains("active and recent (<14d) journals are kept"),
+            .contains("active journals and archived ones started in the last 14 days are kept"),
         "{}",
         f.reason
     );
@@ -197,7 +240,7 @@ fn action_uses_the_resolved_command_and_quotes_the_path() {
     let (_t, b) = base();
     let b = b.join("my journal");
     let j = journal_root(&b);
-    write(&j.join(MID).join("system@x.journal"), 2 * MIB, 30);
+    write(&j.join(MID).join(archived("system", 1, 30)), 2 * MIB, 30);
     let c = ctx(
         true,
         vec![tool("journalctl", None, Some("/opt/sd/journalctl"))],
@@ -228,9 +271,30 @@ fn no_finding_with_only_active_or_recent_journals() {
     let m = journal_root(&b).join(MID);
     write(&m.join("system.journal"), 8 * MIB, 40);
     write(&m.join("user-1000.journal"), 4 * MIB, 40);
-    write(&m.join("system@a.journal"), 8 * MIB, 13);
-    write(&m.join("system@b.journal~"), 8 * MIB, 1);
+    write(&m.join(archived("system", 1, 13)), 8 * MIB, 13);
+    write(&m.join(corrupt("system", 2, 1)), 8 * MIB, 1);
     assert!(detect(&b, &b).is_empty());
+}
+
+#[test]
+fn a_file_started_over_14_days_ago_counts_though_written_since() {
+    // journalctl judges an archived file by the head realtime in its name,
+    // so it removes this one whole, the last 3 days of entries included.
+    let (_t, b) = base();
+    let j = journal_root(&b);
+    let started = j.join(MID).join(archived("system", 1, 20));
+    write(&started, 2 * MIB, 3);
+    write(&j.join(MID).join(corrupt("system", 2, 20)), 2 * MIB, 3);
+    let found = detect(&b, &b);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let f = &found[0];
+    assert!(
+        f.reason.starts_with("2 archived journal files"),
+        "{}",
+        f.reason
+    );
+    assert!(f.reason.contains("last written 3 days ago"), "{}", f.reason);
+    assert_eq!(f.last_modified, Some(rfc3339(mtime(&started))));
 }
 
 #[test]
@@ -238,8 +302,8 @@ fn no_finding_below_one_mib() {
     let (_t, b) = base();
     let m = journal_root(&b).join(MID);
     write(&m.join("system.journal"), 8 * MIB, 0);
-    write(&m.join("system@a.journal"), 256 << 10, 30);
-    write(&m.join("system@b.journal"), 256 << 10, 30);
+    write(&m.join(archived("system", 1, 30)), 256 << 10, 30);
+    write(&m.join(archived("system", 2, 30)), 256 << 10, 30);
     assert!(detect(&b, &b).is_empty());
 }
 
@@ -247,7 +311,7 @@ fn no_finding_below_one_mib() {
 fn no_finding_when_the_journal_is_outside_the_scan() {
     let (_t, b) = base();
     write(
-        &journal_root(&b).join(MID).join("system@a.journal"),
+        &journal_root(&b).join(MID).join(archived("system", 1, 30)),
         4 * MIB,
         30,
     );
@@ -264,16 +328,18 @@ fn symlinks_are_not_followed() {
     let (_t, b) = base();
     let j = journal_root(&b);
     let outside = b.join("elsewhere");
-    write(&outside.join(MID).join("system@a.journal"), 4 * MIB, 30);
-    write(&outside.join("system@b.journal"), 4 * MIB, 30);
+    let a = archived("system", 1, 30);
+    let bb = archived("system", 2, 30);
+    write(&outside.join(MID).join(&a), 4 * MIB, 30);
+    write(&outside.join(&bb), 4 * MIB, 30);
     fs::create_dir_all(&j).unwrap();
     // A symlinked machine-id directory and a symlinked archived journal.
     symlink(outside.join(MID), j.join(MID)).unwrap();
-    symlink(outside.join("system@b.journal"), j.join("system@b.journal")).unwrap();
+    symlink(outside.join(&bb), j.join(&bb)).unwrap();
     assert!(detect(&b, &b).is_empty());
     // The journal directory itself a symlink.
     let (_u, c) = base();
-    write(&c.join("real/system@a.journal"), 4 * MIB, 30);
+    write(&c.join("real").join(&a), 4 * MIB, 30);
     fs::create_dir_all(c.join("var/log")).unwrap();
     symlink(c.join("real"), journal_root(&c)).unwrap();
     assert!(detect(&c, &c).is_empty());
@@ -284,9 +350,9 @@ fn hardlinks_count_once_and_outside_links_are_not_freed() {
     let (_t, b) = base();
     let j = journal_root(&b);
     let m = j.join(MID);
-    let alone = m.join("system@a.journal");
-    let linked_out = m.join("system@b.journal");
-    let linked_in = m.join("system@c.journal");
+    let alone = m.join(archived("system", 1, 30));
+    let linked_out = m.join(archived("system", 2, 30));
+    let linked_in = m.join(archived("system", 3, 30));
     write(&alone, 2 * MIB, 30);
     write(&linked_out, 2 * MIB, 30);
     write(&linked_in, 2 * MIB, 30);
@@ -294,7 +360,7 @@ fn hardlinks_count_once_and_outside_links_are_not_freed() {
     // directory and counts it as shared.
     fs::create_dir_all(b.join("zz-out")).unwrap();
     fs::hard_link(&linked_out, b.join("zz-out/b")).unwrap();
-    fs::hard_link(&linked_in, j.join("system@c2.journal")).unwrap();
+    fs::hard_link(&linked_in, j.join(archived("system", 4, 30))).unwrap();
 
     let tree = scan_tree(&b);
     let node = tree.node(tree.find(&j).unwrap());
@@ -321,7 +387,7 @@ fn hardlinks_count_once_and_outside_links_are_not_freed() {
 fn bytes_never_exceed_what_the_walk_attributes() {
     let (_t, b) = base();
     let j = journal_root(&b);
-    let file = j.join(MID).join("system@b.journal");
+    let file = j.join(MID).join(archived("system", 1, 30));
     write(&file, 4 * MIB, 30);
     // "aa-out" sorts before "var": the walk attributes the inode outside,
     // so the journal directory frees almost nothing.
@@ -334,7 +400,7 @@ fn bytes_never_exceed_what_the_walk_attributes() {
 fn runs_only_as_root_with_journalctl() {
     let (_t, b) = base();
     let j = journal_root(&b);
-    write(&j.join(MID).join("system@a.journal"), 2 * MIB, 30);
+    write(&j.join(MID).join(archived("system", 1, 30)), 2 * MIB, 30);
     let tree = scan_tree(&b);
     let built: Vec<Box<dyn Detector>> = vec![Box::new(Journald::with_root(j))];
     let journalctl = || vec![tool("journalctl", Some("/usr/bin/journalctl"), None)];
@@ -410,7 +476,7 @@ fn plan_and_apply_ignore_journald_holding_the_active_journal() {
     let j = journal_root(&b);
     let m = j.join(MID);
     let active = m.join("system.journal");
-    write(&m.join("system@a.journal"), 2 * MIB, 30);
+    write(&m.join(archived("system", 1, 30)), 2 * MIB, 30);
     write(&active, MIB, 0);
     let c = ctx(
         true,
