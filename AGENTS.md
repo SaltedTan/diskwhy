@@ -7,7 +7,7 @@ Working rules for coding agents in this repo. Humans: start at [README.md](READM
 `diskwhy` (binary `dwhy`) answers "why is my disk filling up, and what is safe to remove?" on Linux dev boxes. [docs/DESIGN.md](docs/DESIGN.md) is the spec: decisions, concepts, CLI, JSON contract, safety rules, milestones. Read it before starting a milestone or changing behaviour. Don't change a recorded decision on your own; raise it with the user or in an issue. [docs/COMMERCIAL.md](docs/COMMERCIAL.md) records the licence rationale and commercial notes.
 
 - **Licence:** dual-licensed under `MIT OR Apache-2.0` (`LICENSE-MIT`, `LICENSE-APACHE`).
-- **Progress:** MVP milestones M0–M4 are complete and M5 (`v0.1.0` release prep) is in progress. Work is tracked as GitHub issues.
+- **Progress:** MVP milestones M0–M5 (`v0.1.0`) and agent ergonomics / MCP (`v0.2.0`) are complete. Work is tracked as GitHub issues.
 
 ## Layout
 
@@ -48,8 +48,8 @@ cargo is in `~/.cargo/bin`, which non-interactive shells may not have on PATH. U
 cargo fmt --all --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
-cargo build --locked --release --target x86_64-unknown-linux-musl -p dwhy-cli    # static x86_64 binary, as in CI
-cargo build --locked --release --target aarch64-unknown-linux-musl -p dwhy-cli   # static aarch64 binary, as in CI
+cargo build --locked --release --target x86_64-unknown-linux-musl -p dwhy-cli -p dwhy-mcp    # static x86_64 binaries, as in CI
+cargo build --locked --release --target aarch64-unknown-linux-musl -p dwhy-cli -p dwhy-mcp   # static aarch64 binaries, as in CI
 ```
 
 CI (`.github/workflows/ci.yml`) runs exactly these checks. All of them must pass before you push.

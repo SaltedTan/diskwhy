@@ -33,20 +33,23 @@ A plain `du` browser (`gdu`, `ncdu`) shows what is big right now, not what is gr
 
 ## Installation
 
-`dwhy` is a single static Linux binary with zero runtime dependencies. Optional tools (`git`, `docker`, `cargo`, `go`, `uv`, etc.) are detected automatically; missing tools disable only the detectors or probes that need them (`dwhy doctor` shows what is active).
+`dwhy` and `dwhy-mcp` are static Linux binaries with zero runtime dependencies. Optional tools (`git`, `docker`, `cargo`, `go`, `uv`, etc.) are detected automatically; missing tools disable only the detectors or probes that need them (`dwhy doctor` shows what is active).
 
 ### Prebuilt static binaries (Linux x86_64 and aarch64)
 
-Download the archive for your architecture (`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`) from GitHub Releases, verify `SHA256SUMS`, and put `dwhy` on your `PATH`:
+Download the archive for your architecture (`x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`) from GitHub Releases, verify `SHA256SUMS`, and install `dwhy` (and optionally `dwhy-mcp` and `skills/diskwhy/SKILL.md`):
 
 ```sh
 # Example for x86_64 Linux (replace VERSION with the release tag)
-VERSION=v0.1.0
+VERSION=v0.2.0
 curl -LO "https://github.com/SaltedTan/diskwhy/releases/download/${VERSION}/dwhy-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
 curl -LO "https://github.com/SaltedTan/diskwhy/releases/download/${VERSION}/SHA256SUMS"
 sha256sum --ignore-missing -c SHA256SUMS
 tar -xzf "dwhy-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
 install -Dm 0755 "dwhy-${VERSION}-x86_64-unknown-linux-musl/dwhy" ~/.local/bin/dwhy
+# Optional: stdio MCP server for non-shell agent clients
+install -Dm 0755 "dwhy-${VERSION}-x86_64-unknown-linux-musl/dwhy-mcp" ~/.local/bin/dwhy-mcp
+# Optional: copy skills/diskwhy/ into your AI agent's skills directory
 ```
 
 ### Cargo (`cargo install`)
@@ -71,14 +74,14 @@ The MCP server is a separate binary (`dwhy-mcp`), so `dwhy` itself stays synchro
 cargo install --git https://github.com/SaltedTan/diskwhy --locked dwhy-mcp
 ```
 
-*(v0.1.0 ships via GitHub Releases and `cargo install --git`; crates.io publishing is deferred.)*
+*(Releases ship via GitHub Releases and `cargo install --git`; crates.io publishing is deferred.)*
 
 ### Building from source
 
 ```sh
-cargo build --locked --release                                               # target/release/dwhy and dwhy-mcp
-cargo build --locked --release --target x86_64-unknown-linux-musl -p dwhy-cli  # static x86_64 binary
-cargo build --locked --release --target aarch64-unknown-linux-musl -p dwhy-cli # static aarch64 binary (uses rust-lld)
+cargo build --locked --release                                                             # target/release/dwhy and dwhy-mcp
+cargo build --locked --release --target x86_64-unknown-linux-musl -p dwhy-cli -p dwhy-mcp  # static x86_64 binaries
+cargo build --locked --release --target aarch64-unknown-linux-musl -p dwhy-cli -p dwhy-mcp # static aarch64 binaries (uses rust-lld)
 ```
 
 For cross-building the static `aarch64` binary on an `x86_64` Linux host, install the Rust target once (`rustup target add aarch64-unknown-linux-musl`); `.cargo/config.toml` configures `rust-lld` with self-contained musl objects, so no C cross-compiler is needed.

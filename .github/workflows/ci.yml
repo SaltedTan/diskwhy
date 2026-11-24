@@ -61,24 +61,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: musl-${{ matrix.target }}
-      - run: cargo build --locked --release --target ${{ matrix.target }} -p dwhy-cli
+      - run: cargo build --locked --release --target ${{ matrix.target }} -p dwhy-cli -p dwhy-mcp
         env:
           # The workflow-level RUSTFLAGS overrides .cargo/config.toml's
           # [target.*.rustflags] (linker = "rust-lld" still comes from config),
           # so the musl target flags are repeated here.
           RUSTFLAGS: -D warnings ${{ matrix.extra_rustflags }}
-      - name: Check the binary is static and runs
+      - name: Check the binaries are static and run
         env:
           TARGET: ${{ matrix.target }}
           FILE_ARCH: ${{ matrix.file_arch }}
           QEMU: ${{ matrix.qemu }}
         run: |
           bin="target/$TARGET/release/dwhy"
-          file "$bin"
-          file "$bin" | grep -F "$FILE_ARCH"
-          # aarch64-musl links non-PIE, so `file` says "statically linked";
-          # x86_64-musl says "static-pie linked".
-          file "$bin" | grep -Eq 'static(-pie)? linked|statically linked'
+          mcp_bin="target/$TARGET/release/dwhy-mcp"
+          for b in "$bin" "$mcp_bin"; do
+            file "$b"
+            file "$b" | grep -F "$FILE_ARCH"
+            # aarch64-musl links non-PIE, so `file` says "statically linked";
+            # x86_64-musl says "static-pie linked".
+            file "$b" | grep -Eq 'static(-pie)? linked|statically linked'
+          done
           if [ "$QEMU" = "true" ]; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends qemu-user
@@ -89,8 +92,12 @@ jobs:
           DOCKER_HOST=unix:///nonexistent $run "$bin" --version
           DOCKER_HOST=unix:///nonexistent $run "$bin" doctor
           DOCKER_HOST=unix:///nonexistent $run "$bin" scan . --json -q --detectors cargo-target > /dev/null
+          DOCKER_HOST=unix:///nonexistent $run "$mcp_bin" --version
+          DOCKER_HOST=unix:///nonexistent $run "$mcp_bin" --help > /dev/null
       - uses: actions/upload-artifact@v7
         with:
           name: dwhy-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/dwhy
+          path: |
+            target/${{ matrix.target }}/release/dwhy
+            target/${{ matrix.target }}/release/dwhy-mcp
           retention-days: 14

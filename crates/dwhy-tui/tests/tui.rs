@@ -3975,12 +3975,18 @@ fn apply_rescan_reports_removed_roots_and_stays_open() {
             app.scan_done(outcome);
 
             let screen = render(&mut app, 80, 24, None);
+            let message = app.message.clone().unwrap();
             assert!(
-                screen.contains(&format!("removed: {}", scratch.display())),
+                message.contains(&format!("removed: {}", scratch.display())),
+                "{message}"
+            );
+            let tail = if lose_other { &other } else { &scratch };
+            assert!(
+                screen.contains("removed: ")
+                    && screen.contains(tail.file_name().unwrap().to_str().unwrap()),
                 "{screen}"
             );
             if lose_other {
-                let message = app.message.clone().unwrap();
                 assert!(
                     message.contains(&format!("unavailable: {}", other.display())),
                     "{message}"
