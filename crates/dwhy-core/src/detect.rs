@@ -27,6 +27,9 @@ pub enum Needs {
     Requires(&'static str),
     /// The docker CLI and a usable socket.
     Docker,
+    /// A usable Docker socket, no CLI: reads the Engine API for findings on
+    /// the walked filesystem (not Docker pseudo-paths).
+    DockerSocket,
     RootAnd(&'static str),
     /// Root, and every one of these tools.
     RootAndAll(&'static [&'static str]),
@@ -61,6 +64,7 @@ pub const CATALOG: &[DetectorInfo] = &[
         "post-MVP",
         Needs::RootAndAll(&["apt-get", "dpkg-query"]),
     ),
+    info("docker-logs", "post-MVP", Needs::DockerSocket),
 ];
 
 const fn info(name: &'static str, milestone: &'static str, needs: Needs) -> DetectorInfo {
@@ -199,6 +203,21 @@ pub fn availability(info: &DetectorInfo, ctx: &DetectContext) -> (DetectorAvaila
             ),
         ),
         Needs::Docker => (Available, "uses the docker CLI and socket".into()),
+        Needs::DockerSocket if !sock.exists => {
+            (Unavailable, format!("no Docker socket at {}", sock.path))
+        }
+        Needs::DockerSocket if !sock.accessible => (
+            Unavailable,
+            format!(
+                "cannot use {} (not root and not in the docker group)",
+                sock.path
+            ),
+        ),
+        Needs::DockerSocket if !ctx.root => (
+            Available,
+            "uses the Docker socket; a rootful daemon's logs need a root scan".into(),
+        ),
+        Needs::DockerSocket => (Available, "uses the Docker socket".into()),
         Needs::RootAnd(t) if !ctx.on_path(t) => (Unavailable, ctx.missing(t)),
         Needs::RootAnd(_) if !ctx.root => (Unavailable, "system detector; run as root".into()),
         Needs::RootAnd(t) => (Available, format!("uses `{t}`")),

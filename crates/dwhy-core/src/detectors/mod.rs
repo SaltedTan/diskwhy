@@ -3,6 +3,7 @@
 mod apt_cache;
 mod cargo_target;
 mod docker;
+mod docker_logs;
 mod git_worktree;
 mod journald;
 mod node_modules;
@@ -28,6 +29,7 @@ pub use docker::{
 pub(crate) use docker::{
     container_name, image_label, image_label_from_tags, image_named, short_id,
 };
+pub use docker_logs::{DockerLogs, MIN_LOG_BYTES};
 pub use git_worktree::{
     GitWorktree, STALE_DAYS, WorktreeEntry, parse_porcelain, parse_porcelain_z,
 };
@@ -61,6 +63,7 @@ pub fn registry() -> Vec<Box<dyn Detector>> {
         Box::new(AptCache::from_system()),
         Box::new(SnapRevisions::from_system()),
         Box::new(OldKernels::from_system()),
+        Box::new(DockerLogs::from_system()),
     ]
 }
 
