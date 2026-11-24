@@ -1221,6 +1221,33 @@ pub(crate) fn finding_kernel(path: &str) -> Option<(PathBuf, &str)> {
     Some((root, u))
 }
 
+/// Where the process guards look for an `old-kernels` finding besides its
+/// modules directory: each headers package's `/usr/src/<package>` and the
+/// tools packages' `/usr/lib/linux-tools/<release>` and
+/// `/usr/lib/linux-tools-<abi>`, so a DKMS build or a `perf` running from
+/// them blocks.
+pub(crate) fn process_roots(f: &Finding) -> Vec<PathBuf> {
+    let Some((root, u)) = finding_kernel(&f.path) else {
+        return Vec::new();
+    };
+    let Some((_, pkgs)) = parse_action(f.action.argv.as_deref().unwrap_or_default()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for p in pkgs {
+        if p.starts_with("linux-headers-") {
+            out.push(root.join("usr/src").join(p));
+        } else if let Some(v) = p.strip_prefix("linux-tools-") {
+            if v == u {
+                out.push(root.join("usr/lib/linux-tools").join(v));
+            } else {
+                out.push(root.join("usr/lib").join(p));
+            }
+        }
+    }
+    out
+}
+
 /// The `apt-removal-set` guard for an `old-kernels` finding, with
 /// `release` as the running kernel's ([`running_release`]). It blocks
 /// unless, read afresh:

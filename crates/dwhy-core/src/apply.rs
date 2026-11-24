@@ -18,6 +18,7 @@ use std::process::{Command, Stdio};
 use crate::detect::{
     DetectContext, PATH_NOT_UTF8, add_lossy_guard, escape_controls, lossy_argv, lossy_detail,
 };
+use crate::detectors::APT_REMOVAL_SET;
 use crate::guard::{self, Processes};
 use crate::mounts::MountTable;
 use crate::plan::{
@@ -209,6 +210,10 @@ pub struct Check {
     /// below another root on its own.
     pub tree_root: Option<PathBuf>,
     nested: Vec<MeasuredRoot>,
+    /// For a ready `old-kernels` item: the context to run `apt-removal-set`
+    /// with again right before its command runs, since an earlier purge in
+    /// the same apply can change what this one removes.
+    recheck: Option<Box<DetectContext>>,
 }
 
 impl Check {
@@ -294,6 +299,9 @@ pub fn evaluate(
             c.item.detail = format!("blocked by {}", blocks(&f));
         } else {
             c.nested = nested.to_vec();
+            if f.detector == "old-kernels" {
+                c.recheck = Some(Box::new(ctx.clone()));
+            }
         }
         c.item.guards = f.guards;
     }
@@ -342,6 +350,7 @@ fn decide(
         dispatched: false,
         tree_root: None,
         nested: Vec::new(),
+        recheck: None,
     };
     // Backstop for `detect::block_lossy`: never act on a path or command
     // spelled with U+FFFD, whether the plan file or the fresh finding has it.
@@ -758,6 +767,28 @@ fn run(
     }
     if (options.stop)() {
         return (ApplyOutcome::Skipped, NOT_RUN_STOPPED.into());
+    }
+    // `apt-removal-set` again, just before the purge: an earlier purge in
+    // this apply may have changed what this one removes.
+    if item.action.kind == ActionKind::Command
+        && let Some(ctx) = c.recheck.as_deref()
+    {
+        let Some(fresh) = c.fresh.as_ref() else {
+            return (
+                ApplyOutcome::Skipped,
+                format!("blocked by {APT_REMOVAL_SET}: no fresh finding to check; not run"),
+            );
+        };
+        let g =
+            crate::detectors::removal_set_guard(fresh, ctx, crate::detectors::running_release());
+        item.guards.retain(|old| old.name != g.name);
+        item.guards.push(g.clone());
+        if g.status == GuardStatus::Block {
+            return (
+                ApplyOutcome::Skipped,
+                format!("blocked by {APT_REMOVAL_SET}: {}; not run", g.detail),
+            );
+        }
     }
     match item.action.kind {
         ActionKind::RemovePath => {

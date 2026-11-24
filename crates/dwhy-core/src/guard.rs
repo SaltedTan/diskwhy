@@ -53,7 +53,9 @@
 //! caches built in memory) must succeed and purge exactly those packages,
 //! installing nothing. It blocks otherwise, and when any of that cannot be
 //! checked. Like every guard, it runs when `plan` builds a plan and again
-//! when `apply` checks it.
+//! when `apply` checks it; `apply` also runs it once more right before each
+//! `old-kernels` command, since an earlier purge in the same apply can
+//! change what a later one removes, and skips an item it blocks then.
 //!
 //! Git guards skip repositories inside a cache (below a `CACHEDIR.TAG`)
 //! and do not apply to `user-cache` and `tool-versions` findings: those
@@ -70,7 +72,9 @@
 //! those paths without the instance key). Apps running on a disabled base
 //! revision are not seen: it is their namespace's root. Git guards do not
 //! apply to `old-kernels` (`apt-get remove --purge` removes only the
-//! packages' files); the process guards do, on the modules directory.
+//! packages' files); the process guards do, on the modules directory and
+//! the version's `/usr/src/linux-headers-*` and `linux-tools` directories,
+//! so a DKMS build or a `perf` running from them blocks.
 //!
 //! Identities are checked again at this boundary, before any git state is
 //! read: a finding root or repository that is no longer the directory the
@@ -412,8 +416,15 @@ fn process_guarded(f: &Finding) -> bool {
 /// still run on is not seen: snap-confine makes the base's mount the root
 /// of their namespace, so their paths carry no `/snap/<base>/<rev>`
 /// prefix.
+///
+/// For `old-kernels`, also the version's `/usr/src/linux-headers-*` and
+/// `linux-tools` directories ([`crate::detectors::old_kernel_process_roots`]).
 fn process_roots(f: &Finding, root: &Path) -> Vec<PathBuf> {
     let mut roots = vec![root.to_path_buf()];
+    if f.detector == "old-kernels" {
+        roots.extend(crate::detectors::old_kernel_process_roots(f));
+        return roots;
+    }
     if f.detector != "snap-revisions" {
         return roots;
     }

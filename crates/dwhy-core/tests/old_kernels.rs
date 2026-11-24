@@ -247,7 +247,11 @@ if [ "$1" = -s ]; then
   esac
   exit 2
 fi
-if [ "$1" = remove ]; then printf '%s\n' "$@" > "$D/ran"; exit 0; fi
+if [ "$1" = remove ]; then
+  printf '%s\n' "$@" >> "$D/ran"
+  if [ -f "$D/after-remove" ]; then cp "$D/after-remove" "$D/extra"; fi
+  exit 0
+fi
 exit 2
 "#
             ),
@@ -975,14 +979,18 @@ fn the_removal_set_guard_simulates_the_exact_removal() {
 }
 
 fn select(fx: &Fx, n: u32, procs: &Processes) -> dwhy_core::report::Plan {
+    select_all(fx, &[n], procs)
+}
+
+fn select_all(fx: &Fx, kernels: &[u32], procs: &Processes) -> dwhy_core::report::Plan {
     let tree = scan_tree(&fx.root);
     let found = fx.detector(12).detect(&tree, &fx.ctx()).unwrap();
-    let id = of(&found, fx, n).id;
+    let ids = kernels.iter().map(|&n| of(&found, fx, n).id).collect();
     plan::build(
         found,
         &Selection {
             tier: None,
-            select: vec![id],
+            select: ids,
             free: None,
         },
         &tree,
@@ -1054,6 +1062,59 @@ fn plan_blocks_what_the_guards_block() {
         unreadable: 0,
     };
     assert_eq!(select(&fx, 9, &other).items.len(), 1);
+
+    // A DKMS build in the version's headers.
+    let dkms = Processes {
+        procs: vec![Proc {
+            pid: 4343,
+            name: "make".into(),
+            cwd: Some(
+                fx.root
+                    .join(format!("usr/src/linux-headers-{}/scripts", uname(9))),
+            ),
+            open: vec![],
+        }],
+        unreadable: 0,
+    };
+    let plan = select(&fx, 9, &dkms);
+    assert!(plan.items.is_empty(), "{plan:?}");
+    let g = plan.blocked[0]
+        .guards
+        .iter()
+        .find(|g| g.name == "in-use-cwd")
+        .unwrap();
+    assert_eq!(g.status, GuardStatus::Block);
+    // A perf running from the version's tools, flavoured or flavourless.
+    for tool in [
+        format!("usr/lib/linux-tools/{}/perf", uname(9)),
+        "usr/lib/linux-tools-9.8.0-9/turbostat".to_string(),
+    ] {
+        let perf = Processes {
+            procs: vec![Proc {
+                pid: 4444,
+                name: "perf".into(),
+                cwd: Some(PathBuf::from("/")),
+                open: vec![fx.root.join(&tool)],
+            }],
+            unreadable: 0,
+        };
+        assert!(select(&fx, 9, &perf).items.is_empty(), "{tool}");
+    }
+    // ... but not another kernel's headers and tools.
+    let elsewhere = Processes {
+        procs: vec![Proc {
+            pid: 4545,
+            name: "make".into(),
+            cwd: Some(fx.root.join(format!("usr/src/linux-headers-{}", uname(12)))),
+            open: vec![
+                fx.root
+                    .join(format!("usr/lib/linux-tools/{}/perf", uname(12))),
+                fx.root.join("usr/lib/linux-tools-9.8.0-12/turbostat"),
+            ],
+        }],
+        unreadable: 0,
+    };
+    assert_eq!(select(&fx, 9, &elsewhere).items.len(), 1);
 }
 
 #[test]
@@ -1171,4 +1232,93 @@ fn plan_and_apply_purge_one_version_and_skip_it_once_its_packages_change() {
         "{}",
         checks[0].item.detail
     );
+}
+
+#[test]
+fn an_earlier_purge_that_changes_a_later_one_skips_it() {
+    let fx = Fx::new(FULL);
+    let plan = select_all(&fx, &[9, 10], &idle());
+    assert_eq!(plan.items.len(), 2, "{plan:?}");
+    let cx = fx.ctx();
+    let tree = scan_tree(&fx.root);
+    let fresh = fx.detector(12).detect(&tree, &cx).unwrap();
+    let confirmed = Policy {
+        confirm: plan.items.iter().map(|i| i.finding.id.clone()).collect(),
+        ..Policy::default()
+    };
+    let mut checks = apply::evaluate(&plan, fresh, &tree, &cx, &idle(), &confirmed);
+    for c in &checks {
+        assert_eq!(
+            c.item.outcome,
+            ApplyOutcome::WouldRemove,
+            "{}",
+            c.item.detail
+        );
+    }
+
+    // The first purge takes away something a package outside the second
+    // version's set needed, so the second would now remove that too.
+    fs::write(fx.data.join("after-remove"), "linux-generic-hwe-26.04").unwrap();
+    let (_s, state) = base();
+    let mut audit = Audit::open(&state.join("audit.jsonl")).unwrap();
+    let env = Env {
+        host: "host".into(),
+        uid: 0,
+        now: || "2026-11-24T00:00:00Z".to_string(),
+        invocation: None,
+    };
+    apply::execute(
+        &plan,
+        &mut checks,
+        &mut audit,
+        &MountTable::default(),
+        &env,
+        &mut |_| {},
+    );
+    let removed: Vec<_> = checks
+        .iter()
+        .filter(|c| c.item.outcome == ApplyOutcome::Removed)
+        .collect();
+    let skipped: Vec<_> = checks
+        .iter()
+        .filter(|c| c.item.outcome == ApplyOutcome::Skipped)
+        .collect();
+    assert_eq!(
+        (removed.len(), skipped.len()),
+        (1, 1),
+        "{:?}",
+        checks
+            .iter()
+            .map(|c| (&c.item.outcome, &c.item.detail))
+            .collect::<Vec<_>>()
+    );
+    let detail = &skipped[0].item.detail;
+    assert!(detail.contains(APT_REMOVAL_SET), "{detail}");
+    assert!(detail.contains("linux-generic-hwe-26.04"), "{detail}");
+    let g = skipped[0]
+        .item
+        .guards
+        .iter()
+        .find(|g| g.name == APT_REMOVAL_SET)
+        .unwrap();
+    assert_eq!(g.status, GuardStatus::Block);
+    assert_eq!(
+        removed[0]
+            .item
+            .guards
+            .iter()
+            .filter(|g| g.name == APT_REMOVAL_SET)
+            .map(|g| g.status)
+            .collect::<Vec<_>>(),
+        [GuardStatus::Pass]
+    );
+
+    // Only the first command ran.
+    let mut want = ["remove", "--purge", "-y", "--no-auto-remove"].join("\n");
+    for p in &removed[0].item.action.argv.as_ref().unwrap()[9..] {
+        want.push('\n');
+        want.push_str(p);
+    }
+    want.push('\n');
+    assert_eq!(fs::read_to_string(fx.data.join("ran")).unwrap(), want);
 }
