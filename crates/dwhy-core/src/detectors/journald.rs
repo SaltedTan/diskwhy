@@ -26,8 +26,9 @@
 //! vacuum removes a whole file started more than 14 days ago, entries from
 //! the last 14 days in it included, so such a file counts in full. It goes
 //! through each directory's archived files oldest first (by head seqnum
-//! within one seqnum ID, otherwise by that time) and stops at the first that
-//! is not old, so an old file sorted after a recent one (the clock went back
+//! within one seqnum ID, otherwise by that time, to the microsecond), in
+//! the order glibc's `qsort` puts them, and stops at the first that is not
+//! old, so an old file sorted after a recent one (the clock went back
 //! between rotations) stays and does not count.
 //! The finding is `review`: logs are not regenerable. The action is
 //! `journalctl --directory <dir> --vacuum-time=14d`, which leaves the
@@ -295,11 +296,12 @@ fn entries(dir: &OwnedFd, dev: u64) -> Vec<(Vec<u8>, Stat)> {
 }
 
 /// An archived journal the vacuum of one directory may remove.
+#[derive(Clone, Copy)]
 struct Archived<'a> {
     name: &'a [u8],
     st: &'a Stat,
-    /// The time the vacuum judges it by, in seconds ([`vacuum_time`]).
-    time: i64,
+    /// The time the vacuum judges it by, in microseconds ([`vacuum_time`]).
+    time: u64,
     /// `(seqnum id, head seqnum)`; `None` for a `.journal~`.
     seq: Option<(u128, u64)>,
 }
@@ -316,6 +318,36 @@ fn vacuum_order(a: &Archived, b: &Archived) -> Ordering {
         (Some((ia, _)), Some((ib, _))) => ia.cmp(&ib),
         _ => a.name.cmp(b.name),
     })
+}
+
+/// Sorts as journalctl's `qsort` does: glibc's merge sort, which splits at
+/// `n / 2`, sorts each half and merges them, taking from the left half
+/// unless it compares greater. `vacuum_compare` is not a total order when
+/// times disagree with seqnums (the clock went back), so the order, and
+/// where the vacuum stops, depends on the algorithm and on readdir order;
+/// `files` keep readdir order, as journalctl's list does. (`sort_by` may
+/// also panic on such an order.)
+fn vacuum_sort(v: &mut [Archived]) {
+    if v.len() <= 1 {
+        return;
+    }
+    let n1 = v.len() / 2;
+    vacuum_sort(&mut v[..n1]);
+    vacuum_sort(&mut v[n1..]);
+    let (mut i, mut j) = (0, n1);
+    let mut merged = Vec::with_capacity(v.len());
+    while i < n1 && j < v.len() {
+        if vacuum_order(&v[i], &v[j]) == Ordering::Greater {
+            merged.push(v[j]);
+            j += 1;
+        } else {
+            merged.push(v[i]);
+            i += 1;
+        }
+    }
+    merged.extend_from_slice(&v[i..n1]);
+    merged.extend_from_slice(&v[j..]);
+    v.copy_from_slice(&merged);
 }
 
 /// Records the journal files among one directory's regular `files`. Its
@@ -339,15 +371,8 @@ fn note_dir<'a>(
             inode(inodes, st).kept_name = true;
         }
     }
-    // An insertion sort: `vacuum_compare` is not a total order when times
-    // disagree with seqnums, and `sort_by` may panic on such an order.
-    for i in 1..archived.len() {
-        let mut j = i;
-        while j > 0 && vacuum_order(&archived[j - 1], &archived[j]) == Ordering::Greater {
-            archived.swap(j - 1, j);
-            j -= 1;
-        }
-    }
+    vacuum_sort(&mut archived);
+    let cutoff = cutoff.max(0) as u64 * 1_000_000;
     let mut old = true;
     for a in &archived {
         old = old && a.time < cutoff;
@@ -373,8 +398,8 @@ fn inode<'a>(inodes: &'a mut HashMap<(u64, u64), Inode>, st: &Stat) -> &'a mut I
 
 /// What `journalctl --vacuum-time` reads from an archived journal's name.
 struct ArchivedName {
-    /// Head realtime, in seconds.
-    head: i64,
+    /// Head realtime, in microseconds.
+    head: u64,
     /// `(seqnum id, head seqnum)`; `None` for a `.journal~`.
     seq: Option<(u128, u64)>,
 }
@@ -400,10 +425,7 @@ fn archived_journal(name: &[u8]) -> Option<ArchivedName> {
         }
         (hex(&t[1..17])?, None)
     };
-    Some(ArchivedName {
-        head: (usec / 1_000_000) as i64,
-        seq,
-    })
+    Some(ArchivedName { head: usec, seq })
 }
 
 /// A 128-bit ID in its plain form: 32 hex digits.
@@ -419,14 +441,20 @@ fn hex(s: &[u8]) -> Option<u64> {
     u64::from_str_radix(std::str::from_utf8(s).ok()?, 16).ok()
 }
 
-/// The time `journalctl --vacuum-time` judges an archived file by: `head`,
-/// or the file's ctime, atime or mtime when earlier.
+/// The time `journalctl --vacuum-time` judges an archived file by, in
+/// microseconds as it compares and sorts them: `head`, or the file's ctime,
+/// atime or mtime when earlier.
 #[allow(clippy::unnecessary_cast)]
-fn vacuum_time(st: &Stat, head: i64) -> i64 {
-    [st.st_ctime as i64, st.st_atime as i64, mtime(st)]
-        .into_iter()
-        .filter(|&t| t > 0)
-        .fold(head, i64::min)
+fn vacuum_time(st: &Stat, head: u64) -> u64 {
+    [
+        (st.st_ctime as i64, st.st_ctime_nsec as u64),
+        (st.st_atime as i64, st.st_atime_nsec as u64),
+        (st.st_mtime as i64, st.st_mtime_nsec as u64),
+    ]
+    .into_iter()
+    .filter(|&(s, _)| s > 0)
+    .map(|(s, ns)| s as u64 * 1_000_000 + ns / 1_000)
+    .fold(head, u64::min)
 }
 
 /// mtime in seconds; `st_mtime` is narrower than i64 on 32-bit targets.
@@ -445,14 +473,108 @@ fn nlink(st: &Stat) -> u64 {
 mod tests {
     use super::archived_journal;
 
-    fn archived_head(name: &[u8]) -> Option<i64> {
+    /// journalctl sorts a directory's archived files with glibc's `qsort`,
+    /// so glibc's own `qsort_r` is the oracle for the order: with seqnums
+    /// and times that disagree (the clock went back), across several seqnum
+    /// IDs and `.journal~` files, `vacuum_order` is not a total order and
+    /// another algorithm (an insertion sort, say) gives a different order,
+    /// so the vacuum stops at a different file.
+    #[cfg(target_env = "gnu")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn vacuum_sort_orders_as_glibc_qsort() {
+        use super::{Archived, vacuum_order, vacuum_sort};
+        use std::cmp::Ordering;
+        use std::ffi::c_void;
+
+        unsafe extern "C" {
+            fn qsort_r(
+                base: *mut c_void,
+                n: usize,
+                size: usize,
+                cmp: unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void) -> i32,
+                arg: *mut c_void,
+            );
+        }
+        /// The size of journalctl's `struct vacuum_info`.
+        #[repr(C)]
+        struct Elem {
+            idx: usize,
+            _pad: [u8; 48],
+        }
+        unsafe extern "C" fn cmp(a: *const c_void, b: *const c_void, arg: *mut c_void) -> i32 {
+            // SAFETY: qsort_r passes two elements of the `Elem` array and the
+            // `arg` given below, a `&[Archived]` that outlives the call.
+            let (a, b, v) = unsafe {
+                (
+                    &*(a as *const Elem),
+                    &*(b as *const Elem),
+                    &*(arg as *const &[Archived]),
+                )
+            };
+            match vacuum_order(&v[a.idx], &v[b.idx]) {
+                Ordering::Less => -1,
+                Ordering::Equal => 0,
+                Ordering::Greater => 1,
+            }
+        }
+
+        let st = rustix::fs::stat("/").unwrap();
+        let names: Vec<Vec<u8>> = (0..12).map(|i| format!("f{i:02}").into_bytes()).collect();
+        let mut seed: u64 = 0x2545f4914f6cdd1d;
+        let mut rnd = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for _ in 0..2000 {
+            let n = 2 + rnd(11) as usize;
+            let mut seqs = [0u64; 3];
+            let v: Vec<Archived> = (0..n)
+                .map(|k| {
+                    let seq = (rnd(5) != 0).then(|| {
+                        let id = rnd(3) as usize;
+                        seqs[id] += 1;
+                        (id as u128, seqs[id])
+                    });
+                    Archived {
+                        name: &names[k],
+                        st: &st,
+                        time: rnd(8),
+                        seq,
+                    }
+                })
+                .collect();
+            let mut elems: Vec<Elem> = (0..n).map(|idx| Elem { idx, _pad: [0; 48] }).collect();
+            let arg: &[Archived] = &v;
+            // SAFETY: `elems` holds `n` initialised `Elem`s, and `cmp` reads
+            // only them and `arg`.
+            unsafe {
+                qsort_r(
+                    elems.as_mut_ptr().cast(),
+                    n,
+                    size_of::<Elem>(),
+                    cmp,
+                    (&arg as *const &[Archived]).cast_mut().cast(),
+                );
+            }
+            let want: Vec<&[u8]> = elems.iter().map(|e| v[e.idx].name).collect();
+            let mut got = v.clone();
+            vacuum_sort(&mut got);
+            let got: Vec<&[u8]> = got.iter().map(|a| a.name).collect();
+            assert_eq!(got, want);
+        }
+    }
+
+    fn archived_head(name: &[u8]) -> Option<u64> {
         archived_journal(name).map(|a| a.head)
     }
 
     #[test]
     fn archived_journal_names() {
         // 0x0005f0a1b2c3d4e5 microseconds.
-        let head = 0x0005f0a1b2c3d4e5_i64 / 1_000_000;
+        let head = 0x0005f0a1b2c3d4e5_u64;
         for archived in [
             "system@70c2d3c15eb342d091269c9ee491d117-0000000000000001-0005f0a1b2c3d4e5.journal",
             "user-1000@70C2D3C15EB342D091269C9EE491D117-00000000000a0001-0005f0a1b2c3d4e5.journal",
