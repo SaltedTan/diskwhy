@@ -6,7 +6,8 @@
 //! A kernel version (an ABI such as `7.0.0-43-generic`) is offered only
 //! when all of these hold:
 //!
-//! - `apt-get -s autoremove` (a read-only simulation, run with `LANG=C`)
+//! - `apt-get -s autoremove` (a read-only simulation, run with `LANG=C`
+//!   and apt's binary caches built in memory, so nothing is written)
 //!   lists its `linux-image-<ver>` in a `Remv` or `Purg` line. The output
 //!   is parsed strictly: an `Inst` or `Conf` line, a missing or second
 //!   summary line, a summary that counts other than the removals listed,
@@ -35,9 +36,8 @@
 //! packages in any state but installed (`ii`) or config-files (`rc`).
 //!
 //! The finding sits at the version's modules directory,
-//! `/usr/lib/modules/<ver>` (or `/lib/modules/<ver>` where `/lib` is not
-//! the usrmerge symlink to `usr/lib`), and groups every installed package of
-//! that version: `linux-<kind>-<ver>` for `image`, `image-unsigned`,
+//! `/usr/lib/modules/<ver>`, and groups every installed package of that
+//! version: `linux-<kind>-<ver>` for `image`, `image-unsigned`,
 //! `modules`, `modules-extra`, `headers`, `tools`, `cloud-tools`,
 //! `buildinfo` and the `modules-*`, `main-modules-*`, `objects-*` and
 //! `signatures-*` families, plus the flavourless `linux-headers-<abi>`,
@@ -88,7 +88,7 @@ use crate::units::human;
 /// Reclaimable totals below this are not worth a finding.
 const MIN_BYTES: u64 = 1 << 20;
 
-/// How long apt's simulations may take (it may rebuild its cache).
+/// How long apt's simulations may take (they build apt's cache in memory).
 const APT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long a `dpkg-query` may take.
@@ -113,14 +113,25 @@ const ACTION_ENV: [&str; 4] = ["env", "-u", "APT_CONFIG", "DEBIAN_FRONTEND=nonin
 /// The action's arguments after apt-get, before the packages.
 const ACTION_ARGS: [&str; 4] = ["remove", "--purge", "-y", "--no-auto-remove"];
 
-/// What the simulation runs after apt-get, before the packages.
-const SIMULATE_ARGS: [&str; 4] = ["-s", "remove", "--purge", "--no-auto-remove"];
+/// What every simulation runs after apt-get: `-s`, and apt's binary caches
+/// kept in memory rather than written to `/var/cache/apt`.
+const SIMULATE: [&str; 5] = [
+    "-s",
+    "-o",
+    "Dir::Cache::pkgcache=",
+    "-o",
+    "Dir::Cache::srcpkgcache=",
+];
+
+/// What the removal's simulation runs after [`SIMULATE`], before the
+/// packages.
+const SIMULATE_REMOVE: [&str; 3] = ["remove", "--purge", "--no-auto-remove"];
 
 /// `/boot/<name>-<ver>` files of a kernel version.
 const BOOT_FILES: [&str; 4] = ["vmlinuz", "initrd.img", "System.map", "config"];
 
 /// Where kernel modules live, below the system root.
-const MODULE_DIRS: [&str; 2] = ["usr/lib/modules", "lib/modules"];
+const MODULES: &str = "usr/lib/modules";
 
 /// Top-level directories usrmerge turns into symlinks to `usr/<name>`.
 const USRMERGE: [&str; 6] = ["bin", "sbin", "lib", "lib32", "lib64", "libx32"];
@@ -739,7 +750,12 @@ fn run(
         .env_remove("DPKG_ROOT")
         .current_dir("/");
     let shown = std::iter::once(prog)
-        .chain(args.iter().copied().take(3))
+        .chain(
+            args.iter()
+                .copied()
+                .filter(|a| !SIMULATE[1..].contains(a))
+                .take(3),
+        )
         .collect::<Vec<_>>()
         .join(" ");
     let out =
@@ -995,16 +1011,11 @@ impl Detector for OldKernels {
         tree: &ScanTree,
         ctx: &DetectContext,
     ) -> Result<Vec<Candidate>, String> {
-        let aliases = usrmerge_aliases(&self.root);
-        let mut module_dirs: Vec<PathBuf> = MODULE_DIRS
-            .iter()
-            .filter_map(|d| resolve(&self.root, &aliases, format!("/{d}").as_bytes()))
-            .filter(|d| tree.find(d).is_some_and(|id| tree.node(id).is_dir))
-            .collect();
-        module_dirs.dedup();
-        if module_dirs.is_empty() {
+        let modules = self.root.join(MODULES);
+        if !tree.find(&modules).is_some_and(|id| tree.node(id).is_dir) {
             return Ok(Vec::new());
         }
+        let aliases = usrmerge_aliases(&self.root);
         let release = self.release()?;
         let apt = ctx
             .tool_command("apt-get")
@@ -1019,12 +1030,13 @@ impl Detector for OldKernels {
         }
         let links = boot_links(&self.root.join("boot"))?;
         let protection = protection(&release, &images, &links);
-        let autoremove: BTreeSet<String> =
-            parse_simulation(&run(ctx, &apt, &["-s", "autoremove"], APT_TIMEOUT)?)
-                .map_err(|e| format!("apt-get -s autoremove: {e}"))?
-                .into_iter()
-                .map(|r| r.name)
-                .collect();
+        let mut args = SIMULATE.to_vec();
+        args.push("autoremove");
+        let autoremove: BTreeSet<String> = parse_simulation(&run(ctx, &apt, &args, APT_TIMEOUT)?)
+            .map_err(|e| format!("apt-get -s autoremove: {e}"))?
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
 
         let unames: BTreeSet<&str> = images.iter().map(|i| i.uname.as_str()).collect();
         let mut out = Vec::new();
@@ -1039,12 +1051,13 @@ impl Detector for OldKernels {
             let Ok(pkgs) = version_packages(&rows, u, &images) else {
                 continue;
             };
-            let Some((dir, node)) = module_dirs.iter().map(|d| d.join(u)).find_map(|d| {
-                let node = tree.find(&d).map(|id| tree.node(id))?;
-                node.is_dir.then_some((d, node))
-            }) else {
+            let dir = modules.join(u);
+            let Some(node) = tree.find(&dir).map(|id| tree.node(id)) else {
                 continue;
             };
+            if !node.is_dir {
+                continue;
+            }
             let Some(listed) = file_list(ctx, &dpkg, &pkgs) else {
                 continue;
             };
@@ -1191,51 +1204,21 @@ fn parse_action(argv: &[String]) -> Option<(&str, Vec<&str>)> {
 }
 
 /// The system root and release of an `old-kernels` finding's path,
-/// `<root>/usr/lib/modules/<release>` or `<root>/lib/modules/<release>`.
+/// `<root>/usr/lib/modules/<release>`.
 pub(crate) fn finding_kernel(path: &str) -> Option<(PathBuf, &str)> {
     let p = Path::new(path);
     let u = p.file_name()?.to_str()?;
     if !p.is_absolute() || !valid_uname(u) {
         return None;
     }
-    let parent = p.parent()?;
-    for d in MODULE_DIRS {
-        if parent.ends_with(d) {
-            let mut root = parent.to_path_buf();
-            for _ in Path::new(d).components() {
-                root.pop();
-            }
-            return Some((root, u));
-        }
+    let mut root = p.parent()?.to_path_buf();
+    if !root.ends_with(MODULES) {
+        return None;
     }
-    None
-}
-
-/// Where the process guards look for an `old-kernels` finding besides its
-/// modules directory: each headers package's `/usr/src/<package>` and the
-/// tools packages' `/usr/lib/linux-tools/<release>` and
-/// `/usr/lib/linux-tools-<abi>`, so a DKMS build or a `perf` running from
-/// them blocks.
-pub(crate) fn process_roots(f: &Finding) -> Vec<PathBuf> {
-    let Some((root, u)) = finding_kernel(&f.path) else {
-        return Vec::new();
-    };
-    let Some((_, pkgs)) = parse_action(f.action.argv.as_deref().unwrap_or_default()) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for p in pkgs {
-        if p.starts_with("linux-headers-") {
-            out.push(root.join("usr/src").join(p));
-        } else if let Some(v) = p.strip_prefix("linux-tools-") {
-            if v == u {
-                out.push(root.join("usr/lib/linux-tools").join(v));
-            } else {
-                out.push(root.join("usr/lib").join(p));
-            }
-        }
+    for _ in Path::new(MODULES).components() {
+        root.pop();
     }
-    out
+    Some((root, u))
 }
 
 /// The `apt-removal-set` guard for an `old-kernels` finding, with
@@ -1249,7 +1232,7 @@ pub(crate) fn process_roots(f: &Finding) -> Vec<PathBuf> {
 /// - the listed packages are exactly the version's packages `dpkg-query`
 ///   reports now, each installed or config-files only;
 /// - `LANG=C apt-get -s remove --purge --no-auto-remove <packages>` (with
-///   the action's apt-get) succeeds and purges exactly those packages and
+///   the action's apt-get, apt's caches built in memory) succeeds and purges exactly those packages and
 ///   nothing else, installing nothing.
 ///
 /// A check that cannot run blocks.
@@ -1305,7 +1288,8 @@ fn check_removal(
             pkgs.join(", ")
         ));
     }
-    let mut args: Vec<&str> = SIMULATE_ARGS.to_vec();
+    let mut args: Vec<&str> = SIMULATE.to_vec();
+    args.extend(SIMULATE_REMOVE);
     args.extend(pkgs.iter().copied());
     let out = run(ctx, apt, &args, APT_TIMEOUT)
         .map_err(|e| format!("the removal's simulation failed: {e}"))?;
@@ -1347,12 +1331,7 @@ pub(crate) fn package_state(f: &Finding, ctx: &DetectContext) -> Option<String> 
     let mut args = vec!["-W", STATUS_FORMAT];
     args.extend(pkgs);
     let out = run(ctx, &dpkg, &args, DPKG_TIMEOUT).ok()?;
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in &out {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    Some(format!("{h:016x}"))
+    Some(format!("{:016x}", crate::plan::fnv1a(&out)))
 }
 
 #[cfg(test)]
@@ -1649,9 +1628,10 @@ foo\t1\tiF \n",
             Some((PathBuf::from("/"), "7.0.0-43-generic"))
         );
         assert_eq!(
-            finding_kernel("/t/x/lib/modules/7.0.0-43-generic"),
+            finding_kernel("/t/x/usr/lib/modules/7.0.0-43-generic"),
             Some((PathBuf::from("/t/x"), "7.0.0-43-generic"))
         );
+        assert_eq!(finding_kernel("/t/x/lib/modules/7.0.0-43-generic"), None);
         assert_eq!(finding_kernel("/usr/lib/modules/../x"), None);
         assert_eq!(finding_kernel("/usr/lib/modules"), None);
         assert_eq!(finding_kernel("/srv/7.0.0-43-generic"), None);

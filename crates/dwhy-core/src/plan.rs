@@ -747,7 +747,7 @@ pub fn size_bucket(bytes: u64) -> u32 {
     4 * log + ((bytes >> (log - 2)) & 3) as u32
 }
 
-fn fnv1a(data: &[u8]) -> u64 {
+pub(crate) fn fnv1a(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in data {
         h ^= b as u64;

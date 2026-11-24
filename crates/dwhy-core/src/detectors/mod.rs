@@ -33,8 +33,8 @@ pub use git_worktree::{
 };
 pub use journald::Journald;
 pub use node_modules::NodeModules;
+pub(crate) use old_kernels::package_state;
 pub use old_kernels::{APT_REMOVAL_SET, OldKernels, removal_set_guard, running_release};
-pub(crate) use old_kernels::{package_state, process_roots as old_kernel_process_roots};
 pub use snap_revisions::SnapRevisions;
 pub use stale_tree::{SCRATCH_LOCATIONS, SCRATCH_MARKER, SCRATCH_STALE_DAYS, StaleTree};
 pub use tool_versions::ToolVersions;

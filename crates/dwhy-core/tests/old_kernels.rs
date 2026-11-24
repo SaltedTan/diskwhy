@@ -226,14 +226,16 @@ esac
 D='{d}'
 if [ "$1" = -s ]; then
   echo "$@" >> "$D/simulated"
-  case "$2" in
+  [ "$2 $3 $4 $5" = "-o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache=" ] || exit 3
+  shift 5
+  case "$1" in
   autoremove)
     cat "$D/autoremove"
     exit "$(cat "$D/autoremove.rc" 2>/dev/null || echo 0)"
     ;;
   remove)
     if [ -f "$D/remove" ]; then cat "$D/remove"; exit "$(cat "$D/remove.rc" 2>/dev/null || echo 0)"; fi
-    shift 4
+    shift 3
     n=$#
     if [ -f "$D/extra" ]; then n=$((n + 1)); fi
     echo "Reading package lists..."
@@ -740,40 +742,6 @@ fn symlinks_are_never_followed() {
 }
 
 #[test]
-fn a_non_usrmerged_root_keeps_modules_in_lib() {
-    let fx = Fx::new(FULL);
-    // `/lib` a real directory holding 9's modules.
-    fs::remove_file(fx.root.join("lib")).unwrap();
-    fs::create_dir_all(fx.root.join("lib/modules")).unwrap();
-    fs::rename(fx.modules(9), fx.root.join("lib/modules").join(uname(9))).unwrap();
-    let found = fx.detect();
-    let lib = fx.root.join("lib/modules").join(uname(9));
-    let f = found
-        .iter()
-        .find(|f| Path::new(&f.path) == lib)
-        .unwrap_or_else(|| panic!("{found:?}"));
-    // Only the nvidia module is listed under /lib; the others, listed
-    // under /usr/lib, are not there.
-    let rest: u64 = [
-        format!("boot/vmlinuz-{}", uname(9)),
-        format!("boot/System.map-{}", uname(9)),
-        format!("boot/config-{}", uname(9)),
-        format!("boot/initrd.img-{}", uname(9)),
-        format!("usr/src/linux-headers-{}/Makefile", uname(9)),
-        "usr/src/linux-headers-9.8.0-9/include/x.h".into(),
-        format!("usr/lib/linux-tools/{}/perf", uname(9)),
-        "usr/lib/linux-tools-9.8.0-9/turbostat".into(),
-    ]
-    .iter()
-    .map(|p| allocated(&fx.root.join(p)))
-    .sum();
-    assert_eq!(
-        f.bytes,
-        rest + allocated(&lib.join("kernel/nvidia/nvidia.ko"))
-    );
-}
-
-#[test]
 fn hardlinks_count_once_and_only_when_every_link_goes() {
     let fx = Fx::new(FULL);
     let big = fx.modules(9).join("kernel/fs/big.ko");
@@ -897,7 +865,7 @@ fn the_removal_set_guard_simulates_the_exact_removal() {
     assert_eq!(
         last,
         format!(
-            "-s remove --purge --no-auto-remove {}",
+            "-s -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= remove --purge --no-auto-remove {}",
             packages(&f).join(" ")
         )
     );
@@ -1057,15 +1025,12 @@ fn plan_blocks_what_the_guards_block() {
     );
     fs::remove_file(fx.data.join("extra")).unwrap();
 
-    // A DKMS build in the version's headers.
+    // A process working in the version's modules directory.
     let busy = Processes {
         procs: vec![Proc {
             pid: 4242,
-            name: "make".into(),
-            cwd: Some(
-                fx.root
-                    .join(format!("usr/src/linux-headers-{}/scripts", uname(9))),
-            ),
+            name: "modinfo".into(),
+            cwd: Some(fx.modules(9).join("kernel")),
             open: vec![],
         }],
         unreadable: 0,
@@ -1082,27 +1047,13 @@ fn plan_blocks_what_the_guards_block() {
     let other = Processes {
         procs: vec![Proc {
             pid: 4242,
-            name: "make".into(),
-            cwd: Some(fx.root.join(format!("usr/src/linux-headers-{}", uname(12)))),
-            open: vec![
-                fx.root
-                    .join(format!("usr/lib/linux-tools/{}/perf", uname(12))),
-            ],
+            name: "modinfo".into(),
+            cwd: Some(fx.modules(12)),
+            open: vec![fx.modules(12).join("kernel/fs/big.ko")],
         }],
         unreadable: 0,
     };
     assert_eq!(select(&fx, 9, &other).items.len(), 1);
-    // A perf running from the version's tools.
-    let perf = Processes {
-        procs: vec![Proc {
-            pid: 4343,
-            name: "perf".into(),
-            cwd: Some(PathBuf::from("/")),
-            open: vec![fx.root.join("usr/lib/linux-tools-9.8.0-9/turbostat")],
-        }],
-        unreadable: 0,
-    };
-    assert!(select(&fx, 9, &perf).items.is_empty());
 }
 
 #[test]
