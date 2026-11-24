@@ -129,6 +129,15 @@ expression: v
       "name": "apt-cache",
       "ran": false,
       "status": "[status]"
+    },
+    {
+      "detail": "[detail]",
+      "elapsed_ms": "[elapsed_ms]",
+      "error": null,
+      "findings": 0,
+      "name": "snap-revisions",
+      "ran": false,
+      "status": "[status]"
     }
   ],
   "docker": null,

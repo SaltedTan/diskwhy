@@ -609,7 +609,8 @@ fn doctor_json() {
             "pyenv",
             "fnm",
             "journalctl",
-            "apt-get"
+            "apt-get",
+            "snap"
         ]
     );
     assert!(v["detectors"].as_array().unwrap().len() >= 12);

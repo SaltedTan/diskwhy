@@ -6,6 +6,7 @@ mod docker;
 mod git_worktree;
 mod journald;
 mod node_modules;
+mod snap_revisions;
 mod stale_tree;
 mod tool_versions;
 mod trash;
@@ -31,6 +32,7 @@ pub use git_worktree::{
 };
 pub use journald::Journald;
 pub use node_modules::NodeModules;
+pub use snap_revisions::SnapRevisions;
 pub use stale_tree::{SCRATCH_LOCATIONS, SCRATCH_MARKER, SCRATCH_STALE_DAYS, StaleTree};
 pub use tool_versions::ToolVersions;
 pub use trash::{TRASH_RECENT_DAYS, Trash};
@@ -54,6 +56,7 @@ pub fn registry() -> Vec<Box<dyn Detector>> {
         Box::new(DockerVolume),
         Box::new(Journald::from_system()),
         Box::new(AptCache::from_system()),
+        Box::new(SnapRevisions::from_system()),
     ]
 }
 

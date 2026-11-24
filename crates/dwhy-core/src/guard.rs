@@ -50,7 +50,13 @@
 //! journals open, and the vacuum removes only closed archived files. Git
 //! guards do not apply to `apt-cache` either (`apt-get clean` removes only
 //! apt's cache files), but process guards do: `apt` and `dpkg` hold
-//! `archives/lock` open while they work.
+//! `archives/lock` open while they work. Likewise for `snap-revisions`:
+//! `snap remove --revision` removes only snapd's own files, and the
+//! process guards block while a process has its working directory or an
+//! open or mapped file in the `.snap` file, the revision's mount or its
+//! `/var/snap/<name>/<rev>` data directory (for a parallel instance, also
+//! those paths without the instance key). Apps running on a disabled base
+//! revision are not seen: it is their namespace's root.
 //!
 //! Identities are checked again at this boundary, before any git state is
 //! read: a finding root or repository that is no longer the directory the
@@ -308,8 +314,9 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
         if f.path.starts_with('/') {
             let root = PathBuf::from(&f.path);
             if process_guarded(f) {
-                results.push(in_use_cwd(&root, procs));
-                results.push(in_use_open(&root, procs));
+                let roots = process_roots(f, &root);
+                results.push(in_use_cwd(&roots, procs));
+                results.push(in_use_open(&roots, procs));
             }
             if let Some(detail) = root_change {
                 plan::add_changed_guard(&mut results, detail);
@@ -339,13 +346,14 @@ pub fn check(findings: &mut [Finding], tree: &ScanTree, ctx: &DetectContext, pro
 /// versions, whose repositories are the tools' own checkouts (Cargo's git
 /// dependencies, uv's source builds, VS Code's servers).
 ///
-/// Nor to `journald` and `apt-cache`: the vacuum removes only archived
-/// journal files and `apt-get clean` only apt's own cache files, so
-/// neither can touch a repository.
+/// Nor to `journald`, `apt-cache` and `snap-revisions`: the vacuum
+/// removes only archived journal files, `apt-get clean` only apt's own
+/// cache files and `snap remove --revision` only snapd's files for that
+/// revision, so none of them can touch a repository.
 pub(crate) fn git_guarded(f: &Finding) -> bool {
     !matches!(
         f.detector.as_str(),
-        "user-cache" | "tool-versions" | "journald" | "apt-cache"
+        "user-cache" | "tool-versions" | "journald" | "apt-cache" | "snap-revisions"
     )
 }
 
@@ -357,6 +365,48 @@ pub(crate) fn git_guarded(f: &Finding) -> bool {
 /// still applies.
 fn process_guarded(f: &Finding) -> bool {
     f.detector != "journald"
+}
+
+/// Where `in-use-cwd` and `in-use-open` look: the finding's root, and for
+/// `snap-revisions` also the revision's mount (`/snap/<name>/<rev>`, or
+/// `/var/lib/snapd/snap/<name>/<rev>` where snapd mounts there) and its
+/// system data directory (`/var/snap/<name>/<rev>`). The kernel's loop
+/// device holds the `.snap` file, not a process, so an app still running
+/// from a disabled revision shows up only through paths under its mount,
+/// and `snap remove --revision` deletes the data directory under it. For
+/// a parallel instance (`<name>_<key>`) the same paths without the key
+/// are checked too: inside the instance's mount namespace snap-confine
+/// maps its directories onto `/snap/<name>` and `/var/snap/<name>`, which
+/// is what its processes show. The name and revision come from the
+/// action's argv (`snap remove --revision=<rev> <name>`), which the
+/// detector built from names it validated.
+///
+/// A disabled `base` or `os` revision that apps started before a refresh
+/// still run on is not seen: snap-confine makes the base's mount the root
+/// of their namespace, so their paths carry no `/snap/<base>/<rev>`
+/// prefix.
+fn process_roots(f: &Finding, root: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![root.to_path_buf()];
+    if f.detector != "snap-revisions" {
+        return roots;
+    }
+    let argv = f.action.argv.as_deref().unwrap_or_default();
+    let rev = argv.iter().find_map(|a| a.strip_prefix("--revision="));
+    let name = argv.last();
+    let safe =
+        |s: &str| !s.is_empty() && s != "." && s != ".." && !s.contains('/') && !s.contains('\0');
+    if let (Some(rev), Some(name)) = (rev, name)
+        && safe(rev)
+        && safe(name)
+    {
+        let names = std::iter::once(name.as_str()).chain(name.split_once('_').map(|(n, _)| n));
+        for n in names {
+            for base in ["/snap", "/var/lib/snapd/snap", "/var/snap"] {
+                roots.push(Path::new(base).join(n).join(rev));
+            }
+        }
+    }
+    roots
 }
 
 /// What the git guards check. Work trees sort before git directories, so
@@ -482,11 +532,15 @@ fn unread_note(procs: &Processes) -> String {
     }
 }
 
-fn in_use_cwd(root: &Path, procs: &Processes) -> GuardResult {
+fn in_use_cwd(roots: &[PathBuf], procs: &Processes) -> GuardResult {
     let hits: Vec<&Proc> = procs
         .procs
         .iter()
-        .filter(|p| p.cwd.as_deref().is_some_and(|c| c.starts_with(root)))
+        .filter(|p| {
+            p.cwd
+                .as_deref()
+                .is_some_and(|c| roots.iter().any(|r| c.starts_with(r)))
+        })
         .collect();
     if hits.is_empty() {
         GuardResult {
@@ -506,11 +560,12 @@ fn in_use_cwd(root: &Path, procs: &Processes) -> GuardResult {
     }
 }
 
-fn in_use_open(root: &Path, procs: &Processes) -> GuardResult {
+fn in_use_open(roots: &[PathBuf], procs: &Processes) -> GuardResult {
+    let within = |o: &Path| roots.iter().any(|r| o.starts_with(r));
     let hits: Vec<&Proc> = procs
         .procs
         .iter()
-        .filter(|p| p.open.iter().any(|o| o.starts_with(root)))
+        .filter(|p| p.open.iter().any(|o| within(o)))
         .collect();
     if hits.is_empty() {
         GuardResult {
@@ -522,7 +577,7 @@ fn in_use_open(root: &Path, procs: &Processes) -> GuardResult {
         let example = hits[0]
             .open
             .iter()
-            .find(|o| o.starts_with(root))
+            .find(|o| within(o))
             .map(|o| format!(", e.g. {}", o.display()))
             .unwrap_or_default();
         GuardResult {

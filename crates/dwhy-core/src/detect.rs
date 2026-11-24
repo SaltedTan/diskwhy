@@ -3,8 +3,8 @@
 //! and the rule for nested findings.
 //!
 //! Detectors only read: they look at the [`ScanTree`] and may read small
-//! files, run read-only tool commands, or make read-only Docker API GETs
-//! (see [`crate::docker`]). They never remove anything.
+//! files, run read-only tool commands, or make read-only Docker or snapd
+//! API GETs (see [`crate::docker`]). They never remove anything.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,6 +52,7 @@ pub const CATALOG: &[DetectorInfo] = &[
     info("docker-volume", "M1", Needs::Docker),
     info("journald", "post-MVP", Needs::RootAnd("journalctl")),
     info("apt-cache", "post-MVP", Needs::RootAnd("apt-get")),
+    info("snap-revisions", "post-MVP", Needs::RootAnd("snap")),
 ];
 
 const fn info(name: &'static str, milestone: &'static str, needs: Needs) -> DetectorInfo {
