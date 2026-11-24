@@ -734,6 +734,54 @@ fn plan_and_apply_remove_one_revision_and_skip_it_once_reverted() {
         .unwrap();
     assert_eq!(g.status, GuardStatus::Block);
 
+    // An app still running from the disabled revision: the loop device
+    // holds the .snap file, so only paths under the revision's mount or
+    // data directory show it.
+    for (cwd, open) in [
+        ("/", "/snap/firefox/9057/usr/lib/firefox/libxul.so"),
+        (
+            "/",
+            "/var/lib/snapd/snap/firefox/9057/usr/lib/firefox/firefox",
+        ),
+        ("/var/snap/firefox/9057", "/usr/lib/libc.so.6"),
+    ] {
+        let running = Processes {
+            procs: vec![Proc {
+                pid: 4343,
+                name: "firefox".into(),
+                cwd: Some(PathBuf::from(cwd)),
+                open: vec![PathBuf::from(open)],
+            }],
+            unreadable: 0,
+        };
+        let plan = plan_with(&running);
+        assert!(plan.items.is_empty(), "{cwd} {open}: {plan:?}");
+        assert!(
+            plan.blocked[0]
+                .guards
+                .iter()
+                .any(|g| g.name.starts_with("in-use") && g.status == GuardStatus::Block),
+            "{cwd} {open}: {plan:?}"
+        );
+    }
+
+    // The active revision's mount and data, and a revision sharing a
+    // prefix, do not block the disabled one.
+    let other = Processes {
+        procs: vec![Proc {
+            pid: 4444,
+            name: "firefox".into(),
+            cwd: Some(PathBuf::from("/var/snap/firefox/9137")),
+            open: vec![
+                PathBuf::from("/snap/firefox/9137/usr/lib/firefox/libxul.so"),
+                PathBuf::from("/snap/firefox/90570/usr/lib/firefox/libxul.so"),
+                PathBuf::from("/var/snap/firefox/common/cache"),
+            ],
+        }],
+        unreadable: 0,
+    };
+    assert_eq!(plan_with(&other).items.len(), 1);
+
     let idle = Processes {
         procs: vec![],
         unreadable: 0,
