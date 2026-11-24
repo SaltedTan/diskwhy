@@ -220,33 +220,30 @@ impl Journald {
             .filter(|(_, st)| FileType::from_raw_mode(st.st_mode) == FileType::RegularFile);
         note_dir(&mut inodes, files, cutoff);
         for (name, st) in &top {
-            match FileType::from_raw_mode(st.st_mode) {
-                FileType::Directory => {
-                    // A `<machine-id>/` directory, checked to be the inode
-                    // just stat'ed; nothing below it is read. journalctl
-                    // vacuums no other subdirectory.
-                    if !is_id128(name) {
-                        continue;
-                    }
-                    let Ok(sub) = rustix::fs::openat(&root, name.as_slice(), flags, Mode::empty())
-                    else {
-                        continue;
-                    };
-                    let Ok(sst) = rustix::fs::fstat(&sub) else {
-                        continue;
-                    };
-                    if (sst.st_dev, sst.st_ino) != (st.st_dev, st.st_ino) {
-                        continue;
-                    }
-                    let sub = entries(&sub, dev);
-                    let files = sub.iter().filter(|(_, st)| {
-                        FileType::from_raw_mode(st.st_mode) == FileType::RegularFile
-                    });
-                    note_dir(&mut inodes, files, cutoff);
+            // Regular files are noted above. Symlinks are never followed;
+            // anything else is not a journal.
+            if FileType::from_raw_mode(st.st_mode) == FileType::Directory {
+                // A `<machine-id>/` directory, checked to be the inode
+                // just stat'ed; nothing below it is read. journalctl
+                // vacuums no other subdirectory.
+                if !is_id128(name) {
+                    continue;
                 }
-                // Regular files are noted above. Symlinks are never
-                // followed; anything else is not a journal.
-                _ => {}
+                let Ok(sub) = rustix::fs::openat(&root, name.as_slice(), flags, Mode::empty())
+                else {
+                    continue;
+                };
+                let Ok(sst) = rustix::fs::fstat(&sub) else {
+                    continue;
+                };
+                if (sst.st_dev, sst.st_ino) != (st.st_dev, st.st_ino) {
+                    continue;
+                }
+                let sub = entries(&sub, dev);
+                let files = sub
+                    .iter()
+                    .filter(|(_, st)| FileType::from_raw_mode(st.st_mode) == FileType::RegularFile);
+                note_dir(&mut inodes, files, cutoff);
             }
         }
         let mut t = Tally::default();
@@ -309,10 +306,10 @@ struct Archived<'a> {
 /// journal-vacuum.c's `vacuum_compare`: by head seqnum within one seqnum ID,
 /// otherwise by time, then seqnum ID, then name.
 fn vacuum_order(a: &Archived, b: &Archived) -> Ordering {
-    if let (Some((ia, sa)), Some((ib, sb))) = (a.seq, b.seq) {
-        if ia == ib {
-            return sa.cmp(&sb);
-        }
+    if let (Some((ia, sa)), Some((ib, sb))) = (a.seq, b.seq)
+        && ia == ib
+    {
+        return sa.cmp(&sb);
     }
     a.time.cmp(&b.time).then_with(|| match (a.seq, b.seq) {
         (Some((ia, _)), Some((ib, _))) => ia.cmp(&ib),
